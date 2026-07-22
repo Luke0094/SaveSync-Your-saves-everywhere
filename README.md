@@ -83,7 +83,7 @@ choice — with an always-on-top overlay so you never have to leave the game.
 **Requirements:** Python 3.10+
 
 ```bash
-git clone https://github.com/Luke0094/SaveSync.git
+git clone https://github.com/Luke0094/SaveSync-Your-saves-everywhere.git
 cd SaveSync
 pip install -r requirements.txt
 python main.py
