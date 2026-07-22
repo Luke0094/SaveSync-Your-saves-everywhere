@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from i18n import t
 from ui.styles.theme import palette
 
-_GITHUB_URL = "https://github.com/Luke0094/SaveSync"
+_GITHUB_URL = "https://github.com/Luke0094/SaveSync-Your-saves-everywhere"
 
 _WALLETS = [
     ("Bitcoin",  "3G3MDNUh51g6iK7ZRSQPX4EeBXEb3UyAtw"),
