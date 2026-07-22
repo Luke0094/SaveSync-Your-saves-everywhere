@@ -80,6 +80,8 @@
     "edit": "Modifica",
     "open_folder": "Apri Cartella Salvataggi",
     "web_search": "Cerca Online",
+    "adjust_cover_focus": "Regola Focus Copertina",
+    "cover_focus_instruction": "Seleziona quale parte dell'immagine focalizzare per la visualizzazione della copertina.",
     "status_synced": "Sincronizzato",
     "status_pending": "Sync in attesa",
     "status_conflict": "Conflitto",

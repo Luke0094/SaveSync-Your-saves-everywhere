@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -222,7 +222,7 @@ def _find_game_image(entry: GameEntry) -> Optional[str]:
     return images[0] if images else None
 
 
-def _make_pixmap(path: Optional[str], w: int, h: int) -> Optional[QPixmap]:
+def _make_pixmap(path: Optional[str], w: int, h: int, focus: str = "center") -> Optional[QPixmap]:
     if not path:
         return None
     try:
@@ -231,15 +231,31 @@ def _make_pixmap(path: Optional[str], w: int, h: int) -> Optional[QPixmap]:
             logger.debug(f"Pixmap load returned null for path: {path}")
             return None
         # Scale so the image covers the target size (KeepAspectRatioByExpanding),
-        # then centre-crop to exact dimensions to avoid left-aligned content.
+        # then crop to exact dimensions based on focus position.
         scaled = px.scaled(
             w, h,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         )
-        # Centre crop
+        # Calculate crop offset based on 3x3 grid focus
+        # Default center crop
         x_off = max(0, (scaled.width()  - w) // 2)
         y_off = max(0, (scaled.height() - h) // 2)
+        
+        # Apply focus offset (shift crop towards the specified region)
+        extra_w = max(0, scaled.width() - w)
+        extra_h = max(0, scaled.height() - h)
+        
+        if "left" in focus:
+            x_off = 0
+        elif "right" in focus:
+            x_off = extra_w
+        
+        if "top" in focus:
+            y_off = 0
+        elif "bottom" in focus:
+            y_off = extra_h
+        
         return scaled.copy(x_off, y_off, w, h)
     except Exception as e:
         logger.debug(f"Pixmap load failed for path '{path}': {e}")
@@ -516,6 +532,12 @@ class _GameItemMixin:
     def _build_context_menu(self) -> QMenu:
         """Build the full context menu (split from exec for testability)."""
         menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
         menu.addAction(t('library.details'),         lambda: self.detail_requested.emit(self._entry.id))
         menu.addAction(t("library.backup_now"),  lambda: self.backup_requested.emit(self._entry.id))
         menu.addAction(t("sync.sync_now"),       lambda: self.sync_requested.emit(self._entry.id))
@@ -527,6 +549,7 @@ class _GameItemMixin:
         self._add_folder_submenu(menu)
         menu.addAction(t("library.edit"),        lambda: self.edit_requested.emit(self._entry.id))
         menu.addAction(t("library.web_search"),  lambda: self._web_search_game(self._entry.id))
+        menu.addAction(t("library.adjust_cover_focus"), lambda: self._show_cover_focus_dialog())
         # "Open save folder": with several targets the choice is a SUBMENU —
         # exec-ing a second popup from this menu's triggered handler left a
         # floating empty popup on Windows (nested popup during teardown).
@@ -537,6 +560,12 @@ class _GameItemMixin:
             # it (empirically reproduced) — parenting to the menu keeps it
             # alive for the exec that happens in the caller.
             sub = QMenu(t("library.open_folder"), menu)
+            sub.setStyleSheet(
+                f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+                f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+                f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+                f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+            )
             _populate_save_folder_menu(sub, _targets)
             menu.addMenu(sub)
         elif len(_targets) == 1:
@@ -562,6 +591,12 @@ class _GameItemMixin:
         # can be GC'd once this method exits (empirically reproduced), and
         # exec happens later in the caller.
         sub = QMenu(t("library.move_to_folder"), menu)
+        sub.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
         menu.addMenu(sub)
         sub.addAction(t("library.no_folder"), lambda: self._set_folder(""))
         sub.addSeparator()
@@ -582,6 +617,148 @@ class _GameItemMixin:
 
     def _web_search_game(self, game_id: str):
         _web_search_game_dialog(self, game_id)
+
+    def _show_cover_focus_dialog(self):
+        """Show a dialog with a 3x3 grid to select cover focus position."""
+        from PySide6.QtWidgets import QDialog, QGridLayout, QPushButton, QLabel
+        from PySide6.QtCore import QEvent
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle(t("library.adjust_cover_focus"))
+        dialog.setFixedSize(320, 380)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        
+        # Instructions
+        info = QLabel(t("library.cover_focus_instruction"))
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        layout.addWidget(info)
+        
+        # Load the original image once for all previews
+        original_px = None
+        if self._img_path:
+            try:
+                original_px = _load_pixmap_any(self._img_path)
+            except Exception:
+                pass
+        
+        # 3x3 grid of buttons showing preview
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(8)
+        
+        focus_positions = [
+            "top-left", "top-center", "top-right",
+            "center-left", "center", "center-right",
+            "bottom-left", "bottom-center", "bottom-right"
+        ]
+        
+        current_focus = getattr(self._entry, 'cover_focus', 'center')
+        
+        # Use same aspect ratio as actual card (186x240) but half resolution for performance
+        card_w, card_h = 186, 240
+        preview_w, preview_h = card_w // 2, card_h // 2  # 93x120
+        button_w, button_h = 100, 125  # Slightly larger than preview for visible borders
+        
+        scaled_px = None
+        if original_px and not original_px.isNull():
+            scaled_px = original_px.scaled(
+                preview_w, preview_h,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        
+        # Event filter for hover effects
+        buttons = []
+        
+        class HoverFilter(QObject):
+            def __init__(self, normal_style, hover_style):
+                super().__init__()
+                self.normal_style = normal_style
+                self.hover_style = hover_style
+            
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Type.Enter:
+                    obj.setStyleSheet(self.hover_style)
+                elif event.type() == QEvent.Type.Leave:
+                    obj.setStyleSheet(self.normal_style)
+                return super().eventFilter(obj, event)
+        
+        for i, pos in enumerate(focus_positions):
+            btn = QPushButton()
+            btn.setFixedSize(button_w, button_h)  # Slightly larger than preview for visible borders
+            btn.setCheckable(True)
+            btn.setChecked(pos == current_focus)
+            
+            # Create preview with this focus from the pre-scaled image
+            if scaled_px:
+                # Calculate crop offset based on focus position (same logic as _make_pixmap)
+                extra_w = max(0, scaled_px.width() - preview_w)
+                extra_h = max(0, scaled_px.height() - preview_h)
+                
+                x_off = extra_w // 2
+                y_off = extra_h // 2
+                
+                if "left" in pos:
+                    x_off = 0
+                elif "right" in pos:
+                    x_off = extra_w
+                
+                if "top" in pos:
+                    y_off = 0
+                elif "bottom" in pos:
+                    y_off = extra_h
+                
+                preview = scaled_px.copy(x_off, y_off, preview_w, preview_h)
+                icon = QIcon(preview)
+                btn.setIcon(icon)
+                # Add margin so icon doesn't fill entire button - borders will be visible
+                btn.setIconSize(preview.size())
+            else:
+                btn.setText("🖼️")
+            
+            # Custom hover effect using event filter
+            padding = (button_w - preview_w) // 2
+            normal_style = (
+                f"QPushButton{{background:{palette('bg_elevated')};border:1px solid {palette('border')};border-radius:6px;padding:{padding}px;}}"
+                f"QPushButton:checked{{border:2px solid {palette('accent')};}}"
+            )
+            hover_style = (
+                f"QPushButton{{background:{palette('bg_hover')};border:1px solid {palette('accent')};border-radius:6px;padding:{padding}px;}}"
+                f"QPushButton:checked{{border:2px solid {palette('accent')};}}"
+            )
+            btn.setStyleSheet(normal_style)
+            
+            hover_filter = HoverFilter(normal_style, hover_style)
+            btn.installEventFilter(hover_filter)
+            
+            btn.clicked.connect(lambda checked=False, p=pos: self._set_cover_focus(p, dialog))
+            
+            buttons.append((btn, hover_filter))
+            
+            row = i // 3
+            col = i % 3
+            grid_layout.addWidget(btn, row, col)
+        
+        layout.addLayout(grid_layout)
+        layout.addStretch()
+        
+        # Apply theme styling
+        dialog.setStyleSheet(
+            f"QDialog{{background:{palette('bg_card')};}}"
+        )
+        
+        dialog.exec()
+
+    def _set_cover_focus(self, focus: str, dialog):
+        """Set the cover focus and update the entry."""
+        self._entry.cover_focus = focus
+        lib = get_library()
+        lib.update_game(self._entry)
+        self._update_cover()
+        dialog.accept()
 
     def set_playing(self, is_playing: bool):
         if hasattr(self, "_playing_badge"):
@@ -743,7 +920,8 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             return
         self._slideshow_idx = (self._slideshow_idx + 1) % len(self._all_images)
         path = self._all_images[self._slideshow_idx]
-        px = _make_pixmap(path, 186, 240)
+        focus = getattr(self._entry, 'cover_focus', 'center')
+        px = _make_pixmap(path, 186, 240, focus)
         if px and not px.isNull():
             self._start_cover_fade(px)
             self._cover.setText("")
@@ -1007,7 +1185,8 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         return palette(color_key) if color_key else ""
 
     def _update_cover(self):
-        px = _make_pixmap(self._img_path, 186, 240)
+        focus = getattr(self._entry, 'cover_focus', 'center')
+        px = _make_pixmap(self._img_path, 186, 240, focus)
         if px:
             self._cover.setPixmap(px)
             self._cover.setText("")
@@ -1075,7 +1254,8 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         self._sty(self._thumb, lambda: (
             f"background:{palette('bg_elevated')};border-radius:6px;font-size:22px;"
         ))
-        px = _make_pixmap(self._img_path, 48, 48)
+        focus = getattr(entry, 'cover_focus', 'center')
+        px = _make_pixmap(self._img_path, 48, 48, focus)
         if px:
             self._thumb.setPixmap(px)
         else:
@@ -1209,7 +1389,8 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         new_img = _find_game_image(entry)
         if new_img != self._img_path:
             self._img_path = new_img
-            px = _make_pixmap(new_img, 48, 48)
+            focus = getattr(entry, 'cover_focus', 'center')
+            px = _make_pixmap(new_img, 48, 48, focus)
             if px:
                 self._thumb.setPixmap(px)
             else:

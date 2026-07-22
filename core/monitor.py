@@ -70,6 +70,7 @@ _SYSTEM_STEMS: frozenset[str] = frozenset({
     "epiconlineservicesuihelper", "epiconlineservicesinstallhelper",
     "discord", "discordptb", "discordcanary",  # Chat apps
     "spotify", "slack", "teams", "telegram",
+    "winrar", "chrome", "firefox",  # Common utilities and browsers
     # Only essential system processes - let runtime filter handle the rest
     # "rundll32", "conhost",
 })

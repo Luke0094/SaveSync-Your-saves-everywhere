@@ -60,6 +60,7 @@ class GameEntry:
     suppressed_overlay: bool = False
     save_paths_confirmed: bool = False   # True once user has confirmed/chosen save paths
     icon_path: Optional[str] = None
+    cover_focus: str = "center"            # 3x3 grid position for cover cropping (top-left, top-center, top-right, center-left, center, center-right, bottom-left, bottom-center, bottom-right)
     machine_id: Optional[str] = None       # last backup machine
     cloud_metadata: dict = field(default_factory=dict)
     # Per-game backup settings

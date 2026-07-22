@@ -80,6 +80,8 @@
     "edit": "Edit",
     "open_folder": "Open Save Folder",
     "web_search": "Web Search",
+    "adjust_cover_focus": "Adjust Cover Focus",
+    "cover_focus_instruction": "Select which part of the image to focus on for the cover display.",
     "status_synced": "Synced",
     "status_pending": "Pending sync",
     "status_conflict": "Conflict",

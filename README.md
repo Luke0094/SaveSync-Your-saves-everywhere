@@ -8,7 +8,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
 <!-- Drop a screenshot into screenshot/ and update the path below -->
-<img width="957" height="636" alt="Immagine 2026-07-22 130446" src="https://github.com/user-attachments/assets/436c34d7-9615-4f62-b9cd-12fed7544932" />
+<!-- ![SaveSync](screenshot/main.png) -->
 
 SaveSync watches the games you play, finds their save folders on its own, keeps
 versioned local backups, and mirrors everything to the cloud provider of your

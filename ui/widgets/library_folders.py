@@ -1012,6 +1012,12 @@ class FolderTree(QFrame, ThemedMixin):
                 if row._path == "__all__":
                     # All-games row: just the root "new folder" shortcut
                     menu = QMenu(self)
+                    menu.setStyleSheet(
+                        f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+                        f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+                        f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+                        f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+                    )
                     menu.addAction(f"+ {t('library.new_folder')}",
                                    lambda: self._add_folder(""))
                     menu.exec(event.globalPos())
@@ -1021,10 +1027,22 @@ class FolderTree(QFrame, ThemedMixin):
 
     def _show_folder_menu(self, path: str, pos):
         menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
         menu.addAction(t("library.add_subfolder"), lambda: self._add_folder(path))
         menu.addAction(t("library.rename_folder"), lambda: self._rename_folder(path))
         menu.addSeparator()
         color_menu = QMenu(t("library.change_folder_color"), menu)
+        color_menu.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
         menu.addMenu(color_menu)
         for ck in FOLDER_COLOR_KEYS:
             color_name = ck.replace("folder_", "")
