@@ -714,7 +714,7 @@ class BackupsPage(QWidget, ThemedMixin):
                 # entries never vanish when this model is rebuilt.
                 self._search_candidates.append((g.name, g.id))
                 # Native dropdown items: respect the active text filter —
-                # with "dark" typed, "Dota 2" must not be selectable there.
+                # with "dark" typed, "My Game" must not be selectable there.
                 if tf and tf not in g.name.lower():
                     continue
                 n = counts.get(g.id, 0)
@@ -975,7 +975,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
     def _do_game_search(self):
         """Debounced: rebuild the NATIVE dropdown filtered by the typed
-        characters (typing 'dark' must remove 'Dota 2' from the arrow
+        characters (typing 'dark' must remove 'My Game' from the arrow
         dropdown too) and refresh the backup list. The typing popup is
         unaffected: it reads from _search_candidates, which _load_games
         always builds from the FULL origin-filtered set — so its entries

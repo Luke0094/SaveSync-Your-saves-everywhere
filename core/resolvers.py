@@ -40,7 +40,7 @@ def fuzzy_score(query: str, target: str) -> float:
     if target_slug in query_slug:
         return 75.0
     
-    # Check for word-level matches (important for "Dota Underlords" -> "underlords")
+    # Check for word-level matches (important for "My Great Game" -> "game")
     query_words = query_slug.split()
     target_words = target_slug.split()
     
@@ -65,84 +65,118 @@ def fuzzy_score(query: str, target: str) -> float:
     return 0.0
 
 
-def find_executable_by_fuzzy_name(name: str, search_paths: Optional[list[Path]] = None) -> Optional[Path]:
+def find_executable_by_fuzzy_name(name: str,
+                                  search_paths: Optional[list[Path]] = None,
+                                  deadline: Optional[float] = None,
+                                  cancel_event=None) -> Optional[Path]:
     """Find executable by fuzzy name search.
-    
+
+    ONE disk pass scoring ALL name variants at once: the old version
+    re-walked every search path once per word of the name ("My Great
+    Game" = three full-disk scans) — on a cold filesystem cache that
+    alone blew past any caller-side timeout with NOTHING to show.
+
     Args:
         name: The name to search for (can be game name or appid)
         search_paths: Optional list of paths to search in
-        
+        deadline: Optional time.monotonic() timestamp — when reached, the
+            scan STOPS and returns the best candidate seen SO FAR (a
+            partial answer beats a timeout with nothing)
+        cancel_event: Optional threading.Event checked alongside deadline
+
     Returns:
-        Path to the executable if found, None otherwise
+        Path to the best-matching executable, None if none scored.
     """
     if search_paths is None:
         search_paths = _get_default_exe_search_paths()
-    
-    # Try original name and all individual words (e.g., "Dota Underlords" → ["Dota Underlords", "Dota", "Underlords"])
-    search_names = [name]
+
+    # Full name first, then individual words — as score WEIGHTS in a
+    # single pass (full-name matches keep their old priority without
+    # re-scanning the disk once per word).
+    weighted: list[tuple[str, str, float]] = [(name, fuzzy_slug(name), 1.0)]
     if " " in name:
-        words = name.split()
-        for word in words:
-            search_names.append(word)
-    
-    for search_name in search_names:
-        result = _search_executables(search_name, search_paths)
-        if result:
-            return result
-    
-    return None
+        for word in name.split():
+            weighted.append((word, fuzzy_slug(word), 0.85))
+
+    return _search_executables_multi(weighted, search_paths,
+                                     deadline=deadline,
+                                     cancel_event=cancel_event)
 
 
-def _search_executables(name: str, search_paths: list[Path]) -> Optional[Path]:
-    """Internal search helper. Also scans ``.url`` files on Desktop paths."""
-    candidates = []
-    name_slug = fuzzy_slug(name)
-    
+class _DeadlineHit(Exception):
+    pass
+
+
+def _search_executables_multi(weighted_names: list[tuple[str, str, float]],
+                              search_paths: list[Path],
+                              deadline: Optional[float] = None,
+                              cancel_event=None) -> Optional[Path]:
+    """Single-pass search helper. Also scans ``.lnk``/``.url`` on Desktop
+    paths. *weighted_names* is [(name, slug, weight), ...]."""
+    import time as _time
+
+    candidates: list[tuple[float, Path]] = []
+    checked = 0
+
+    def _expired() -> bool:
+        if deadline is not None and _time.monotonic() >= deadline:
+            return True
+        return cancel_event is not None and cancel_event.is_set()
+
     for search_base in search_paths:
+        if _expired():
+            break
         if not search_base.exists():
             continue
-        
+
         try:
             for exe_path in search_base.rglob("*.exe"):
+                checked += 1
+                # rglob can grind through hundreds of thousands of
+                # entries on a cold cache — honour the deadline INSIDE
+                # the walk, not just between phases.
+                if checked % 128 == 0 and _expired():
+                    raise _DeadlineHit
                 try:
-                    # Check folder name match first
                     folder_slug = fuzzy_slug(exe_path.parent.name)
-                    folder_score = fuzzy_score(name_slug, folder_slug)
-                    
-                    # Check exe stem match
                     stem = exe_path.stem
-                    stem_score = fuzzy_score(name, stem)
-                    
-                    # Use the higher score, with folder match weighted higher
-                    score = max(folder_score * 1.2, stem_score)
-                    
+                    score = 0.0
+                    for _name, _slug, _w in weighted_names:
+                        folder_score = fuzzy_score(_slug, folder_slug)
+                        stem_score = fuzzy_score(_name, stem)
+                        # Folder match weighted higher, like before
+                        score = max(score,
+                                    max(folder_score * 1.2, stem_score) * _w)
                     if score >= 30.0:
                         candidates.append((score, exe_path))
                 except Exception:
                     pass
+        except _DeadlineHit:
+            logger.info(
+                f"Fuzzy search deadline reached after {checked} files — "
+                f"returning best of {len(candidates)} candidate(s)")
+            break
         except Exception as e:
             logger.debug(f"Error scanning {search_base}: {e}")
-        
+
         # Also scan .url and .lnk files on Desktop paths (game launcher shortcuts)
         if "Desktop" in search_base.name:
             try:
-                for lnk_path in search_base.glob("*.lnk"):
-                    stem_score = fuzzy_score(name, lnk_path.stem)
-                    if stem_score >= 30.0:
-                        candidates.append((stem_score, lnk_path))
-                for url_path in search_base.glob("*.url"):
-                    stem_score = fuzzy_score(name, url_path.stem)
-                    if stem_score >= 30.0:
-                        candidates.append((stem_score, url_path))
+                for link_path in list(search_base.glob("*.lnk")) + list(search_base.glob("*.url")):
+                    for _name, _slug, _w in weighted_names:
+                        stem_score = fuzzy_score(_name, link_path.stem) * _w
+                        if stem_score >= 30.0:
+                            candidates.append((stem_score, link_path))
             except Exception as e:
                 logger.debug(f"Error scanning Desktop in {search_base}: {e}")
-    
+
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
-        logger.info(f"Fuzzy search for '{name}' found: {candidates[0][1]}")
+        logger.info(f"Fuzzy search found: {candidates[0][1]} "
+                    f"(score {candidates[0][0]:.0f}, {checked} files scanned)")
         return candidates[0][1]
-    
-    logger.info(f"Fuzzy search for '{name}' found no matches")
+
+    logger.info(f"Fuzzy search found no matches ({checked} files scanned)")
     return None
 
 

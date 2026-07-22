@@ -1018,31 +1018,41 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         game_name = None
         if original_url:
             appid = get_appid_from_url(original_url)
-            
+
             # Try to get game name from parent process
             game_name = get_pending_appid(original_url)
-            
+
             # Build search paths
             recommended_paths = []
             launcher_paths = _get_launcher_install_paths()
             for launcher, dirs in launcher_paths.items():
                 recommended_paths.extend(dirs)
-            
+
+            # Bounded resolution: the fuzzy walk honours the deadline
+            # internally and returns the best candidate found so far —
+            # a cold-cache disk never wedges this path anymore.
+            import time as _time
+            _deadline = _time.monotonic() + 30
+
             # Resolve URL to actual exe path using launcher paths first
             exe_path = None
             if game_name:
-                exe_path = find_executable_by_fuzzy_name(game_name, recommended_paths)
-            
+                exe_path = find_executable_by_fuzzy_name(
+                    game_name, recommended_paths, deadline=_deadline)
+
             if not exe_path and appid:
-                exe_path = find_executable_by_fuzzy_name(appid, recommended_paths)
-            
+                exe_path = find_executable_by_fuzzy_name(
+                    appid, recommended_paths, deadline=_deadline)
+
             # Wide scan if not found
             if not exe_path:
                 wide_paths = _get_default_exe_search_paths()
                 if game_name:
-                    exe_path = find_executable_by_fuzzy_name(game_name, wide_paths)
+                    exe_path = find_executable_by_fuzzy_name(
+                        game_name, wide_paths, deadline=_deadline)
                 if not exe_path and appid:
-                    exe_path = find_executable_by_fuzzy_name(appid, wide_paths)
+                    exe_path = find_executable_by_fuzzy_name(
+                        appid, wide_paths, deadline=_deadline)
             
             if exe_path:
                 logger.info(f"Resolved launcher URL to {exe_path}")

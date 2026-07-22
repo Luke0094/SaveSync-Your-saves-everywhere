@@ -192,6 +192,14 @@ class _ExePickerDialog(QFileDialog):
             target = resolve_lnk_target(files[0]).strip().strip('"')
             if target and target != files[0] and Path(target).is_dir():
                 self.setDirectory(target)
+                # The filename box still holds "Folder.lnk" after the hop,
+                # and the widget dialog FILTERS the listing by that text —
+                # the target directory loaded but looked completely empty.
+                # Clear it so the new directory's content is visible.
+                from PySide6.QtWidgets import QLineEdit
+                edit = self.findChild(QLineEdit, "fileNameEdit")
+                if edit is not None:
+                    edit.clear()
                 return
         super().accept()
 
@@ -1499,7 +1507,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             
             from core.resolvers import find_executable_by_fuzzy_name, _get_suggested_exe_search_paths
             import os
-            
+            import time as _time
+            # This path is SYNCHRONOUS on the GUI thread — bound it hard:
+            # better a partial answer after 20s than a frozen window.
+            _deadline = _time.monotonic() + 20
+
             # Build paths the same way as async version
             paths = _get_suggested_exe_search_paths()
             if self._shortcut_dir:
@@ -1527,11 +1539,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             
             exe_path = None
             if game_name:
-                exe_path = find_executable_by_fuzzy_name(game_name, paths)
-            
+                exe_path = find_executable_by_fuzzy_name(game_name, paths,
+                                                         deadline=_deadline)
+
             if not exe_path and appid:
-                exe_path = find_executable_by_fuzzy_name(appid, paths)
-            
+                exe_path = find_executable_by_fuzzy_name(appid, paths,
+                                                         deadline=_deadline)
+
             if not exe_path:
                 # No executable found, but still return the parsed appid
                 # so launcher URLs (battlenet://, etc.) can be saved for launching
@@ -1557,7 +1571,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         _sel = dlg.selectedFiles()
         path = _sel[0] if _sel else ""
         if path:
-            # Extract name and directory from shortcut filename (e.g., "Baldur's Gate 3.url" -> "Baldur's Gate 3").
+            # Extract name and directory from shortcut filename (e.g., "My Game.url" -> "My Game").
             # For plain executables, a generic stem ("game", "launcher"…) is
             # replaced with the install-folder name so the game is never
             # proposed as "Game" or "Launcher".
@@ -1736,6 +1750,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         
         def resolve():
             start_time = time.time()
+            # Hard deadline INSIDE the fuzzy search too: the old code only
+            # checked the clock BETWEEN phases, so a single cold-cache disk
+            # walk could blow past the whole budget and time out with
+            # nothing — now the walk stops at the deadline and returns the
+            # best candidate found so far.
+            deadline_m = time.monotonic() + timeout
             try:
                 parsed = parse_launcher_url(url)
                 if not parsed:
@@ -1758,18 +1778,26 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 exe_path = None
                 
                 if game_name and time.time() - start_time < timeout and not self._cancel_event.is_set():
-                    exe_path = find_executable_by_fuzzy_name(game_name, search_paths)
-                
+                    exe_path = find_executable_by_fuzzy_name(
+                        game_name, search_paths,
+                        deadline=deadline_m, cancel_event=self._cancel_event)
+
                 if not exe_path and appid and time.time() - start_time < timeout and not self._cancel_event.is_set():
-                    exe_path = find_executable_by_fuzzy_name(appid, search_paths)
-                
+                    exe_path = find_executable_by_fuzzy_name(
+                        appid, search_paths,
+                        deadline=deadline_m, cancel_event=self._cancel_event)
+
                 if not exe_path and self._shortcut_dir and time.time() - start_time < timeout and not self._cancel_event.is_set():
                     update_placeholder(t('add_game.exe_full_scan'))
                     focused = [Path(self._shortcut_dir)]
                     if game_name:
-                        exe_path = find_executable_by_fuzzy_name(game_name, focused)
+                        exe_path = find_executable_by_fuzzy_name(
+                            game_name, focused,
+                            deadline=deadline_m, cancel_event=self._cancel_event)
                     if not exe_path and appid:
-                        exe_path = find_executable_by_fuzzy_name(appid, focused)
+                        exe_path = find_executable_by_fuzzy_name(
+                            appid, focused,
+                            deadline=deadline_m, cancel_event=self._cancel_event)
                 
                 if self._cancel_event.is_set():
                     update_placeholder(t('add_game.exe_search_cancelled'))
