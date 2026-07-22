@@ -288,4 +288,4 @@ the copyright notice with every copy. Selling this software, or
 distributing it as part of a paid product or service, is not permitted.
 
 > Required Notice: Copyright (c) 2026 Luke0094
-> (https://github.com/Luke0094/SaveSync)
+> (https://github.com/Luke0094/SaveSync-Your-saves-everywhere)
