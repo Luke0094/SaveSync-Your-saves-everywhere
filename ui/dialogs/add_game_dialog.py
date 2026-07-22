@@ -184,6 +184,60 @@ class _ExePickerDialog(QFileDialog):
         self.setOption(QFileDialog.Option.DontResolveSymlinks, True)
         self.setFileMode(QFileDialog.FileMode.ExistingFile)
         self.setNameFilter(name_filter)
+        # Sidebar: the widget dialog ships only the user-home entry —
+        # game shortcuts overwhelmingly live on the DESKTOP, so add it
+        # (kept alongside whatever entries are already there).
+        from PySide6.QtCore import QStandardPaths, QUrl
+        urls = list(self.sidebarUrls())
+        for loc in (QStandardPaths.StandardLocation.DesktopLocation,
+                    QStandardPaths.StandardLocation.HomeLocation):
+            p = QStandardPaths.writableLocation(loc)
+            if p:
+                u = QUrl.fromLocalFile(p)
+                if u not in urls:
+                    urls.append(u)
+        self.setSidebarUrls(urls)
+        # THE actual folder-shortcut hook. Qt treats .lnk files as
+        # symlinks, so double-clicking a FOLDER shortcut makes isDir()
+        # true and the dialog "enters" the .lnk FILE ITSELF — Look-in
+        # shows "...\\Folder.lnk", the listing is empty, and accept() is
+        # NEVER reached on that path. Hook the filesystem model's
+        # rootPathChanged (fired for EVERY directory change, UI or
+        # programmatic — directoryEntered only covers UI navigation):
+        # when the new "directory" is a .lnk, redirect to its resolved
+        # target on the next loop turn.
+        from PySide6.QtWidgets import QFileSystemModel
+        _fsm = self.findChild(QFileSystemModel)
+        if _fsm is not None:
+            _fsm.rootPathChanged.connect(self._redirect_lnk_directory)
+
+    def _redirect_lnk_directory(self, path: str):
+        if not path.lower().endswith('.lnk'):
+            return
+        from core.resolvers import resolve_lnk_target
+        from PySide6.QtCore import QTimer
+        target = resolve_lnk_target(path).strip().strip('"')
+        if not (target and target != path and Path(target).is_dir()):
+            # Unresolvable link-as-directory: bounce back to its folder
+            # instead of stranding the view on an empty file-root.
+            target = str(Path(path).parent)
+
+        def _go(t=target):
+            try:
+                self.setDirectory(t)
+                self._clear_name_box()
+            except RuntimeError:
+                pass
+        QTimer.singleShot(0, _go)
+
+    def _clear_name_box(self):
+        try:
+            from PySide6.QtWidgets import QLineEdit
+            edit = self.findChild(QLineEdit, "fileNameEdit")
+            if edit is not None:
+                edit.clear()
+        except RuntimeError:
+            pass
 
     def accept(self):
         files = self.selectedFiles()
@@ -192,14 +246,13 @@ class _ExePickerDialog(QFileDialog):
             target = resolve_lnk_target(files[0]).strip().strip('"')
             if target and target != files[0] and Path(target).is_dir():
                 self.setDirectory(target)
-                # The filename box still holds "Folder.lnk" after the hop,
-                # and the widget dialog FILTERS the listing by that text —
-                # the target directory loaded but looked completely empty.
-                # Clear it so the new directory's content is visible.
-                from PySide6.QtWidgets import QLineEdit
-                edit = self.findChild(QLineEdit, "fileNameEdit")
-                if edit is not None:
-                    edit.clear()
+                # The filename box still holds "Folder.lnk" after the hop —
+                # clear it (immediately AND on the next event-loop turn:
+                # the click/selection handlers that invoked accept() may
+                # still write the old name back after we return).
+                from PySide6.QtCore import QTimer
+                self._clear_name_box()
+                QTimer.singleShot(0, self._clear_name_box)
                 return
         super().accept()
 
