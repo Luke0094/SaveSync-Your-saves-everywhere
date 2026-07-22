@@ -1,0 +1,2006 @@
+"""
+SaveSync - Web scraping + search-engine layer.
+
+Extracted verbatim from core/game_api.py: HTML fetch with browser headers,
+MediaWiki search helper, the OpenGraph scraper, the search-engine rotation
+(Brave/Bing/SearXNG/DuckDuckGo) with per-engine throttling and cooldowns,
+the trusted-sites targeted search (itch/DLSite/MobyGames/Wikipedia) and the
+generic single-query web search. Pure move.
+"""
+import json
+import logging
+import re
+import threading
+import urllib.parse
+import urllib.request
+from typing import Optional
+
+from core.constants import CAMEL_SPLIT_RE
+from core.game_sources.common import (GameInfo, _clean_game_name,
+                                      _decode_entities, _dedupe_candidates,
+                                      _fuzzy_score, _fuzzy_slug,
+                                      _is_favicon_like,
+                                      _is_non_game_media_title,
+                                      _parse_forum_description,
+                                      _strip_release_noise,
+                                      _GENERIC_EXE_STEMS, _VER_NUM_RE)
+from core.net import open_url as _open_url
+
+logger = logging.getLogger(__name__)
+
+
+def _find_itch_url_via_search(
+    query: str,
+    game_name: str | None = None,
+    headers: dict | None = None,
+) -> Optional[str]:
+    """Find an itch.io game page URL via web search then direct itch.io search.
+
+    *query* is the full search string (e.g. ``'"Example Game" site:itch.io'``).
+    *game_name* is the plain game name used for fuzzy scoring on direct itch.io results
+    (falls back to the query string if not given).
+    """
+    _ITCH_GAME_RE = re.compile(
+        r'https?://[a-zA-Z0-9-]+\.itch\.io/[a-z0-9][a-z0-9-]*'
+    )
+    _SKIP_SUFFIXES = ("/search", "/games", "/jam", "/profile",
+                      "/login", "/register", "/docs", "/t/", "/devlogs/", "/main")
+    _SKIP_DOMAINS = {"static.itch.io", "api.itch.io", "img.itch.io"}
+
+    def _extract(html: str) -> list[str]:
+        seen: dict[str, None] = {}
+        for m in _ITCH_GAME_RE.finditer(html):
+            url = m.group(0).rstrip("/")
+            domain = url.split("://", 1)[-1].split("/")[0]
+            if domain in _SKIP_DOMAINS:
+                continue
+            path = url.split("itch.io", 1)[-1]
+            if any(path.startswith(s) for s in _SKIP_SUFFIXES):
+                continue
+            if url not in seen:
+                seen[url] = None
+        return list(seen)
+
+    # 1. Web search engines (shared layer: Brave → Bing → SearXNG → DuckDuckGo).
+    # DDG wraps result URLs percent-encoded inside its redirect links
+    # (uddg=https%3A%2F%2F…), so decode the page before pattern-matching.
+    try:
+        for engine, page_html in _iter_search_engine_html(query):
+            urls = _extract(urllib.parse.unquote(page_html))
+            if urls:
+                logger.debug(f"{engine} found itch URLs: {urls[:3]}")
+                return urls[0]
+    except Exception as e:
+        logger.debug(f"Engine search failed for {query!r}: {e}")
+
+    # 2. Direct itch.io search — try progressively shorter query terms.
+    # Bounded on purpose: at most 4 subquery lengths, and at most 5 titles
+    # scraped per subquery — the unbounded version could quietly spend a
+    # minute+ fetching pages when nothing matches, with no log trace.
+    name = game_name or query.replace('"', "").replace("site:itch.io", "").strip()
+    name_slug = _fuzzy_slug(name)
+    terms = name.split()
+    for n_words in range(min(len(terms), 4), 0, -1):
+        sub = " ".join(terms[:n_words])
+        try:
+            itch_url = f"https://itch.io/search?q={urllib.parse.quote(sub)}"
+            html = _fetch_html(itch_url)
+            if html:
+                urls = _extract(html)
+                if urls:
+                    # Pass 1: prefer URL whose slug matches the game name
+                    for u in urls:
+                        url_slug = u.rstrip("/").rsplit("/", 1)[-1]
+                        url_slug = _fuzzy_slug(url_slug)
+                        if url_slug == name_slug:
+                            logger.debug(
+                                f"itch.io slug match: {u} == {name_slug}"
+                            )
+                            return u
+                    # Pass 2: score by page title (each title = one fetch)
+                    scored: list[tuple[float, str]] = []
+                    for u in urls[:5]:
+                        title = _scrape_itch_title(u) or u
+                        score = _fuzzy_score(name, title)
+                        if score >= 40.0:
+                            scored.append((score, u))
+                    if scored:
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        best_score, best_url = scored[0]
+                        logger.debug(
+                            f"itch.io search for {sub!r}: best={best_url} "
+                            f"(score={best_score:.0f}, n={len(scored)}/{len(urls)})"
+                        )
+                        return best_url
+        except Exception as e:
+            logger.debug(f"itch.io search for {sub!r} failed: {e}")
+
+    return None
+
+
+def _scrape_itch_title(url: str) -> str | None:
+    """Quick scrape of an itch.io page title."""
+    html = _fetch_html(url)
+    if html:
+        m = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
+        if m:
+            t = m.group(1).strip()
+            # Strip trailing " by AuthorName"
+            t = re.sub(r'\s+by\s+\S+\s*$', '', t)
+            return t.strip()
+    return None
+
+
+# Product-work URL pattern for DLSite (maniax / soft / pro / books / etc.)
+_DLSITE_WORK_RE = re.compile(
+    r'https?://(?:www\.)?dlsite\.com/\w+/work/=[^\s"\'<>]*\.html',
+    re.IGNORECASE,
+)
+
+
+def _find_dlsite_url_via_search(keyword: str) -> Optional[str]:
+    """Find a DLSite product work URL via web search (shared engine layer).
+
+    Mirrors _find_itch_url_via_search: prefers search-engine discovery over
+    DLSite's own /fsr/ endpoint, which is frequently rate-limited or returns
+    JavaScript-only pages that prevent reliable HTML parsing.
+    Returns the first product URL found, or None.
+    """
+    def _extract(html: str) -> Optional[str]:
+        m = _DLSITE_WORK_RE.search(html)
+        if m:
+            # Strip any trailing quote / fragment that may have been consumed
+            return re.split(r'["\'<>\s]', m.group(0))[0]
+        return None
+
+    queries = [
+        f'"{keyword}" site:dlsite.com',
+        f'{keyword} site:dlsite.com',
+    ]
+
+    for query in queries:
+        try:
+            for engine, page_html in _iter_search_engine_html(query):
+                # Decode DDG's percent-encoded redirect URLs before matching
+                url = _extract(urllib.parse.unquote(page_html))
+                if url:
+                    logger.debug(f"{engine} found DLSite URL for {keyword!r}: {url}")
+                    return url
+        except Exception as exc:
+            logger.debug(f"Engine DLSite search failed for {query!r}: {exc}")
+
+    return None
+
+
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def _fetch_html_ex(url: str, timeout: int = 12,
+                   extra_headers: dict | None = None) -> tuple[int, str]:
+    """Fetch *url* and return (http_status, decoded_html).
+
+    Status 0 means a transport failure (DNS, timeout, refused connection);
+    an HTTPError becomes its status code with the (decoded) error body, so
+    callers can tell a 403/challenge wall apart from an empty page."""
+    def _decode(raw, headers) -> str:
+        enc = (headers.get_content_charset("utf-8") if headers else None) or "utf-8"
+        # Some sites (e.g. DLSite) claim UTF-8 but serve cp932/Shift-JIS.
+        # Try strict decode first; if that fails, try common JP encodings.
+        for e in (enc, "cp932", "utf-8"):
+            try:
+                return raw.decode(e, errors="strict")
+            except (LookupError, UnicodeDecodeError, ValueError):
+                continue
+        # Last resort: UTF-8 with replace (garbled but survivable)
+        return raw.decode("utf-8", errors="replace")
+
+    hdrs = dict(_DEFAULT_HEADERS)
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with _open_url(req, timeout=timeout) as r:
+            return r.status, _decode(r.read(), r.headers)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, _decode(e.read(), e.headers)
+        except Exception:
+            return e.code, ""
+    except Exception as e:
+        logger.debug(f"_fetch_html {url[:60]}: {e}")
+        return 0, ""
+
+
+def _fetch_html(url: str, timeout: int = 12,
+                extra_headers: dict | None = None) -> str:
+    """Fetch *url* and return the decoded HTML.  Returns empty string on any error."""
+    status, html = _fetch_html_ex(url, timeout=timeout, extra_headers=extra_headers)
+    return html if 200 <= status < 300 else ""
+
+
+# ── Targeted site search ──────────────────────────────────────────────────────
+#
+# Instead of scraping generic search engine results (which block bots),
+# we search directly against trusted, structured game databases.
+# Each source is tried in order; the first that returns a plausible match wins.
+#
+    # Sources covered (no API key required):
+    #   1. PCGamingWiki     – MediaWiki OpenSearch API  → title + URL → scrape OG
+    #   2. MobyGames HTML   – /search/quick?q=         → extract game page URL
+    #   3. GameFAQs search  – /search?game=            → first result URL
+    #   4. itch.io          – via web search (SearXNG/DDG) with site: filter
+    #   5. DLSite           – for Japanese/indie games
+    #   6. Wikipedia        – MediaWiki OpenSearch API  → title + URL → scrape OG (last resort)
+    #
+    # YouTube is explicitly excluded from all queries.
+    # ─────────────────────────────────────────────────────────────────────────────
+
+def _mediawiki_search(base_url: str, query: str,
+                      namespace: int = 0) -> list[tuple[str, str]]:
+    """OpenSearch on a MediaWiki instance.  Returns list of (title, page_url)."""
+    api = (
+        f"{base_url}?action=opensearch&search={urllib.parse.quote(query)}"
+        f"&limit=5&namespace={namespace}&format=json"
+    )
+    try:
+        html = _fetch_html(api)
+        if not html:
+            return []
+        data = json.loads(html)
+        # OpenSearch returns [query, [titles], [descriptions], [urls]]
+        titles = data[1] if len(data) > 1 else []
+        urls   = data[3] if len(data) > 3 else []
+        return list(zip(titles, urls))
+    except Exception as e:
+        logger.debug(f"MediaWiki OpenSearch failed ({base_url}): {e}")
+        return []
+
+
+# Store-link triggers for forum first posts: an anchor whose TEXT says it's
+# the shop ("Store"/"Shop"/"Buy"/…) or whose HOST is a known store domain —
+# the latter catches store links whose visible text is the registration-gate
+# placeholder instead of a real label.
+_STORE_LINK_TEXT_RE = re.compile(
+    r'\b(store|shop|buy|purchase|official\s+(?:site|page|website)'
+    r'|website|homepage)\b', re.IGNORECASE)
+_STORE_LINK_HOST_RE = re.compile(
+    r'(store\.steampowered\.com|\bitch\.io|dlsite\.com|\bgog\.com'
+    r'|gamejolt\.com|nutaku\.net)', re.IGNORECASE)
+
+
+def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo]:
+    """Fetch *url* and extract Open Graph / JSON-LD / meta tag info.
+
+    Works for any modern site: PCGamingWiki, Wikipedia, itch.io, GOG,
+    Epic store pages, DLSite, GameFAQs, etc.
+    Extracts genres from keywords, og:video:tag, and JSON-LD.
+    YouTube URLs are never fetched.
+
+    *html*, when given, is used as the already-fetched page body (the
+    caller wanted the HTTP status too — see _fetch_html_ex) so the page
+    is not downloaded twice.
+    """
+    if not url or "youtube.com" in url or "youtu.be" in url:
+        return None
+
+    if html is None:
+        html = _fetch_html(url)
+    if not html:
+        return None
+
+    def _meta(*names: str) -> str:
+        for name in names:
+            for m in [
+                re.search(
+                    rf'<meta\s+(?:property|name)=["\'](?:og:|twitter:)?{re.escape(name)}["\']\s+content=["\']([^"\']+)["\']',
+                    html, re.IGNORECASE,
+                ),
+                re.search(
+                    rf'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\'](?:og:|twitter:)?{re.escape(name)}["\']',
+                    html, re.IGNORECASE,
+                ),
+            ]:
+                if m:
+                    return m.group(1).strip()
+        return ""
+
+    # Title
+    title = _meta("og:title", "title", "twitter:title")
+    if not title:
+        m = re.search(r"<title>([^<]{2,120})</title>", html)
+        if m:
+            title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+    # Strip platform suffixes
+    title = re.sub(
+        r'\s*[\|\-–—]\s*(itch\.io|gog\.com|epic games|steam|gog|itch'
+        r'|gamejolt\.com|humble bundle|pcgamingwiki|wikipedia'
+        r'|dlsite\.com|gamefaqs\.gamespot\.com|moby ?games?).*$',
+        '', title, flags=re.IGNORECASE,
+    ).strip()
+    if not title:
+        return None
+
+    _raw_description = _meta("og:description", "description", "twitter:description")
+    description = _raw_description[:600]
+    image_url   = _meta("og:image:secure_url", "og:image", "twitter:image")
+
+    # Resolve relative image URLs to absolute
+    if image_url:
+        from urllib.parse import urljoin as _urljoin
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
+        elif image_url.startswith("/"):
+            from urllib.parse import urlparse as _up
+            p = _up(url)
+            image_url = f"{p.scheme}://{p.netloc}{image_url}"
+        elif not image_url.startswith(("http://", "https://")):
+            image_url = _urljoin(url, image_url)
+
+    # Also try itemprop="image" and link[rel="image_src"]
+    if not image_url:
+        for m in [
+            re.search(r'<meta\s+itemprop=["\']image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE),
+            re.search(r'<meta\s+content=["\']([^"\']+)["\'][^>]+itemprop=["\']image["\']', html, re.IGNORECASE),
+            re.search(r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']', html, re.IGNORECASE),
+            re.search(r'<link[^>]+href=["\']([^"\']+)["\'](?:[^>]*)rel=["\']image_src["\']', html, re.IGNORECASE),
+        ]:
+            if m:
+                img_raw = m.group(1).strip()
+                if img_raw.startswith("//"):
+                    image_url = "https:" + img_raw
+                elif img_raw.startswith("/"):
+                    from urllib.parse import urlparse as _up
+                    p = _up(url)
+                    image_url = f"{p.scheme}://{p.netloc}{img_raw}"
+                elif img_raw.startswith(("http://", "https://")):
+                    image_url = img_raw
+                else:
+                    from urllib.parse import urljoin as _urljoin
+                    image_url = _urljoin(url, img_raw)
+                break
+
+    # A favicon/site-logo/tiny icon set as og:image (or itemprop/image_src) is
+    # not a cover — drop it so the HTML image scan below (which already skips
+    # these) or "no image" takes over, instead of using the site's favicon.
+    if _is_favicon_like(image_url):
+        logger.debug(f"Rejecting favicon/icon as cover: {image_url}")
+        image_url = ""
+
+    # Fallback: find first plausible image tag in HTML when OG/twitter image absent
+    if not image_url:
+        import re as _re
+        _SKIP_IMG = _re.compile(
+            r'(logo|icon|avatar|favicon|spinner|loader|pixel|badge|rating|star|ads?[/_])',
+            _re.IGNORECASE,
+        )
+
+        def _resolve_src(src: str) -> str | None:
+            src = src.strip()
+            if _SKIP_IMG.search(src):
+                return None
+            if src.startswith("//"):
+                return "https:" + src
+            if src.startswith("/"):
+                from urllib.parse import urlparse as _up
+                p = _up(url)
+                return f"{p.scheme}://{p.netloc}{src}"
+            if src.startswith(("http://", "https://")):
+                return src
+            from urllib.parse import urljoin as _urljoin
+            resolved = _urljoin(url, src)
+            return resolved if resolved.startswith("http") else None
+
+        # Pass 1: URLs ending in known image extensions
+        for m in _re.finditer(
+            r'<img[^>]+src=([\'"])(.*?\.(?:png|jpg|jpeg|webp|gif|avif|bmp))(?:\?[^\1]*)?\1',
+            html, _re.IGNORECASE,
+        ):
+            src = _resolve_src(m.group(2))
+            if src:
+                image_url = src
+                break
+
+        # Pass 2: any img src with a path that looks like an image (no extension needed, CDNs)
+        if not image_url:
+            _IMG_ANY_RE = _re.compile(
+                r'<img[^>]+src=([\'"])((?:https?:)?//[^\1]{10,})?\1',
+                _re.IGNORECASE,
+            )
+            for m in _IMG_ANY_RE.finditer(html):
+                raw = m.group(2)
+                if not raw:
+                    continue
+                path = raw.split("?")[0].rstrip("/")
+                if not path or path.endswith(("/", ".html", ".php", ".aspx", ".css", ".js")):
+                    continue
+                if re.search(r'(logo|icon|avatar|favicon|spinner|loader|pixel|badge|star)', raw, re.IGNORECASE):
+                    continue
+                src = _resolve_src(raw)
+                if src:
+                    image_url = src
+                    break
+
+        # Pass 3: last resort — first img with an absolute http(s) src that isn't tiny
+        if not image_url:
+            for m in _re.finditer(
+                r'<img[^>]+src=([\'"])(https?://[^\'"]+?\.\w{2,5}(?:[?#]\S*?)?)\1',
+                html, _re.IGNORECASE
+            ):
+                raw = m.group(2).strip()
+                if re.search(r'(logo|icon|avatar|favicon|spinner|loader|pixel|badge|star|sprite)', raw, re.IGNORECASE):
+                    continue
+                if re.search(r'[\d]+x[\d]+(?:\.[a-z]+)?$', raw.split("/")[-1].split("?")[0]):
+                    continue
+                src = _resolve_src(raw)
+                if src:
+                    image_url = src
+                    break
+
+    # Genres from meta keywords / tags
+    genres: list[str] = []
+    kw = _meta("keywords", "og:video:tag", "genre")
+    if kw:
+        genres = [k.strip() for k in re.split(r'[,;|]', kw) if k.strip()][:8]
+
+    # Game-related JSON-LD type keywords (ignore Article/BreadcrumbList/WebSite)
+    _GAME_LD_TYPES = ("game", "videogame", "softwareapplication", "product", "creativework")
+
+    def _ld_is_game_related(ld: dict) -> bool:
+        t = (ld.get("@type") or "").lower().replace(" ", "")
+        return any(gt in t for gt in _GAME_LD_TYPES)
+
+    ld_dates: list[str] = []
+    ld_publishers: list[str] = []
+    ld_developers: list[str] = []
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL | re.IGNORECASE
+    ):
+        try:
+            data = json.loads(m.group(1))
+            for ld in ([data] if isinstance(data, list) else [data]):
+                if not isinstance(ld, dict):
+                    continue
+                is_game = _ld_is_game_related(ld)
+                if not title and ld.get("name"):
+                    title = str(ld["name"])
+                if not description and ld.get("description"):
+                    description = str(ld["description"])[:600]
+                if not image_url and isinstance(ld.get("image"), str):
+                    img = ld["image"]
+                    if img.startswith("//"):
+                        img = "https:" + img
+                    elif img.startswith("/"):
+                        from urllib.parse import urlparse as _up
+                        p = _up(url)
+                        img = f"{p.scheme}://{p.netloc}{img}"
+                    elif not img.startswith(("http://", "https://")):
+                        from urllib.parse import urljoin as _urljoin
+                        img = _urljoin(url, img)
+                    image_url = img
+                # Only extract game-specific fields from game-related types
+                if is_game:
+                    for dk in ("datePublished", "releaseDate"):
+                        dv = ld.get(dk)
+                        if dv:
+                            ld_dates.append(str(dv))
+                            break
+                    pub = ld.get("publisher")
+                    if pub:
+                        if isinstance(pub, str):
+                            ld_publishers.append(pub)
+                        elif isinstance(pub, list):
+                            for p in pub:
+                                ld_publishers.append(str(p) if isinstance(p, str) else (p.get("name", str(p)) if isinstance(p, dict) else str(p)))
+                        elif isinstance(pub, dict) and pub.get("name"):
+                            ld_publishers.append(str(pub["name"]))
+                    for ak in ("author", "creator", "brand"):
+                        val = ld.get(ak)
+                        if val:
+                            if isinstance(val, str):
+                                ld_developers.append(val)
+                            elif isinstance(val, list):
+                                for v in val:
+                                    ld_developers.append(str(v) if isinstance(v, str) else (v.get("name", str(v)) if isinstance(v, dict) else str(v)))
+                            elif isinstance(val, dict) and val.get("name"):
+                                ld_developers.append(str(val["name"]))
+                    for gk in ("genre", "gameCategory", "applicationCategory"):
+                        val = ld.get(gk)
+                        if val:
+                            for g in ([val] if isinstance(val, str) else val):
+                                if str(g) not in genres:
+                                    genres.append(str(g))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    release_date = ld_dates[0] if ld_dates else ""
+    publisher = "; ".join(dict.fromkeys(ld_publishers)) if ld_publishers else ""
+    developer = "; ".join(dict.fromkeys(ld_developers)) if ld_developers else ""
+
+    # Site-specific HTML extraction for fields OG/JSON-LD missed
+    if "dlsite.com" in url:
+        # DLSite: extract release, developer, genre from HTML tables
+
+        # Developer: try Brand (pro) or Circle (maniax) label, fallback itemprop
+        bm = re.search(r'<th>(?:ブランド名|サークル名|Brand|Circle)</th>\s*<td>[\s\S]*?<a[^>]*>([^<]+)</a>', html)
+        if bm and not developer:
+            developer = bm.group(1).strip()
+        if not developer:
+            ipm = re.search(r'itemprop=["\']brand["\'][^>]*>[\s\S]*?<a[^>]*>([^<]+)</a>', html)
+            if ipm:
+                developer = ipm.group(1).strip()
+
+        # Release date (販売日 / Release)
+        dm = re.search(r'<th>(?:販売日|Release\s*date)</th>\s*<td>(?:<a[^>]*>)?([^<]+)(?:</a>)?', html)
+        if dm and not release_date:
+            release_date = dm.group(1).strip().replace("年", "-").replace("月", "-").replace("日", "")
+
+        # Category type (作品形式 / Product format)
+        cm = re.search(r'<th>(?:作品形式|Product\s*format|Category)</th>[\s\S]*?<span[^>]*title="([^"]+)"', html)
+        if cm:
+            cat = cm.group(1).strip()
+            if cat not in genres:
+                genres.append(cat)
+
+        # Genre tags (ジャンル / Genre)
+        gm = re.search(r'<th>(?:ジャンル|Genre)</th>\s*<td>\s*<div class="main_genre">([\s\S]*?)</div>', html)
+        if gm:
+            for a_match in re.finditer(r'<a[^>]*>([^<]+)</a>', gm.group(1)):
+                g = a_match.group(1).strip()
+                if g and g not in genres:
+                    genres.append(g)
+
+        # Cleaner title: itemprop="name" has clean name without "| DLsite" suffix
+        im = re.search(r'itemprop=["\']name["\'][^>]*>\s*([^<]+)\s*<', html)
+        if im and not im.group(1).strip().endswith("DLsite"):
+            title_clean = im.group(1).strip()
+            if title_clean and len(title_clean) > 2:
+                title = title_clean
+
+        # Description from work_parts_container (more detailed than og:description)
+        _wpc = re.search(
+            r'<div\s+itemprop=["\']description["\']\s+class=["\']work_parts_container["\']>'
+            r'\s*<div\s+class=["\']work_parts_body["\']>(.*?)</div>\s*</div>',
+            html, re.S | re.I
+        )
+        if _wpc and not description:
+            _d_desc = re.sub(r'<[^>]+>', '', _wpc.group(1)).strip()
+            _d_desc = re.sub(r'\s+', ' ', _d_desc).strip()
+            if _d_desc and len(_d_desc) > 20:
+                description = _d_desc[:600]
+
+    elif "wikipedia.org" in url:
+        # Wikipedia: extract description from first substantial paragraph
+        if not description:
+            for pm in re.finditer(r'<p[^>]*>(.*?)</p>', html, re.S):
+                desc_raw = re.sub(r'<[^>]+>', '', pm.group(1)).strip()
+                desc_raw = re.sub(r'\[\d+\]', '', desc_raw).strip()
+                desc_raw = re.sub(r'\.mw-parser-output[^}]*\}', '', desc_raw).strip()
+                desc_raw = re.sub(r'\s+', ' ', desc_raw).strip()
+                if desc_raw and len(desc_raw) > 20:
+                    description = desc_raw[:600]
+                    break
+
+        # Wikipedia: extract developer, publisher, release, genre from infobox
+        ib = re.search(r'<table[^>]*class="[^"]*infobox[^"]*"[^>]*>(.*?)</table>', html, re.I | re.S)
+        if ib:
+            ib_html = ib.group(1)
+            # Strip <style> blocks and <sup> tags before parsing
+            ib_html = re.sub(r'<style[^>]*>[\s\S]*?</style>', '', ib_html)
+            ib_html = re.sub(r'<sup[^>]*>[\s\S]*?</sup>', '', ib_html)
+            for row in re.finditer(r'<th[^>]*scope=["\']row["\'][^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>', ib_html, re.I | re.S):
+                label = re.sub(r'<[^>]+>', '', row.group(1)).strip().lower()
+                value_raw = re.sub(r'<[^>]+>', ' ', row.group(2))
+                value = re.sub(r'\s+', ' ', value_raw).strip()
+                if label == "developer" and not developer:
+                    developer = value
+                elif "publisher" in label and not publisher:
+                    publisher = value
+                elif label == "release" and not release_date:
+                    # Clean up multi-region to just take the earliest year
+                    year_m = re.search(r'(\d{4})', value)
+                    if year_m:
+                        release_date = year_m.group(1)
+                    else:
+                        release_date = value[:80]
+                elif label in ("genre", "genres") and not genres:
+                    for g in re.split(r'[,;]', value):
+                        gs = g.strip().strip('.')
+                        if gs and gs not in genres:
+                            genres.append(gs)
+
+    elif "mobygames.com" in url:
+        # MobyGames: extract Developers from static Vue-rendered <dt>Developers</dt>
+        if not developer:
+            dm = re.search(r'<dt>[Dd]evelopers?</dt>\s*<dd>[\s\S]*?<a[^>]*>([^<]+)</a>', html)
+            if dm:
+                developer = dm.group(1).strip()
+
+    elif "vndb.org" in url:
+        # VNDB entry page: developer + release date live in the infobox table
+        # (<tr><td>Developer</td><td><a …>Name</a></td></tr>) — no JSON-LD,
+        # so without this the generic web search would drop the developer.
+        if not developer:
+            dm = re.search(
+                r'<td>Developers?</td>\s*<td>[\s\S]*?<a[^>]*>([^<]+)</a>', html)
+            if dm:
+                developer = dm.group(1).strip()
+        if not release_date:
+            rm = re.search(r'<td>Released</td>\s*<td[^>]*>[\s\S]*?((?:19|20)\d{2})', html)
+            if rm:
+                release_date = rm.group(1)
+
+    elif "itch.io" in url:
+        # itch.io: prefer the full description from formatted_description user_formatted
+        # over the short OG/description meta tagline.
+        fd = re.search(
+            r'<div\s+class="formatted_description\s+user_formatted"[^>]*>\s*(.*?)\s*</div>\s*</div>\s*</div>',
+            html, re.I | re.S,
+        )
+        if fd:
+            desc_raw = re.sub(r'<[^>]+>', ' ', fd.group(1))
+            desc_raw = re.sub(r'&nbsp;', ' ', desc_raw)
+            desc_raw = re.sub(r'&#x27;', "'", desc_raw)
+            desc_raw = re.sub(r'\s+', ' ', desc_raw).strip()
+            if desc_raw and len(desc_raw) > 20:
+                description = desc_raw[:600]
+
+        # itch.io: extract developer from "Title by DeveloperName" pattern
+        if not developer:
+            im = re.search(r' \b[bB]y\s+([A-Za-z0-9][A-Za-z0-9_. -]{1,40})$', title)
+            if im:
+                developer = im.group(1).strip()
+                # Remove " by Developer" from title
+                title = re.sub(r'\s+by\s+[A-Za-z0-9][A-Za-z0-9_. -]{1,40}$', '', title).strip()
+
+        # itch.io: extract genre(s) + tags from the game info panel
+        ip = re.search(
+            r'<div[^>]*class="[^"]*game_info_panel_widget[^"]*"[^>]*>(.*?)</div>\s*</div>\s*</div>',
+            html, re.I | re.S,
+        )
+        if ip:
+            panel = ip.group(1)
+            # Genre row
+            gm = re.search(r'<tr>\s*<td>\s*Genre\s*</td>\s*<td>(.*?)</td>', panel, re.I | re.S)
+            if gm:
+                g = re.sub(r'<[^>]+>', ' ', gm.group(1)).strip()
+                g = re.sub(r'\s+', ' ', g).strip()
+                if g and g not in genres:
+                    genres.append(g)
+            # Tags row — comma-separated values from <a> tags
+            tm = re.search(r'<tr>\s*<td>\s*Tags?\s*</td>\s*<td>(.*?)</td>', panel, re.I | re.S)
+            if tm:
+                tag_html = tm.group(1)
+                for a in re.finditer(r'<a[^>]*>([^<]+)</a>', tag_html):
+                    t = a.group(1).strip()
+                    if t and t not in genres:
+                        genres.append(t)
+            # Author row as fallback for developer
+            if not developer:
+                am = re.search(r'<tr>\s*<td>\s*Author\s*</td>\s*<td>\s*<a[^>]*>\s*([^<]+)\s*</a>', panel, re.I)
+                if am:
+                    developer = am.group(1).strip()
+            # Release date from "Published" or "Updated" row
+            if not release_date:
+                dm = re.search(r'<tr>\s*<td>\s*(?:Published|Updated)\s*</td>\s*<td[^>]*>\s*<abbr[^>]*title="([^"]+)"', panel, re.I)
+                if dm:
+                    rd = dm.group(1).strip()
+                    ym = re.search(r'(\d{4})', rd)
+                    if ym:
+                        release_date = ym.group(1)
+
+    # Publisher is only a fallback for developer (we don't expose it separately)
+    if not developer and publisher:
+        developer = publisher
+
+    # Forum thread pages label everything inside the description — split it
+    # into the proper fields (Overview→description, Developer/Release Date/Tags)
+    # rather than dumping the whole truncated blob into the description.
+    #
+    # The labelled header lives IN FULL in the first post's BODY; the
+    # og:description is only a truncated preview of it, so labels that fall
+    # beyond the preview cut (often Tags:/Developer:) never reach the parser
+    # from the meta tag alone. Like the per-site extractors above, read the
+    # structured source directly: the first XenForo-style message body on the
+    # page, tags stripped, entities decoded. Fallback order: full post body →
+    # raw og:description → whatever description another origin (JSON-LD,
+    # site-specific extractor) produced. Only fills fields that a
+    # higher-quality source didn't already provide.
+    _post_text = ""
+    _post_html = ""
+    _pm = re.search(
+        r'<article[^>]+class=["\'][^"\']*message-body[^"\']*["\'][^>]*>([\s\S]*?)</article>',
+        html, re.IGNORECASE,
+    ) or re.search(
+        r'<div[^>]+class=["\'][^"\']*\bbbWrapper\b[^"\']*["\'][^>]*>([\s\S]{0,20000})',
+        html, re.IGNORECASE,
+    )
+    if _pm:
+        _post_html = _pm.group(1)
+        # Spoiler-aware flattening. The usual thread shape is
+        #     <b>Genre</b>: <div class=bbCodeSpoiler>[button "Spoiler"]
+        #     <div class=bbCodeSpoiler-content>2D Game, 2DCG, …</div></div>
+        # — the label is real text and the list is in the served HTML
+        # (hidden only by CSS/JS), but the spoiler BUTTON's own caption
+        # ("Spoiler") lands between them after tag-stripping ("Genre :
+        # Spoiler 2D Game, …") and pollutes the first tag. Replace each
+        # spoiler button with nothing — or with its title as a "Title: "
+        # label when it carries one (bbCodeSpoiler-button-title) — so the
+        # labelled parse reads straight into the spoiler's content and
+        # extracts EXACTLY the labelled fields, nothing else.
+        # Same treatment for HTML5 <details><summary> spoilers.
+        def _spoiler_btn(m):
+            _tm = re.search(
+                r'bbCodeSpoiler-button-title[^>]*>\s*([^<]{1,60}?)\s*</span>',
+                m.group(0), re.IGNORECASE)
+            if _tm:
+                return f' {_tm.group(1).strip().rstrip(":")}: '
+            return ' '
+        _ph = re.sub(
+            r'<button[^>]+class=["\'][^"\']*bbCodeSpoiler-button[^"\']*["\']'
+            r'[\s\S]*?</button>',
+            _spoiler_btn, _post_html, flags=re.IGNORECASE)
+        _ph = re.sub(r'<summary[^>]*>\s*([^<]{1,60}?)\s*</summary>',
+                     lambda m: f' {m.group(1).strip().rstrip(":")}: ',
+                     _ph, flags=re.IGNORECASE)
+        _pt = re.sub(r'<script[\s\S]*?</script>|<style[\s\S]*?</style>', ' ', _ph)
+        _pt = re.sub(r'<[^>]+>', ' ', _pt)
+        _post_text = re.sub(r'\s+', ' ', _decode_entities(_pt)).strip()
+
+    _forum = (_parse_forum_description(_post_text)
+              or _parse_forum_description(_raw_description))
+    if not _forum and description and description != _raw_description[:600]:
+        _forum = _parse_forum_description(description)
+    if _forum:
+        description = _forum["overview"][:600]
+        developer = developer or _forum.get("developer", "")
+        release_date = release_date or _forum.get("release_date", "")
+        if not genres and _forum.get("tags"):
+            genres = _forum["tags"]
+
+    # Last resort for forum threads: the thread's native tag list (XenForo
+    # "tagItem" anchors under the title). It lives OUTSIDE the post body —
+    # never inside a spoiler — so it survives even when the header keeps
+    # its Genre list in a shape the labelled parse can't read.
+    if not genres:
+        _seen_t: set[str] = set()
+        for _tm in re.finditer(
+                r'<a[^>]+class=["\'][^"\']*\btagItem\b[^"\']*["\'][^>]*>([^<]{1,40})</a>',
+                html, re.IGNORECASE):
+            _tag = _decode_entities(_tm.group(1)).strip()
+            if _tag and _tag.casefold() not in _seen_t:
+                _seen_t.add(_tag.casefold())
+                genres.append(_tag)
+            if len(genres) >= 16:
+                break
+
+    # Safety net: whatever path produced the description, a leftover leading
+    # "Overview:" / "Description:"-style label is never part of the text.
+    if description:
+        description = re.sub(
+            r'^\s*(?:overview|description|story|synopsis|plot)\s*:\s*',
+            '', description, flags=re.IGNORECASE)
+
+    # Forum threads: the game's real store page is usually linked from the
+    # first post ("Store"/"Shop"/"Buy"/… anchors, or a bare link to a known
+    # store domain). Use that as the store_url — the thread URL itself only
+    # as fallback when no such link is present — and keep the thread URL as
+    # an extra site page so its chip survives in the dialog. Only EXTERNAL
+    # links count: forum-internal/masked (registration-gated) hrefs point
+    # back at the forum host and are never a store page.
+    _store_link = ""
+    _store_extra: list[str] = []
+    if _post_html and _forum:
+        _page_host = urllib.parse.urlsplit(url).netloc.lower()
+        _seen_links: set[str] = set()
+        for _am in re.finditer(
+                r'<a[^>]+href=["\'](https?://[^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+                _post_html, re.IGNORECASE):
+            _href = _am.group(1).strip()
+            _atext = re.sub(r'<[^>]+>', ' ', _am.group(2))
+            _host = urllib.parse.urlsplit(_href).netloc.lower()
+            if not _host or _host == _page_host or _href in _seen_links:
+                continue
+            if _STORE_LINK_HOST_RE.search(_host) or _STORE_LINK_TEXT_RE.search(_atext):
+                _seen_links.add(_href)
+                if not _store_link:
+                    _store_link = _href
+                elif len(_store_extra) < 4:
+                    _store_extra.append(_href)
+
+    # Derive source from URL for known sites
+    _source = "web"
+    _url_lower = url.lower()
+    if "dlsite.com" in _url_lower:
+        _source = "dlsite"
+    elif "itch.io" in _url_lower:
+        _source = "itch"
+    elif "mobygames.com" in _url_lower:
+        _source = "mobygames"
+    elif "wikipedia.org" in _url_lower:
+        _source = "wikipedia"
+    elif "vndb.org" in _url_lower:
+        _source = "vndb"
+
+    return GameInfo(
+        name=title,
+        description=description,
+        image_url=image_url,
+        release_date=release_date,
+        genres=genres[:16],
+        developer=developer,
+        publisher='',
+        store_url=_store_link or url,
+        source=_source,
+        extra_urls=([url] + _store_extra) if _store_link else [],
+    )
+
+
+# ── Search-engine access layer ────────────────────────────────────────────────
+# Every scraped engine eventually rate-limits or challenges an IP that sends
+# bursts of queries (DuckDuckGo returns its HTTP 202 "anomaly" page, most
+# commercial engines serve captchas). All engine traffic therefore goes
+# through one shared layer that (a) spaces requests to the same engine,
+# (b) puts an engine that signalled a block into a cooldown instead of
+# hammering it, and (c) logs every outcome.
+#
+# Engine lineup, tried in this order per query (consumers break as soon as
+# they extracted what they need, so a healthy earlier engine short-circuits
+# the rest):
+#   1. Brave  — best recall, and the only engine that reliably surfaces niche
+#               (indie/adult, versioned) titles. Answers residential clients
+#               but returns 429/challenge to datacenter/CI IPs, so it can look
+#               dead from a build server; its 429 is a stochastic burst limit,
+#               not a durable block (see the branch — it is retried, never
+#               cooled down on a 429).
+#   2. Bing   — classic server-rendered SERP (via a minimal, non-Chrome UA —
+#               see _bing_http_get); result links are /ck/a?…u=a1<b64>, decoded
+#               downstream by _unwrap_redirect. Reliable and captcha-free, but
+#               its index is weak on niche titles, so it mainly backs up Brave
+#               for mainstream queries.
+#   3. SearXNG— best-effort meta-search over a small pool of public instances,
+#               each response health-checked (_searx_page_relevant rejects the
+#               homepage/decoy pages these instances often serve). No hardcoded
+#               instance list stays healthy for long — this is a fallback, and
+#               Bing carries the mainstream load that used to rest here.
+#   4. DDG    — LAST: largely redundant with Bing (whose index it draws on) and
+#               it 202-blocks aggressively, so it is deprioritized but kept for
+#               the IPs where it is the one engine still answering. On IPs DDG
+#               has classified as bot traffic ("cc=botnet" in its challenge
+#               form) EVERY variant — html, lite, the SPA's d.js API — serves
+#               the duck captcha, so there is no endpoint fallback; repeated
+#               blocks escalate to the long hard cooldown instead.
+#
+# Mojeek was removed: it serves an anti-bot captcha (HTTP 200) from every IP
+# tried, so it only ever cost a throttled request and contributed nothing.
+#
+# Brave and Bing were dropped in an earlier build after they 429'd "nearly
+# every scripted request" — but that was measured from a datacenter/CI IP,
+# which they block far more aggressively than the residential IPs this app
+# actually runs on, where they answer normally. They are back for that reason;
+# the request shapes (UA-only for Brave, minimal-UA for Bing) match what worked
+# before. Each engine has its OWN throttle/cooldown bucket, so one engine's
+# block never sidelines the others — combined with the one-probe-per-phase rule
+# below, that is what keeps a later tier searchable after an earlier tier
+# tripped a block on some engines.
+
+_ENGINE_MIN_INTERVAL = {          # seconds between requests to the same engine
+    "brave": 3.0,
+    "bing": 2.0,
+    "searxng": 2.0,
+    "ddg": 3.0,
+}
+_ENGINE_NAMES = tuple(_ENGINE_MIN_INTERVAL)
+# Sit out after a block signal (429/captcha/anomaly). In practice this now
+# bounds the block WITHIN a tier only: _engine_new_search_phase() lifts every
+# cooldown at each tier boundary, so a block never carries into the next tier.
+# The value just has to outlast a single tier's queries (seconds); 300s does.
+_ENGINE_COOLDOWN_S = 300.0
+# Durable-wall escalation: an engine that serves a block signal on EVERY
+# attempt (observed 2026-07: DuckDuckGo answering 202 + duck-captcha with a
+# "cc=botnet" IP classification on every endpoint variant — html, lite,
+# d.js — regardless of UA/method) will never recover within a session, yet
+# the per-phase probe kept spending one request + min-interval sleep on it
+# every tier, forever. After _ENGINE_HARD_BLOCK_STRIKES consecutive blocks
+# with no success in between, the engine sits out _ENGINE_HARD_COOLDOWN_S —
+# a window that survives phase resets. Any real answer clears the strikes,
+# so an engine that was merely rate-limited still comes back on its own.
+_ENGINE_HARD_BLOCK_STRIKES = 3
+_ENGINE_HARD_COOLDOWN_S = 3600.0
+_engine_lock = threading.Lock()
+_engine_state: dict[str, dict] = {}   # engine → {"last","blocked_until","probe_gen","strikes","hard_until"}
+_probe_generation = 0             # bumped by _engine_new_search_phase()
+
+
+def _engine_entry(engine: str) -> dict:
+    return _engine_state.setdefault(
+        engine, {"last": 0.0, "blocked_until": 0.0, "probe_gen": -1,
+                 "strikes": 0, "hard_until": 0.0}
+    )
+
+
+def _engine_new_search_phase():
+    """Mark the start of a user-facing search phase (targeted / generic tier).
+
+    Every engine's cooldown is LIFTED here, so a block picked up in an earlier
+    tier never sidelines that engine for the next tier: each tier retries all
+    engines from scratch, matching the pre-cooldown build's per-tier freshness.
+    Within a tier the block still applies (an engine that signalled a block is
+    skipped for the rest of THAT tier — see _engine_wait_slot), so this frees
+    later tiers without re-hammering an engine inside one. The throttle
+    (min-interval spacing) is untouched — that is the "queue" protection.
+
+    This is the mechanism behind "don't block all tiers": the pure-engine
+    generic tier (tier 3) always gets a fresh shot even when the targeted tier
+    (tier 2) just blocked every engine.
+    """
+    global _probe_generation
+    with _engine_lock:
+        _probe_generation += 1
+        for st in _engine_state.values():
+            st["blocked_until"] = 0.0
+        # NB: hard_until (the durable-wall sit-out) is deliberately NOT
+        # cleared — an engine that blocked every attempt stays out across
+        # phases until its long cooldown expires or it answers again.
+        # NB: SearXNG per-instance cooldowns are deliberately NOT cleared here.
+        # Lifting the "searxng" engine cooldown already gives a later tier a
+        # fresh probe; keeping the per-instance blocks lets that probe advance
+        # to UNTRIED instances in the (large searx.space) pool instead of
+        # re-hitting the same dead ones each tier.
+
+
+def _engine_wait_slot(engine: str) -> bool:
+    """Reserve a request slot for *engine*: False while it cools down after a
+    block (except for the phase's single probe), otherwise sleeps out the
+    remaining min-interval and returns True."""
+    import time as _time
+    min_iv = _ENGINE_MIN_INTERVAL.get(engine, 2.0)
+    with _engine_lock:
+        st = _engine_entry(engine)
+        now = _time.time()
+        if now < st["hard_until"]:
+            return False              # durably walled — no per-phase probe either
+        if now < st["blocked_until"]:
+            if st["probe_gen"] == _probe_generation:
+                return False          # already probed (and re-blocked) this phase
+            st["probe_gen"] = _probe_generation
+            logger.info(f"Search engine {engine} in cooldown — probing once this phase")
+        wait = max(0.0, st["last"] + min_iv - now)
+        # Reserve the slot before sleeping so concurrent searches space out too.
+        st["last"] = now + wait
+    if wait > 0:
+        _time.sleep(wait)
+    return True
+
+
+def _engine_mark_ok(engine: str):
+    """The engine answered with a real page: lift any active cooldown."""
+    import time as _time
+    with _engine_lock:
+        st = _engine_entry(engine)
+        if st["blocked_until"] > _time.time() or st["hard_until"] > _time.time():
+            logger.info(f"Search engine {engine} recovered — cooldown lifted")
+        st["blocked_until"] = 0.0
+        st["hard_until"] = 0.0
+        st["strikes"] = 0
+
+
+def _engine_block(engine: str, reason: str):
+    """Put *engine* into cooldown after it signalled rate-limiting/challenge.
+    Consecutive blocks with no success in between escalate to the long
+    hard cooldown (see the durable-wall note by _ENGINE_HARD_COOLDOWN_S)."""
+    import time as _time
+    with _engine_lock:
+        st = _engine_entry(engine)
+        st["blocked_until"] = _time.time() + _ENGINE_COOLDOWN_S
+        # The block consumes this phase's probe allowance too: later queries
+        # of the SAME phase skip the engine outright; the next phase probes.
+        st["probe_gen"] = _probe_generation
+        st["strikes"] += 1
+        strikes = st["strikes"]
+        hard = strikes >= _ENGINE_HARD_BLOCK_STRIKES
+        if hard:
+            st["hard_until"] = _time.time() + _ENGINE_HARD_COOLDOWN_S
+    if hard:
+        logger.info(
+            f"Search engine {engine} blocked us ({reason}) — "
+            f"{strikes} blocks in a row with no success, sitting out "
+            f"for {_ENGINE_HARD_COOLDOWN_S / 60:.0f} min"
+        )
+    else:
+        logger.info(
+            f"Search engine {engine} blocked us ({reason}) — "
+            f"cooling down for {_ENGINE_COOLDOWN_S / 60:.0f} min"
+        )
+
+
+def engines_blocked_status() -> tuple[int, int, int]:
+    """(engines currently in cooldown, total engines, minutes until the
+    soonest blocked one may be retried). Lets the UI say "the search
+    engines are rate-limiting us, retry in ~N min" instead of a generic
+    "no results" when a search found nothing because of a total blackout."""
+    import math
+    import time as _time
+    now = _time.time()
+    blocked = 0
+    soonest = 0.0
+    with _engine_lock:
+        for name in _ENGINE_NAMES:
+            st = _engine_entry(name)
+            remaining = max(st["blocked_until"], st["hard_until"]) - now
+            if remaining > 0:
+                blocked += 1
+                soonest = min(soonest, remaining) if blocked > 1 else remaining
+    minutes = max(1, math.ceil(soonest / 60.0)) if blocked else 0
+    return blocked, len(_ENGINE_NAMES), minutes
+
+
+def _http_get(url: str, timeout: int = 10) -> tuple[int, str]:
+    """GET *url* with browser-like headers. Returns (status, html).
+    HTTPError is returned as its status code (not raised); other errors bubble."""
+    req = urllib.request.Request(url, headers=dict(_DEFAULT_HEADERS))
+    try:
+        with _open_url(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return e.code, body
+
+
+def _brave_http_get(url: str, timeout: int = 10) -> tuple[int, str]:
+    """GET Brave Search with a UA-only header set. Returns (status, html).
+
+    Mirrors the request shape the prior build used successfully — the default
+    Accept-* headers are omitted deliberately to match it. Brave answers
+    residential clients but returns 429/challenge pages to datacenter/CI IPs;
+    a block here just cools Brave down and the chain falls through to Bing.
+    HTTPError is returned as its status code (not raised)."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": _DEFAULT_HEADERS["User-Agent"]})
+    try:
+        with _open_url(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return e.code, body
+
+
+# Bing serves a JS-rendered SPA shell (no result links in the static HTML) to
+# modern-Chrome User-Agents, but the classic server-rendered SERP — organic
+# results in <li class="b_algo"> with bing.com/ck/a?…u=a1<b64> links that
+# _unwrap_redirect decodes — to a plain UA WITHOUT the "Chrome" token. So Bing
+# is fetched with a deliberately minimal UA (this is the approach an earlier
+# build used; the current default Chrome UA silently got the linkless shell).
+_BING_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+# Retry UA: Firefox also gets the classic server-rendered SERP (verified
+# 2026-07: 200 + 10 b_algo blocks). When the first attempt draws the linkless
+# shell / consent wall, redrawing with the SAME UA tends to hit the same
+# variant — the retry switches UA to get an independent draw instead.
+# (The format=rss endpoint is NOT a fallback: it silently truncates the query
+# to roughly its first word and returns dictionary/unrelated links.)
+_BING_UA_RETRY = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) "
+                  "Gecko/20100101 Firefox/128.0")
+
+
+def _bing_http_get(url: str, timeout: int = 12, ua: str = _BING_UA) -> tuple[int, str]:
+    """GET Bing with a UA that yields the classic (non-JS) SERP.
+    Returns (status, html); HTTPError becomes its status code."""
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    try:
+        with _open_url(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", errors="replace")
+        except Exception:
+            return e.code, ""
+
+
+# SearXNG instances are IMPORTED from searx.space (the public instance tracker)
+# rather than hardcoded, so the pool self-updates instead of rotting. A tiny
+# seed is kept only as the offline fallback when searx.space is unreachable.
+# IMPORTANT: searx.space's own health grade is NOT our client's experience — an
+# instance it rates 100% may still serve US its homepage or a decoy SERP — so
+# _searx_page_relevant() vets every response regardless (it rejects any page
+# without the query's own tokens). The import only picks a live, search-capable,
+# non-Tor starting pool; the guard does the trusting. SearXNG stays best-effort:
+# Bing now carries the mainstream load that used to rest here.
+_SEARX_SPACE_URL = "https://searx.space/data/instances.json"
+_SEARX_SEED = (
+    "https://search.rhscz.eu",
+    "https://etsi.me",
+    "https://ooglester.com",
+)
+_SEARX_MAX_TRY = 8          # instances probed per search before giving up
+_searx_pool_cache: Optional[list[str]] = None
+
+
+def _searx_instances() -> list[str]:
+    """Healthy public SearXNG instances from searx.space, cached per process.
+
+    Filters to normal-network (non-Tor), HTTP-200, search-capable instances and
+    shuffles them to spread load; falls back to _SEARX_SEED if searx.space is
+    unreachable. Callers MUST still validate each response — searx.space's grade
+    is not our client's success."""
+    global _searx_pool_cache
+    if _searx_pool_cache is not None:
+        return _searx_pool_cache
+    pool: list[str] = []
+    try:
+        status, body = _http_get(_SEARX_SPACE_URL, timeout=10)
+        if status == 200 and body:
+            for url, s in (json.loads(body).get("instances") or {}).items():
+                if not url.startswith("https://"):     # scheme guard
+                    continue
+                if not isinstance(s, dict) or s.get("network_type") != "normal":
+                    continue
+                if (s.get("http") or {}).get("status_code") != 200:
+                    continue
+                search = (s.get("timing") or {}).get("search") or {}
+                if (search.get("success_percentage") or 0) < 95:
+                    continue
+                pool.append(url.rstrip("/"))
+    except Exception as e:
+        logger.debug(f"searx.space instance list unavailable: {e}")
+    if pool:
+        import random
+        random.shuffle(pool)                 # spread load across the pool
+        src = "searx.space"
+    else:
+        pool = list(_SEARX_SEED)
+        src = "seed"
+    _searx_pool_cache = pool
+    logger.info(f"SearXNG pool: {len(pool)} instances ({src})")
+    return _searx_pool_cache
+_SEARX_INSTANCE_COOLDOWN_S = 1800.0   # failed instance sit-out
+_searx_instance_blocked: dict[str, float] = {}   # base_url → blocked_until
+_searx_sticky: list = [None]   # last instance that worked this process — tried first
+
+# SearXNG's built-in bot detection rejects requests without the Sec-Fetch-*
+# browser headers (302 back to the index page) and 429s clients whose
+# Accept-Encoding lacks gzip/deflate — so send both and decompress manually
+# (urllib doesn't).
+_SEARX_HEADERS = {
+    "Accept-Encoding": "gzip, deflate",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+# Markers of anti-bot interstitials some instances put in front of SearXNG
+# (Anubis proof-of-work, "checking request" pages) — no organic links inside.
+_SEARX_CHALLENGE_RE = re.compile(
+    r"(making sure you're not a bot|checking request|anubis|proof-of-work"
+    r"|verification could not run)", re.IGNORECASE)
+
+
+def _searx_http_get(url: str, timeout: int = 12) -> tuple[int, str]:
+    """GET *url* with the headers SearXNG's bot detection requires.
+    Returns (status, html); HTTPError becomes its status code."""
+    import gzip
+    import zlib
+
+    def _decode(resp) -> str:
+        data = resp.read()
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+        try:
+            if "gzip" in enc:
+                data = gzip.decompress(data)
+            elif "deflate" in enc:
+                data = zlib.decompress(data, -zlib.MAX_WBITS)
+        except Exception:
+            pass
+        return data.decode("utf-8", errors="replace")
+
+    req = urllib.request.Request(
+        url, headers={**_DEFAULT_HEADERS, **_SEARX_HEADERS})
+    try:
+        with _open_url(req, timeout=timeout) as r:
+            return r.status, _decode(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, _decode(e)
+        except Exception:
+            return e.code, ""
+
+
+def _searx_page_relevant(html: str, query: str) -> bool:
+    """True when the organic results actually relate to *query*.
+
+    Several public instances anti-scrape by serving a real-looking results
+    page whose entries are random cached SERPs for OTHER queries (observed
+    2026-07: a game-title query answered with car-dealer and tax-office links).
+    Accepting those would poison downstream metadata scraping, so require at
+    least one significant query token inside the result <article> blocks.
+    The check is scoped to the articles because the search box echoes the
+    query, making a whole-page substring test always pass.
+    """
+    articles = re.findall(r'<article[\s\S]*?</article>', html)
+    if not articles:
+        return False                  # zero organic results → nothing usable
+    tokens = {
+        t for t in re.findall(r'[a-z0-9]{4,}', query.lower())
+        if t not in ("site", "game", "https", "http")
+    }
+    if not tokens:
+        return True                   # query too short to judge — accept
+    joined = " ".join(articles).lower()
+    return any(t in joined for t in tokens)
+
+
+def _searx_fetch_one(base: str, q: str, query: str, timeout: int = 6) -> tuple[str, Optional[str]]:
+    """ONE request to *base* (asking for JSON to dodge the <article> markup
+    drift). Returns (kind, html):
+      ('ok', html)    — usable results. JSON → synthetic <a href> HTML built
+                        from results[].url (so the shared link extractor works
+                        unchanged); HTML results page (instance ignored
+                        &format=json) → that HTML, when relevant.
+      ('empty', None) — the instance ANSWERED with valid JSON but zero
+                        results. The instance works; the query just has no
+                        hits there. Callers must NOT punish it for this —
+                        treating a valid empty answer as a failure is what
+                        used to cool the instance down for 30 min and, after
+                        _SEARX_MAX_TRY of them, block the whole engine.
+      ('bad', None)   — error/challenge/decoy: the instance is unusable.
+    Deliberately a SINGLE request per instance — probing twice (JSON then a
+    separate HTML request) doubles our footprint and is exactly what gets
+    public instances to challenge/ban us."""
+    try:
+        status, body = _searx_http_get(f"{base}/search?q={q}&format=json", timeout=timeout)
+    except Exception:
+        return "bad", None
+    if status != 200 or not body:
+        return "bad", None
+    # JSON response?
+    if body.lstrip()[:1] in ("[", "{"):
+        try:
+            data = json.loads(body)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            urls = [r.get("url", "") for r in data["results"] if isinstance(r, dict)]
+            urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
+            if urls:
+                return "ok", "".join(f'<a href="{u}"></a>' for u in urls)
+            return "empty", None
+    # HTML results page (instance ignored &format=json)
+    if not _SEARX_CHALLENGE_RE.search(body[:4000]) and _searx_page_relevant(body, query):
+        return "ok", body
+    return "bad", None
+
+
+def _searx_fetch(q: str, query: str):
+    """Return (instance_base, html) from ONE working SearXNG instance,
+    the string "empty" when at least one instance answered validly but had
+    no results for the query, or None when every probed instance was
+    unusable (error/challenge/decoy).
+
+    "empty" vs None matters to the caller: a valid empty answer means the
+    engine is HEALTHY and must not be put in the 5-min engine cooldown —
+    the query simply has no hits.
+
+    Politeness is the point — public instances challenge/ban clients that probe
+    hard, so a multi-query search must not hammer the pool. Therefore:
+      1. reuse the last instance that worked this process (sticky) FIRST, so a
+         whole search rides one instance instead of probing fresh ones per query;
+      2. exactly ONE request per instance (see _searx_fetch_one);
+      3. at most _SEARX_MAX_TRY non-cooled instances before giving up."""
+    import time as _time
+    order: list[str] = []
+    _s = _searx_sticky[0]
+    if _s:
+        order.append(_s)
+    for base in _searx_instances():
+        if base not in order:
+            order.append(base)
+    tried = 0
+    first_empty: Optional[str] = None
+    for base in order:
+        if tried >= _SEARX_MAX_TRY:
+            break
+        with _engine_lock:
+            if _time.time() < _searx_instance_blocked.get(base, 0.0):
+                continue
+        tried += 1
+        kind, html = _searx_fetch_one(base, q, query)
+        if kind == "ok":
+            _searx_sticky[0] = base          # remember the winner for next query
+            return base, html
+        if kind == "empty":
+            # The instance works — a no-results answer is not a failure, so
+            # no instance cooldown and no sticky drop. Keep probing the
+            # remaining budget: instances enable different upstream engines,
+            # so another one may still have hits for this query.
+            logger.debug(f"searxng {base} answered empty for {query!r}")
+            first_empty = first_empty or base
+            continue
+        logger.debug(f"searxng {base} unusable for {query!r}")
+        with _engine_lock:
+            _searx_instance_blocked[base] = _time.time() + _SEARX_INSTANCE_COOLDOWN_S
+        if _searx_sticky[0] == base:
+            _searx_sticky[0] = None          # sticky went bad — drop it
+    if first_empty:
+        if not _searx_sticky[0]:
+            _searx_sticky[0] = first_empty   # a healthy instance beats none
+        return "empty"
+    return None
+
+
+def _iter_search_engine_html(query: str):
+    """Yield (engine_name, html) for *query* from each usable engine in turn.
+
+    Consumers loop and break as soon as they extracted what they need, so
+    healthy engines cost one request and blocked ones are skipped via their
+    cooldown. Order: Brave, then Bing (classic SERP via a minimal UA), then
+    the SearXNG instance pool (meta-search — keeps working through a Brave/Bing
+    cooldown), then DuckDuckGo last. See the lineup note above.
+    """
+    q = urllib.parse.quote(query)
+
+    # Brave Search first — short-circuits the rest when it answers. Brave's
+    # 429 is a stochastic short-window burst limit, NOT a durable block:
+    # observed on the same IP, a 200 with full results and a 429 two seconds
+    # apart. So a 429 never cools Brave down — every query re-tries it (one
+    # quick in-query retry after 2s, then the min-interval throttle paces the
+    # cross-query attempts), which is exactly how the prior build kept
+    # recovering on IPs where every other engine is walled off. A 403 (a real
+    # wall) does cool it down for the rest of the tier.
+    if _engine_wait_slot("brave"):
+        import time as _time
+        for _attempt in (0, 1):
+            try:
+                status, html = _brave_http_get(f"https://search.brave.com/search?q={q}")
+            except Exception as e:
+                logger.debug(f"brave fetch failed for {query!r}: {e}")
+                break
+            if status == 200 and html:
+                logger.debug(f"brave answered {query!r} ({len(html)}B)")
+                _engine_mark_ok("brave")
+                yield "brave", html
+                break
+            if status == 403:
+                _engine_block("brave", "HTTP 403")
+                break
+            if status == 429 and _attempt == 0:
+                _time.sleep(2)          # burst limit — one quick fresh draw
+                continue
+            if status == 429:
+                logger.info(f"brave 429 for {query!r} — will retry on the next query")
+            break
+
+    # Bing — classic server-rendered SERP via the minimal UA (see the note by
+    # _bing_http_get). Result links are bing.com/ck/a?…u=a1<b64>, decoded
+    # downstream by _unwrap_redirect. Own cooldown bucket, separate from Brave.
+    if _engine_wait_slot("bing"):
+        try:
+            # mkt/setlang nudge Bing to the en-US market so it serves the
+            # classic SERP and skips the EU region-consent interstitial more
+            # often (games are searched in English anyway).
+            bing_url = f"https://www.bing.com/search?q={q}&mkt=en-US&setlang=en-US"
+            status, html = _bing_http_get(bing_url)
+            # Bing occasionally A/Bs the linkless JS shell even for this UA;
+            # the classic SERP always carries "b_algo" result blocks. Retry
+            # once with the Firefox UA — a same-UA redraw tends to serve the
+            # same shell again (see _BING_UA_RETRY).
+            if status == 200 and html and "b_algo" not in html:
+                status, html = _bing_http_get(bing_url, ua=_BING_UA_RETRY)
+            if status == 200 and html and "b_algo" in html:
+                logger.debug(f"bing answered {query!r} ({len(html)}B)")
+                _engine_mark_ok("bing")
+                yield "bing", html
+            elif status in (403, 429):
+                _engine_block("bing", f"HTTP {status}")
+            elif status == 200 and html:
+                # 200 but no organic-results block — a consent/region wall or
+                # the linkless JS shell. This was silent before; surface it so
+                # "Bing returned nothing" is visible in the run log.
+                logger.info(f"bing served a non-results page for {query!r} "
+                            f"(no b_algo: consent/region wall or JS shell)")
+        except Exception as e:
+            logger.debug(f"bing fetch failed for {query!r}: {e}")
+
+    # SearXNG instance pool (one engine bucket, per-instance failover)
+    if _engine_wait_slot("searxng"):
+        hit = _searx_fetch(q, query)
+        if hit == "empty":
+            # A healthy instance answered "no results" — the engine works,
+            # so no cooldown; blocking here made a hitless query look like
+            # a ban and silenced SearXNG for 5 min despite a live pool.
+            logger.debug(f"searxng answered empty for {query!r}")
+            _engine_mark_ok("searxng")
+        elif hit is not None:
+            base, html = hit
+            logger.debug(f"searxng ({base}) answered {query!r} ({len(html)}B)")
+            _engine_mark_ok("searxng")
+            yield "searxng", html
+        else:
+            _engine_block("searxng", "all instances failed/challenged")
+
+    # DuckDuckGo static HTML endpoints, LAST: largely redundant with Bing (whose
+    # index it draws on) and it 202-blocks aggressively, so a healthy engine
+    # above short-circuits it — but it still answers on some IPs where the
+    # others are walled, so it is kept rather than dropped.
+    if _engine_wait_slot("ddg"):
+        for endpoint in (f"https://html.duckduckgo.com/html/?q={q}",
+                         f"https://lite.duckduckgo.com/lite/?q={q}"):
+            try:
+                status, html = _http_get(endpoint)
+            except Exception as e:
+                logger.debug(f"ddg fetch failed for {query!r}: {e}")
+                break
+            if status == 202:
+                # 202 is DDG's rate-limit/anomaly answer, not a real result
+                # page. Detect by status ONLY — the page <title> echoes the
+                # query, so text markers would false-positive on games whose
+                # name contains words like "anomaly".
+                _engine_block("ddg", "HTTP 202 anomaly page")
+                break
+            if status == 200 and html:
+                logger.debug(f"ddg answered {query!r} ({len(html)}B)")
+                _engine_mark_ok("ddg")
+                yield "ddg", html
+                break
+
+
+def _unwrap_redirect(url: str) -> str:
+    """Decode engine redirect links (DuckDuckGo /l/?uddg=…, Bing /ck/a?…u=a1…)."""
+    m = re.search(r'[?&]uddg=([^&]+)', url)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    # Bing wraps results as /ck/a?...&u=a1<base64url> — decode when present
+    m = re.search(r'bing\.com/ck/a\?.*?[?&]u=a1([^&]+)', url)
+    if m:
+        try:
+            import base64
+            token = m.group(1)
+            padded = token + "=" * (-len(token) % 4)
+            decoded = base64.urlsafe_b64decode(padded).decode("utf-8", "replace")
+            if decoded.startswith("http"):
+                return decoded
+        except Exception:
+            pass
+    return url
+
+
+def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
+    """Return result URLs from web search engines, excluding YouTube.
+
+    Iterates the shared engine layer (Brave → Bing → SearXNG → DDG)
+    and stops as soon as enough links were extracted.
+    """
+    # Engine self-links: SearXNG pages link to their own preferences/about
+    # pages, searx.space, the SearXNG GitHub/docs, and per-result cache links.
+    # Only the seed hosts are listed statically (the dynamic pool's instances
+    # mostly use relative nav links); searx\.space/searxng\.org below cover the
+    # rest.
+    _searx_hosts = "|".join(
+        re.escape(urllib.parse.urlsplit(b).netloc) for b in _SEARX_SEED
+    )
+    _SKIP = re.compile(
+        r'(' + _searx_hosts + r'|searx\.space|searxng\.org|github\.com/searxng'
+        r'|cache\.google\.com|mojeek\.com|duckduckgo\.com'
+        r'|search\.brave\.com|brave\.com'
+        r'|google\.com|microsoft\.com|bing\.com'
+        r'|w3\.org|schema\.org|wikipedia\.org/wiki/Special'
+        r'|web\.archive\.org|translate\.google|msn\.com'
+        r'|ad\.doubleclick|cloudflare\.com/cdn'
+        r'|buttondown\.email'          # Mojeek footer newsletter link
+        r'|youtube\.com|youtu\.be)',
+        re.IGNORECASE,
+    )
+    def _resolve(url: str) -> str | None:
+        # Unescape &amp; first: Bing wraps results as ck/a?…&amp;u=a1<b64>, and
+        # the entity would otherwise break _unwrap_redirect's &u= match.
+        u = _unwrap_redirect(url.replace("&amp;", "&"))
+        u = urllib.parse.unquote(u).split("&")[0].rstrip("/")
+        if u.startswith("http") and not _SKIP.search(u):
+            return u
+        return None
+
+    def _extract_links(html: str, limit: int) -> list[str]:
+        seen: dict[str, None] = {}
+        # href may be protocol-relative (DuckDuckGo redirect links are
+        # //duckduckgo.com/l/?uddg=…) — normalize before resolving.
+        for m in re.finditer(
+            r'<a[^>]+href="((?:https?:)?//(?:[^/"]+\.)+[a-z]{2,}[^"]*)"',
+            html,
+        ):
+            raw = m.group(1)
+            if raw.startswith("//"):
+                raw = "https:" + raw
+            u = _resolve(raw)
+            if u:
+                seen[u] = None
+                if len(seen) >= limit:
+                    break
+        return list(seen)
+
+    urls: list[str] = []
+    for engine, page_html in _iter_search_engine_html(query):
+        new = 0
+        for u in _extract_links(page_html, max_results * 2):
+            if u not in urls:
+                urls.append(u)
+                new += 1
+        logger.debug(f"_web_search_urls {query!r}: {engine} contributed {new} links")
+        if len(urls) >= max_results:
+            break
+
+    (logger.info if not urls else logger.debug)(
+        f'_web_search_urls {query!r}: {len(urls)} URLs'
+    )
+    return urls[:max_results]
+
+
+
+def _search_targeted_sites(primary: str,
+                            secondary: list[str],
+                            skip_sources: list[str] | None = None,
+                            return_all: bool = False):
+    """Web-fallback step 1: query trusted game databases directly.
+
+    Called only when the primary APIs (Steam, PCGamingWiki, VNDB) return
+    no result above threshold.  Tries ALL sources in order:
+
+    1. itch.io       (web search + direct itch.io search → scrape OG)
+    2. DLSite        (for Japanese/indie titles, HTML scrape)
+    3. MobyGames     (HTML search → first game URL → scrape OG)
+    4. Wikipedia     (MediaWiki OpenSearch → scrape OG, last resort)
+
+    ALL sources are always tried.  Returns the best-scored GameInfo (or
+    None), or — with *return_all* — every distinct-title qualifying result
+    as a best-first list.
+
+    *skip_sources* is an optional list of source keys (e.g. ['itch']) to
+    exclude — used when the caller already has data from that source and wants
+    to try alternative sources within the same tier.
+    """
+    _engine_new_search_phase()   # blocked engines get one fresh probe per tier
+    _skip = {s.lower() for s in (skip_sources or [])}
+    _raw_all_hints = [primary] + list(secondary)   # before cleaning — may carry version info
+    primary = _clean_game_name(primary) or primary
+    secondary = [_clean_game_name(h) or h for h in secondary]
+    all_hints = [primary] + secondary
+    # Filter out generic stems from search queries and scoring
+    _search_hints = [h for h in all_hints if h.lower() not in _GENERIC_EXE_STEMS] or all_hints[:1]
+    _scoring_hints = [h for h in all_hints if h.lower() not in _GENERIC_EXE_STEMS] or all_hints[:1]
+    # SCORING ONLY (never queries): add release-noise-stripped variants so a
+    # base-name candidate ("Dilmur") isn't penalised against a hint carrying
+    # platform noise ("Dilmur - Win") — _clean_game_name drops version but NOT
+    # "Win"/"PC"/"ENG"…, so the trailing "Win" counts as a missing mandatory
+    # word and sinks the score. _search_hints is derived above from the raw
+    # hints, so the live query set is unchanged — important, since extra
+    # queries would only worsen engine rate-limiting. Applied to all_hints
+    # (itch/DLsite _collect scoring) and _scoring_hints (Wikipedia scoring).
+    for _hset in (all_hints, _scoring_hints):
+        for _h in list(_hset):
+            _stripped = _strip_release_noise(_h, drop_version=True)
+            if _stripped and _stripped not in _hset:
+                _hset.append(_stripped)
+    # Query hints prefer the CamelCase-split form: pages write the spaced
+    # form ("Super Game Story"), not the compound one ("SuperGameStory"),
+    # so the spaced variant is what the engines can actually retrieve
+    # (scoring is unaffected — _fuzzy_score splits camelCase on its own).
+    _camel_re = CAMEL_SPLIT_RE
+    _q_hints: list[str] = []
+    for _h in _search_hints:
+        _sp = re.sub(_camel_re, ' ', _h).strip()
+        for _v in ([_sp, _h] if _sp != _h else [_h]):
+            if _v not in _q_hints:
+                _q_hints.append(_v)
+    # Self-published stores (itch.io, DLSite) are frequently titled straight
+    # after the dev's raw release folder/zip name ("My Game v0.4.8"), so
+    # cleaning can strip the very token that would have found the page.
+    # Append any raw (pre-clean) hint whose fuzzy-slug isn't already covered
+    # by a cleaned _q_hints entry — one extra query only when the version
+    # actually adds new information, never a duplicate of a cleaned query.
+    _q_slugs = {_fuzzy_slug(h) for h in _q_hints}
+    for _rh in _raw_all_hints:
+        _rh = (_rh or '').strip()
+        if not _rh or _rh.lower() in _GENERIC_EXE_STEMS:
+            continue
+        _rslug = _fuzzy_slug(_rh)
+        if _rslug and _rslug not in _q_slugs:
+            _q_slugs.add(_rslug)
+            _q_hints.append(_rh)
+    MIN_SCORE = 40.0
+    results: list[tuple[GameInfo, float]] = []
+
+    def _collect(source_name: str, info: GameInfo | None, score_bonus: float = 0.0) -> None:
+        """Collect result from source. *score_bonus* is added for high-precision matches."""
+        if info and info.name:
+            score = max(_fuzzy_score(h, info.name) for h in all_hints)
+            score = min(100.0, score + score_bonus)
+            bonus_str = f", base+{score_bonus:.0f}bonus" if score_bonus else ""
+            accepted = score >= MIN_SCORE
+            logger.info(
+                f"Web fallback via {source_name}: {info.name!r} "
+                f"(score={score:.0f}{bonus_str}) "
+                f"{'✓' if accepted else f'✗ below MIN={MIN_SCORE}'}"
+            )
+            if accepted:
+                results.append((info, score))
+
+    # 1. itch.io (direct search — best for indie games)
+    # RJ/VJ/RE product codes are DLSite-specific — searching itch.io with them
+    # is meaningless.  Build a separate hint list that strips those codes.
+    # Take at most one spelling per TITLE (slug-dedup): _q_hints interleaves
+    # the spaced and compact spelling of the same name, and both spellings
+    # of the primary would otherwise crowd out the other hints. Up to four
+    # distinct titles are queried (was 3) so a version-preserving hint always
+    # gets a turn even when 3 cleaned hints already filled the earlier slots
+    # — the install-folder hint alone can be too vague to find the right page.
+    _DL_CODE_RE = re.compile(r'^(RJ|RE|VJ)\d{4,10}$', re.IGNORECASE)
+    _itch_hints: list[str] = []
+    _itch_slugs: set[str] = set()
+    for _h in _q_hints:
+        if _DL_CODE_RE.match(_h.strip()):
+            continue
+        _slug = _fuzzy_slug(_h)
+        if _slug in _itch_slugs:
+            continue
+        _itch_slugs.add(_slug)
+        _itch_hints.append(_h)
+        if len(_itch_hints) == 4:
+            break
+    if not _itch_hints:
+        _itch_hints = [primary]  # always have at least the primary name
+    if 'itch' not in _skip:
+        try:
+            # The version/platform/language tokens a dev bakes into a release
+            # name ("MyGame v0.4.8 - Win [ENG]") are hints, not part of the
+            # itch page title — quoting the whole thing as an exact phrase
+            # finds nothing. Query the bare title (version dropped too); the
+            # version stays available to tier 3, here it must not be mandatory.
+            # Skip a hint whose stripped title was already queried so two
+            # spellings of one name don't fire the same itch.io fetch twice.
+            _itch_seen: set[str] = set()
+            for hint in _itch_hints:
+                _q = _strip_release_noise(hint, drop_version=True) or hint
+                _qslug = _fuzzy_slug(_q)
+                if not _qslug or _qslug in _itch_seen:
+                    continue
+                _itch_seen.add(_qslug)
+                url = _find_itch_url_via_search(
+                    f'"{_q}" site:itch.io',
+                    game_name=_q,
+                )
+                if url:
+                    _collect("itch.io", _scrape_opengraph(url))
+                else:
+                    logger.info(f"Targeted itch.io: no page for {_q!r}")
+        except Exception as e:
+            logger.debug(f"itch.io targeted search failed: {e}")
+
+    # 2. DLSite direct (product code RJ/RE/VJ in hints — precise match)
+    _dl_codes: list[str] = []
+    for h in all_hints:
+        for m in re.finditer(r'(?:^|[\s\[\(\{])(RJ|RE|VJ)(\d{4,10})(?:[\s\]\)\}]|$)', h, re.IGNORECASE):
+            code = m.group(0).strip().strip('[](){}')
+            if code not in _dl_codes:
+                _dl_codes.append(code)
+    if _dl_codes and 'dlsite' not in _skip:
+        for _dl_sub in ("maniax", "soft", "pro"):
+            try:
+                for code in _dl_codes:
+                    product_url = f"https://www.dlsite.com/{_dl_sub}/work/=/product_id/{code}.html"
+                    dlscrape_url = product_url + "?locale=en_US"
+                    info = _scrape_opengraph(dlscrape_url)
+                    if info and info.name:
+                        # Product code ensures we found the right game, but score
+                        # by name so better-matched sources (itch.io with English
+                        # name) win.  Floor at 40 so a code-only hit (Japanese
+                        # title vs English folder) is included but not dominant.
+                        name_score = max(_fuzzy_score(h, info.name) for h in all_hints)
+                        _score = max(name_score, 40.0)
+                        logger.info(
+                            f"Web fallback via DLSite product code {code}: "
+                            f"{info.name!r} (name_score={name_score:.0f}, final={_score:.0f})"
+                        )
+                        results.append((info, _score))
+            except Exception as e:
+                logger.debug(f"DLSite product direct ({_dl_sub}) failed: {e}")
+
+    # 3. DLSite keyword search (by name, no RJ code needed)
+    #
+    #    Two paths for DLSite:
+    #      A) RJ/RE/VJ code present  -> direct product URL (section 2 above)
+    #      B) No code                -> web-indexed search via _find_dlsite_url_via_search
+    #                                   (shared engine layer, filtered with site:dlsite.com)
+    #    No /fsr/ direct endpoint - unreliable, no structured parsing needed.
+    _dl_keyword = _q_hints[0] if _q_hints else primary
+    if 'dlsite' not in _skip:
+        _dl_url = _find_dlsite_url_via_search(_dl_keyword)
+        if _dl_url:
+            _dl_scrape = _dl_url if "?" in _dl_url else _dl_url + "?locale=en_US"
+            # No score_bonus here: web-indexed search may surface any DLSite page
+            # that matches keywords.  The 40-pt bonus is reserved for direct
+            # product-code hits (section 2 above) where the match is guaranteed.
+            _collect("DLSite (web)", _scrape_opengraph(_dl_scrape))
+        else:
+            logger.info(f"Targeted DLSite: no product for {_dl_keyword!r}")
+
+    # 4. MobyGames (mainstream / commercial games) — use first non-generic hint
+    _mg_keyword = _q_hints[0] if _q_hints else primary
+    _mg_found = False
+    if 'mobygames' not in _skip:
+        try:
+            mg_url = (
+                f"https://www.mobygames.com/search/quick"
+                f"?q={urllib.parse.quote(_mg_keyword)}&type=game"
+            )
+            html = _fetch_html(mg_url)
+            if html:
+                m = re.search(r'href="(https?://www\.mobygames\.com/game/[^"]+)"', html)
+                if m:
+                    _collect("MobyGames", _scrape_opengraph(m.group(1)))
+                    _mg_found = True
+        except Exception as e:
+            logger.debug(f"MobyGames failed: {e}")
+        # Web-engine fallback for MobyGames when direct search is blocked
+        if not _mg_found:
+            try:
+                # Deeper pool: the /game/ filter below runs AFTER this slice,
+                # so with only 4 URLs a run of non-game mobygames links
+                # (search/company/person pages) could hide a /game/ result
+                # ranked just past the cut. Same single engine query — a
+                # wider pool only extracts more links from the same page.
+                _mg_urls = _web_search_urls(
+                    f'{_mg_keyword} site:mobygames.com', max_results=8
+                )
+                _mgm = next(
+                    (u for u in _mg_urls
+                     if re.match(r'https?://www\.mobygames\.com/game/', u)),
+                    None,
+                )
+                if _mgm:
+                    _collect("MobyGames (web)", _scrape_opengraph(_mgm))
+                else:
+                    logger.info(f"Targeted MobyGames: nothing for {_mg_keyword!r}")
+            except Exception as _be:
+                logger.debug(f"MobyGames web fallback failed: {_be}")
+
+    # 5. Wikipedia — try with and without "video game" suffix (last resort).
+    #    Uses a higher threshold for bare-name results to avoid
+    #    false matches between a short game title and an unrelated
+    #    near-homograph encyclopedia article.
+    if 'wikipedia' not in _skip:
+        try:
+            wiki_hits: list[tuple[str, str, float]] = []
+            for suffix, min_score in [("", 55.0), (" video game", MIN_SCORE)]:
+                _wiki_query = (_q_hints[0] if _q_hints else primary) + suffix
+                hits = _mediawiki_search(
+                    "https://en.wikipedia.org/w/api.php", _wiki_query
+                )
+                if hits:
+                    for title, url in hits:
+                        if not url or "youtube.com" in url:
+                            continue
+                        # Reject film/TV/band/etc. articles of the same name.
+                        if _is_non_game_media_title(title):
+                            logger.debug(f"Wikipedia skip (non-game media): {title!r}")
+                            continue
+                        score = max(_fuzzy_score(h, title) for h in _scoring_hints)
+                        if score >= min_score:
+                            wiki_hits.append((score, title, url))
+            if wiki_hits:
+                wiki_hits.sort(key=lambda x: x[0], reverse=True)
+                for score, title, url in wiki_hits:
+                    logger.debug(f"Trying Wikipedia {url[:60]} (score={score:.0f})")
+                    info = _scrape_opengraph(url)
+                    if info:
+                        _collect("Wikipedia", info)
+            else:
+                logger.info("Targeted Wikipedia: no qualifying article")
+        except Exception as e:
+            logger.debug(f"Wikipedia failed: {e}")
+
+    # No merging of fields from multiple sources — enrichment from
+    # additional sources is handled separately by the caller
+    # (add_game_dialog enrichment chain).
+    if not results:
+        return [] if return_all else None
+    results.sort(key=lambda x: x[1], reverse=True)
+    if return_all:
+        deduped = _dedupe_candidates(results)
+        logger.info(
+            "Trusted results: " + ", ".join(
+                f"{i.name!r} ({i.source}, {s:.0f})" for i, s in deduped
+            )
+        )
+        return [info for info, _ in deduped]
+    best_info, best_score = results[0]
+    logger.info(
+        f"Best trusted result: {best_info.name!r} "
+        f"(source={getattr(best_info,'source','?')}, score={best_score:.0f})"
+    )
+    return best_info
+
+
+# A version/build string in the folder name (e.g. "v0.4.8") is the strongest
+# signal that splits two same-named games apart — an early-access build is a
+# different release from a later version of a same-titled game. So the
+# version-bearing hint is queried verbatim (the '"…" game' form returns nothing
+# for a version string) and a candidate whose title or URL carries that SAME
+# version is lifted over clean-titled namesakes. Only high-entropy versions
+# (≥3 numeric parts) count — a bare "1.0" would match unrelated pages. No
+# site/domain is ever preferred: the folder's own version, not the kind of
+# site, disambiguates.
+_BARE_VERSION_RE = re.compile(r'(?<![\w.])(\d+(?:\.\d+){2,}[a-z]?)(?![\w.])')
+
+
+def _hint_version(text: str) -> Optional[str]:
+    """The version number in *text*, only when specific enough (≥3 parts)."""
+    m = _VER_NUM_RE.search(text or "")
+    if m and len(re.findall(r'\d+', m.group("num"))) >= 3:
+        return m.group("num")
+    m2 = _BARE_VERSION_RE.search(text or "")
+    return m2.group(1) if m2 else None
+
+
+def _version_match_re(num: str):
+    """Match *num* with flexible separators: '0.4.8' also matches '0-4-8',
+    '0_4_8' and '048' as they appear in result titles and URLs."""
+    parts = re.findall(r'\d+', num)
+    return re.compile(r'(?<!\d)' + r'[._\-]?'.join(parts) + r'(?!\d)')
+
+
+def _web_search_urls_single(query: str,
+                            all_hints: list[str] | None = None,
+                            return_all: bool = False):
+    """Generic web-engine search only, no targeted-site lookups.
+
+    Returns the single best GameInfo (or None) — or, with *return_all*,
+    every distinct-title candidate scoring ≥ 30 as a best-first list. Used
+    as a last-resort fallback when primary APIs and trusted targeted sites
+    have all been exhausted.
+
+    Note: hints are sent verbatim (no name cleaning) because search engines
+    index full titles including version strings, product codes etc. —
+    stripping them would hurt recall.
+    """
+    raw_hints = [h for h in (all_hints or [query]) if h]
+    # Reorder: folder_name (usually the most descriptive) first, then
+    # game_name (query), then exe_stem last — the folder name typically
+    # carries the most complete title for web search indexing.
+    hints = [h for h in raw_hints if h != query] + [query]
+    # Build a separate list for scoring that excludes generic stems, so that
+    # a Wikipedia hit for "Game" doesn't get a high score via the generic query.
+    _scoring_hints = [h for h in hints if h.lower() not in _GENERIC_EXE_STEMS] or hints[:1]
+    # Early-exit: if every hint is a generic stem, nothing useful to search for.
+    if not any(h.lower() not in _GENERIC_EXE_STEMS for h in hints):
+        logger.debug(
+            f"_web_search_urls_single: all {len(hints)} hint(s) are "
+            f"generic stems — skipping"
+        )
+        return [] if return_all else None
+    _engine_new_search_phase()   # blocked engines get one fresh probe per tier
+    # Query with the CamelCase-split form and drop slug-duplicates: pages
+    # write the spaced form ("Super Game Story"), not the compound one
+    # ("SuperGameStory"), and querying both spellings of the same title
+    # would just burn engine quota. When two hints share a slug the
+    # more-worded (spaced) variant wins. Capped to bound the number of
+    # throttled engine round-trips.
+    _camel_re = CAMEL_SPLIT_RE
+    _by_slug: dict[str, str] = {}
+    _order: list[str] = []
+    for h in hints:
+        if h.lower() in _GENERIC_EXE_STEMS:
+            logger.debug(f"Generic web: skipping generic exe stem {h!r}")
+            continue
+        spaced = re.sub(_camel_re, ' ', h).strip()
+        slug = _fuzzy_slug(h)
+        if not slug:
+            continue
+        best_form = spaced if len(spaced.split()) > len(h.split()) else h
+        if slug not in _by_slug:
+            _by_slug[slug] = best_form
+            _order.append(slug)
+        elif len(best_form.split()) > len(_by_slug[slug].split()):
+            _by_slug[slug] = best_form
+    query_hints = [_by_slug[s] for s in _order][:3]
+    # Query the version-bearing hint first (it is the most specific), and keep
+    # the version so a candidate carrying it can be lifted over namesakes.
+    _folder_ver = next((v for h in query_hints if (v := _hint_version(h))), None)
+    _ver_re = _version_match_re(_folder_ver) if _folder_ver else None
+    query_hints.sort(key=lambda h: _hint_version(h) is None)   # stable: versioned first
+
+    MAX_GENERIC_RESULTS = 6
+    candidates: list[tuple[GameInfo, float]] = []
+    seen_urls: set[str] = set()
+    stop = False
+
+    for hint in query_hints:
+        if stop or len(candidates) >= MAX_GENERIC_RESULTS:
+            break
+        # A version-bearing hint is queried verbatim (the '"…" game' form
+        # returns nothing for a version string) and fetched deeper, since the
+        # right game is often ranked below generic same-named pages.
+        _hv = _hint_version(hint)
+        _forms = [hint] if _hv else [f'"{hint}" game', hint]
+        # _target counts VALID candidates per query — results dropped AFTER
+        # their fetch (failed scrape, film/TV page) don't consume it. The URL
+        # pool is fetched 2× deeper so each dropped result is replaced by the
+        # next URL in line; the old fixed top-N slice shrank with every
+        # post-fetch rejection and could dwindle to zero. Extra page fetches
+        # happen only 1:1 for rejected results, bounded by the pool size.
+        _target = 8 if _hv else 4
+        for q in _forms:
+            if stop or len(candidates) >= MAX_GENERIC_RESULTS:
+                break
+            urls = _web_search_urls(q, max_results=_target * 2)
+            _query_valid = 0
+            for url in urls:
+                if _query_valid >= _target or len(candidates) >= MAX_GENERIC_RESULTS:
+                    break
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                info = _scrape_opengraph(url)
+                if not info or not info.name:
+                    continue
+                # Same film/TV/band rejection as the Wikipedia tier — generic
+                # web results can surface an encyclopedia/fandom page whose
+                # og:title is "<Name> (film)" / "(TV series)" / "(band)".
+                if _is_non_game_media_title(info.name):
+                    logger.debug(f"Generic web skip (non-game media): {info.name!r}")
+                    continue
+                # Generic web results must always be labeled "web" regardless
+                # of the actual site (DLsite, Wikipedia, etc.) — the user
+                # rejected targeted results from these sources already.
+                info.source = "web"
+                info.store_url = info.store_url or url
+                score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
+                # The folder's version appearing in the candidate's title or
+                # URL is a high-precision same-game signal — lift it over a
+                # clean-titled namesake (whose padded title would otherwise
+                # out-score the correct, noisier one).
+                if _ver_re and (_ver_re.search(info.name or "") or _ver_re.search(url)):
+                    score = max(score, 90.0)
+                    logger.debug(
+                        f"Generic web: version {_folder_ver} matched in "
+                        f"{url[:45]} → boosted to {score:.0f}")
+                logger.debug(f"Generic web: {url[:55]} → {info.name!r} (score={score:.0f})")
+                candidates.append((info, score))
+                _query_valid += 1
+                if score >= 60:
+                    # Strong hit: stop burning engine quota on more queries,
+                    # keep what was already collected for the picker.
+                    logger.info(f"Generic web early hit: {info.name!r} (score={score:.0f})")
+                    stop = True
+                    break
+
+    if not candidates:
+        logger.info("Generic web: no results found")
+        return [] if return_all else None
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    if return_all:
+        kept = _dedupe_candidates([c for c in candidates if c[1] >= 30.0])
+        logger.info(
+            "Generic web results: " + (
+                ", ".join(f"{i.name!r} ({s:.0f})" for i, s in kept) or "none ≥ 30"
+            )
+        )
+        return [info for info, _ in kept]
+    best, best_score = candidates[0]
+    logger.info(f"Generic web best: {best.name!r} (score={best_score:.0f})")
+    return best if best_score >= 30 else None

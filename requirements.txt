@@ -1,0 +1,29 @@
+# pip install -r requirements.txt
+PySide6>=6.6.0
+psutil>=5.9.0
+watchdog>=3.0.0
+requests>=2.31.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-api-python-client>=2.100.0
+msal>=1.24.0
+dropbox>=11.36.0
+webdavclient3>=3.14.6
+python-dateutil>=2.8.2
+pynput>=1.7.6
+cryptography>=41.0.0
+keyring>=24.0.0
+Pillow>=10.0.0
+pillow-avif-plugin>=1.0
+
+# ── Test / tools ──────────────────────────────────────────────────────────
+langdetect>=1.0.9
+PyYAML>=6.0
+
+# ── Build ──────────────────────────────────────────────────────────────────
+# pip install pyinstaller
+#
+# Build EXE (from project root):
+#   pyinstaller savesync.spec
+#
+# Output: dist/SaveSync/SaveSync.exe
