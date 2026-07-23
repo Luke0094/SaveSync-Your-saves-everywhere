@@ -1254,7 +1254,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         self._sty(self._thumb, lambda: (
             f"background:{palette('bg_elevated')};border-radius:6px;font-size:22px;"
         ))
-        focus = getattr(entry, 'cover_focus', 'center')
+        focus = getattr(self._entry, 'cover_focus', 'center')
         px = _make_pixmap(self._img_path, 48, 48, focus)
         if px:
             self._thumb.setPixmap(px)
