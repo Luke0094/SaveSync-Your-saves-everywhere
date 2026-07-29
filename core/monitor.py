@@ -172,6 +172,14 @@ class ProcessMonitor(QObject):
     game_exited           = Signal(object)         # GameEntry
     unknown_game_detected = Signal(str, str)       # display_name, exe_path
     unknown_game_exited   = Signal(str)            # exe_path
+    # A process matched a library entry by NAME ONLY (its own path was
+    # unreadable, so nothing could confirm or contradict it). NOT tracked —
+    # the user is asked first. (GameEntry, process_name)
+    game_match_unverified = Signal(object, str)
+    # …and that process exited before the question was answered: take the
+    # prompt down, it now asks about something that no longer exists.
+    # (process_name, game_id)
+    game_match_unverified_gone = Signal(str, str)
     # Worker-thread → GUI-thread hop for the process snapshot (see _poll)
     _snapshot_ready       = Signal(object)         # dict[ProcessKey, dict]
 
@@ -187,6 +195,12 @@ class ProcessMonitor(QObject):
         self._stem_lookup: Optional[dict] = None
         self._proc_match_cache: dict = {}
         self._proc_resolved_cache: dict = {}
+        # (process_name, game_id) pairs already put to the user this session,
+        # so an unverified match is queried once, not on every launch.
+        self._unverified_prompted: set = set()
+        # Prompts still awaiting an answer: ProcessKey → (process_name, game_id).
+        # Lets an unanswered prompt be withdrawn when its process exits.
+        self._unverified_pending: dict = {}
         self._suppressed_raw: set = set()
         self._suppressed_resolved: set = set()
         # Cross-poll snapshot cache: (pid, create_time) → verdict dict
@@ -657,23 +671,56 @@ class ProcessMonitor(QObject):
             self._proc_resolved_cache[exe] = cached
         return cached
 
+    @staticmethod
+    def _proc_match_key(name: str) -> str:
+        """Key for the confirmed/rejected stores: the process filename. The
+        path is precisely what's missing in these cases, so it can't be used."""
+        return Path(name or "").name.lower()
+
+    @staticmethod
+    def _match_confirmed(proc_name: str, game_id: str) -> bool:
+        """User already said "yes, that process IS this game"."""
+        return get_config().get("confirmed_process_matches", {}).get(proc_name) == game_id
+
+    @staticmethod
+    def _match_rejected(proc_name: str, game_id: str) -> bool:
+        """User already said "no, that process is NOT this game". Stored per
+        (process, game) pair on purpose: rejecting launcher.exe as Alpha must
+        not stop it from ever matching Beta."""
+        return game_id in (get_config().get("rejected_process_matches", {}).get(proc_name) or [])
+
     def _find_entry(self, name: str, exe: str) -> Optional[GameEntry]:
+        """The matched entry, regardless of how confidently it was matched."""
+        return self._match_process(name, exe)[0]
+
+    def _match_process(self, name: str, exe: str) -> tuple[Optional[GameEntry], bool]:
+        """Match a running process to a library entry.
+
+        Returns ``(entry, verified)``. *verified* is False when the match
+        rests on the process NAME alone because the process's own path was
+        unreadable — typically an elevated game, where psutil raises
+        AccessDenied on proc.exe(). A name is not an identity (plenty of
+        games ship launcher.exe), so an unverified match must NOT be acted
+        on silently: callers ask the user instead, and the answer is
+        remembered so the question is asked once per process name.
+        """
         from core.resolvers import fuzzy_slug as _slug
         lib = get_library()
         cache_key = (name.lower(), exe.lower())
-        if cache_key in self._proc_match_cache:
-            gid = self._proc_match_cache[cache_key]
-            return lib.get_by_id(gid) if gid else None
+        cached = self._proc_match_cache.get(cache_key)
+        if cached is not None:
+            gid, verified = cached
+            return (lib.get_by_id(gid) if gid else None), verified
         if self._exe_lookup is None or self._stem_lookup is None:
             self._build_entry_lookup()
 
-        def _remember(gid):
+        def _remember(gid, verified: bool = True):
             if len(self._proc_match_cache) > 1024:
                 self._proc_match_cache.clear()
-            self._proc_match_cache[cache_key] = gid
-            return lib.get_by_id(gid) if gid else None
+            self._proc_match_cache[cache_key] = (gid, verified)
+            return (lib.get_by_id(gid) if gid else None), verified
 
-        # 1-2) Exact / resolved exe path
+        # 1-2) Exact / resolved exe path — the path IS the proof.
         gid = self._exe_lookup.get(exe.lower())
         if gid is None:
             gid = self._exe_lookup.get(self._resolve_proc_exe(exe))
@@ -683,23 +730,144 @@ class ProcessMonitor(QObject):
         # 3) Stem matching, only for stems long enough to be meaningful
         s = _stem(name)
         if len(s) >= 4:
+            from core.resolvers import is_different_program
             pname = _slug(Path(name).stem)
             exe_resolved = self._resolve_proc_exe(exe) if exe else ""
-            # Exact stem — same stem but a DIFFERENT resolved path means a
-            # different game (two "sol.exe"), so skip those candidates.
+            # No readable process path → nothing can contradict a name match,
+            # and nothing can confirm it either.
+            has_path_evidence = bool(exe_resolved)
+            proc_key = self._proc_match_key(name)
+
+            def _consider(gid_c: str, g_resolved: str):
+                """(entry, verified) for a candidate, or None to skip it."""
+                if is_different_program(g_resolved, exe_resolved):
+                    return None
+                if not has_path_evidence:
+                    if self._match_rejected(proc_key, gid_c):
+                        return None
+                    return _remember(gid_c, self._match_confirmed(proc_key, gid_c))
+                return _remember(gid_c, True)
+
+            # Exact stem — same stem but a DIFFERENT (still existing) path
+            # means a different game, so skip those.
             for gid_c, g_resolved in self._stem_lookup.get(pname, []):
-                if exe_resolved and g_resolved and g_resolved != exe_resolved:
-                    continue
-                return _remember(gid_c)
-            # Substring stem with ≤2 chars of difference
+                hit = _consider(gid_c, g_resolved)
+                if hit is not None:
+                    return hit
+            # Substring stem with ≤2 chars of difference. The SAME path rule
+            # applies here — without it this loop silently handed back the
+            # very candidates the exact-stem loop had just rejected:
+            # _stem_lookup is keyed by stem, so `pname` also matches itself
+            # here (length difference 0) and cands[0] is that same
+            # different-path game. A second game's launcher.exe was being
+            # attributed to the first one, backups included.
             for stem, cands in self._stem_lookup.items():
                 if not stem or not pname:
                     continue
                 shorter, longer = ((stem, pname) if len(stem) <= len(pname)
                                    else (pname, stem))
                 if shorter in longer and (len(longer) - len(shorter)) <= 2:
-                    return _remember(cands[0][0])
+                    for gid_c, g_resolved in cands:
+                        hit = _consider(gid_c, g_resolved)
+                        if hit is not None:
+                            return hit
         return _remember(None)
+
+    def _prompt_unverified_match(self, entry: GameEntry, proc_name: str,
+                                 proc_key: Optional[tuple] = None):
+        """Ask the user whether this name-only match is really that game.
+
+        Asked once per (process, game) per session; the answer is persisted,
+        so in practice it is once, ever. Until it comes, the process stays
+        untracked — attributing another game's saves to this entry is a worse
+        outcome than missing a session.
+        """
+        name_key = self._proc_match_key(proc_name)
+        pair = (name_key, entry.id)
+        if pair in self._unverified_prompted:
+            return
+        self._unverified_prompted.add(pair)
+        if proc_key is not None:
+            with self._data_lock:
+                self._unverified_pending[proc_key] = pair
+        logger.info(
+            f"Unverified match: process {proc_name!r} looks like {entry.name} "
+            f"but its path is unreadable — not tracking until confirmed")
+        self.game_match_unverified.emit(entry, Path(proc_name or "").name)
+
+    def _prompt_unverified_after_runtime(self, entry: GameEntry, name: str, key: tuple):
+        """Defer the prompt by the same runtime threshold every other launch
+        notification respects, so a short-lived updater/installer that happens
+        to share a game's executable name never raises the question."""
+        game_id = entry.id
+
+        def _check():
+            try:
+                if time.time() - psutil.Process(key[0]).create_time() < _MIN_RUNTIME_SECONDS:
+                    return
+            except Exception:
+                return          # already gone — nothing to ask about
+            fresh = get_library().get_by_id(game_id)
+            if fresh is not None:
+                self._prompt_unverified_match(fresh, name, key)
+
+        QTimer.singleShot(_MIN_RUNTIME_SECONDS * 1000, _check)
+
+    def confirm_unverified_match(self, proc_name: str, game_id: str, accept: bool):
+        """Record the user's answer to an unverified-match prompt.
+
+        On accept the live process is attached straight away — persisting the
+        mapping without doing that would leave the running session untracked,
+        which reads as the confirmation having done nothing.
+        """
+        config = get_config()
+        key = self._proc_match_key(proc_name)
+        if not key or not game_id:
+            return
+        if accept:
+            store = dict(config.get("confirmed_process_matches", {}))
+            store[key] = game_id
+            config.set("confirmed_process_matches", store)
+        else:
+            store = {k: list(v) for k, v in config.get("rejected_process_matches", {}).items()}
+            ids = store.setdefault(key, [])
+            if game_id not in ids:
+                ids.append(game_id)
+            config.set("rejected_process_matches", store)
+        # The verdict is cached alongside the match — drop it so the next
+        # lookup reflects the answer.
+        self._proc_match_cache.clear()
+        logger.info(f"Unverified match for {key}: user said "
+                    f"{'YES' if accept else 'NO'} to game {game_id}")
+        if accept:
+            self._attach_confirmed_match(key, game_id)
+
+    def _attach_confirmed_match(self, proc_key: str, game_id: str):
+        """Start tracking every still-running process the user just confirmed."""
+        entry = get_library().get_by_id(game_id)
+        if entry is None:
+            return
+        with self._data_lock:
+            candidates = [
+                (key, info) for key, info in self._running.items()
+                if self._proc_match_key(info.get("name", "")) == proc_key
+                and self._tracked.get(key) is None
+            ]
+            for key, _info in candidates:
+                self._unverified_pending.pop(key, None)
+        # _running is only as fresh as the last poll, so a process that died
+        # in between is still listed — attaching it would start a session for
+        # a pid that no longer exists.
+        candidates = [(k, i) for k, i in candidates
+                      if not PSUTIL_AVAILABLE or psutil.pid_exists(k[0])]
+        for key, _info in candidates:
+            entry.mark_played()
+            get_library().update_game(entry)
+            with self._data_lock:
+                self._register_tracked_locked(key, entry)
+            if not self._has_tracked_ancestor(key[0], entry.id):
+                self.game_launched.emit(entry, entry.exe_path or "")
+                logger.info(f"Confirmed match attached: {entry.name} (pid={key[0]})")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -826,7 +994,10 @@ class ProcessMonitor(QObject):
                 name, exe = info["name"], info["exe"]
 
                 # Check if this process is in our library
-                entry = self._find_entry(name, exe)
+                entry, verified = self._match_process(name, exe)
+                if entry is not None and not verified:
+                    self._prompt_unverified_after_runtime(entry, name, key)
+                    continue
 
                 if entry:
                     # Known game - track it but wait for runtime threshold before showing popup
@@ -872,10 +1043,16 @@ class ProcessMonitor(QObject):
                 continue           # already known
 
             name, exe = info["name"], info["exe"]
-            
+
             # Check if this process is in our library
-            entry = self._find_entry(name, exe)
-            
+            entry, verified = self._match_process(name, exe)
+            if entry is not None and not verified:
+                # Matched on the name alone (unreadable process path). Do NOT
+                # start tracking a game we can't confirm this is — ask.
+                new_processes_found = True
+                self._prompt_unverified_after_runtime(entry, name, key)
+                continue
+
             if entry:
                 # Known game - track it but wait for runtime threshold before showing popup
                 new_processes_found = True
@@ -961,7 +1138,17 @@ class ProcessMonitor(QObject):
             running_keys = set(self._running)
             gone = running_keys - set(current)
             gone_data: list[tuple] = []
+            # Unanswered "is this really that game?" prompts whose process is
+            # now gone. Dropped from _unverified_prompted too, so a later
+            # launch in this session asks again instead of staying silent
+            # about a question that was never actually answered.
+            withdrawn: list[tuple] = []
             for key in gone:
+                pending = self._unverified_pending.pop(key, None)
+                if pending is not None and not any(
+                        v == pending for k, v in self._unverified_pending.items()):
+                    self._unverified_prompted.discard(pending)
+                    withdrawn.append(pending)
                 entry = self._tracked.pop(key, None)
                 self._first_seen.pop(key, None)
                 info = self._running.get(key, {})
@@ -975,6 +1162,11 @@ class ProcessMonitor(QObject):
                         if not sess["procs"]:
                             finished_session = self._game_sessions.pop(entry.id)
                 gone_data.append((key, entry, finished_session, exe, seen))
+
+        for proc_name, game_id in withdrawn:
+            logger.info(f"Withdrawing unanswered match prompt for {proc_name!r} "
+                        "— the process exited")
+            self.game_match_unverified_gone.emit(proc_name, game_id)
 
         for key, entry, finished_session, exe, seen in gone_data:
             if entry is not None:
@@ -1067,8 +1259,13 @@ class ProcessMonitor(QObject):
             name, exe = info.get("name", ""), info.get("exe", "")
             if not name and not exe:
                 continue
-            found = self._find_entry(name, exe)
-            if found:
+            # Late-match after the user added a game. An unverified (name-only)
+            # match is skipped rather than prompted: a process whose path is
+            # unreadable never became a tracked-unknown in the first place
+            # (_is_plausible_game needs an existing path), so this branch can
+            # only be reached with real path evidence.
+            found, verified = self._match_process(name, exe)
+            if found and verified:
                 found.mark_played()
                 lib.update_game(found)
                 with self._data_lock:

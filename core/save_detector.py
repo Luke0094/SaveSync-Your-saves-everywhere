@@ -106,6 +106,10 @@ GENERIC_EXE_STEMS = {
     'savesync', 'save',
     'menu', 'title', 'gui', 'ui', 'frontend',
     'runtime', 'redist', 'redistributable',
+    # Tools and helpers shipped beside a game — meaningless as a title, so a
+    # game is named after its folder instead of after them.
+    'gamepro', 'tool', 'tools', 'patch', 'gameupdate', 'startwithtool',
+    'windowsiconupdater', 'iconupdater',
     'win64', 'win32', 'x64', 'x86', 'win',
     'release', 'debug', 'test', 'dev',
     'program', 'executable', 'exe',
@@ -177,11 +181,16 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
 
 def display_name_for_added_file(path: str) -> str:
     """Display name for a file the user added by drag-drop or file picker: an
-    exe/bat walks generic stems ("nw", "game"…) up to the install-folder name
-    via derive_display_name, while a shortcut (.lnk/.url) keeps its filename
-    stem. Single source of truth for every add entry point."""
+    executable walks generic stems ("nw", "game"…) up to the install-folder
+    name via derive_display_name, while a shortcut (.lnk/.url, or .desktop on
+    Linux) keeps its filename stem. Single source of truth for every add entry
+    point — including Unix binaries, which are typically extension-less and
+    named exactly like the generic stems this is here to replace."""
+    from core.resolvers import is_executable_file, is_shortcut_file
     p = Path(path)
-    if p.suffix.lower() in ('.exe', '.bat'):
+    if is_shortcut_file(p):
+        return p.stem
+    if is_executable_file(p):
         return derive_display_name(path)
     return p.stem
 
@@ -813,17 +822,20 @@ def _live_save_paths(pid: int) -> list[str]:
                 logger.debug(f"Live tracking: sibling match -> {sib}")
 
     # Folder entries for dedicated save dirs; per-FILE entries when the
-    # written files sit in an install/root folder (the dir contains an
-    # .exe, or is the game exe's own dir) — backing up the whole install
+    # written files sit in an install/root folder (the dir contains a game
+    # program, or is the game exe's own dir) — backing up the whole install
     # folder for a couple of Save*.rxdata beside the exe is exactly the
-    # "spread" this avoids.
+    # "spread" this avoids. Program detection is platform-aware: on Unix the
+    # binary is usually extension-less, so an ".exe" test would never fire
+    # and every Linux install root fell through to the whole-folder branch.
+    from core.resolvers import is_program_binary
     result_set: set[str] = set()
     for d in {f.parent for f in all_files}:
         is_install_root = (exe_dir is not None and d == exe_dir)
         if not is_install_root:
             try:
                 is_install_root = any(
-                    c.is_file() and c.suffix.lower() == ".exe" for c in d.iterdir()
+                    c.is_file() and is_program_binary(c) for c in d.iterdir()
                 )
             except OSError:
                 is_install_root = False
@@ -1799,17 +1811,20 @@ def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3) -> list
             return
         if not p.is_dir():
             return
-        # Install/root folders (an .exe lives right here) must NEVER become
-        # a whole-folder entry: e.g. RPG Maker XP writes Save1.rxdata beside
-        # Game.exe — the backup must cover those save files only, not the
-        # entire installation. Emit the save-like files individually and
-        # only follow save-named subfolders.
+        # Install/root folders (the game program lives right here) must NEVER
+        # become a whole-folder entry: e.g. RPG Maker XP writes Save1.rxdata
+        # beside Game.exe — the backup must cover those save files only, not
+        # the entire installation. Emit the save-like files individually and
+        # only follow save-named subfolders. Program detection is
+        # platform-aware (see is_program_binary): a Linux game binary carries
+        # no extension, so an ".exe" test never fired there.
+        from core.resolvers import is_program_binary
         try:
             direct = list(p.iterdir())
         except (PermissionError, OSError):
             out.append(p)
             return
-        if any(c.is_file() and c.suffix.lower() == ".exe" for c in direct):
+        if any(c.is_file() and is_program_binary(c) for c in direct):
             for f in sorted((c for c in direct
                              if c.is_file() and c.suffix.lower() in _SAVE_EXTENSIONS),
                             key=lambda c: c.name.lower()):

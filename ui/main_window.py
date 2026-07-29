@@ -131,6 +131,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # handlers pop it). Closing the prompt does NOT pop it — that is what
         # lets _toggle_overlay() re-summon it via the hotkey until decided.
         self._pending_cloud_notification: dict[str, str] = {}
+        # Unanswered "is this process really that game?" prompts:
+        # (process_name, game_id) → game name. Same role as the dict above —
+        # it keeps the question re-summonable by the hotkey until answered.
+        self._pending_unverified: dict[tuple, str] = {}
         # game_id → QTimer for periodic in-game backup
         self._ingame_backup_timers: dict[str, "QTimer"] = {}
         # Pending "both" conflict resolution: chain upload after download
@@ -222,6 +226,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._nav_buttons.append(btn)
             sl.addWidget(btn)
 
+        # Under Settings: the way back to a batch web search that was put away.
+        # Not a page — it reopens the panel, and only exists while there is a
+        # run to reopen.
+        self._search_nav_btn = NavButton(t("game_search.nav"), "🔎")
+        self._search_nav_btn.clicked.connect(self._show_game_search_panel)
+        self._search_nav_btn.setVisible(False)
+        sl.addWidget(self._search_nav_btn)
+
         sl.addStretch()
 
         # Credits button — just above the Online/Offline status
@@ -264,6 +276,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Wire library page signals
         self._library_page.add_game_requested.connect(self._show_add_game)
+        self._library_page.scan_folder_requested.connect(self._show_scan_folder)
         self._library_page.backup_requested.connect(self._backup_game)
         self._library_page.restore_requested.connect(self._restore_game_latest)
         self._library_page.remove_requested.connect(self._remove_game)
@@ -548,6 +561,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
 
     def _on_overlay_action(self, action: str, context: str):
+        # Matched FIRST: this context is "procname|game_id", not an exe path,
+        # so it must never fall through to a branch that treats it as one.
+        if action in ("confirm_process_match", "reject_process_match"):
+            proc_name, _, game_id = context.partition("|")
+            self._pending_unverified.pop((proc_name, game_id), None)   # answered
+            get_monitor().confirm_unverified_match(
+                proc_name, game_id, accept=(action == "confirm_process_match"))
+            return
         if action == "add_game":
             self._auto_add_game_from_overlay(context)
         elif action == "download_saves":
@@ -1101,6 +1122,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             appid=appid,
         )
         
+        # The names as found on disk — release folder and executable stem —
+        # kept for matching, never for display.
+        entry.record_exe_hints(exe_path)
+
         if appid:
             logger.info(f"Auto-adding game with launcher appid: {appid}")
 
@@ -1193,6 +1218,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 else:
                     continue
                 return
+
+        # Next: an unanswered "is this process really that game?" prompt. Same
+        # rule as the cloud prompts above — a decision-required question stays
+        # re-summonable until it is actually answered, otherwise dismissing it
+        # once would leave the game untracked for the rest of the session with
+        # no way to bring the question back.
+        if self._pending_unverified:
+            (proc_name, game_id), game_name = next(iter(self._pending_unverified.items()))
+            self._overlay.show_unverified_match(game_name, proc_name, game_id)
+            return
 
         # Check if overlay is currently showing a tracking popup for a known game.
         # NOTE: use the module-level get_library — a function-local re-import
@@ -1340,7 +1375,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         monitor.game_exited.connect(self._on_game_exited)
         monitor.unknown_game_detected.connect(self._on_unknown_game)
         monitor.unknown_game_exited.connect(self._on_unknown_game_exited)
+        monitor.game_match_unverified.connect(self._on_unverified_match)
+        monitor.game_match_unverified_gone.connect(self._on_unverified_match_gone)
         monitor.start()
+
+        # A hand-registered destination waiting for its game is picked up the
+        # moment that game appears — no periodic re-check, just this one
+        # event, matched on the name coincidence.
+        get_library().game_added.connect(self._adopt_manual_entries_for)
 
         from core.watcher import get_save_watcher
         self._watcher = get_save_watcher()
@@ -1464,6 +1506,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """
         if not entry:
             return
+
+        # Launching is the one moment a game is GUARANTEED to have its
+        # executable — that is what makes a save destination registered by
+        # hand ("www/save under the game") placeable at all. So any such
+        # destination still waiting for this game is taken over here, before
+        # the cloud check reads save_paths: a game added without an exe and
+        # given one later never emits game_added again, and would otherwise
+        # keep waiting forever.
+        try:
+            from core.manual_paths import adopt_manual_entries_for
+            if adopt_manual_entries_for(entry):
+                refreshed = get_library().get_by_id(entry.id)
+                if refreshed is not None:
+                    entry = refreshed
+        except Exception:
+            logger.debug("Manual-entry adoption at launch failed", exc_info=True)
 
         self._update_sidebar_status()
 
@@ -1943,6 +2001,30 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             pass
         self._pending_unknown.pop(exe_path, None)
 
+    def _on_unverified_match(self, entry, proc_name: str):
+        """A process matched *entry* by name only (its path was unreadable).
+
+        The monitor has deliberately NOT started tracking it. Ask the user
+        whether it really is that game — the alternative, guessing, can file
+        one game's saves under another. The answer is persisted by the
+        monitor, so this appears once per executable name.
+        """
+        if not entry or not self._overlay:
+            return
+        # Unresolved until the user answers — kept here so the hotkey can
+        # re-summon it, exactly like an unanswered cloud prompt. Without this
+        # a dismissed prompt is unrecoverable: the monitor won't re-ask this
+        # session and the game stays untracked with no way back.
+        self._pending_unverified[(proc_name, entry.id)] = entry.name
+        self._overlay.show_unverified_match(entry.name, proc_name, entry.id)
+
+    def _on_unverified_match_gone(self, proc_name: str, game_id: str):
+        """The process exited before the user answered — take the prompt down
+        rather than leave a question about something that no longer runs."""
+        self._pending_unverified.pop((proc_name, game_id), None)
+        if self._overlay:
+            self._overlay.dismiss_unverified_match(proc_name, game_id)
+
     def _on_unknown_game(self, name: str, exe_path: str):
         """Unknown process started: check for cloud saves first; fall back to add-to-library."""
         if get_library().get_by_exe(exe_path) is not None:
@@ -2360,6 +2442,92 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._update_sidebar_status()
 
     # ── Game actions ──────────────────────────────────────────────────────────
+
+    def _adopt_manual_entries_for(self, entry):
+        """A game just appeared: give it any save destination registered for
+        it by hand. One name comparison — nothing is scanned or polled."""
+        if entry is None:
+            return
+        try:
+            from core.manual_paths import adopt_manual_entries_for
+            absorbed = adopt_manual_entries_for(entry)
+        except Exception:
+            logger.debug("Manual-entry adoption failed", exc_info=True)
+            return
+        if absorbed:
+            logger.info(f"{entry.name}: absorbed {absorbed} hand-registered destination(s)")
+            try:
+                self._library_page._load_library()
+            except Exception:
+                pass
+
+    def _show_scan_folder(self):
+        """🔍 — scan a folder for installed games, confirm, add."""
+        from ui.dialogs.exe_scan_dialog import ExeScanDialog
+        dlg = ExeScanDialog(self)
+        dlg.search_requested.connect(self._start_batch_game_search)
+        dlg.exec()
+
+    def _start_batch_game_search(self, game_ids):
+        """Kick off the opt-in web-search pass over freshly added games.
+
+        The runner outlives this call and the panel: the user can put the
+        window away and pick it up again from the sidebar entry.
+        """
+        if not game_ids:
+            return
+        runner = self._game_search_runner()
+        if runner.running:
+            self._show_game_search_panel()
+            return
+        if runner.start(list(game_ids)):
+            self._search_nav_btn.setVisible(True)
+            self._show_game_search_panel()
+
+    def _game_search_runner(self):
+        runner = getattr(self, "_search_runner", None)
+        if runner is None:
+            from ui.game_search_runner import GameSearchRunner
+            runner = GameSearchRunner(self)
+            runner.finished.connect(self._on_batch_search_finished)
+            self._search_runner = runner
+        return runner
+
+    def _show_game_search_panel(self):
+        """Open (or re-show) the batch-search panel."""
+        runner = self._game_search_runner()
+        if not runner.has_run:
+            return
+        panel = getattr(self, "_search_panel", None)
+        if panel is not None:
+            try:
+                panel.show()
+                panel.raise_()
+                panel.activateWindow()
+                return
+            except RuntimeError:
+                self._search_panel = None
+        from ui.dialogs.game_search_panel import GameSearchPanel
+        panel = GameSearchPanel(runner, self)
+        panel.dismissed.connect(self._on_batch_search_dismissed)
+        self._search_panel = panel
+        panel.show()
+
+    def _on_batch_search_finished(self, _matched: int, _total: int, _cancelled: bool):
+        # Refresh the library so newly fetched covers and metadata show up.
+        try:
+            self._library_page._load_library()
+        except Exception:
+            logger.debug("Library refresh after batch search failed", exc_info=True)
+
+    def _on_batch_search_dismissed(self):
+        """The user closed a finished run: retire it, so the sidebar entry
+        doesn't linger pointing at a search nobody is waiting on any more."""
+        self._search_panel = None
+        self._search_nav_btn.setVisible(False)
+        runner = getattr(self, "_search_runner", None)
+        if runner is not None and not runner.running:
+            self._search_runner = None
 
     def _show_add_game(self, name: str = "", exe_path: str = ""):
         dlg = AddGameDialog(name=name, exe_path=exe_path, parent=self)

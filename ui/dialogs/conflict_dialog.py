@@ -12,10 +12,18 @@ from PySide6.QtWidgets import (
 
 from i18n import t
 from ui.styles.theme import palette
+from ui.helpers import TopmostPinMixin, apply_game_friendly_flags
 
 
-class ConflictDialog(QDialog):
-    """Shown when local and remote saves were both modified since last sync."""
+class ConflictDialog(TopmostPinMixin, QDialog):
+    """Shown when local and remote saves were both modified since last sync.
+
+    Same window treatment as the save-confirmation panel: a conflict is a
+    decision the user has to make, and it can surface while a game is in the
+    foreground — a plain dialog would sit invisible behind it. So it stays on
+    top without stealing the game's focus, and the caller backs it with the
+    in-game blur vignette.
+    """
 
     resolution = Signal(str)  # "local" | "cloud" | "both"
 
@@ -30,8 +38,24 @@ class ConflictDialog(QDialog):
         self.setWindowTitle(t("sync.conflict_title"))
         self.setMinimumWidth(440)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._topmost_timer = None
+        apply_game_friendly_flags(self)
         self._choice: str = "local"
         self._build(game_name, local_mtime, cloud_mtime)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.start_topmost_pin()
+
+    def closeEvent(self, event):
+        self.stop_topmost_pin()
+        super().closeEvent(event)
+
+    def done(self, result):
+        # exec() ends through done(), not closeEvent — stop the timer there
+        # too so it never outlives the dialog.
+        self.stop_topmost_pin()
+        super().done(result)
 
     def _build(self, game_name: str, local_dt: Optional[datetime], cloud_dt: Optional[datetime]):
         layout = QVBoxLayout(self)

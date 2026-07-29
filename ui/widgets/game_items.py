@@ -222,6 +222,89 @@ def _find_game_image(entry: GameEntry) -> Optional[str]:
     return images[0] if images else None
 
 
+# ── Cover framing ─────────────────────────────────────────────────────────────
+# cover_focus carries the whole framing, as a plain string so it round-trips
+# through the library JSON untouched and every _make_pixmap call site keeps
+# working unchanged:
+#   "center", "top-left", …   the 3x3 grid (what every existing entry has)
+#   "custom:<mode>:<zoom>:<x>:<y>"
+#       mode  cover | fit | stretch   zoom  ≥ 1.0
+#       x, y  0..1 — where the visible window sits (0.5 = centred), the same
+#             axis the 3x3 grid samples at 0 / 0.5 / 1.
+COVER_MODES = ("cover", "fit", "stretch")
+_FOCUS_AXIS = {"left": 0.0, "top": 0.0, "center": 0.5, "right": 1.0, "bottom": 1.0}
+
+
+def parse_cover_focus(focus: Optional[str]) -> tuple[str, float, float, float]:
+    """(mode, zoom, x, y) for any focus string, past or present.
+
+    Total by design: entries written before custom framing existed, and
+    anything corrupted, fall back to the plain centred cover rather than
+    raising in the middle of painting a card.
+    """
+    text = (focus or "center").strip()
+    if text.lower().startswith("custom:"):
+        parts = text.split(":")
+        try:
+            mode = parts[1].strip().lower()
+            if mode not in COVER_MODES:
+                mode = "cover"
+            zoom = max(0.1, min(8.0, float(parts[2])))
+            x = max(0.0, min(1.0, float(parts[3])))
+            y = max(0.0, min(1.0, float(parts[4])))
+            return mode, zoom, x, y
+        except (IndexError, ValueError, TypeError):
+            return "cover", 1.0, 0.5, 0.5
+    # 3x3 grid: "top-left", "center-right", … — each half names one axis.
+    x = y = 0.5
+    for token in text.lower().split("-"):
+        if token in ("left", "right"):
+            x = _FOCUS_AXIS[token]
+        elif token in ("top", "bottom"):
+            y = _FOCUS_AXIS[token]
+    return "cover", 1.0, x, y
+
+
+def format_cover_focus(mode: str, zoom: float, x: float, y: float) -> str:
+    """Serialize a custom framing back into cover_focus."""
+    mode = mode if mode in COVER_MODES else "cover"
+    return f"custom:{mode}:{zoom:.3f}:{x:.4f}:{y:.4f}"
+
+
+def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center") -> QPixmap:
+    """Frame *px* into a w×h cover according to *focus*.
+
+    One path for all three modes — they differ only in how the source is
+    scaled, never in how it is positioned:
+      cover    fill the frame, overflow cropped (the historical behaviour)
+      fit      whole image visible, letterboxed
+      stretch  distorted to fill exactly
+    Position comes from (x, y): with the image larger than the frame it
+    chooses which part shows, with it smaller it chooses where it sits.
+    """
+    mode, zoom, x, y = parse_cover_focus(focus)
+    tw, th = max(1, int(round(w * zoom))), max(1, int(round(h * zoom)))
+    aspect = {
+        "cover": Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        "fit": Qt.AspectRatioMode.KeepAspectRatio,
+        "stretch": Qt.AspectRatioMode.IgnoreAspectRatio,
+    }[mode]
+    scaled = px.scaled(tw, th, aspect, Qt.TransformationMode.SmoothTransformation)
+
+    canvas = QPixmap(w, h)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    try:
+        # int() truncates toward zero, which reproduces the old
+        # `extra // 2` / `extra` crop offsets exactly for the 3x3 values.
+        dx = int((w - scaled.width()) * x)
+        dy = int((h - scaled.height()) * y)
+        painter.drawPixmap(dx, dy, scaled)
+    finally:
+        painter.end()
+    return canvas
+
+
 def _make_pixmap(path: Optional[str], w: int, h: int, focus: str = "center") -> Optional[QPixmap]:
     if not path:
         return None
@@ -230,33 +313,7 @@ def _make_pixmap(path: Optional[str], w: int, h: int, focus: str = "center") -> 
         if px.isNull():
             logger.debug(f"Pixmap load returned null for path: {path}")
             return None
-        # Scale so the image covers the target size (KeepAspectRatioByExpanding),
-        # then crop to exact dimensions based on focus position.
-        scaled = px.scaled(
-            w, h,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # Calculate crop offset based on 3x3 grid focus
-        # Default center crop
-        x_off = max(0, (scaled.width()  - w) // 2)
-        y_off = max(0, (scaled.height() - h) // 2)
-        
-        # Apply focus offset (shift crop towards the specified region)
-        extra_w = max(0, scaled.width() - w)
-        extra_h = max(0, scaled.height() - h)
-        
-        if "left" in focus:
-            x_off = 0
-        elif "right" in focus:
-            x_off = extra_w
-        
-        if "top" in focus:
-            y_off = 0
-        elif "bottom" in focus:
-            y_off = extra_h
-        
-        return scaled.copy(x_off, y_off, w, h)
+        return render_cover(px, w, h, focus)
     except Exception as e:
         logger.debug(f"Pixmap load failed for path '{path}': {e}")
         return None
@@ -743,14 +800,73 @@ class _GameItemMixin:
             grid_layout.addWidget(btn, row, col)
         
         layout.addLayout(grid_layout)
+
+        # ── Custom framing ────────────────────────────────────────────────────
+        # The grid covers "which ninth"; anything else (pan, zoom, fit mode)
+        # lives in the editor below, opened in place on the same dialog.
+        custom_btn = QPushButton(t("library.cover_focus_custom"))
+        custom_btn.setStyleSheet(
+            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
+            f"border:1px solid {palette('border')};border-radius:6px;padding:7px;font-size:12px;}}"
+            f"QPushButton:hover{{border-color:{palette('accent')};}}"
+        )
+        _current_is_custom = str(current_focus).lower().startswith("custom:")
+        if _current_is_custom:
+            custom_btn.setText(f"{t('library.cover_focus_custom')} ✓")
+        custom_btn.clicked.connect(lambda: self._show_cover_custom_editor(dialog, original_px))
+        layout.addWidget(custom_btn)
         layout.addStretch()
-        
+
         # Apply theme styling
         dialog.setStyleSheet(
             f"QDialog{{background:{palette('bg_card')};}}"
         )
-        
+
         dialog.exec()
+
+    def _show_cover_custom_editor(self, parent_dialog, original_px):
+        """Free framing (pan / zoom / fill-fit-stretch) for this cover."""
+        from PySide6.QtWidgets import QDialog, QPushButton
+        from ui.modal_helpers import information_window_modal
+        from ui.widgets.cover_editor import CoverCustomEditor
+
+        if original_px is None or original_px.isNull():
+            information_window_modal(
+                self, t("library.adjust_cover_focus"), t("library.cover_no_image"))
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(t("library.cover_focus_custom"))
+        dlg.setStyleSheet(f"QDialog{{background:{palette('bg_card')};}}")
+        vbox = QVBoxLayout(dlg)
+        vbox.setContentsMargins(16, 16, 16, 16)
+        vbox.setSpacing(12)
+
+        editor = CoverCustomEditor(
+            original_px, game_name=_clean_tag_display(self._entry.name),
+            focus=getattr(self._entry, "cover_focus", "center"), parent=dlg)
+        vbox.addWidget(editor)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton(t("common.cancel"))
+        cancel_btn.clicked.connect(dlg.reject)
+        save_btn = QPushButton(t("common.save_changes"))
+        save_btn.setObjectName("primary_btn")
+        save_btn.setStyleSheet(
+            f"QPushButton{{background:{palette('accent')};color:{palette('accent_text')};"
+            f"border:none;border-radius:6px;padding:7px 14px;font-weight:600;}}"
+            f"QPushButton:hover{{background:{palette('accent_hover')};}}"
+        )
+        save_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        vbox.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Same commit path as a preset click, so the card refreshes and the
+            # preset dialog closes behind it.
+            self._set_cover_focus(editor.focus_string(), parent_dialog)
 
     def _set_cover_focus(self, focus: str, dialog):
         """Set the cover focus and update the entry."""

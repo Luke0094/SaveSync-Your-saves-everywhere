@@ -375,7 +375,20 @@ class CloudFlowsMixin:
             pass
         dlg = ConflictDialog(entry.name, local_time, remote_time, self)
         dlg.resolution.connect(lambda choice: self._handle_conflict_choice(entry, choice))
-        dlg.exec()
+        # Same in-game backdrop the save-confirmation panel gets: a conflict
+        # can appear while a game is running, and the vignette is what makes
+        # it read as a decision to make rather than a stray window.
+        try:
+            self._show_blur_for_dialog(dlg)
+        except Exception:
+            logger.debug("Blur backdrop unavailable for conflict dialog", exc_info=True)
+        try:
+            dlg.exec()
+        finally:
+            try:
+                self._on_blur_dialog_gone(dlg)
+            except Exception:
+                pass
 
 
     def _handle_conflict_choice(self, entry, choice: str):

@@ -90,6 +90,30 @@ class GameEntry:
     # (e.g. "Alpha_2") that get_folder_name_for_save can't reconstruct from a
     # name, so save/backup migration can still find data after a later rename.
     folder_history: list[str] = field(default_factory=list)
+    # A save destination registered by hand that could not be anchored yet:
+    # the chain relative to the game ("www/save") plus the folder name that
+    # identifies the game on disk. Kept so the entry can be re-anchored when
+    # the game is (re)installed — possibly somewhere else entirely, since the
+    # destination RELATIVE to the game never changes.
+    pending_save_chain: str = ""
+    pending_save_anchor: str = ""
+    # The same destination, kept AFTER it resolves: "www/save" describes where
+    # this game's saves live relative to it, and that stays true across
+    # reinstalls and across machines. Recorded on every backup so a restore
+    # elsewhere can rebase even when the backup carries no executable.
+    save_chain: str = ""
+    # The same thing, but per save path: {path: chain}. save_chain above can
+    # only hold one, and a game can perfectly well have two hand-added folders
+    # with different destinations — a copy of "www/save" and a copy of
+    # "AppData/Roaming/…". With one field the second destination was simply
+    # dropped, silently, and those saves could only ever be put back where
+    # they came from.
+    #
+    # A dict rather than a parallel list on purpose: save_paths is edited from
+    # several places (the confirmation dialog removes entries), and positional
+    # lists drift apart the first time one of them does. A stale key costs
+    # nothing.
+    save_path_chains: dict = field(default_factory=dict)
     # One-shot: the user chose "keep local saves" for a game whose cloud folder
     # already holds another machine's data. The NEXT sync must be forced to
     # upload (local wins) — a plain "auto" sync could otherwise DOWNLOAD a
@@ -97,6 +121,78 @@ class GameEntry:
     # successful sync. "up" is additive (never deletes remote), so the other
     # machine's copy survives and stays restorable.
     pending_local_wins: bool = False
+    # The names this game was found under, BEFORE they were cleaned up for
+    # display: the release folder with its code and version still attached
+    # ("[RJ01234] Some Title v1.0"), the executable's own stem, and so on.
+    #
+    # The display name drops that decoration on purpose — it is noise in a
+    # library — but it is the most specific identifier the game has, and it is
+    # the one that matches: a folder of saves kept under the full release name
+    # and the game's install folder agree on it exactly, while the two tidied
+    # titles may not. Kept as a hint, never shown.
+    name_hints: list[str] = field(default_factory=list)
+
+    def record_path_chain(self, path: str, chain: str):
+        """Remember where the saves in *path* belong."""
+        if not path or not chain:
+            return
+        self.save_path_chains = dict(self.save_path_chains or {})
+        self.save_path_chains[str(path)] = chain
+        # Keep the single field filled for anything still reading it, and for
+        # entries written before this one existed.
+        if not self.save_chain:
+            self.save_chain = chain
+
+    def chain_for_path(self, path: str) -> str:
+        """The chain recorded for *path*, or the entry's own as a fallback."""
+        chains = self.save_path_chains or {}
+        if not chains:
+            return self.save_chain or ""
+        direct = chains.get(str(path))
+        if direct:
+            return direct
+        wanted = str(path).casefold()
+        for known, chain in chains.items():
+            if str(known).casefold() == wanted:
+                return chain
+        return self.save_chain or ""
+
+    def all_chains(self) -> list:
+        """Every chain this game knows about, per path and the single one."""
+        out = [c for c in (self.save_path_chains or {}).values() if c]
+        if self.save_chain and self.save_chain not in out:
+            out.append(self.save_chain)
+        return out
+
+    def record_exe_hints(self, exe_path: str = ""):
+        """Record the raw names an executable is found under.
+
+        The install folder first — that is where a release keeps its code and
+        version — then the executable's own stem, but only when it says
+        something. "game.exe" says nothing, and recording it would make every
+        RPG Maker title in the library answer to the name "game".
+        """
+        if not exe_path:
+            return
+        try:
+            exe = Path(exe_path)
+        except (OSError, ValueError):
+            return
+        self.record_name_hint(exe.parent.name)
+        try:
+            from core.save_detector import GENERIC_EXE_STEMS
+            if exe.stem.strip().lower() not in GENERIC_EXE_STEMS:
+                self.record_name_hint(exe.stem)
+        except Exception:
+            pass
+
+    def record_name_hint(self, raw: str):
+        """Remember a name as it was found, decoration and all."""
+        raw = (raw or "").strip()
+        if not raw:
+            return
+        if raw.casefold() not in {h.casefold() for h in self.name_hints}:
+            self.name_hints.append(raw)
 
     def __post_init__(self):
         if self.sync_status not in VALID_SYNC_STATUSES:
@@ -530,8 +626,15 @@ class LibraryManager(QObject):
            (e.g. two different games both called "launcher.exe").
         2. Exact stem match.
         3. Substring match only when the length difference is ≤ 2 chars.
+
+        Steps 2 and 3 are name-based, so both reject a candidate whose own
+        exe path is known to be a different (still existing) program — see
+        is_different_program. Step 3 used to skip that test entirely, which
+        let a process match a library entry whose exe merely has a
+        near-identical name, purely on spelling.
         """
         from core.resolvers import fuzzy_slug as slug   # shared normalizer
+        from core.resolvers import is_different_program
 
         # 1. Exact path match (most reliable)
         if exe_path:
@@ -558,17 +661,15 @@ class LibraryManager(QObject):
                 if not stem or not pname:
                     continue
                 if stem == pname:
-                    # If both have full exe paths and they differ, skip —
-                    # same stem but different game (e.g. two sol.exe)
-                    if exe_path and g.exe_path:
-                        try:
-                            if Path(g.exe_path).resolve() != Path(exe_path).resolve():
-                                continue  # different path → different game
-                        except OSError:
-                            pass
+                    # Same stem but a different, still-existing path → a
+                    # different game (two exes sharing a short name).
+                    if is_different_program(g.exe_path, exe_path):
+                        continue
                     return copy.deepcopy(g)
                 shorter, longer = (stem, pname) if len(stem) <= len(pname) else (pname, stem)
                 if shorter in longer and (len(longer) - len(shorter)) <= 2:
+                    if is_different_program(g.exe_path, exe_path):
+                        continue
                     return copy.deepcopy(g)
         return None
 

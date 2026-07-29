@@ -3,6 +3,7 @@ SaveSync - Game Resolvers
 Handles resolution of launcher shortcuts (steam://, epic://, etc.) to executable paths.
 """
 import logging
+import os
 import re
 import subprocess
 import unicodedata
@@ -10,6 +11,156 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_IS_WINDOWS = os.name == 'nt'
+
+# ── What counts as "an executable the user can add" ───────────────────────────
+# Windows says it with an extension; Unix mostly doesn't — the common case is a
+# suffix-less file carrying the exec bit, so recognition there needs a stat, not
+# a glob. Shortcuts are the platform's own indirection format (.lnk/.url vs
+# .desktop) and are deliberately kept apart from real executables: the add flow
+# resolves them to a target and derives the display name from the shortcut's
+# filename rather than the binary's.
+_EXEC_SUFFIXES_WINDOWS = ('.exe', '.bat', '.cmd')
+_SHORTCUT_SUFFIXES_WINDOWS = ('.lnk', '.url')
+# .x86_64/.x86 are Unity's Linux builds, .AppImage a self-contained bundle,
+# .command a double-clickable macOS script. .app is a macOS bundle DIRECTORY,
+# handled separately since every suffix/is_file() test would reject it.
+_EXEC_SUFFIXES_POSIX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin', '.command')
+_SHORTCUT_SUFFIXES_POSIX = ('.desktop',)
+_MACOS_BUNDLE_SUFFIX = '.app'
+
+
+def executable_suffixes() -> tuple[str, ...]:
+    """Executable file extensions for this platform (lowercase, with dot)."""
+    return _EXEC_SUFFIXES_WINDOWS if _IS_WINDOWS else _EXEC_SUFFIXES_POSIX
+
+
+def shortcut_suffixes() -> tuple[str, ...]:
+    """Shortcut/launcher-file extensions for this platform."""
+    return _SHORTCUT_SUFFIXES_WINDOWS if _IS_WINDOWS else _SHORTCUT_SUFFIXES_POSIX
+
+
+def is_shortcut_file(path) -> bool:
+    """True for a shortcut that points at a game rather than being one."""
+    return Path(path).suffix.lower() in shortcut_suffixes()
+
+
+def is_executable_file(path) -> bool:
+    """True when *path* is a runnable program on this platform.
+
+    On Unix a game binary usually has NO extension at all, so the exec bit is
+    the real signal; the suffix list only covers the conventions that do exist
+    (.sh, .AppImage, Unity's .x86_64…). A macOS .app is a directory and is
+    accepted as itself.
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if _IS_WINDOWS:
+        return suffix in _EXEC_SUFFIXES_WINDOWS
+    if suffix in _EXEC_SUFFIXES_POSIX:
+        return True
+    if suffix == _MACOS_BUNDLE_SUFFIX:
+        return p.is_dir()
+    if suffix:
+        return False
+    try:
+        return p.is_file() and os.access(p, os.X_OK)
+    except OSError:
+        return False
+
+
+# Leading bytes of a real program. Used ONLY by is_program_binary — the exec
+# bit alone is not trustworthy evidence on Unix: FAT/NTFS mounts are commonly
+# mounted with it set on every single file, which would make any save folder
+# on such a mount look like a game install.
+_BINARY_MAGICS = (
+    b'\x7fELF',            # Linux/BSD executables and shared objects
+    b'\xcf\xfa\xed\xfe',   # Mach-O 64-bit
+    b'\xce\xfa\xed\xfe',   # Mach-O 32-bit
+    b'\xca\xfe\xba\xbe',   # Mach-O universal binary
+    b'#!',                 # shebang — how a launcher wrapper script starts
+)
+
+
+def is_program_binary(path) -> bool:
+    """Stricter than is_executable_file: is this the program a game is
+    *installed as*?
+
+    is_executable_file answers "could the user launch this" and is
+    deliberately permissive, because there the user picked the file. This one
+    backs an automatic decision — "this folder is an install root, so back up
+    its save files individually instead of the whole folder" — where a false
+    positive silently narrows what gets backed up. So an extension-less file
+    must both carry the exec bit AND actually start like a binary.
+
+    Windows keeps the exact ``.exe`` test the heuristic has always used.
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if _IS_WINDOWS:
+        return suffix == '.exe'
+    if suffix in _EXEC_SUFFIXES_POSIX:
+        return True
+    if suffix:
+        return False
+    try:
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            return False
+        with open(p, 'rb') as fh:
+            head = fh.read(4)
+    except OSError:
+        return False
+    return any(head.startswith(magic) for magic in _BINARY_MAGICS)
+
+
+def is_different_program(stored_exe: str, running_exe: str) -> bool:
+    """True only with POSITIVE evidence that two exe paths are different
+    programs — the rule that keeps same-named executables apart.
+
+    An exe stem is not an identity: plenty of games ship ``game.exe``,
+    ``launcher.exe`` or a short shared name, so a name-based match must be able to
+    reject a candidate the path contradicts.
+
+    Returns False whenever the evidence is missing or ambiguous:
+    - either path unknown (an unreadable process exe proves nothing), or
+    - the stored path no longer EXISTS. That's a moved or reinstalled game,
+      not a different one — rejecting the name match there would lose the
+      entry (and its backups) instead of disambiguating it, which is the
+      opposite of what this guard is for.
+    """
+    if not stored_exe or not running_exe:
+        return False
+    try:
+        stored_resolved = str(Path(stored_exe).resolve()).casefold()
+        running_resolved = str(Path(running_exe).resolve()).casefold()
+    except OSError:
+        return False
+    if stored_resolved == running_resolved:
+        return False
+    try:
+        return Path(stored_exe).exists()
+    except OSError:
+        return False
+
+
+def is_addable_file(path) -> bool:
+    """True for anything the add-game entry points accept: a real executable
+    or a shortcut to one. Single source of truth for drag & drop and Browse."""
+    return is_executable_file(path) or is_shortcut_file(path)
+
+
+def executable_name_filter(all_files_label: str = "All Files") -> str:
+    """QFileDialog name filter for picking a game executable.
+
+    On Unix "All Files" comes FIRST on purpose: the typical game binary has no
+    extension, so no pattern can match it and a restrictive default filter
+    would hide exactly what the user came to select.
+    """
+    patterns = " ".join(f"*{s}" for s in executable_suffixes() + shortcut_suffixes())
+    if _IS_WINDOWS:
+        return f"Executables ({patterns});;{all_files_label} (*)"
+    return f"{all_files_label} (*);;Executables ({patterns})"
 
 
 def fuzzy_slug(s: str) -> str:
@@ -107,6 +258,25 @@ class _DeadlineHit(Exception):
     pass
 
 
+def _iter_executable_candidates(search_base: Path):
+    """Files worth scoring as a game executable under *search_base*.
+
+    Windows keeps the exact ``rglob("*.exe")`` pass it always had — one glob,
+    ~1k hits in a Program Files tree. Unix cannot glob for its main case (a
+    suffix-less binary), so it walks everything and rejects by suffix, which
+    is a pure string test: the same tree yields ~80x more entries, so anything
+    per-entry costlier than that (notably the exec-bit stat) is left to the
+    caller, which only pays it for entries that actually scored.
+    """
+    if _IS_WINDOWS:
+        yield from search_base.rglob("*.exe")
+        return
+    for path in search_base.rglob("*"):
+        suffix = path.suffix.lower()
+        if not suffix or suffix in _EXEC_SUFFIXES_POSIX or suffix == _MACOS_BUNDLE_SUFFIX:
+            yield path
+
+
 def _search_executables_multi(weighted_names: list[tuple[str, str, float]],
                               search_paths: list[Path],
                               deadline: Optional[float] = None,
@@ -130,7 +300,7 @@ def _search_executables_multi(weighted_names: list[tuple[str, str, float]],
             continue
 
         try:
-            for exe_path in search_base.rglob("*.exe"):
+            for exe_path in _iter_executable_candidates(search_base):
                 checked += 1
                 # rglob can grind through hundreds of thousands of
                 # entries on a cold cache — honour the deadline INSIDE
@@ -148,7 +318,12 @@ def _search_executables_multi(weighted_names: list[tuple[str, str, float]],
                         score = max(score,
                                     max(folder_score * 1.2, stem_score) * _w)
                     if score >= 30.0:
-                        candidates.append((score, exe_path))
+                        # The exec-bit stat is deliberately deferred to here:
+                        # on Unix the candidate stream includes every
+                        # suffix-less file, and stat-ing all of them (vs only
+                        # the few that scored) is what would blow the deadline.
+                        if _IS_WINDOWS or is_executable_file(exe_path):
+                            candidates.append((score, exe_path))
                 except Exception:
                     pass
         except _DeadlineHit:
@@ -159,10 +334,14 @@ def _search_executables_multi(weighted_names: list[tuple[str, str, float]],
         except Exception as e:
             logger.debug(f"Error scanning {search_base}: {e}")
 
-        # Also scan .url and .lnk files on Desktop paths (game launcher shortcuts)
+        # Also scan shortcut files on Desktop paths (game launcher shortcuts):
+        # .lnk/.url on Windows, .desktop entries on Linux.
         if "Desktop" in search_base.name:
             try:
-                for link_path in list(search_base.glob("*.lnk")) + list(search_base.glob("*.url")):
+                link_paths = []
+                for _suffix in shortcut_suffixes():
+                    link_paths.extend(search_base.glob(f"*{_suffix}"))
+                for link_path in link_paths:
                     for _name, _slug, _w in weighted_names:
                         stem_score = fuzzy_score(_name, link_path.stem) * _w
                         if stem_score >= 30.0:
@@ -532,6 +711,44 @@ def get_appid_from_url(url: str) -> Optional[str]:
     if parsed:
         return parsed.get("appid")
     return None
+
+
+def resolve_desktop_entry(path: str) -> str:
+    """Resolve a Linux ``.desktop`` launcher to the program it starts.
+
+    The Unix counterpart of resolve_lnk_target: reads the ``Exec=`` key from
+    the ``[Desktop Entry]`` group and strips the field codes the spec allows
+    there (``%u``, ``%F``, ``%i``…) — they are placeholders the desktop
+    environment substitutes at launch, not part of the path. Arguments after
+    the program are kept, mirroring what resolve_lnk_target does with a
+    shortcut's Arguments. Returns the original *path* when there is nothing
+    usable to resolve.
+    """
+    try:
+        text = Path(path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return path
+    in_entry = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith('['):
+            # Only the main group counts — later groups are extra "actions"
+            # (Desktop Action New, …) with their own Exec= lines.
+            in_entry = line.lower() == '[desktop entry]'
+            continue
+        if not in_entry or not line.lower().startswith('exec='):
+            continue
+        command = line[5:].strip()
+        # Drop field codes; %% is a literal percent and must survive.
+        command = re.sub(r'(?<!%)%[fFuUdDnNickvm]', '', command).strip()
+        if command.startswith('"'):
+            end = command.find('"', 1)
+            if end > 0:
+                target = command[1:end]
+                rest = command[end + 1:].strip()
+                return f"{target} {rest}".strip() if rest else target
+        return command or path
+    return path
 
 
 def resolve_lnk_target(path: str) -> str:

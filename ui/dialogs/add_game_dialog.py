@@ -144,10 +144,17 @@ class IgnoredPathsDialog(QDialog):
         from core.config_manager import get_config
         config = get_config()
 
+        # Touch the store only when there IS something stored to un-ignore:
+        # a game still being added has no id (and nothing persisted), and
+        # session-only restores would otherwise write a junk "" key and
+        # trigger a pointless config write + Settings refresh.
         deleted_cfg = dict(config.get("auto_scan_deleted_paths", {}))
-        remaining = [p for p in deleted_cfg.get(self.game_id, []) if p not in to_restore]
-        deleted_cfg[self.game_id] = remaining
-        config.set("auto_scan_deleted_paths", deleted_cfg)
+        stored = list(deleted_cfg.get(self.game_id, [])) if self.game_id else []
+        if stored:
+            remaining = [p for p in stored if p not in to_restore]
+            if remaining != stored:
+                deleted_cfg[self.game_id] = remaining
+                config.set("auto_scan_deleted_paths", deleted_cfg)
 
         # Session-only entries aren't in the store — the caller reads this
         # to un-delete them locally and re-propose the rows.
@@ -159,102 +166,9 @@ class IgnoredPathsDialog(QDialog):
 from ui.dialogs.search_flow import SearchFlowMixin
 
 
-class _ExePickerDialog(QFileDialog):
-    """Executable picker where a FOLDER shortcut is a navigation step and an
-    application shortcut is a result — in ONE window.
-
-    Explorer's own dialog gets this for free because the shell dereferences
-    .lnk items (double-click on a folder link navigates into the target).
-    Qt's native-dialog wrapper turns that off (FOS_NODEREFERENCELINKS), so
-    once ``*.lnk`` is in the filter a folder shortcut becomes a returnable
-    item that closes the window — and the native window offers no hook to
-    intercept it (reopening a fresh dialog per hop loses the "back"
-    history). The widget dialog DOES virtualize accept(): when the chosen
-    item is a .lnk resolving to a directory, enter that directory in place —
-    same window, history preserved — otherwise accept as usual, so game
-    shortcuts still come back as .lnk paths for the auto-resolve/naming
-    logic."""
-
-    def __init__(self, parent, caption: str, name_filter: str):
-        super().__init__(parent, caption)
-        self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        # Hand back the RAW .lnk path: the widget dialog otherwise resolves
-        # shortcuts itself, and the caller needs the .lnk (display name from
-        # the shortcut filename, its folder as exe-search hint).
-        self.setOption(QFileDialog.Option.DontResolveSymlinks, True)
-        self.setFileMode(QFileDialog.FileMode.ExistingFile)
-        self.setNameFilter(name_filter)
-        # Sidebar: the widget dialog ships only the user-home entry —
-        # game shortcuts overwhelmingly live on the DESKTOP, so add it
-        # (kept alongside whatever entries are already there).
-        from PySide6.QtCore import QStandardPaths, QUrl
-        urls = list(self.sidebarUrls())
-        for loc in (QStandardPaths.StandardLocation.DesktopLocation,
-                    QStandardPaths.StandardLocation.HomeLocation):
-            p = QStandardPaths.writableLocation(loc)
-            if p:
-                u = QUrl.fromLocalFile(p)
-                if u not in urls:
-                    urls.append(u)
-        self.setSidebarUrls(urls)
-        # THE actual folder-shortcut hook. Qt treats .lnk files as
-        # symlinks, so double-clicking a FOLDER shortcut makes isDir()
-        # true and the dialog "enters" the .lnk FILE ITSELF — Look-in
-        # shows "...\\Folder.lnk", the listing is empty, and accept() is
-        # NEVER reached on that path. Hook the filesystem model's
-        # rootPathChanged (fired for EVERY directory change, UI or
-        # programmatic — directoryEntered only covers UI navigation):
-        # when the new "directory" is a .lnk, redirect to its resolved
-        # target on the next loop turn.
-        from PySide6.QtWidgets import QFileSystemModel
-        _fsm = self.findChild(QFileSystemModel)
-        if _fsm is not None:
-            _fsm.rootPathChanged.connect(self._redirect_lnk_directory)
-
-    def _redirect_lnk_directory(self, path: str):
-        if not path.lower().endswith('.lnk'):
-            return
-        from core.resolvers import resolve_lnk_target
-        from PySide6.QtCore import QTimer
-        target = resolve_lnk_target(path).strip().strip('"')
-        if not (target and target != path and Path(target).is_dir()):
-            # Unresolvable link-as-directory: bounce back to its folder
-            # instead of stranding the view on an empty file-root.
-            target = str(Path(path).parent)
-
-        def _go(t=target):
-            try:
-                self.setDirectory(t)
-                self._clear_name_box()
-            except RuntimeError:
-                pass
-        QTimer.singleShot(0, _go)
-
-    def _clear_name_box(self):
-        try:
-            from PySide6.QtWidgets import QLineEdit
-            edit = self.findChild(QLineEdit, "fileNameEdit")
-            if edit is not None:
-                edit.clear()
-        except RuntimeError:
-            pass
-
-    def accept(self):
-        files = self.selectedFiles()
-        if len(files) == 1 and files[0].lower().endswith('.lnk'):
-            from core.resolvers import resolve_lnk_target
-            target = resolve_lnk_target(files[0]).strip().strip('"')
-            if target and target != files[0] and Path(target).is_dir():
-                self.setDirectory(target)
-                # The filename box still holds "Folder.lnk" after the hop —
-                # clear it (immediately AND on the next event-loop turn:
-                # the click/selection handlers that invoked accept() may
-                # still write the old name back after we return).
-                from PySide6.QtCore import QTimer
-                self._clear_name_box()
-                QTimer.singleShot(0, self._clear_name_box)
-                return
-        super().accept()
+# The executable picker moved to ui/widgets/file_pickers so the scan and
+# manual-path dialogs get the identical shortcut-aware behaviour.
+from ui.widgets.file_pickers import ExePickerDialog as _ExePickerDialog  # noqa: E402
 
 
 class AddGameDialog(SearchFlowMixin, QDialog):
@@ -269,6 +183,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._detection_in_progress = False
         self._cancel_event = threading.Event()
         self._save_paths: list[str] = []   # current path list
+        # Rows the user trashed (✕) in this dialog session. Kept locally and
+        # written to the ignored-paths store on Save, so Cancel discards them
+        # and a delete-then-re-add nets out to nothing.
+        self._removed_paths: list[str] = []
         self._image_path: Optional[str] = None
         self._image_url_cache: dict[str, str] = {}  # API image URL → local cached path
         self._image_path_to_url: dict[str, str] = {}  # reverse: local cached path → URL
@@ -591,7 +509,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         exe_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
         exe_row = QHBoxLayout()
         self._exe_edit = QLineEdit()
-        self._exe_edit.setPlaceholderText("C:\\Games\\game.exe")
+        self._exe_edit.setPlaceholderText(
+            "C:\\Games\\game.exe" if os.name == 'nt' else "/opt/games/game")
         self._exe_edit.textChanged.connect(self._on_exe_changed)
         browse_exe = QPushButton(t("add_game.browse"))
         browse_exe.setFixedWidth(80)
@@ -936,27 +855,36 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         manual_row.addWidget(browse_save)
         layout.addLayout(manual_row)
 
-        # ── Ignored paths (edit mode only) — right below the manual path row ─
-        # Paths the user deselected or deleted in a previous post-game-exit
-        # save confirmation are excluded from future scans permanently —
-        # this is the only place to undo that, since there's otherwise no
-        # way back from an accidental "delete" in that dialog.
-        if self._editing_entry:
-            ignored_header = QHBoxLayout()
-            ignored_lbl = QLabel(t("add_game.ignored_paths_section"))
-            ignored_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
-            ignored_header.addWidget(ignored_lbl)
-            layout.addLayout(ignored_header)
+        # ── Ignored paths — right below the manual path row ──────────────────
+        # Paths deleted here or in a post-game-exit save confirmation are
+        # excluded from future scans permanently — this is the way back from
+        # an accidental delete.
+        # Present when ADDING a game too: a ✕ there is just as permanent
+        # (it's recorded against the entry's id the moment it's created), so
+        # it needs the same way back. Edit mode shows the box always — it can
+        # hold entries from earlier sessions; add mode has nothing stored yet,
+        # so the box appears as soon as the first row is deleted.
+        self._ignored_paths_box = QWidget()
+        _ig_vbox = QVBoxLayout(self._ignored_paths_box)
+        _ig_vbox.setContentsMargins(0, 0, 0, 0)
+        _ig_vbox.setSpacing(2)
 
-            ignored_row = QHBoxLayout()
-            self._ignored_paths_count_lbl = QLabel()
-            self._ignored_paths_count_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
-            manage_ignored_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
-            manage_ignored_btn.clicked.connect(self._open_ignored_paths_dialog)
-            ignored_row.addWidget(self._ignored_paths_count_lbl, 1)
-            ignored_row.addWidget(manage_ignored_btn)
-            layout.addLayout(ignored_row)
-            self._refresh_ignored_paths_count()
+        ignored_lbl = QLabel(t("add_game.ignored_paths_section"))
+        ignored_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        _ig_vbox.addWidget(ignored_lbl)
+
+        ignored_row = QHBoxLayout()
+        self._ignored_paths_count_lbl = QLabel()
+        self._ignored_paths_count_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        manage_ignored_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
+        manage_ignored_btn.clicked.connect(self._open_ignored_paths_dialog)
+        ignored_row.addWidget(self._ignored_paths_count_lbl, 1)
+        ignored_row.addWidget(manage_ignored_btn)
+        _ig_vbox.addLayout(ignored_row)
+
+        layout.addWidget(self._ignored_paths_box)
+        self._ignored_paths_box.setVisible(bool(self._editing_entry))
+        self._refresh_ignored_paths_count()
 
         self._status_lbl = QLabel()
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
@@ -1014,23 +942,37 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         btn_row.addWidget(self._add_btn)
         layout.addLayout(btn_row)
 
+    def _pending_removed_paths(self) -> list[str]:
+        """This session's trashed rows that are still gone from the list —
+        a path deleted and then re-added (manually, re-detected or restored)
+        must NOT be ignored."""
+        return [p for p in self._removed_paths if p not in self._save_paths]
+
     def _refresh_ignored_paths_count(self):
         """Update the 'N paths excluded from future scans' label."""
-        if not self._editing_entry or not hasattr(self, '_ignored_paths_count_lbl'):
+        if not hasattr(self, '_ignored_paths_count_lbl'):
             return
         from core.config_manager import get_config
-        config = get_config()
-        gid = self._editing_entry.id
-        n = len(config.get("auto_scan_deleted_paths", {}).get(gid, []))
+        # No id before the entry exists — a new game can only have this
+        # session's deletions, never a stored list.
+        gid = self._editing_entry.id if self._editing_entry else ""
+        stored = get_config().get("auto_scan_deleted_paths", {}).get(gid, []) if gid else []
+        # Session deletions count too: they're already gone from the list, so
+        # the label would otherwise under-report until Save.
+        n = len(set(stored) | set(self._pending_removed_paths()))
         if n:
             self._ignored_paths_count_lbl.setText(t("add_game.ignored_paths_count", count=n))
         else:
             self._ignored_paths_count_lbl.setText(t("add_game.ignored_paths_none"))
+        if not self._editing_entry and hasattr(self, '_ignored_paths_box'):
+            self._ignored_paths_box.setVisible(n > 0)
 
     def _open_ignored_paths_dialog(self):
-        if not self._editing_entry:
-            return
-        dlg = IgnoredPathsDialog(self._editing_entry.id, self._editing_entry.name, parent=self)
+        gid = self._editing_entry.id if self._editing_entry else ""
+        gname = (self._editing_entry.name if self._editing_entry
+                 else self._name_edit.text().strip())
+        dlg = IgnoredPathsDialog(gid, gname, parent=self,
+                                 extra_paths=self._pending_removed_paths())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             # Restoring means "I want this path back" — so besides removing
             # it from the ignored store, insert it STRAIGHT into the
@@ -1038,6 +980,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # on confirm), instead of waiting for a future scan to
             # re-propose it.
             for p in getattr(dlg, "restored_paths", []) or []:
+                # Undo a not-yet-persisted deletion from this same session.
+                if p in self._removed_paths:
+                    self._removed_paths.remove(p)
                 self._add_path(p)
             self._refresh_ignored_paths_count()
 
@@ -1613,9 +1558,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # Qt widget dialog, ONE window: a folder shortcut navigates in place
         # (see _ExePickerDialog) — reopening a fresh native dialog per hop
         # lost the navigation history ("back" stopped working).
+        from core.resolvers import executable_name_filter
         dlg = _ExePickerDialog(
             self, t('add_game.select_executable'),
-            "Executables (*.exe *.bat *.lnk *.url);;All Files (*)",
+            executable_name_filter(),
         )
         if start_dir:
             dlg.setDirectory(start_dir)
@@ -1655,6 +1601,16 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                                 return
                 except Exception as e:
                     logger.warning(f"Failed to read .url file: {e}")
+            elif path.lower().endswith('.desktop'):
+                # Linux launcher: same role as .lnk — resolve to what it starts.
+                from core.resolvers import resolve_desktop_entry
+                target = resolve_desktop_entry(path)
+                if target and target != path:
+                    self._exe_edit.setText(target)
+                    self._detect_btn.setEnabled(True)
+                    self._seed_fingerprint_from_path(target)
+                    self._auto_detect_image(target)
+                    return
             elif path.lower().endswith('.lnk'):
                 from core.resolvers import resolve_lnk_target
                 target = resolve_lnk_target(path)
@@ -1681,8 +1637,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             return
         path = urls[0].toLocalFile()
         p = Path(path)
-        valid_ext = p.suffix.lower() in ('.exe', '.bat', '.lnk', '.url')
-        if not valid_ext:
+        # Platform-aware (see core.resolvers.is_addable_file): Windows
+        # extensions, or on Unix the exec-bit binaries and .sh/.AppImage/
+        # .x86_64/.desktop equivalents.
+        from core.resolvers import is_addable_file, resolve_desktop_entry
+        if not is_addable_file(path):
             return
         event.acceptProposedAction()
         # Generic exe stems ("nw", "game", "launcher"…) fall back to the
@@ -1706,6 +1665,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                             return
             except Exception as e:
                 logger.warning(f"Failed to read .url file: {e}")
+        elif p.suffix.lower() == '.desktop':
+            # Linux launcher: same role as .lnk — resolve to what it starts.
+            target = resolve_desktop_entry(path)
+            if target and target != path:
+                self._exe_edit.setText(target)
+                self._detect_btn.setEnabled(True)
+                self._seed_fingerprint_from_path(target)
+                self._auto_detect_image(target)
+                return
         elif p.suffix.lower() == '.lnk':
             from core.resolvers import resolve_lnk_target
             target = resolve_lnk_target(path)
@@ -1733,6 +1701,48 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Enable/disable web search button based on name field."""
         self._web_search_btn.setEnabled(bool(text.strip()))
 
+    def _find_game_by_launcher(self, url: str = "", appid: str = ""):
+        """Library entry already registered for this launcher URL / appid.
+
+        Deliberately a STRING comparison, not get_by_exe(): a launcher URL is
+        not a filesystem path, and Path("steam://…").resolve() turns it into
+        nonsense relative to the cwd. An auto-added launcher game keeps the
+        raw URL in `appid` (see MainWindow._auto_add_game_from_overlay) while
+        one added through this dialog before its URL could be resolved keeps
+        it in `exe_path` — so both fields are checked, plus the bare appid.
+        """
+        from core.resolvers import is_launcher_url
+        url = (url or "").strip()
+        # Only a real launcher URL may be compared against exe_path below —
+        # otherwise passing a plain path here would "match" any game that
+        # simply has that exe, which is get_by_exe's job, not this one.
+        url_cf = url.casefold() if (url and is_launcher_url(url)) else ""
+        appid_cf = (appid or "").strip().casefold()
+        if not url_cf and not appid_cf:
+            return None
+        try:
+            games = get_library().all_games()
+        except Exception:
+            return None
+        for g in games:
+            if self._editing_entry and g.id == self._editing_entry.id:
+                continue
+            g_appid = (g.appid or "").strip().casefold()
+            g_exe = (g.exe_path or "").strip().casefold()
+            if url_cf and (g_appid == url_cf or g_exe == url_cf):
+                return g
+            # The bare id ("413150") is only meaningful in the appid field —
+            # matching it against exe_path would be a coincidence, not a game.
+            if appid_cf and g_appid == appid_cf:
+                return g
+        return None
+
+    def _report_already_in_library(self, existing) -> None:
+        """Tell the user this game is already there and stop the add flow."""
+        self._status_lbl.setText(t('add_game.game_exists_with_appid', name=existing.name))
+        self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+        logger.info(f"Launcher target already in library: {existing.name} ({existing.id})")
+
     def _resolve_exe_from_url_async(self, url: str, timeout: int = 30):
         """Start async resolution of URL to exe path.
 
@@ -1748,7 +1758,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         import time
         from core.resolvers import find_executable_by_fuzzy_name
         from core.resolvers import parse_launcher_url, get_appid_from_url
-        
+
+        # Already in the library? Say so NOW, before the fuzzy search: the
+        # search can take up to 30s of disk walking to land on an exe the
+        # duplicate check would reject anyway — and on a URL it can't resolve
+        # it may land on an unrelated exe, which is precisely how a second
+        # entry for the same game used to get created.
+        if not self._editing_entry:
+            existing = self._find_game_by_launcher(url, get_appid_from_url(url) or "")
+            if existing is not None:
+                self._report_already_in_library(existing)
+                self._exe_edit.setPlaceholderText("")
+                return
+
         # Disable save button during resolution
         self._add_btn.setEnabled(False)
         self._detect_btn.setEnabled(False)
@@ -2240,6 +2262,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Add a save path row. detected=True places it in the detected section."""
         if path_str in self._save_paths:
             return
+        # A row deleted earlier in THIS session must not be resurrected by a
+        # re-run of auto-detect (same rule the confirmation panel applies in
+        # add_paths). Manual add / Browse / an explicit restore still get
+        # through: those are the user asking for the path back.
+        if detected and path_str in self._removed_paths:
+            return
         self._save_paths.append(path_str)
         self._paths_empty_lbl.setVisible(False)
 
@@ -2296,6 +2324,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _remove_path(self, path_str: str):
         if path_str in self._save_paths:
             self._save_paths.remove(path_str)
+        # Deleting a row here is the same act as the trash icon in the save
+        # confirmation panel: the path must stop being proposed by future
+        # scans. Recorded now, persisted to the ignored-paths store on Save
+        # (see _persist_removed_paths) — so it lands in both "Ignored paths"
+        # here and "Excluded save paths" in Settings.
+        if path_str not in self._removed_paths:
+            self._removed_paths.append(path_str)
+        self._refresh_ignored_paths_count()
         # Find and remove the PathRow widget
         for i in range(self._paths_layout.count()):
             item = self._paths_layout.itemAt(i)
@@ -2557,6 +2593,36 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 if not widget.is_checked():
                     excluded.append(p)
         return all_paths, excluded
+
+    def _persist_removed_paths(self, game_id: str, final_paths: list[str]):
+        """Record this session's trashed rows in the ignored-paths store.
+
+        Same store the save-confirmation panel writes to, so the paths show
+        up under "Ignored paths" for this game AND under "Excluded save
+        paths" in Settings, and stop being proposed by future scans. Called
+        on Save only — Cancel must leave the store untouched.
+
+        *final_paths* is the list actually being written to the entry: a row
+        deleted and then re-added during the same session is back in it, and
+        must not be ignored (it would otherwise be filtered out of every
+        future scan while still sitting in save_paths).
+        """
+        removed = [p for p in self._removed_paths if p not in final_paths]
+        if not game_id or not removed:
+            return
+        try:
+            from core.config_manager import get_config
+            config = get_config()
+            store = {k: list(v) for k, v in config.get("auto_scan_deleted_paths", {}).items()}
+            existing = store.get(game_id, [])
+            merged = existing + [p for p in removed if p not in existing]
+            if merged != existing:
+                store[game_id] = merged
+                config.set("auto_scan_deleted_paths", store)
+                logger.info(
+                    f"Ignored {len(merged) - len(existing)} deleted save path(s) for game {game_id}")
+        except Exception as e:
+            logger.warning(f"Could not record deleted save paths for {game_id}: {e}")
 
     # ── Tag input: ghost completion + commit ─────────────────────────────────
 
@@ -2970,6 +3036,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._exe_edit.setText(exe)
         
         appid = None
+        # Capture the launcher URL BEFORE resolution replaces `exe` with a
+        # filesystem path — it is the only reliable identity for a game whose
+        # exe can't be (or is wrongly) resolved, and the duplicate check below
+        # needs it.
+        _launcher_url = exe if (exe and is_launcher_url(exe)) else (
+            appid_from_field if is_launcher_url(appid_from_field) else "")
         if exe and is_launcher_url(exe):
             resolved_exe, appid = self._resolve_launcher_url(exe)
             if resolved_exe:
@@ -2997,9 +3069,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._status_lbl.setStyleSheet(f"color:{palette('error')};")
             return
 
-        # Duplicate exe check (only for new games, not edits)
-        if exe and not self._editing_entry:
-            existing = lib.get_by_exe(exe)
+        # Duplicate check (only for new games, not edits). Two identities,
+        # because a launcher game may have neither field in common with the
+        # stored entry: the resolved exe, and the launcher URL/appid — the
+        # latter matters when resolution failed or picked a different exe
+        # than the one recorded when the game was first added.
+        if not self._editing_entry:
+            existing = lib.get_by_exe(exe) if exe else None
+            if existing is None:
+                existing = self._find_game_by_launcher(_launcher_url, appid or "")
             if existing:
                 if appid and not existing.appid:
                     existing.appid = appid
@@ -3141,6 +3219,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 logger.warning(
                     f"Could not resolve pre-confirmation backups for {entry.name}: {e}")
 
+            # Rows trashed here are ignored from now on — same treatment the
+            # save-confirmation panel gives its trash icon.
+            self._persist_removed_paths(entry.id, all_paths)
+
             self.game_added.emit(entry)
 
             # Save per-file exclusions from file browsers
@@ -3183,6 +3265,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # Initialise name_history for new entries so rename tracking works
             # from day one (record_name also sets computed_folder_name)
             entry.record_name(name)
+            # …and the names as they are on disk. The title above has been
+            # tidied for the library; the release folder still carries the
+            # code and version, which is what a folder of saves kept under
+            # the same release name will match on.
+            entry.record_exe_hints(exe)
             # Isolate this game's folder from any other library entry sharing the
             # same title (add_game re-checks too, but the icon cache below keys off
             # computed_folder_name, so resolve it here first).
@@ -3194,6 +3281,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 self._image_path, entry.exe_path, entry.name, entry.id, entry.computed_folder_name,
             )
             lib.add_game(entry)
+            # Deferred until here on purpose: the ignored-paths store is keyed
+            # by game id, which only exists once the entry has been built.
+            self._persist_removed_paths(entry.id, all_paths)
             self.game_added.emit(entry)
 
             # Save per-file exclusions from file browsers

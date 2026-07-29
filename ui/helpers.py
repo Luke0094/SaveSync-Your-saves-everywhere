@@ -8,8 +8,9 @@ import platform
 import subprocess
 
 import shiboken6 as sip
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap, QFontMetrics
+from PySide6.QtWidgets import QApplication, QLabel, QSizePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -154,3 +155,109 @@ def load_pixmap_any(path: str) -> QPixmap:
     except Exception as e:
         logger.debug(f"PIL fallback failed for '{path}': {e}")
     return px
+
+
+class TopmostPinMixin:
+    """Keep a dialog above a fullscreen game, without a focus war.
+
+    A plain Qt dialog cannot surface itself over a game that keeps reclaiming
+    the foreground — raise_() only re-stacks our own windows. Re-asserting
+    HWND_TOPMOST on a timer does, and SWP_NOACTIVATE keeps it from stealing
+    the game's focus. Unlike the overlay this deliberately does NOT set
+    WS_EX_TOOLWINDOW, so the dialog stays in the taskbar and alt-tab.
+
+    Shared by the save-confirmation panel and the sync-conflict dialog: both
+    are decisions the user has to make while a game may be in front.
+    """
+
+    _TOPMOST_INTERVAL_MS = 1000
+
+    def start_topmost_pin(self):
+        """Begin re-pinning (Windows only — elsewhere the window manager
+        honours WindowStaysOnTopHint on its own)."""
+        import platform
+        from PySide6.QtCore import QTimer
+        if platform.system() != "Windows":
+            return
+        timer = getattr(self, "_topmost_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(self._TOPMOST_INTERVAL_MS)
+            timer.timeout.connect(self.repin_topmost)
+            self._topmost_timer = timer
+        if not timer.isActive():
+            timer.start()
+        self.repin_topmost()
+
+    def repin_topmost(self):
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            SWP_NOSIZE, SWP_NOMOVE = 0x0001, 0x0002
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER = 0x0010, 0x0200
+            HWND_TOPMOST = -1
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+        except Exception:
+            pass
+
+    def stop_topmost_pin(self):
+        timer = getattr(self, "_topmost_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+
+def apply_game_friendly_flags(dialog):
+    """Window recipe for a dialog that may open over a running game: on top
+    where the platform supports it, and shown without stealing focus."""
+    import platform
+    from PySide6.QtCore import Qt
+    flags = (Qt.WindowType.Dialog
+             | Qt.WindowType.CustomizeWindowHint
+             | Qt.WindowType.WindowTitleHint
+             | Qt.WindowType.WindowCloseButtonHint)
+    if platform.system() == "Windows":
+        flags |= Qt.WindowType.WindowStaysOnTopHint
+    dialog.setWindowFlags(flags)
+    dialog.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+
+class ElidedLabel(QLabel):
+    """One-line label that shortens its text in the MIDDLE to fit, keeping the
+    full value in the tooltip.
+
+    Paths are the wrong shape for word wrap: they are one long token, so a
+    wrapped label grows to three or four lines and — inside a list of a few
+    hundred rows — both buries the rest of the row and makes the list
+    unreadable. Eliding in the middle keeps the two ends that identify a path
+    (the drive and the leaf) while the whole thing stays available on hover.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(40)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setFullText(text)
+
+    def setFullText(self, text: str):
+        self._full = text or ""
+        self.setToolTip(self._full)
+        self._apply_elide()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def _apply_elide(self):
+        metrics = QFontMetrics(self.font())
+        width = max(40, self.width() - 2)
+        super().setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideMiddle, width))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()

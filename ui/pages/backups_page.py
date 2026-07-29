@@ -319,6 +319,18 @@ class BackupsPage(QWidget, ThemedMixin):
         header_row.addWidget(self._header)
         header_row.addStretch()
 
+        # Add save folders that have no executable behind them — the only way
+        # into the backup pipeline for saves SaveSync never detected.
+        # U+2795 rather than a plain "+": the emoji is drawn in colour by the
+        # system font, so it reads at a glance next to the text buttons —
+        # a bare glyph in the muted icon-button colour did not.
+        self._add_paths_btn = QPushButton("➕")
+        self._add_paths_btn.setObjectName("icon_btn")
+        self._add_paths_btn.setFixedSize(30, 30)
+        self._add_paths_btn.setToolTip(t("manual_path.button_tooltip"))
+        self._add_paths_btn.clicked.connect(self._on_add_manual_paths)
+        header_row.addWidget(self._add_paths_btn)
+
         self._open_folder_btn = QPushButton(t("buttons.open_folder"))
         self._open_folder_btn.setFixedHeight(30)
         self._open_folder_btn.setToolTip(t("tooltips.open_save_folder"))
@@ -1148,6 +1160,16 @@ class BackupsPage(QWidget, ThemedMixin):
         that entry's folder."""
         from core.constants import BACKUP_DIR
         open_in_file_manager(BACKUP_DIR)
+
+    def _on_add_manual_paths(self):
+        """Register save folders by hand — for saves with no executable."""
+        from PySide6.QtWidgets import QDialog
+        from ui.dialogs.manual_path_dialog import ManualPathDialog
+        dlg = ManualPathDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.added_entries:
+            # New entries mean new titles in the picker and new rows below.
+            self._load_games()
+            self._refresh_list()
 
     def _refresh_list(self):
         """Refresh the backup list for the selected game."""

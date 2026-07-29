@@ -49,15 +49,128 @@ def _is_skip_file(f: Path) -> bool:
             or f.stem.lower() in _BACKUP_SKIP_FILENAME_STEMS)
 
 
-def _is_in_skipped_subdir(f: Path, root: Path) -> bool:
+def _is_in_skipped_subdir(f: Path, root: Path, keep: frozenset = frozenset()) -> bool:
     """True if any directory between *root* and *f* is a banned backup
     subdirectory (game assets, caches — see _BACKUP_SKIP_DIRS). Files whose
-    relative position can't be computed are treated as skipped."""
+    relative position can't be computed are treated as skipped.
+
+    *keep* holds the directory names on the save chain the user declared for
+    this game. A chain as ordinary as "data/www/save" crosses a folder that
+    normally reads as game assets, and dropping it would silently leave those
+    saves out of the archive. The user pointed at that folder, so the chain
+    wins over the general rule.
+    """
     try:
         rel_parts = f.relative_to(root).parts
     except ValueError:
         return True
-    return any(part.lower() in _BACKUP_SKIP_DIRS for part in rel_parts[:-1])
+    return any(part.lower() in _BACKUP_SKIP_DIRS and part.lower() not in keep
+               for part in rel_parts[:-1])
+
+
+def _library_entry(game_id: str):
+    if not game_id:
+        return None
+    try:
+        from core.library import get_library
+        return get_library().get_by_id(game_id)
+    except Exception:
+        return None
+
+
+def _declared_chain(game_id: str, save_path: str = "") -> str:
+    """The save chain recorded for *save_path*, or the entry's own.
+
+    Per path, because one game can hold two hand-added folders with different
+    destinations; the single field is only the fallback for entries written
+    before that was possible.
+    """
+    entry = _library_entry(game_id)
+    if entry is None:
+        return ""
+    if save_path and hasattr(entry, "chain_for_path"):
+        return entry.chain_for_path(save_path) or ""
+    return getattr(entry, "save_chain", "") or ""
+
+
+def _chain_parts(chain: str) -> list:
+    return [s for s in (chain or "").replace("\\", "/").split("/") if s and s != "."]
+
+
+def _content_chains(save_paths: list, game_id: str) -> list:
+    """For each save path, the declared chain when it really is INSIDE it.
+
+    The test is the path itself — the chain has to exist under the folder —
+    so a chain belonging to some other save location of the same game is not
+    attached to this one.
+    """
+    out = []
+    for path in save_paths:
+        parts = _chain_parts(_declared_chain(game_id, path))
+        if not parts:
+            out.append("")
+            continue
+        try:
+            out.append("/".join(parts) if (Path(path) / Path(*parts)).exists() else "")
+        except (OSError, ValueError):
+            out.append("")
+    return out
+
+
+def chain_destination(chain: str, game_id: str = "") -> Optional[Path]:
+    """Where a chain's contents belong ON THIS MACHINE, or None.
+
+    Two shapes, and the difference is the whole point:
+      "AppData/Roaming/Studio/CODE"  → this machine's own profile. The chain
+          carries no account name, so there is nothing to translate: the
+          current user IS the answer.
+      "www/save"                      → under the game's install folder, which
+          means there has to be an executable on file to anchor it.
+    """
+    parts = _chain_parts(chain)
+    if not parts:
+        return None
+    try:
+        from core.manual_paths import profile_destination
+        profile = profile_destination(chain)
+    except Exception:
+        profile = None
+    if profile is not None:
+        return profile
+    exe = ""
+    try:
+        from core.library import get_library
+        entry = get_library().get_by_id(game_id) if game_id else None
+        exe = (getattr(entry, "exe_path", "") or "") if entry else ""
+    except Exception:
+        exe = ""
+    if not exe:
+        return None
+    try:
+        return Path(exe).parent.joinpath(*parts)
+    except (OSError, ValueError):
+        return None
+
+
+def _declared_chain_dirs(game_id: str) -> frozenset:
+    """Directory names on EVERY chain recorded for *game_id*, lowercased.
+
+    All of them, not just the one that matches the path being walked: the set
+    only ever spares a directory the user pointed at, and working out which
+    chain belongs to which path here would buy nothing.
+    """
+    entry = _library_entry(game_id)
+    if entry is None:
+        return frozenset()
+    try:
+        chains = entry.all_chains() if hasattr(entry, "all_chains") \
+            else [getattr(entry, "save_chain", "") or ""]
+    except Exception:
+        return frozenset()
+    return frozenset(part.strip().lower()
+                     for chain in chains
+                     for part in (chain or "").replace("\\", "/").split("/")
+                     if part.strip())
 
 # Subdirectory names to skip entirely during backup (game assets, not saves).
 # Shared with the save-path detector via core.skip_dirs; kept under the
@@ -200,6 +313,44 @@ class BackupEntry:
     # substitution case. See _resolve_cross_machine_paths's install-
     # relative tier.
     exe_path: str = ""
+    # Each save_path expressed RELATIVE to the game's install folder ("" when
+    # it isn't under it — a profile path, say). Parallel to save_paths.
+    #
+    # The install-relative tier can normally derive this at restore time by
+    # subtracting exe_path from save_paths. Recording it removes the
+    # dependency on that: a backup taken while the game had no executable on
+    # file (a save folder registered by hand, before the game itself turned
+    # up) carries no exe_path to subtract, and its saves would otherwise be
+    # unrestorable on another machine even though the destination — "www/save
+    # under the game" — is perfectly well known. Old index files simply lack
+    # the field and fall back to the derivation.
+    save_chains: list[str] = field(default_factory=list)
+    # Each save_path's chain INSIDE it — the structure the folder reproduces,
+    # which is where those files belong. Parallel to save_paths, "" when there
+    # is none.
+    #
+    # Different from save_chains, and deliberately a separate field: there the
+    # chain says where the save path sits relative to the game, here it says
+    # what the save path CONTAINS. A folder handed over by hand is the second
+    # kind — "<Title>/AppData/Roaming/Studio/CODE" is a copy of a destination,
+    # not a location under an install folder — and without this the
+    # destination is known to the library and to nobody else, so a restore
+    # can only put the files back where they were copied from.
+    content_chains: list[str] = field(default_factory=list)
+
+    def chain_for(self, save_path: str) -> str:
+        """The install-relative chain recorded for *save_path*, if any."""
+        try:
+            return self.save_chains[self.save_paths.index(save_path)]
+        except (ValueError, IndexError, TypeError):
+            return ""
+
+    def content_chain_for(self, save_path: str) -> str:
+        """The chain that lives INSIDE *save_path*, if any."""
+        try:
+            return self.content_chains[self.save_paths.index(save_path)]
+        except (ValueError, IndexError, TypeError):
+            return ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -578,7 +729,8 @@ class BackupManager(QObject):
         import hashlib
         return hashlib.sha256(data).hexdigest()
 
-    def _get_recent_files(self, save_paths: list[str], hours: int = 24) -> list[Path]:
+    def _get_recent_files(self, save_paths: list[str], hours: int = 24,
+                          keep_dirs: frozenset = frozenset()) -> list[Path]:
         """Get files modified in the last N hours for selective backup."""
         import time
         cutoff_time = time.time() - (hours * 3600)
@@ -601,7 +753,7 @@ class BackupManager(QObject):
                         if f.is_file():
                             if _is_skip_file(f):
                                 continue
-                            if _is_in_skipped_subdir(f, p):
+                            if _is_in_skipped_subdir(f, p, keep_dirs):
                                 continue
                             try:
                                 if f.stat().st_mtime >= cutoff_time:
@@ -682,6 +834,9 @@ class BackupManager(QObject):
         reg_save_paths = [p for p in save_paths if is_registry_path(p)]
         fs_save_paths = [p for p in save_paths if not is_registry_path(p)]
         valid_reg = [r for r in reg_save_paths if registry_key_exists(r)]
+        # Directories the user's own recorded chain passes through are never
+        # treated as game assets — see _is_in_skipped_subdir.
+        chain_dirs = _declared_chain_dirs(game_id)
         valid_paths = [Path(p) for p in fs_save_paths if Path(p).exists()]
         if not valid_paths and not valid_reg:
             logger.warning(f"No valid save paths for backup of '{game_name}'")
@@ -707,7 +862,7 @@ class BackupManager(QObject):
         recent_file_set: set[str] | None = None
         if selective:
             import time as _time
-            recent_files = self._get_recent_files(fs_save_paths, recent_hours)
+            recent_files = self._get_recent_files(fs_save_paths, recent_hours, chain_dirs)
             reg_recent = any(
                 registry_last_write(r) >= _time.time() - recent_hours * 3600
                 for r in valid_reg)
@@ -724,7 +879,7 @@ class BackupManager(QObject):
                         continue
                     if _is_skip_file(f):
                         continue
-                    if _is_in_skipped_subdir(f, sp):
+                    if _is_in_skipped_subdir(f, sp, chain_dirs):
                         continue
                     # In selective mode, skip files not recently modified
                     if recent_file_set is not None:
@@ -895,19 +1050,23 @@ class BackupManager(QObject):
             if pre_confirmation:
                 metadata["pre_confirmation"] = True
 
+            _recorded_paths = [str(p) for p in valid_paths] + valid_reg
             entry = BackupEntry(
                 game_id=game_id,
                 game_name=game_name,
                 backup_id=backup_id,
                 created_at=now.isoformat(),
                 machine_id=get_machine_id(),
-                save_paths=[str(p) for p in valid_paths] + valid_reg,
+                save_paths=_recorded_paths,
                 zip_path=str(zip_path),
                 size_bytes=zip_path.stat().st_size,
                 note=note,
                 cloud_metadata=metadata,
                 origin=origin,
                 exe_path=exe_path,
+                save_chains=self._install_relative_chains(
+                    _recorded_paths, exe_path, game_id),
+                content_chains=_content_chains(_recorded_paths, game_id),
             )
             with _index_lock:
                 self._index.append(entry)
@@ -925,6 +1084,56 @@ class BackupManager(QObject):
                     pass
             logger.error(f"Backup failed for '{game_name}': {e}")
             return _ret(None, False)
+
+    @staticmethod
+    def _install_relative_chains(save_paths: list, exe_path: str,
+                                 game_id: str = "") -> list:
+        """Express each save path relative to the game's install folder.
+
+        Two sources, in order: the executable being backed up (subtract its
+        folder), and — when there is no executable — the destination the user
+        registered by hand for this game, which is exactly this chain and is
+        the only thing that survives the game not existing yet.
+
+        "" for anything that isn't install-relative (a profile path), so the
+        list stays positionally parallel to save_paths.
+        """
+        from core.registry_saves import is_registry_path
+        install_dir = None
+        if exe_path:
+            try:
+                install_dir = Path(exe_path).parent.resolve()
+            except (OSError, ValueError):
+                install_dir = None
+
+        # Only consulted when there is no executable to subtract; per path,
+        # since one game can have declared more than one destination.
+        def declare(path: str) -> str:
+            if install_dir is not None or not game_id:
+                return ""
+            return _declared_chain(game_id, path)
+
+        chains = []
+        for path in save_paths:
+            if is_registry_path(path):
+                chains.append("")
+                continue
+            if install_dir is not None:
+                try:
+                    chains.append(Path(path).resolve().relative_to(install_dir).as_posix())
+                except (ValueError, OSError):
+                    chains.append("")
+                continue
+            # No executable on file: fall back to what the user declared, but
+            # only when the path really ends with it — otherwise it describes
+            # some other save location of the same game.
+            declared = declare(path)
+            if declared and Path(path).as_posix().lower().endswith(
+                    "/" + declared.strip("/").lower()):
+                chains.append(declared.strip("/"))
+            else:
+                chains.append("")
+        return chains
 
     def _resolve_cross_machine_paths(self, entry: "BackupEntry",
                                      lib_game_id: str = "") -> list[str]:
@@ -1086,6 +1295,30 @@ class BackupManager(QObject):
                 return False
             return _is_relative_to(rp, install_dir)
 
+        def _rebase_on_declared_chain(p: str) -> Optional[str]:
+            """Last install-relative resort: the chain RECORDED on the backup.
+
+            Tier 3 subtracts the old executable from the old path, so it needs
+            that executable. A backup taken while the game had none — a save
+            folder registered by hand before the game itself existed — has
+            nothing to subtract, yet its destination ("www/save under the
+            game") was known all along and travels with the backup. With this
+            machine's install folder that is all it takes.
+            """
+            chain = entry.chain_for(p) if hasattr(entry, "chain_for") else ""
+            new_exe = lib_entry.exe_path if lib_entry else ""
+            if not chain or not new_exe:
+                return None
+            try:
+                candidate = Path(new_exe).parent.joinpath(*chain.split("/"))
+            except (OSError, ValueError):
+                return None
+            candidate_str = str(candidate)
+            if candidate_str == p:
+                return None
+            return candidate_str if (_parent_exists(candidate_str)
+                                     or _under_current_install(candidate_str)) else None
+
         def _resolve_via_tiers(paths_in: list[str]):
             """Run Tiers 1-3 over *paths_in* and return
             (resolved, all_ok, any_changed). The game's own recorded path is
@@ -1117,6 +1350,11 @@ class BackupManager(QObject):
                 rebased = _rebase_on_current_install(p)
                 if rebased and (_parent_exists(rebased) or _under_current_install(rebased)):
                     resolved_.append(rebased)
+                    any_changed_ = True
+                    continue
+                declared = _rebase_on_declared_chain(p)
+                if declared:
+                    resolved_.append(declared)
                     any_changed_ = True
                     continue
                 resolved_.append(p)
@@ -1285,6 +1523,34 @@ class BackupManager(QObject):
             logger.error(f"Backup not found: {backup_id}")
             return RestoreResult(success=False, errors=["Backup not found"])
 
+        # ── Chain redirect ──────────────────────────────────────────────────
+        # A folder handed over by hand is a COPY of a destination: it holds
+        # "AppData/Roaming/Studio/CODE", or "www/save", inside it. Putting the
+        # files back where they were copied from would rebuild the copy and
+        # leave the game with nothing, so the chain decides where they go —
+        # this machine's own profile, or this machine's install folder.
+        #
+        # Keyed by the archive's top-level name, which is the save folder's
+        # name AT BACKUP TIME, so it is read before any path resolution.
+        # A list per name, not one entry: two folders of the same game share
+        # the same folder NAME as often as not, and it is the chain that tells
+        # their archive members apart.
+        redirects: dict = {}
+        for _sp in entry.save_paths:
+            _chain = entry.content_chain_for(_sp)
+            if not _chain:
+                continue
+            _dest = chain_destination(_chain, lib_game_id or entry.game_id)
+            if _dest is None:
+                continue
+            redirects.setdefault(Path(_sp).name, []).append(
+                (_chain_parts(_chain), _dest))
+            logger.info(f"Restore: '{Path(_sp).name}' carries {_chain} — "
+                        f"restoring it to {_dest}")
+        # Longest chain first: "data/www/save" must be tried before "data".
+        for _name in redirects:
+            redirects[_name].sort(key=lambda pair: len(pair[0]), reverse=True)
+
         # ── Cross-machine path resolution ──────────────────────────────────────
         # Backups made on another PC/account carry save_paths from that
         # machine's user profile (e.g. C:\Users\OldUser\…), which don't exist
@@ -1351,6 +1617,16 @@ class BackupManager(QObject):
             from core.registry_saves import registry_key_exists as _reg_exists
             valid = [p for p in entry.save_paths
                      if (_reg_exists(p) if _is_reg(p) else Path(p).exists())]
+            # What is about to be overwritten is the redirect target, not the
+            # folder the files were copied from — so that is what needs the
+            # safety copy.
+            for _pairs in redirects.values():
+                for _parts, _dest in _pairs:
+                    try:
+                        if _dest.exists() and str(_dest) not in valid:
+                            valid.append(str(_dest))
+                    except OSError:
+                        pass
             if valid:
                 _exe = ""
                 try:
@@ -1491,6 +1767,17 @@ class BackupManager(QObject):
                         restore_root = save_parents[0]
                         dest = None
                         if arc_path.parts:
+                            # The chain decides first: these files describe a
+                            # destination, and the copy they came from is not it.
+                            _rest = arc_path.parts[1:]
+                            for _cparts, _target in redirects.get(arc_path.parts[0], ()):
+                                _head = [p.casefold() for p in _rest[:len(_cparts)]]
+                                if _head == [c.casefold() for c in _cparts] \
+                                        and len(_rest) > len(_cparts):
+                                    restore_root = _target
+                                    dest = _target.joinpath(*_rest[len(_cparts):])
+                                    break
+                        if dest is None and arc_path.parts:
                             matched_parent = _sp_lookup.get(arc_path.parts[0])
                             if matched_parent is not None:
                                 restore_root = matched_parent
@@ -1807,6 +2094,77 @@ class BackupManager(QObject):
                 f"Discarded {len(temp_ids)} pre-confirmation backup(s) for game {game_id}"
             )
         return len(temp_ids)
+
+    def adopt_backups(self, from_game_id: str, to_game_id: str,
+                      to_game_name: str, to_exe_path: str = "",
+                      to_folder_name: str = "") -> int:
+        """Re-file every backup of *from_game_id* under *to_game_id*.
+
+        A save folder registered by hand starts as a placeholder entry: real
+        saves, but no game behind them. Whatever was backed up in the meantime
+        belongs to that placeholder's id and its own storage folder — history
+        stranded on a stub. When the game itself turns up, this moves those
+        backups across so they become that game's own history: the zips are
+        relocated into its folder, the entries re-stamped, and both per-folder
+        indexes rewritten.
+
+        Deliberately a MOVE, not a copy: two indexes claiming the same
+        backup_id would resurface it as a duplicate on the next scan.
+
+        Returns how many backups were re-filed.
+        """
+        if not from_game_id or not to_game_id or from_game_id == to_game_id:
+            return 0
+        with _index_lock:
+            moving = [b for b in self._index if b.game_id == from_game_id]
+            old_folder = self._game_folder_for_entry(moving[0]) if moving else ""
+        if not moving:
+            return 0
+
+        target_folder = to_folder_name or get_install_folder_name(
+            to_exe_path or "", to_game_name, to_game_id, to_folder_name or None)
+        dest_dir = BACKUP_DIR / target_folder
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Cannot prepare {dest_dir} to adopt backups: {e}")
+            return 0
+
+        moved = 0
+        for entry in moving:
+            src = Path(entry.zip_path)
+            dest = dest_dir / src.name
+            try:
+                if src.exists() and src.resolve() != dest.resolve():
+                    if dest.exists():
+                        # Same backup_id already there — keep the existing file
+                        # and drop the duplicate rather than overwrite it.
+                        src.unlink(missing_ok=True)
+                    else:
+                        shutil.move(str(src), str(dest))
+            except Exception as e:
+                logger.warning(f"Could not move {src} into {dest_dir}: {e}")
+                continue
+            with _index_lock:
+                for b in self._index:
+                    if b.backup_id == entry.backup_id:
+                        b.game_id = to_game_id
+                        b.game_name = to_game_name or b.game_name
+                        b.zip_path = str(dest)
+            moved += 1
+
+        if moved:
+            self._save_game_index(to_game_id)
+            # Only clean up the OLD folder when it really is a different one.
+            # When the game reclaimed the placeholder's folder name the two
+            # coincide, and the cleanup branch would delete the index that was
+            # just written there — the backups would survive in memory and
+            # vanish on the next start.
+            if old_folder and old_folder != target_folder:
+                self._save_game_index(from_game_id, _folder_hint=old_folder)
+            logger.info(f"Adopted {moved} backup(s) from placeholder {from_game_id} "
+                        f"into {to_game_name!r} ({to_game_id})")
+        return moved
 
     def get_backups_for_game(self, game_id: str) -> list[BackupEntry]:
         with _index_lock:

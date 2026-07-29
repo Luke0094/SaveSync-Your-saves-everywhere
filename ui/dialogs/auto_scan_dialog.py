@@ -19,6 +19,7 @@ from core.monitor import get_monitor
 from core.config_manager import get_config
 from i18n import t
 from ui.styles.theme import palette
+from ui.helpers import TopmostPinMixin, apply_game_friendly_flags
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +239,9 @@ class SavePathItem(QWidget):
         self._all_detected_paths = paths.copy()  # Store all detected paths for tracking
         self._locally_deleted_paths: List[str] = []  # Deletions pending Save (NOT persisted yet)
         self.checkboxes = []
+        self.open_buttons = []
         self.delete_buttons = []
-        
+
         self.init_ui()
 
     def init_ui(self):
@@ -256,6 +258,14 @@ class SavePathItem(QWidget):
         for path in self.paths:
             self._build_path_row(path)
 
+        # Zero-height marker for the END of the path-row block. Rows added
+        # later (restore, or a slower scan pass) are inserted here so they
+        # join the list — inserting before the separator instead dropped them
+        # UNDER the ignored-paths footer row below, visually outside the list.
+        self._rows_end_anchor = QWidget()
+        self._rows_end_anchor.setFixedHeight(0)
+        layout.addWidget(self._rows_end_anchor)
+
         # Ignored-paths recovery (same UX as Add/Edit Game): count of paths
         # excluded from future scans — persisted store PLUS this session's
         # trash-icon deletions — with a button to review and restore them
@@ -265,10 +275,20 @@ class SavePathItem(QWidget):
         self._ignored_count_lbl = QLabel()
         self._ignored_count_lbl.setStyleSheet(
             f"color:{palette('text_hint')};font-size:10px;")
+        # One-click undo for THIS session's trash clicks: the Manage dialog
+        # below is a two-step review (open, tick, confirm), which is the wrong
+        # weight for "I just misclicked the bin". Shown only while there is
+        # something to put back.
+        self._restore_deleted_btn = QPushButton(t("add_game.restore_deleted_btn"))
+        self._restore_deleted_btn.setToolTip(t("add_game.restore_deleted_tooltip"))
+        self._restore_deleted_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
+        self._restore_deleted_btn.clicked.connect(self._restore_locally_deleted)
+        self._restore_deleted_btn.setVisible(False)
         manage_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
         manage_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
         manage_btn.clicked.connect(self._open_ignored_dialog)
         ignored_row.addWidget(self._ignored_count_lbl, 1)
+        ignored_row.addWidget(self._restore_deleted_btn)
         ignored_row.addWidget(manage_btn)
         layout.addLayout(ignored_row)
         self._refresh_ignored_count()
@@ -291,6 +311,26 @@ class SavePathItem(QWidget):
             self._ignored_count_lbl.setText(t("add_game.ignored_paths_count", count=n))
         else:
             self._ignored_count_lbl.setText(t("add_game.ignored_paths_none"))
+        # The one-click undo only ever concerns THIS session's deletions;
+        # persisted ones belong to the Manage dialog.
+        if hasattr(self, "_restore_deleted_btn"):
+            self._restore_deleted_btn.setVisible(bool(self._locally_deleted_paths))
+
+    def _restore_locally_deleted(self):
+        """Put every path trashed in this session straight back into the list.
+
+        add_paths() refuses anything still listed in _locally_deleted_paths
+        (an in-session deletion must survive a later scan pass re-finding the
+        path), so the list is cleared FIRST — otherwise the button would
+        silently do nothing.
+        """
+        to_restore = list(self._locally_deleted_paths)
+        if not to_restore:
+            return
+        self._locally_deleted_paths.clear()
+        self.add_paths(to_restore)
+        logger.info(f"Restored {len(to_restore)} just-deleted path(s) for {self.game_name}")
+        self._refresh_ignored_count()
 
     def _open_ignored_dialog(self):
         """Review/restore ignored paths — including this session's trash
@@ -309,11 +349,12 @@ class SavePathItem(QWidget):
         self._refresh_ignored_count()
 
     def _build_path_row(self, path: str):
-        """Build and append the checkbox+delete+file-browser row for one
+        """Build and append the checkbox+open+delete+file-browser row for one
         path. Shared by init_ui() (initial build) and add_paths() (merging
         in additional paths found by a subsequent scan pass) so both
         produce identical rows.
         """
+        from functools import partial
         layout = self.layout()
         path_layout = QHBoxLayout()
         path_layout.setContentsMargins(20, 2, 2, 2)
@@ -329,20 +370,31 @@ class SavePathItem(QWidget):
         self.checkboxes.append(checkbox)
         path_layout.addWidget(checkbox)
 
+        # Open button — deciding whether a detected path really holds this
+        # game's saves is much easier with the folder (or the registry key)
+        # in front of you than from the path string alone. Bound to the path,
+        # not to a row index, so deletions never need it rebound.
+        open_btn = QPushButton("\U0001f4c2")
+        open_btn.setFixedSize(24, 24)
+        open_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 0px; }")
+        open_btn.setToolTip(t('add_game.open_folder'))
+        open_btn.clicked.connect(partial(self._open_path, path))
+        self.open_buttons.append(open_btn)
+        path_layout.addWidget(open_btn)
+
         # Delete button
         delete_btn = QPushButton("\U0001f5d1")
         delete_btn.setFixedSize(24, 24)
         delete_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 0px; }")
         delete_btn.setToolTip(t('auto_scan.remove_path'))
-        from functools import partial
         delete_btn.clicked.connect(partial(self._on_delete_clicked, len(self.delete_buttons)))
         self.delete_buttons.append(delete_btn)
         path_layout.addWidget(delete_btn)
 
-        # Insert before the trailing separator if it already exists (i.e.
-        # this call came from add_paths() after init_ui() already ran);
-        # otherwise just append (still building the initial rows).
-        insert_at = layout.indexOf(self._separator_line) if getattr(self, '_separator_line', None) else -1
+        # Insert at the end-of-rows anchor if it already exists (i.e. this
+        # call came from add_paths() after init_ui() already ran); otherwise
+        # just append (still building the initial rows).
+        insert_at = layout.indexOf(self._rows_end_anchor) if getattr(self, '_rows_end_anchor', None) else -1
         if insert_at >= 0:
             layout.insertLayout(insert_at, path_layout)
         else:
@@ -372,7 +424,12 @@ class SavePathItem(QWidget):
             if path in self.paths or path in self._locally_deleted_paths:
                 continue
             self.paths.append(path)
-            self._all_detected_paths.append(path)
+            # Guarded: a RESTORED path is already in _all_detected_paths
+            # (delete_path() drops it from self.paths only). apply_changes()
+            # rebuilds save_paths from _all_detected_paths, so appending
+            # blindly would write the path into the game twice.
+            if path not in self._all_detected_paths:
+                self._all_detected_paths.append(path)
             self._build_path_row(path)
             added.append(path)
         return added
@@ -391,14 +448,17 @@ class SavePathItem(QWidget):
             # stale widget references while deleteLater is pending.
             cb = self.checkboxes[index]
             btn = self.delete_buttons[index]
-            cb.setVisible(False)
-            btn.setVisible(False)
-            if cb.parent() and cb.parent().layout():
-                cb.parent().layout().removeWidget(cb)
-            if btn.parent() and btn.parent().layout():
-                btn.parent().layout().removeWidget(btn)
-            cb.deleteLater()
-            btn.deleteLater()
+            # The open button goes with them: only the row's widgets are
+            # removed (the empty QHBoxLayout stays), so one left behind would
+            # keep floating in a row that no longer has a path.
+            open_btn = self.open_buttons[index] if index < len(self.open_buttons) else None
+            for w in (cb, btn, open_btn):
+                if w is None:
+                    continue
+                w.setVisible(False)
+                if w.parent() and w.parent().layout():
+                    w.parent().layout().removeWidget(w)
+                w.deleteLater()
 
             # Track deletion locally — NOT written to config yet
             if path_to_delete not in self._locally_deleted_paths:
@@ -417,6 +477,8 @@ class SavePathItem(QWidget):
             del self.paths[index]
             del self.checkboxes[index]
             del self.delete_buttons[index]
+            if index < len(self.open_buttons):
+                del self.open_buttons[index]
 
             # Rebind remaining delete buttons with corrected indices
             from functools import partial
@@ -429,6 +491,25 @@ class SavePathItem(QWidget):
 
             logger.info(f"User deleted path for {self.game_name}: {path_to_delete} (pending Apply)")
             self._refresh_ignored_count()
+
+    def _open_path(self, path_str: str, checked=False):
+        """Open a proposed path for inspection — same behaviour as the
+        Add/Edit Game rows: registry keys go to regedit, folders to the
+        system file manager, and a path that doesn't exist (yet) says so
+        instead of failing silently."""
+        from core.registry_saves import is_registry_path, open_in_regedit
+        from ui.helpers import open_in_file_manager
+        from ui.modal_helpers import information_window_modal
+        if is_registry_path(path_str):
+            open_in_regedit(path_str)
+            return
+        target = Path(path_str)
+        if not target.exists():
+            information_window_modal(
+                self, t('add_game.folder_not_found'),
+                t('add_game.folder_not_exist', path=path_str))
+            return
+        open_in_file_manager(target)
 
     def _on_delete_clicked(self, idx, checked=False):
         """Stable callback for delete buttons — avoids lambda closure leaks.
@@ -475,7 +556,7 @@ class SavePathItem(QWidget):
         return excluded
 
 
-class AutoScanDialog(QDialog):
+class AutoScanDialog(TopmostPinMixin, QDialog):
     """Dialog for confirming auto-discovered save paths"""
     
     def __init__(self, parent=None):
@@ -1416,48 +1497,11 @@ class AutoScanDialog(QDialog):
                 self.activateWindow()
             except RuntimeError:
                 pass
-        self._start_topmost_pin()
-
-    def _start_topmost_pin(self):
-        """Start the 1s topmost re-pin (Windows only, where the factory applies
-        WindowStaysOnTopHint). The QTimer is parented to the dialog, so it dies
-        with it (WA_DeleteOnClose)."""
-        if platform.system() != "Windows":
-            return
-        if self._topmost_timer is None:
-            self._topmost_timer = QTimer(self)
-            self._topmost_timer.setInterval(1000)
-            self._topmost_timer.timeout.connect(self._repin_topmost)
-        if not self._topmost_timer.isActive():
-            self._topmost_timer.start()
-        self._repin_topmost()
-
-    def _repin_topmost(self):
-        """Re-assert HWND_TOPMOST WITHOUT activating (SWP_NOACTIVATE), so the
-        panel stays above a game that reclaimed the foreground — without a focus
-        war. Unlike the overlay it stays a normal dialog (no WS_EX_TOOLWINDOW),
-        so it remains in the taskbar / alt-tab."""
-        try:
-            import ctypes
-            hwnd = int(self.winId())
-            user32 = ctypes.windll.user32
-            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOOWNERZORDER = 0x0001, 0x0002, 0x0010, 0x0200
-            HWND_TOPMOST = -1
-            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
-        except Exception:
-            pass
-
-    def _stop_topmost_pin(self):
-        if self._topmost_timer is not None:
-            try:
-                self._topmost_timer.stop()
-            except RuntimeError:
-                pass
+        self.start_topmost_pin()
 
     def closeEvent(self, event):
         """Handle dialog close — reject to avoid auto-confirming paths"""
-        self._stop_topmost_pin()
+        self.stop_topmost_pin()
         if self.scan_thread and self.scan_thread.isRunning():
             self.stop_scan()
             try:

@@ -1150,6 +1150,54 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._hide_suppress_btn()
         self._show_priority_prompt()
 
+    def show_unverified_match(self, game_name: str, proc_name: str, game_id: str):
+        """A running process matched a library game by NAME ONLY — its own
+        path could not be read (typically an elevated game), so nothing
+        confirms it really is that game rather than another one shipping an
+        executable of the same name.
+
+        A decision-required prompt on purpose: until the user answers, the
+        process is not tracked and no save of it is touched. The answer is
+        remembered, so this is asked once per executable name.
+        """
+        context = f"{proc_name}|{game_id}"
+        if self._defer_if_priority(
+                lambda: self.show_unverified_match(game_name, proc_name, game_id),
+                context=context, is_priority=True):
+            return
+        self._set_mode("cloud")          # same decision-prompt chrome
+        self._context_exe = context
+        self._priority_context = context
+        self._icon_label.setText("❓")
+        self._title.setText(t("app.name"))
+        self._message.setText(
+            f"<b>{proc_name}</b> {t('overlay.unverified_match_msg', game=game_name)}<br>"
+            f"<span style='color:{palette('text_hint')};font-size:11px;'>"
+            f"{t('overlay.unverified_match_hint')}</span>"
+        )
+        self._hide_dashboard()
+        self._clear_buttons()
+        self._add_btn(self._btn_area, t("overlay.unverified_match_yes", game=game_name),
+                      "confirm_process_match", primary=True)
+        self._add_btn(self._btn_area, t("overlay.unverified_match_no"),
+                      "reject_process_match")
+        self._hide_suppress_btn()
+        self._show_priority_prompt()
+
+    def dismiss_unverified_match(self, proc_name: str, game_id: str) -> None:
+        """Withdraw an unanswered unverified-match prompt whose process has
+        exited. Without this the prompt sits there asking about something that
+        is gone AND keeps holding priority, deferring every later
+        notification behind a question that can no longer be answered."""
+        context = f"{proc_name}|{game_id}"
+        if self._priority_context != context:
+            return
+        if self.isVisible() and self.windowOpacity() > 0.1:
+            self.hide_animated()      # drops priority and replays deferred
+            self._priority_context = ""
+            return
+        self.clear_priority_for(context)
+
     # ── Priority prompt gating ───────────────────────────────────────────────
 
     def _defer_if_priority(self, fn, context: str = "", is_priority: bool = False) -> bool:

@@ -49,6 +49,12 @@ _DEFAULTS: dict[str, Any] = {
     "auto_scan_confirmed_games": [],  # Games where auto-scan was confirmed
     "auto_scan_deselected_paths": {},  # Paths explicitly deselected by user {game_id: [paths]}
     "auto_scan_deleted_paths": {},     # Paths explicitly deleted by user {game_id: [paths]}
+    # Answers to the "is this process really that game?" prompt, asked when a
+    # process matched a library entry by NAME ONLY because its own path was
+    # unreadable (elevated process). Keyed by process filename — the path is
+    # exactly what's missing, so it cannot be part of the key.
+    "confirmed_process_matches": {},   # {proc_name: game_id} — treat as that game
+    "rejected_process_matches": {},    # {proc_name: [game_id]} — never that game
     # Per-game notification "don't re-prompt" choices. These MUST be registered
     # here: _load() drops any key not in _DEFAULTS (or starting with "sync_"),
     # so before this they behaved as session-only and reappeared every restart

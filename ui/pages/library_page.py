@@ -119,6 +119,7 @@ def build_pager(current: int, total: int, on_page, btn_sink=None) -> QWidget:
 # Singleton drag state shared between cards and folder tree
 class LibraryPage(QWidget, ThemedMixin):
     add_game_requested = Signal(str, str)  # name, exe_path
+    scan_folder_requested = Signal()       # 🔍 — scan a folder for games
     backup_requested   = Signal(str)
     restore_requested  = Signal(str)
     remove_requested   = Signal(str)
@@ -158,7 +159,10 @@ class LibraryPage(QWidget, ThemedMixin):
             return
         path = urls[0].toLocalFile()
         p = Path(path)
-        if p.suffix.lower() not in ('.exe', '.bat', '.lnk', '.url'):
+        # Platform-aware: .exe/.bat/.lnk/.url on Windows, and on Unix the
+        # extension-less exec-bit binaries plus .sh/.AppImage/.x86_64/.desktop.
+        from core.resolvers import is_addable_file, resolve_desktop_entry
+        if not is_addable_file(path):
             return
         event.acceptProposedAction()
         # Same name derivation as every other add entry point (dialog drop /
@@ -178,6 +182,9 @@ class LibraryPage(QWidget, ThemedMixin):
                     exe_path = path
             except Exception:
                 exe_path = path
+        elif p.suffix.lower() == '.desktop':
+            # Linux launcher: same role as .lnk — resolve to what it starts.
+            exe_path = resolve_desktop_entry(path) or path
         elif p.suffix.lower() == '.lnk':
             exe_path = self._resolve_lnk_target(str(p))
             _t = (exe_path or "").strip().strip('"')
@@ -232,6 +239,17 @@ class LibraryPage(QWidget, ThemedMixin):
 
         top.addWidget(self._card_btn)
         top.addWidget(self._list_btn)
+
+        # Scan a folder for installed games — the bulk counterpart of "+ Add".
+        self._scan_btn = QPushButton("🔍")
+        # icon_btn is the app's own transparent icon-button style; without it
+        # the default QPushButton QSS paints a filled square over the glyph.
+        self._scan_btn.setObjectName("icon_btn")
+        self._scan_btn.setFixedSize(34, 34)
+        self._scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._scan_btn.setToolTip(t("exe_scan.button_tooltip"))
+        self._scan_btn.clicked.connect(self.scan_folder_requested.emit)
+        top.addWidget(self._scan_btn)
 
         self._add_btn = QPushButton(f"+ {t('library.add_game')}")
         self._add_btn.setObjectName("primary_btn")
