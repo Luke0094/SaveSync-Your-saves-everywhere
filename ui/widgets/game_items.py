@@ -8,11 +8,13 @@ GameRow widgets. Pure move — no behavior change. The mixin MUST stay first
 in the MRO of both classes so its Qt virtual handlers win over QWidget's.
 """
 import logging
+import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject
-from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize
+from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QImageReader
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QMenu, QApplication, QGraphicsOpacityEffect,
@@ -305,15 +307,101 @@ def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center") -
     return canvas
 
 
+# Covers are decoded on the GUI thread, once per card, every time the library
+# rebuilds — so both halves of that cost are worth cutting.
+_COVER_CACHE: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+_COVER_CACHE_MAX = 192          # ~a page of cards in both view modes, plus slack
+
+# Above this many source pixels, decoding the file at full resolution costs
+# more than asking the decoder for a smaller image. BELOW it the reverse is
+# true — the reader's own overhead (header parse, non-native scaling) makes
+# small files several times slower that way — which is why this is a
+# threshold and not an always-on optimisation. Measured crossover sits
+# between 2 and 8 megapixels.
+_BIG_IMAGE_PIXELS = 4_000_000
+
+
+# How much detail to keep beyond what the render strictly needs. The final
+# step is a smooth downscale, which wants more source than target to look
+# good. Measured on a cover full of text and thin rules — the content that
+# actually shows the damage, unlike a gradient:
+#   margin 1: mean error 9/255, peaks at 50, visibly pixelated
+#   margin 2: mean 3.9, peaks at 28
+#   margin 4: mean 1.4, peaks at 15 — indistinguishable, and still 2-3.5x
+#             faster than decoding the file at full resolution
+_COVER_DETAIL_MARGIN = 4
+
+
+def _load_cover_source(path: str, need_w: int, need_h: int) -> QPixmap:
+    """Decode *path* cheaply, at a size that still comfortably covers
+    need_w × need_h.
+
+    A 4000x6000 cover is 24 million pixels on its way to a 186x240 card. Qt's
+    JPEG/PNG readers can produce a reduced image directly; for JPEG a
+    power-of-two reduction is what libjpeg does natively, so the size asked
+    for is always src/2, /4 or /8 rather than an exact fit.
+
+    *need_w/need_h* are what render_cover will actually scale to — which is
+    the card size TIMES the framing zoom, up to 8x. Reducing against the card
+    size alone left a zoomed-in cover being blown back up from a thumbnail,
+    which is what made them look pixelated.
+    """
+    floor_w = max(1, need_w) * _COVER_DETAIL_MARGIN
+    floor_h = max(1, need_h) * _COVER_DETAIL_MARGIN
+    try:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        src = reader.size()
+        if (src.isValid() and src.width() > 0
+                and src.width() * src.height() > _BIG_IMAGE_PIXELS):
+            sw, sh, shift = src.width(), src.height(), 0
+            while shift < 3 and sw // 2 >= floor_w and sh // 2 >= floor_h:
+                sw //= 2
+                sh //= 2
+                shift += 1
+            if shift:
+                reader.setScaledSize(QSize(sw, sh))
+                img = reader.read()
+                if not img.isNull():
+                    return QPixmap.fromImage(img)
+    except Exception as e:
+        logger.debug(f"Reduced-size decode failed for '{path}': {e}")
+    # Small image, unsupported format, or the reader failed — the plain path
+    # also carries the PIL fallback (AVIF and friends).
+    return _load_pixmap_any(path)
+
+
 def _make_pixmap(path: Optional[str], w: int, h: int, focus: str = "center") -> Optional[QPixmap]:
     if not path:
         return None
     try:
-        px = _load_pixmap_any(path)
+        # Keyed on mtime and size too: an edited or replaced cover file must
+        # not keep serving the old render.
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime_ns, st.st_size, w, h, focus)
+        except OSError:
+            key = None
+        if key is not None:
+            hit = _COVER_CACHE.get(key)
+            if hit is not None:
+                _COVER_CACHE.move_to_end(key)
+                return hit
+
+        # render_cover scales to the card size times the framing zoom, so the
+        # decode has to be told the ZOOMED size, not the card size.
+        _mode, _zoom, _x, _y = parse_cover_focus(focus)
+        _z = max(1.0, _zoom)
+        px = _load_cover_source(path, int(round(w * _z)), int(round(h * _z)))
         if px.isNull():
             logger.debug(f"Pixmap load returned null for path: {path}")
             return None
-        return render_cover(px, w, h, focus)
+        out = render_cover(px, w, h, focus)
+        if key is not None and out is not None:
+            _COVER_CACHE[key] = out
+            while len(_COVER_CACHE) > _COVER_CACHE_MAX:
+                _COVER_CACHE.popitem(last=False)
+        return out
     except Exception as e:
         logger.debug(f"Pixmap load failed for path '{path}': {e}")
         return None
@@ -398,10 +486,16 @@ def _web_search_game_dialog(item: QWidget, game_id: str):
 
 class _PlaytimeLabel(QLabel, ThemedMixin):
     """Card playtime label with a hover effect: shows total playtime
-    normally and the most recent session's duration while hovered."""
+    normally and the most recent session's duration while hovered.
+
+    Only the TEXT swap happens here — both colours are constant per theme
+    and live in the QSS under ``#playtime_lbl``, so the label carries no
+    stylesheet of its own (a library page holds one per card, and each one
+    would cost triple to re-polish on a theme switch)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("playtime_lbl")
         self._normal_text = ""
         self._hover_text = ""
         self._hovering = False
@@ -419,21 +513,25 @@ class _PlaytimeLabel(QLabel, ThemedMixin):
         else:
             self._hover_text = ""
         self.setToolTip("")
+        # Drives #playtime_lbl[hasHover="1"]:hover — without a session to show,
+        # the text stays put on hover, so the colour must stay put too.
+        has_hover = "1" if (self._hover_text and self._normal_text) else "0"
+        if self.property("hasHover") != has_hover:
+            self.setProperty("hasHover", has_hover)
+            self.style().unpolish(self)
+            self.style().polish(self)
         self._apply(self._hovering)
 
     def _apply(self, hovering: bool):
         self._hovering = hovering
         if hovering and self._hover_text and self._normal_text:
             self.setText(self._hover_text)
-            style = f"color:{palette('accent')};font-size:9px;background:transparent;"
         else:
             self.setText(self._normal_text)
-            style = f"color:{palette('text_muted')};font-size:9px;background:transparent;"
-        self.setStyleSheet(style)
 
     def refresh_styles(self):
         super().refresh_styles()
-        self._apply(self._hovering)   # re-colour for current hover state + theme
+        self._apply(self._hovering)   # keep the right text for the hover state
 
     def enterEvent(self, event):
         super().enterEvent(event)
@@ -599,6 +697,9 @@ class _GameItemMixin:
         menu.addAction(t("library.backup_now"),  lambda: self.backup_requested.emit(self._entry.id))
         menu.addAction(t("sync.sync_now"),       lambda: self.sync_requested.emit(self._entry.id))
         menu.addAction(t("library.restore"),     lambda: self.restore_requested.emit(self._entry.id))
+        # Straight to the save editor for THIS game — the page's search step
+        # is skipped, which is the point of coming from here.
+        menu.addAction(t("cheats.menu"),         lambda: self.cheats_requested.emit(self._entry.id))
         if _display_sync_status(self._entry) == "provisional":
             menu.addAction(t("library.review_provisional"),
                             lambda: self.review_provisional_requested.emit(self._entry.id))
@@ -891,6 +992,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
     launch_requested = Signal(str)
     detail_requested = Signal(str)
     review_provisional_requested = Signal(str)
+    cheats_requested = Signal(str)
 
     def __init__(self, entry: GameEntry, parent=None):
         super().__init__(parent)
@@ -1100,32 +1202,32 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
 
     def _build(self):
         self.setFixedSize(186, 240)
-        # Register the (folder-colour + palette) frame style so a theme switch
-        # re-applies it in place; _card_style() re-reads both on refresh.
-        self._sty(self, self._card_style)
+        # Frame: QSS when the card has no folder colour, inline when it does.
+        # NOT registered with _sty — refresh_styles() calls this directly, so
+        # the objectName and the sheet always move together.
+        self._apply_card_style()
 
         # ── Cover fills the entire card ───────────────────────────────────────
+        # The card's children are styled from the theme QSS by objectName
+        # rather than each getting its own stylesheet: a library page holds
+        # one of each per card, and a widget carrying its own sheet costs
+        # about 3x more to re-polish when the theme changes.
         self._cover = QLabel(self)
+        self._cover.setObjectName("game_card_cover")
         self._cover.setFixedSize(186, 240)
         self._cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sty(self._cover, lambda: (
-            f"background:{palette('bg_elevated')};font-size:42px;border-radius:10px;"
-        ))
         self._update_cover()
 
         # Playing badge (top-left overlay)
         self._playing_badge = QLabel(f"▶ {t('library.playing').upper()}", self)
-        self._sty(self._playing_badge, lambda: (
-            f"background:{palette('accent')};color:{palette('accent_text')};font-size:9px;font-weight:700;"
-            f"padding:2px 6px;border-radius:3px;"
-        ))
+        self._playing_badge.setObjectName("playing_badge")
         self._playing_badge.setVisible(False)
         self._playing_badge.move(8, 8)
         self._playing_badge.adjustSize()
 
         # Slideshow dot indicators (bottom-center, visible only on hover)
         self._dots_bar = QWidget(self)
-        self._dots_bar.setStyleSheet("background:rgba(0,0,0,0.55);border-radius:8px;")
+        self._dots_bar.setObjectName("game_card_dots")
         self._dots_layout = QHBoxLayout(self._dots_bar)
         self._dots_layout.setContentsMargins(12, 6, 12, 6)
         self._dots_layout.setSpacing(5)
@@ -1140,13 +1242,10 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._dots_bar.adjustSize()
 
         # ── Bottom info overlay (absolute positioned, full width) ─────────────
-        # rgba re-derived from palette('bg_card') at refresh time, so the panel
-        # tint follows the theme without rebuilding the card.
+        # Translucent tint over the cover; the per-theme rgba lives in the QSS.
         self._bottom = QWidget(self)
+        self._bottom.setObjectName("game_card_bottom")
         self._bottom.setGeometry(0, 130, 186, 110)
-        self._sty(self._bottom, lambda: (
-            f"background:rgba({_hex_to_rgb(palette('bg_card'))},0.88);border-radius:0 0 10px 10px;"
-        ))
         bl = QVBoxLayout(self._bottom)
         bl.setContentsMargins(10, 6, 10, 6)
         bl.setSpacing(2)
@@ -1155,7 +1254,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         # ("N&amp;R") for display, without rewriting the stored value.
         _disp_name = _clean_tag_display(self._entry.name)
         self._name_lbl = QLabel(_disp_name)
-        self._sty(self._name_lbl, lambda: f"color:{palette('text')};font-size:12px;font-weight:600;background:transparent;")
+        self._name_lbl.setObjectName("game_card_name")
         self._name_lbl.setWordWrap(False)
         fm = self._name_lbl.fontMetrics()
         elided = fm.elidedText(_disp_name, Qt.TextElideMode.ElideRight, 162)
@@ -1180,17 +1279,12 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         _status_row.setSpacing(4)
         _status_row.addWidget(self._status_lbl, 1)
         self._sync_card_btn = QPushButton(t("buttons.sync"))
-        self._sync_card_btn.setObjectName("icon_btn")
+        # card_flat_btn, not the shared icon_btn: no background of its own,
+        # because the bottom overlay propagates its rgba fill to children and
+        # painted this button as a darker rectangle.
+        self._sync_card_btn.setObjectName("card_flat_btn")
         self._sync_card_btn.setFixedSize(22, 18)
         self._sync_card_btn.setToolTip(t("sync.sync_now"))
-        # No own background: the card's bottom overlay propagates its rgba
-        # background to child widgets, which painted this button as a darker
-        # rectangle — force full transparency so it blends with the panel.
-        self._sty(self._sync_card_btn, lambda: (
-            f"QPushButton{{background:transparent;border:none;padding:0;"
-            f"color:{palette('text_muted')};font-size:12px;}}"
-            f"QPushButton:hover{{background:transparent;color:{palette('accent')};}}"
-        ))
         self._sync_card_btn.clicked.connect(lambda: self.sync_requested.emit(self._entry.id))
         _status_row.addWidget(self._sync_card_btn)
         bl.addLayout(_status_row)
@@ -1203,31 +1297,22 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         bar.setSpacing(4)
 
         self._launch_btn = QPushButton(t("buttons.play"))
-        self._launch_btn.setObjectName("primary_btn")
+        # card_play_btn: the shared primary_btn look, tightened for the card.
+        self._launch_btn.setObjectName("card_play_btn")
         self._launch_btn.setFixedHeight(26)
-        self._sty(self._launch_btn, lambda: (
-            f"QPushButton#primary_btn{{background:{palette('accent')};color:{palette('accent_text')};font-size:11px;"
-            f"font-weight:700;border-radius:4px;padding:0 8px;}}"
-            f"QPushButton#primary_btn:hover{{background:{palette('accent_hover')};}}"
-        ))
         self._launch_btn.clicked.connect(lambda: self.launch_requested.emit(self._entry.id))
 
         self._backup_btn = QPushButton(t("buttons.backup"))
-        self._backup_btn.setObjectName("icon_btn")
+        # Same transparency treatment as the ⟳ sync button above, one size up.
+        self._backup_btn.setObjectName("card_flat_btn_lg")
         self._backup_btn.setFixedSize(26, 26)
         self._backup_btn.setToolTip(t("library.backup_now"))
-        # Same transparency treatment as the ⟳ sync button above: the card's
-        # bottom overlay propagates its rgba background to child widgets and
-        # painted the 💾 as a darker rectangle — force it fully transparent.
-        self._sty(self._backup_btn, lambda: (
-            f"QPushButton{{background:transparent;border:none;padding:0;"
-            f"color:{palette('text_muted')};font-size:16px;}}"
-            f"QPushButton:hover{{background:transparent;color:{palette('accent')};}}"
-        ))
         self._backup_btn.clicked.connect(lambda: self.backup_requested.emit(self._entry.id))
 
         more_btn = QPushButton(t("buttons.more"))
-        more_btn.setObjectName("icon_btn")
+        # card_more_btn, not the shared icon_btn: it keeps a solid backdrop so
+        # the small ⋯ glyph stays readable over the cover art (see the QSS).
+        more_btn.setObjectName("card_more_btn")
         more_btn.setFixedSize(26, 26)
         more_btn.clicked.connect(lambda: self._show_context_menu(more_btn))
 
@@ -1237,38 +1322,42 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         bl.addLayout(bar)
 
     def _card_style(self) -> str:
-        # State (folder colour) + palette dependent — both re-read here so a
-        # theme switch (via the registered style) and a folder change (via
-        # _apply_card_style in refresh) each produce the correct border.
+        """Inline frame style — ONLY for a card filed under a coloured folder.
+
+        The colour is per-card state, so that variant can't live in the
+        theme QSS. Without a folder the card takes #game_card_grid instead
+        and carries no stylesheet at all, which is the common case and the
+        one worth keeping cheap on a theme switch.
+        """
         folder_color = self._get_folder_color()
-        if folder_color:
-            return f"""
-                QFrame#game_card {{
-                    background: {palette('bg_card')};
-                    border: 1px solid {palette('border')};
-                    border-left: 3px solid {folder_color};
-                    border-radius: 10px;
-                }}
-                QFrame#game_card:hover {{
-                    border-color: {palette('border_hover')};
-                    border-left: 3px solid {folder_color};
-                    background: {palette('bg_hover')};
-                }}
-            """
+        if not folder_color:
+            return ""
         return f"""
             QFrame#game_card {{
                 background: {palette('bg_card')};
                 border: 1px solid {palette('border')};
+                border-left: 3px solid {folder_color};
                 border-radius: 10px;
             }}
             QFrame#game_card:hover {{
                 border-color: {palette('border_hover')};
+                border-left: 3px solid {folder_color};
                 background: {palette('bg_hover')};
             }}
         """
 
     def _apply_card_style(self):
-        self.setStyleSheet(self._card_style())
+        """Swap between the QSS-styled frame and the folder-colour variant.
+
+        The objectName has to move too: the inline rules are written for
+        #game_card, and leaving the name at #game_card_grid would let the
+        plain QSS rule paint over the folder border.
+        """
+        sheet = self._card_style()
+        self.setObjectName("game_card" if sheet else "game_card_grid")
+        self.setStyleSheet(sheet)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def _apply_status(self):
         """(Re)compute the sync-status label's text + palette-derived styles
@@ -1283,11 +1372,12 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         )
 
     def refresh_styles(self):
-        # Registered one-shots (card frame, cover, badge, bottom panel, name,
-        # sync btn, launch btn) re-apply with the current palette…
+        # Everything on the card is styled by objectName and was already
+        # re-resolved by the stylesheet swap. Only the frame (when the card
+        # carries a folder colour) and the state-dependent status badge are
+        # recomputed. NO card is recreated.
         super().refresh_styles()
-        # …then the state-dependent status badge and hover-swap playtime label
-        # are recomputed from the entry. NO card is recreated.
+        self._apply_card_style()
         self._apply_status()
         self._playtime_lbl.refresh_styles()
 
@@ -1348,6 +1438,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
     launch_requested = Signal(str)
     detail_requested = Signal(str)
     review_provisional_requested = Signal(str)
+    cheats_requested = Signal(str)
 
     def __init__(self, entry: GameEntry, parent=None):
         super().__init__(parent)
@@ -1364,12 +1455,12 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         row.setSpacing(12)
 
         # Thumbnail
+        # Styled from the theme QSS by objectName, like the card's children —
+        # see the note in GameCard._build.
         self._thumb = QLabel()
+        self._thumb.setObjectName("game_row_thumb")
         self._thumb.setFixedSize(48, 48)
         self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sty(self._thumb, lambda: (
-            f"background:{palette('bg_elevated')};border-radius:6px;font-size:22px;"
-        ))
         focus = getattr(self._entry, 'cover_focus', 'center')
         px = _make_pixmap(self._img_path, 48, 48, focus)
         if px:
@@ -1414,10 +1505,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
 
         # Playing badge
         self._playing_badge = QLabel(f"▶ {t('library.playing').upper()}")
-        self._sty(self._playing_badge, lambda: (
-            f"background:{palette('accent')};color:{palette('accent_text')};font-size:9px;font-weight:700;"
-            f"padding:2px 6px;border-radius:3px;"
-        ))
+        self._playing_badge.setObjectName("playing_badge")   # shared with the card view
         self._playing_badge.setVisible(False)
         row.addWidget(self._playing_badge)
 
@@ -1431,20 +1519,11 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         # The play button is an ICON like its neighbours (the wide "▶ Play"
         # text button belongs to the card view only).
         self._launch_btn = QPushButton("▶")
-        self._launch_btn.setObjectName("primary_btn")
+        # row_play_btn, not the shared primary_btn: the zero padding this
+        # needs (and the cancelled :pressed) live with the rule in the theme.
+        self._launch_btn.setObjectName("row_play_btn")
         self._launch_btn.setFixedSize(28, 28)
         self._launch_btn.setToolTip(t("buttons.play").lstrip("▶").strip())
-        # Zero padding is REQUIRED: the global QPushButton QSS pads 7px 16px,
-        # which on a fixed 28px-wide button leaves no content area at all —
-        # the ▶ glyph was clipped out entirely (invisible button).
-        # Radius/weight/colors mirror the card view's "▶ Play" button.
-        self._sty(self._launch_btn, lambda: (
-            f"QPushButton#primary_btn{{background:{palette('accent')};"
-            f"color:{palette('accent_text')};border:none;border-radius:4px;"
-            f"padding:0;font-size:12px;font-weight:700;}}"
-            f"QPushButton#primary_btn:hover{{background:{palette('accent_hover')};}}"
-            f"QPushButton#primary_btn:pressed{{background:{palette('accent')};}}"
-        ))
         self._launch_btn.clicked.connect(lambda: self.launch_requested.emit(self._entry.id))
 
         self._backup_btn = QPushButton(t("buttons.backup"))
@@ -1519,10 +1598,10 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         self._update_folder_dot()
 
     def refresh_styles(self):
-        # Registered one-shots (thumb bg, playing badge) re-apply with the
-        # current palette; _name_lbl / _played_lbl / _synced_lbl are styled by
-        # the global QSS (objectName game_name/game_meta) and follow the app
-        # stylesheet automatically. The rest are state-dependent, recomputed:
+        # Thumb, playing badge, play button, name and meta labels are all
+        # styled by the global QSS via their objectName and follow the app
+        # stylesheet on their own. Only the state-dependent ones are
+        # recomputed here:
         super().refresh_styles()
         self._apply_status()
         self._apply_playtime()

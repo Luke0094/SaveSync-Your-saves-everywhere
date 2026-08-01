@@ -55,7 +55,6 @@ class StatCard(QFrame, ThemedMixin):
         val_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
         lbl = QLabel(label)
         lbl.setObjectName("stat_label")
-        self._sty(lbl, lambda: f"color: {palette('text_secondary')}; font-size: 11px; font-weight: 600; letter-spacing: 0.3px; background: transparent;")
         layout.addWidget(val_lbl)
         layout.addWidget(lbl)
         self._val_lbl = val_lbl
@@ -63,31 +62,36 @@ class StatCard(QFrame, ThemedMixin):
 
 
 class ActivityRow(QFrame, ThemedMixin):
+    """One line in the "recent activity" list.
+
+    Every piece of it is named and styled by the theme (#activity_row and
+    friends): none of the five looks varies with the row's content, and a
+    busy overview holds ten of these, so a theme switch has nothing to
+    re-apply here.
+    """
+
     def __init__(self, icon: str, title: str, subtitle: str, time_str: str):
         super().__init__()
-        self._sty(self, lambda: (
-            f"QFrame {{ background: transparent; border-bottom: 1px solid {palette('border')}; }}"
-            f"QFrame:hover {{ background: {palette('bg_elevated')}; }}"
-        ))
+        self.setObjectName("activity_row")
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 8, 0, 8)
         row.setSpacing(12)
 
         icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet("font-size: 18px; min-width: 24px; background: transparent;")
+        icon_lbl.setObjectName("activity_icon")
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(icon_lbl)
 
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
         title_lbl = QLabel(title)
-        self._sty(title_lbl, lambda: f"color: {palette('text_secondary')}; font-size: 12px; font-weight: 600; background: transparent;")
+        title_lbl.setObjectName("activity_title")
         title_lbl.setMinimumWidth(60)
         # Elide long titles with "…" instead of disappearing
         title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         sub_lbl = QLabel(subtitle)
-        self._sty(sub_lbl, lambda: f"color: {palette('text_secondary')}; font-size: 11px; background: transparent;")
+        sub_lbl.setObjectName("activity_sub")
         sub_lbl.setMinimumWidth(60)
         sub_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
@@ -96,7 +100,7 @@ class ActivityRow(QFrame, ThemedMixin):
         row.addLayout(text_col, 1)
 
         time_lbl = QLabel(time_str)
-        self._sty(time_lbl, lambda: f"color: {palette('text_muted')}; font-size: 10px; background: transparent;")
+        time_lbl.setObjectName("activity_time")
         time_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         time_lbl.setMinimumWidth(40)
         time_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
@@ -371,11 +375,11 @@ class OverviewPage(QWidget, ThemedMixin):
         bl.setContentsMargins(16, 12, 16, 12)
         bl.setSpacing(12)
         self._active_icon = QLabel("\U0001f3ae")
-        self._active_icon.setStyleSheet("font-size: 22px; background: transparent;")
+        self._active_icon.setObjectName("active_game_icon")
         self._active_name = QLabel(t("overview.no_active_game"))
-        self._sty(self._active_name, lambda: f"color: {palette('text_secondary')}; font-size: 14px; font-weight: 700; background: transparent;")
+        self._active_name.setObjectName("active_game_name")
         self._active_sub  = QLabel("")
-        self._sty(self._active_sub, lambda: f"color: {palette('text_secondary')}; font-size: 11px; background: transparent;")
+        self._active_sub.setObjectName("active_game_sub")
         self._active_backup_btn = QPushButton(t("buttons.backup_now"))
         self._active_backup_btn.setObjectName("primary_btn")
         self._active_backup_btn.setVisible(False)
@@ -392,30 +396,8 @@ class OverviewPage(QWidget, ThemedMixin):
         self._build_body(root)
 
     def _update_banner_style(self):
-        """Register the active-banner gradient so it re-themes in place.
-
-        The gradient start/border are theme-dependent; the whole style is
-        recomputed at apply time (is_dark() + palette() read live), so a
-        light/dark switch re-applies it without a widget rebuild.
-        """
-        from ui.styles.theme import get_theme_manager
-
-        def _banner_style():
-            if get_theme_manager().is_dark():
-                bg_start, border_c = "#0f1a06", "#1e3a0a"
-            else:
-                bg_start, border_c = "#f0f8e0", "#d0e8b0"
-            return f"""
-                QFrame#active_banner {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                        stop:0 {bg_start},stop:1 {palette('bg')});
-                    border: 1px solid {border_c};
-                    border-left: 3px solid {palette('accent')};
-                    border-radius: 8px;
-                }}
-            """
-
-        self._sty(self._active_banner, _banner_style)
+        """Nothing to do: #active_banner (gradient, border, accent edge) is
+        defined per theme in DARK_THEME/LIGHT_THEME."""
 
     def _provider_style(self) -> str:
         """Provider-label style — colour depends on the current online state."""
@@ -478,21 +460,17 @@ class OverviewPage(QWidget, ThemedMixin):
         activity_col = QVBoxLayout()
         activity_col.setSpacing(8)
         self._activity_header = QLabel(t("overview.recent_activity"))
-        self._sty(self._activity_header, lambda: (
-            f"color: {palette('text_muted')}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;"
-        ))
+        self._activity_header.setObjectName("section_header")
         activity_col.addWidget(self._activity_header)
 
         self._activity_frame = QFrame()
         self._activity_frame.setFrameShape(QFrame.Shape.NoFrame)
-        self._sty(self._activity_frame, lambda: (
-            f"QFrame {{ background: {palette('bg_card')}; border: 1px solid {palette('border')}; border-radius: 8px; }}"
-        ))
+        self._activity_frame.setObjectName("panel_card")
         self._activity_layout = QVBoxLayout(self._activity_frame)
         self._activity_layout.setContentsMargins(12, 8, 12, 8)
         self._activity_layout.setSpacing(0)
         self._activity_empty = QLabel(t("overview.no_activity"))
-        self._sty(self._activity_empty, lambda: f"color: {palette('text_disabled')}; font-size: 12px; padding: 16px;")
+        self._activity_empty.setObjectName("empty_hint")
         self._activity_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # NO setVisible(True) here: the label has no parent yet, so it
         # would be SHOWN AS A TOP-LEVEL WINDOW for one frame (the startup
@@ -507,7 +485,7 @@ class OverviewPage(QWidget, ThemedMixin):
         activity_scroll.setFrameShape(QFrame.Shape.NoFrame)
         activity_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         activity_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        activity_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        activity_scroll.setObjectName("activity_scroll")
         activity_scroll.setWidget(self._activity_frame)
         # Minimum width keeps the column readable at small window sizes
         activity_scroll.setMinimumWidth(260)
@@ -519,9 +497,7 @@ class OverviewPage(QWidget, ThemedMixin):
         donut_col = QVBoxLayout()
         donut_col.setSpacing(4)
         donut_header = QLabel(t("overview.sync_distribution"))
-        self._sty(donut_header, lambda: (
-            f"color: {palette('text_muted')}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;"
-        ))
+        donut_header.setObjectName("section_header")
         donut_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         donut_col.addWidget(donut_header)
         self._donut_header = donut_header
@@ -535,9 +511,7 @@ class OverviewPage(QWidget, ThemedMixin):
         actions_col = QVBoxLayout()
         actions_col.setSpacing(8)
         self._actions_header = QLabel(t("overview.quick_actions"))
-        self._sty(self._actions_header, lambda: (
-            f"color: {palette('text_muted')}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;"
-        ))
+        self._actions_header.setObjectName("section_header")
         actions_col.addWidget(self._actions_header)
 
         self._action_btns: list[tuple[QPushButton, str]] = []   # (button, i18n key) for retranslation
@@ -551,14 +525,7 @@ class OverviewPage(QWidget, ThemedMixin):
             btn.setMinimumHeight(34)
             btn.setFixedWidth(160)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            # Style references only palette() (no loop-local var) — a plain lambda
-            # is correct; each btn is registered separately via its widget arg.
-            self._sty(btn, lambda: (
-                f"QPushButton {{ text-align:left; padding-left:14px; "
-                f"background:{palette('bg_card')}; border:1px solid {palette('border')}; border-radius:6px; "
-                f"color:{palette('text_secondary')}; font-size:12px; }} "
-                f"QPushButton:hover {{ background:{palette('bg_elevated')}; border-color:{palette('accent')}; color:{palette('accent')}; }}"
-            ))
+            btn.setObjectName("quick_action_btn")
             btn.clicked.connect(cb)
             actions_col.addWidget(btn)
 
@@ -576,16 +543,12 @@ class OverviewPage(QWidget, ThemedMixin):
 
         # Backup activity bar chart (full width, below body)
         bar_header = QLabel(t("overview.backup_activity"))
-        self._sty(bar_header, lambda: (
-            f"color: {palette('text_muted')}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;"
-        ))
+        bar_header.setObjectName("section_header")
         self._bar_header = bar_header
         root.addWidget(bar_header)
 
         self._bar_chart = BackupBarChart()
-        self._sty(self._bar_chart, lambda: (
-            f"background: {palette('bg_card')}; border: 1px solid {palette('border')}; border-radius: 8px;"
-        ))
+        self._bar_chart.setObjectName("panel_card")
         root.addWidget(self._bar_chart)
 
     # ── Refresh ───────────────────────────────────────────────────────────────

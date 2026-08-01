@@ -168,7 +168,9 @@ class _ManualPathRow(QFrame):
         self._scan_item = None
 
     def _remove_self(self):
-        self.setParent(None)
+        # Hiding takes the row out of the layout just as well, and does not
+        # leave it standing as a window of its own in the meantime.
+        self.hide()
         self.deleteLater()
 
     def is_included(self) -> bool:
@@ -405,11 +407,16 @@ class ManualPathDialog(QDialog):
 
     def _live_rows(self) -> list:
         """Rows still on screen — a removed row deletes itself, so the list is
-        filtered rather than trusted."""
+        filtered rather than trusted. Being hidden is what marks it gone: it
+        hides and waits to be deleted, rather than detaching itself, which
+        would leave it standing as a window of its own in the meantime.
+        isHidden asks whether THIS row was hidden, not whether the dialog it
+        sits in happens to be, so it holds before the dialog is shown too.
+        """
         alive = []
         for row in self._rows:
             try:
-                if row.parent() is not None and row.is_included():
+                if not row.isHidden() and row.is_included():
                     alive.append(row)
             except RuntimeError:
                 continue      # already deleted by Qt

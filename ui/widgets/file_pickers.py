@@ -160,3 +160,60 @@ def pick_folder(parent, caption: str, start_dir: str = "") -> str:
         if target and Path(target).is_dir():
             return target
     return chosen
+
+
+class FilePickerDialog(_LnkAwareDialog):
+    """Pick any existing file, with the same shortcut behaviour."""
+
+    def __init__(self, parent, caption: str, name_filter: str):
+        super().__init__(parent, caption)
+        self.setFileMode(QFileDialog.FileMode.ExistingFile)
+        if name_filter:
+            self.setNameFilter(name_filter)
+
+
+class SavePickerDialog(_LnkAwareDialog):
+    """Choose where to save a new file."""
+
+    def __init__(self, parent, caption: str, name_filter: str):
+        super().__init__(parent, caption)
+        self.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        self.setFileMode(QFileDialog.FileMode.AnyFile)
+        # Explicit rather than relying on the default: picking a name that
+        # already exists must ask before it replaces someone's file.
+        self.setOption(QFileDialog.Option.DontConfirmOverwrite, False)
+        if name_filter:
+            self.setNameFilter(name_filter)
+
+
+def _run_picker(dialog, start_dir: str) -> str:
+    if start_dir:
+        try:
+            if Path(start_dir).is_dir():
+                dialog.setDirectory(start_dir)
+        except OSError:
+            pass
+    if dialog.exec() != QFileDialog.DialogCode.Accepted:
+        return ""
+    selected = dialog.selectedFiles()
+    return selected[0] if selected else ""
+
+
+def pick_file(parent, caption: str, name_filter: str = "",
+              start_dir: str = "") -> str:
+    """Shared any-file picker. Returns "" when cancelled."""
+    return _run_picker(FilePickerDialog(parent, caption, name_filter), start_dir)
+
+
+def pick_save_path(parent, caption: str, name_filter: str = "",
+                   default_name: str = "", start_dir: str = "") -> str:
+    """Shared "save as" picker. Returns "" when cancelled."""
+    dialog = SavePickerDialog(parent, caption, name_filter)
+    if default_name:
+        dialog.selectFile(default_name)
+        # Typing a bare name must not produce an extension-less file: it would
+        # then be filtered out of the very dialog used to open it again.
+        suffix = Path(default_name).suffix.lstrip(".")
+        if suffix:
+            dialog.setDefaultSuffix(suffix)
+    return _run_picker(dialog, start_dir)

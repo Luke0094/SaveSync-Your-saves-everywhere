@@ -125,7 +125,9 @@ class _CandidateRow(QFrame):
         self._revalidate()
 
     def _remove_self(self):
-        self.setParent(None)
+        # Hiding takes the row out of the layout just as well, and does not
+        # leave it standing as a window of its own in the meantime.
+        self.hide()
         self.deleteLater()
 
     def _browse(self):
@@ -321,7 +323,10 @@ class ExeScanDialog(QDialog):
     def _clear_rows(self):
         for row in self._rows:
             try:
-                row.setParent(None)
+                # Hidden, not detached: a widget with no parent is a window of
+                # its own until deleteLater comes round, and one that lives
+                # even for an instant can be drawn on screen.
+                row.hide()
                 row.deleteLater()
             except RuntimeError:
                 pass
@@ -329,10 +334,16 @@ class ExeScanDialog(QDialog):
         self._empty_lbl.setVisible(True)
 
     def _live_rows(self) -> list:
+        """Rows still on screen. A removed row hides itself and waits to be
+        deleted, so being hidden is what marks it gone — not being detached,
+        which would leave it standing as a window of its own in the meantime.
+        isHidden asks whether THIS row was hidden, not whether the dialog it
+        sits in happens to be, so it holds before the dialog is shown too.
+        """
         alive = []
         for row in self._rows:
             try:
-                if row.parent() is not None and row.is_included():
+                if not row.isHidden() and row.is_included():
                     alive.append(row)
             except RuntimeError:
                 continue

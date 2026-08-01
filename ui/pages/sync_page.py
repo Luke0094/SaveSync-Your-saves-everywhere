@@ -149,8 +149,7 @@ class ProviderCredentialForm(QWidget, ThemedMixin):
                 for i, step in enumerate(steps, 1):
                     step_lbl = QLabel(f"<b>{i}.</b> {step}")
                     step_lbl.setWordWrap(True)
-                    self._sty(step_lbl, lambda: f"color:{palette('text_secondary')};font-size:11px;"
-                                                f"background:transparent;")
+                    step_lbl.setObjectName("setup_step")
                     step_lbl.setOpenExternalLinks(True)
                     step_lbl.setTextFormat(Qt.TextFormat.RichText)
                     guide_layout.addWidget(step_lbl)
@@ -186,7 +185,7 @@ class ProviderCredentialForm(QWidget, ThemedMixin):
         col.addWidget(widget)
         lbl = QLabel(hint)
         lbl.setWordWrap(True)
-        self._sty(lbl, lambda: f"color:{palette('text_hint')};font-size:10px;")
+        lbl.setObjectName("form_hint")
         col.addWidget(lbl)
         return wrapper
 
@@ -368,7 +367,7 @@ class QuickConnectCard(QFrame, ThemedMixin):
                                     f"background:transparent;")
         info.addWidget(name_lbl)
         path_lbl = QLabel(path)
-        self._sty(path_lbl, lambda: f"color:{palette('text_hint')};font-size:10px;background:transparent;")
+        path_lbl.setObjectName("form_hint")
         info.addWidget(path_lbl)
         card_layout.addLayout(info, 1)
 
@@ -461,7 +460,7 @@ class SyncPage(QWidget, ThemedMixin):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
-        content.setStyleSheet("background: transparent;")
+        content.setObjectName("transparent_bg")
         layout  = QVBoxLayout(content)
         layout.setSpacing(20)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -552,15 +551,9 @@ class SyncPage(QWidget, ThemedMixin):
         root.addWidget(scroll)
 
     def _make_group(self, title: str) -> QGroupBox:
-        g = QGroupBox(title)
-        self._sty(g, lambda: f"""
-            QGroupBox {{ color: {palette('text_muted')}; font-size: 11px; font-weight: 600;
-                        letter-spacing: 0.5px; border: 1px solid {palette('border')};
-                        border-radius: 8px; margin-top: 8px; padding: 16px; }}
-            QGroupBox::title {{ subcontrol-origin: margin; left: 12px; top: -6px;
-                               background: {palette('bg')}; padding: 0 4px; }}
-        """)
-        return g
+        """A sync section. Styled by the theme's QGroupBox rule, same as the
+        settings sections — nothing to apply here or on a theme switch."""
+        return QGroupBox(title)
 
     # ── Quick-connect cards ──────────────────────────────────────────────────
 

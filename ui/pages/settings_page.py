@@ -25,16 +25,9 @@ from ui.widgets.hotkey_edit import HotkeyEdit
 
 
 def _group(title: str) -> QGroupBox:
-    g = QGroupBox(title)
-    g.setStyleSheet(f"""
-        QGroupBox {{ color: {palette('text_muted')}; font-size: 11px; font-weight: 600;
-                    letter-spacing: 0.5px; border: 1px solid {palette('border')};
-                    border-radius: 8px; margin-top: 8px;
-                    padding: 16px 16px 16px 16px; }}
-        QGroupBox::title {{ subcontrol-origin: margin; left: 12px; top: -6px;
-                           background: {palette('bg')}; padding: 0 4px; }}
-    """)
-    return g
+    """A settings section. The look is the theme's QGroupBox rule — there is
+    nothing to style here, and nothing to re-apply on a theme switch."""
+    return QGroupBox(title)
 
 
 class SettingsPage(QWidget):
@@ -72,7 +65,7 @@ class SettingsPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
-        content.setStyleSheet("background: transparent;")
+        content.setObjectName("transparent_bg")
         self._scroll_layout = QVBoxLayout(content)
         self._scroll_layout.setSpacing(16)
         self._scroll_layout.setContentsMargins(0, 0, 0, 0)
@@ -84,6 +77,7 @@ class SettingsPage(QWidget):
 
         self._lang_combo = QComboBox()
         self._lang_combo.setMaxVisibleItems(10)
+        self._lang_combo.setToolTip(t("settings.language_tooltip"))
         _display_fallback = {"en": "English", "it": "Italiano"}
         engine = get_engine()
         locale_names = {}
@@ -114,6 +108,7 @@ class SettingsPage(QWidget):
 
         self._theme_combo = QComboBox()
         self._theme_combo.setMaxVisibleItems(10)
+        self._theme_combo.setToolTip(t("settings.theme_tooltip"))
         self._theme_combo.addItem(t("settings.theme_dark"),  "dark")
         self._theme_combo.addItem(t("settings.theme_light"), "light")
         self._theme_combo.currentIndexChanged.connect(self._on_theme_change)
@@ -128,8 +123,10 @@ class SettingsPage(QWidget):
         beh_form.setSpacing(14)
 
         self._startup_cb = QCheckBox(t("settings.launch_on_startup"))
+        self._startup_cb.setToolTip(t("settings.launch_on_startup_tooltip"))
         beh_form.addRow("", self._startup_cb)
         self._tray_cb = QCheckBox(t("settings.minimize_to_tray"))
+        self._tray_cb.setToolTip(t("settings.minimize_to_tray_tooltip"))
         beh_form.addRow("", self._tray_cb)
         self._hide_on_game_cb = QCheckBox(t("settings.hide_to_tray_on_game_launch"))
         self._hide_on_game_cb.setToolTip(t("settings.hide_to_tray_on_game_launch_tooltip"))
@@ -138,37 +135,14 @@ class SettingsPage(QWidget):
         self._backup_on_exit_cb.setToolTip(t("settings.backup_on_exit_tooltip"))
         beh_form.addRow("", self._backup_on_exit_cb)
         self._auto_sync_cb = QCheckBox(t("settings.auto_sync_after_backup"))
+        self._auto_sync_cb.setToolTip(t("settings.auto_sync_after_backup_tooltip"))
         beh_form.addRow("", self._auto_sync_cb)
+        # The explanation is on the option itself — hovering the label is what
+        # people try first, and a "?" next to one option out of a dozen just
+        # raised the question of why the others didn't have one.
         self._auto_scan_cb = QCheckBox(t("settings.auto_scan_on_exit"))
-        # Circled ? button shows tooltip explanation inline
-        self._auto_scan_help_btn = QPushButton("?")
-        self._auto_scan_help_btn.setFixedSize(18, 18)
-        self._auto_scan_help_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        self._auto_scan_help_btn.setStyleSheet(
-            "QPushButton{border:1px solid #888;border-radius:9px;font-size:10px;"
-            "font-weight:bold;background:transparent;color:#888;padding:0;}"
-            "QPushButton:hover{border-color:#ccc;color:#ccc;background:rgba(255,255,255,0.07);}"
-        )
-        self._auto_scan_help_btn.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
-        self._auto_scan_help_btn.clicked.connect(
-            lambda: __import__('PySide6.QtWidgets', fromlist=['QToolTip']).QToolTip.showText(
-                self._auto_scan_help_btn.mapToGlobal(
-                    self._auto_scan_help_btn.rect().bottomLeft()
-                ),
-                t("settings.auto_scan_on_exit_tooltip"),
-                self._auto_scan_help_btn,
-            )
-        )
-        _auto_scan_row = QHBoxLayout()
-        _auto_scan_row.setSpacing(4)
-        _auto_scan_row.setContentsMargins(0, 0, 0, 0)
-        _auto_scan_row.addWidget(self._auto_scan_cb)
-        _auto_scan_row.addWidget(self._auto_scan_help_btn)
-        _auto_scan_row.addStretch()
-        _auto_scan_container = QWidget()
-        _auto_scan_container.setLayout(_auto_scan_row)
-        _auto_scan_container.setContentsMargins(0, 0, 0, 0)
-        beh_form.addRow("", _auto_scan_container)
+        self._auto_scan_cb.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
+        beh_form.addRow("", self._auto_scan_cb)
 
         # ── Per-game suppression list ─────────────────────────────────────────
         # Shows games that have "don't confirm scan" or "don't show notification"
@@ -209,10 +183,13 @@ class SettingsPage(QWidget):
         self._hotkey_lbl = QLabel(t("settings.hotkey"))
         ov_form.addRow(self._hotkey_lbl, self._hotkey_edit)
         self._overlay_launch_cb = QCheckBox(t("settings.show_overlay_on_launch"))
+        self._overlay_launch_cb.setToolTip(t("settings.show_overlay_on_launch_tooltip"))
         ov_form.addRow("", self._overlay_launch_cb)
         self._overlay_cloud_cb = QCheckBox(t("settings.show_overlay_on_cloud"))
+        self._overlay_cloud_cb.setToolTip(t("settings.show_overlay_on_cloud_tooltip"))
         ov_form.addRow("", self._overlay_cloud_cb)
         self._overlay_backup_cb = QCheckBox(t("settings.show_overlay_on_backup"))
+        self._overlay_backup_cb.setToolTip(t("settings.show_overlay_on_backup_tooltip"))
         ov_form.addRow("", self._overlay_backup_cb)
 
         self._scroll_layout.addWidget(ov_grp)
@@ -224,10 +201,12 @@ class SettingsPage(QWidget):
 
         self._max_backups_spin = QSpinBox()
         self._max_backups_spin.setRange(1, 100)
+        self._max_backups_spin.setToolTip(t("settings.max_backups_tooltip"))
         self._max_backups_lbl = QLabel(t("settings.max_backups"))
         bk_form.addRow(self._max_backups_lbl, self._max_backups_spin)
         self._retention_spin = QSpinBox()
         self._retention_spin.setRange(1, 365)
+        self._retention_spin.setToolTip(t("settings.backup_retention_tooltip"))
         self._retention_lbl = QLabel(t("settings.backup_retention"))
         bk_form.addRow(self._retention_lbl, self._retention_spin)
         self._min_kept_spin = QSpinBox()
@@ -238,10 +217,44 @@ class SettingsPage(QWidget):
         self._max_size_spin = QSpinBox()
         self._max_size_spin.setRange(10, 4096)
         self._max_size_spin.setSuffix(" MB")
+        self._max_size_spin.setToolTip(t("settings.max_size_mb_tooltip"))
         self._max_size_lbl = QLabel(t("settings.max_size_mb"))
         bk_form.addRow(self._max_size_lbl, self._max_size_spin)
 
+        # Periodic integrity check — the archive is the whole point of a
+        # backup, and a damaged one is worth finding before it is needed.
+        self._verify_cb = QCheckBox(t("settings.backup_verify"))
+        self._verify_cb.setToolTip(t("settings.backup_verify_tooltip"))
+        bk_form.addRow("", self._verify_cb)
+        self._verify_days_spin = QSpinBox()
+        self._verify_days_spin.setRange(1, 365)
+        self._verify_days_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._verify_days_spin.setToolTip(t("settings.backup_verify_interval_tooltip"))
+        self._verify_days_lbl = QLabel(t("settings.backup_verify_interval"))
+        bk_form.addRow(self._verify_days_lbl, self._verify_days_spin)
+        self._verify_cb.toggled.connect(self._verify_days_spin.setEnabled)
+        self._verify_cb.toggled.connect(self._verify_days_lbl.setEnabled)
+
         self._scroll_layout.addWidget(bk_grp)
+
+        # The save editor keeps a copy of a file before it writes to it. That
+        # is a different thing from the backup policy above — one edited file,
+        # not a whole save folder — so it gets its own rules.
+        ed_grp = _group(t("settings.section_save_edit_copies"))
+        ed_form = QFormLayout(ed_grp)
+        ed_form.setSpacing(14)
+        self._edit_copies_spin = QSpinBox()
+        self._edit_copies_spin.setRange(1, 50)
+        self._edit_copies_spin.setToolTip(t("settings.save_edit_copies_tooltip"))
+        self._edit_copies_lbl = QLabel(t("settings.save_edit_copies"))
+        ed_form.addRow(self._edit_copies_lbl, self._edit_copies_spin)
+        self._edit_copy_days_spin = QSpinBox()
+        self._edit_copy_days_spin.setRange(1, 365)
+        self._edit_copy_days_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._edit_copy_days_spin.setToolTip(t("settings.save_edit_copy_days_tooltip"))
+        self._edit_copy_days_lbl = QLabel(t("settings.save_edit_copy_days"))
+        ed_form.addRow(self._edit_copy_days_lbl, self._edit_copy_days_spin)
+        self._scroll_layout.addWidget(ed_grp)
 
         # ── Process monitor ───────────────────────────────────────────────────
         pm_grp = _group(t("settings.section_process_monitor"))
@@ -337,7 +350,27 @@ class SettingsPage(QWidget):
         self._hints_edit = QPlainTextEdit()
         self._hints_edit.setFixedHeight(90)
         self._hints_edit.setPlaceholderText(t("settings.save_hints_desc"))
+        self._hints_edit.setToolTip(t("settings.save_hints_tooltip"))
         det_form.addRow("", self._hints_edit)
+
+        # Temporal correlation — opt-in. It infers association from timing
+        # alone, so the window is exposed too: the tighter it is, the more it
+        # demands a genuine simultaneous double-write rather than a
+        # coincidence.
+        self._correlation_cb = QCheckBox(t("settings.save_correlation"))
+        self._correlation_cb.setToolTip(t("settings.save_correlation_tooltip"))
+        det_form.addRow("", self._correlation_cb)
+
+        self._correlation_spin = QSpinBox()
+        self._correlation_spin.setRange(100, 10000)
+        self._correlation_spin.setSingleStep(100)
+        self._correlation_spin.setSuffix(" ms")
+        self._correlation_spin.setToolTip(t("settings.save_correlation_window_tooltip"))
+        self._correlation_lbl = QLabel(t("settings.save_correlation_window"))
+        det_form.addRow(self._correlation_lbl, self._correlation_spin)
+        # The window only means anything while the option is on.
+        self._correlation_cb.toggled.connect(self._correlation_spin.setEnabled)
+        self._correlation_cb.toggled.connect(self._correlation_lbl.setEnabled)
 
         self._scroll_layout.addWidget(det_grp)
 
@@ -439,7 +472,8 @@ class SettingsPage(QWidget):
         scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         # Keep references for theme refresh
-        self._groups = [app_grp, beh_grp, ov_grp, bk_grp, pm_grp, self._suppression_group,
+        self._groups = [app_grp, beh_grp, ov_grp, bk_grp, ed_grp, pm_grp,
+                        self._suppression_group,
                         self._excluded_paths_group, det_grp, transfer_grp]
         # (group, i18n key) pairs for retranslating the section titles in
         # place — suppression/excluded groups are retitled separately in
@@ -449,6 +483,7 @@ class SettingsPage(QWidget):
             (beh_grp,      "settings.section_behaviour"),
             (ov_grp,       "settings.section_overlay"),
             (bk_grp,       "settings.section_backup_policy"),
+            (ed_grp,       "settings.section_save_edit_copies"),
             (pm_grp,       "settings.section_process_monitor"),
             (det_grp,      "settings.section_save_detection"),
             (transfer_grp, "settings.section_config_transfer"),
@@ -457,24 +492,15 @@ class SettingsPage(QWidget):
         # Connect change signals
         self._connect_change_signals()
 
-    def _apply_save_btn_style(self, btn):
-        btn.setStyleSheet(
-            f"QPushButton {{ background:{palette('accent')}; color:{palette('accent_text')}; "
-            f"border:1px solid {palette('accent')}; border-radius:6px; padding:7px 16px; "
-            f"font-size:12px; font-weight:600; }} "
-            f"QPushButton:hover {{ background:{palette('accent_hover')}; }} "
-            f"QPushButton:disabled {{ background:{palette('bg_elevated')}; color:{palette('text_disabled')}; "
-            f"border-color:{palette('border')}; }}"
-        )
+    @staticmethod
+    def _apply_save_btn_style(btn):
+        """Primary form button — painted by the theme's #form_primary_btn."""
+        btn.setObjectName("form_primary_btn")
 
-    def _apply_cancel_btn_style(self, btn):
-        btn.setStyleSheet(
-            f"QPushButton {{ background:{palette('bg')}; color:{palette('text_secondary')}; "
-            f"border:1px solid {palette('border')}; border-radius:6px; padding:7px 16px; "
-            f"font-size:12px; }} "
-            f"QPushButton:hover {{ border-color:{palette('accent')}; color:{palette('accent')}; }} "
-            f"QPushButton:disabled {{ color:{palette('text_disabled')}; border-color:{palette('border')}; }}"
-        )
+    @staticmethod
+    def _apply_cancel_btn_style(btn):
+        """Secondary form button — theme rule #form_secondary_btn."""
+        btn.setObjectName("form_secondary_btn")
 
     def _apply_inline_row_style(self):
         self._inline_row.setStyleSheet(
@@ -497,28 +523,13 @@ class SettingsPage(QWidget):
             f"QPushButton:hover {{ background:{palette('warning')}; color:{palette('accent_text')}; }}"
         )
 
-    @staticmethod
-    def _search_box_style() -> str:
-        """Theme-aware QSS for the list search boxes (built once per call so
-        it always reflects the active palette)."""
-        return (
-            f"QLineEdit{{background:{palette('bg_input')};border:1px solid {palette('border')};"
-            f"border-radius:4px;padding:0 6px;font-size:11px;color:{palette('text')};}}"
-        )
-
     def _apply_suppressed_list_style(self):
         self._suppressed_list.setStyleSheet(
             f"QListWidget{{background:{palette('bg_card')};border:1px solid {palette('accent')};border-radius:6px;}}"
             f"QListWidget::item{{padding:4px 8px;color:{palette('text_secondary')};font-size:11px;}}"
             f"QListWidget::item:selected{{background:{palette('bg_elevated')};color:{palette('error')};}}"
         )
-        # Its search box carries the same build-time palette snapshot problem.
-        sb = getattr(self, '_suppressed_search', None)
-        if sb is not None:
-            try:
-                sb.setStyleSheet(self._search_box_style())
-            except RuntimeError:
-                pass
+        # Its search box is named #list_search and needs nothing here.
 
     def _apply_prefs_section_styles(self):
         """Single theme-aware styler for the 'game preferences' and 'excluded
@@ -528,18 +539,17 @@ class SettingsPage(QWidget):
         inline styles must be re-applied here or they keep old-theme colors.
         """
         _hint = f"color:{palette('text_muted')};font-size:10px;"
-        _search = self._search_box_style()
         _list = (
             f"QListWidget{{background:{palette('bg_input')};border:1px solid {palette('border')};"
             f"border-radius:4px;font-size:11px;color:{palette('text')};}}"
             f"QListWidget::item{{padding:3px 6px;}}"
             f"QListWidget::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
+        # The two search boxes are absent from this list on purpose: they are
+        # named #list_search and the theme paints them.
         for w, style in (
             (getattr(self, '_supp_hint', None), _hint),
             (getattr(self, '_exp_hint', None), _hint),
-            (getattr(self, '_suppression_search', None), _search),
-            (getattr(self, '_excluded_paths_search', None), _search),
             (getattr(self, '_suppression_list', None), _list),
             (getattr(self, '_excluded_paths_list', None), _list),
         ):
@@ -561,9 +571,15 @@ class SettingsPage(QWidget):
         self._overlay_backup_cb.stateChanged.connect(self._mark_dirty)
         self._max_backups_spin.valueChanged.connect(self._mark_dirty)
         self._retention_spin.valueChanged.connect(self._mark_dirty)
+        self._edit_copies_spin.valueChanged.connect(self._mark_dirty)
+        self._edit_copy_days_spin.valueChanged.connect(self._mark_dirty)
         self._min_kept_spin.valueChanged.connect(self._mark_dirty)
         self._max_size_spin.valueChanged.connect(self._mark_dirty)
         self._poll_spin.valueChanged.connect(self._mark_dirty)
+        self._verify_cb.stateChanged.connect(self._mark_dirty)
+        self._verify_days_spin.valueChanged.connect(self._mark_dirty)
+        self._correlation_cb.stateChanged.connect(self._mark_dirty)
+        self._correlation_spin.valueChanged.connect(self._mark_dirty)
         self._hints_edit.textChanged.connect(self._mark_dirty)
         self._hotkey_edit.textChanged.connect(self._mark_dirty)
 
@@ -574,7 +590,7 @@ class SettingsPage(QWidget):
         box.setPlaceholderText(t("settings.search_list"))
         box.setFixedHeight(26)
         box.setClearButtonEnabled(True)
-        box.setStyleSheet(self._search_box_style())
+        box.setObjectName("list_search")
         return box
 
     @staticmethod
@@ -681,6 +697,8 @@ class SettingsPage(QWidget):
                 kinds.append(t("settings.suppression_backup_notif"))
             if "sync" in notif_types:
                 kinds.append(t("settings.suppression_sync_notif"))
+            if "regression" in notif_types:
+                kinds.append(t("settings.suppression_regression_notif"))
             if game_id in cloud_no_local:
                 kinds.append(t("settings.suppression_cloud_no_local"))
 
@@ -781,9 +799,15 @@ class SettingsPage(QWidget):
             "overlay_backup": self._overlay_backup_cb.isChecked(),
             "max_backups": self._max_backups_spin.value(),
             "retention": self._retention_spin.value(),
+            "edit_copies": self._edit_copies_spin.value(),
+            "edit_copy_days": self._edit_copy_days_spin.value(),
             "min_kept": self._min_kept_spin.value(),
             "max_size": self._max_size_spin.value(),
             "poll": self._poll_spin.value(),
+            "verify": self._verify_cb.isChecked(),
+            "verify_days": self._verify_days_spin.value(),
+            "correlation": self._correlation_cb.isChecked(),
+            "correlation_window": self._correlation_spin.value(),
             "ignored": "",  # managed via unified process list, not a textarea
             "hints": self._hints_edit.toPlainText(),
         }
@@ -830,9 +854,23 @@ class SettingsPage(QWidget):
         self._overlay_backup_cb.setChecked(config.get("show_overlay_on_backup", True))
         self._max_backups_spin.setValue(config.get("max_local_backups", 6))
         self._retention_spin.setValue(config.get("backup_retention_days", 30))
+        self._edit_copies_spin.setValue(config.get("save_edit_copies", 3))
+        self._edit_copy_days_spin.setValue(config.get("save_edit_copy_days", 7))
         self._min_kept_spin.setValue(config.get("min_kept_backups", 3))
         self._max_size_spin.setValue(config.get("max_backup_size_mb", 512))
         self._poll_spin.setValue(config.get("process_poll_interval", 1))
+        _ver_on = config.get("backup_verify_enabled", True)
+        self._verify_cb.setChecked(_ver_on)
+        self._verify_days_spin.setValue(config.get("backup_verify_interval_days", 7))
+        self._verify_days_spin.setEnabled(_ver_on)
+        self._verify_days_lbl.setEnabled(_ver_on)
+        _corr_on = config.get("save_correlation_enabled", False)
+        self._correlation_cb.setChecked(_corr_on)
+        self._correlation_spin.setValue(config.get("save_correlation_window_ms", 1000))
+        # toggled doesn't fire when the state doesn't change, so the enabled
+        # state of the window row is applied explicitly on load.
+        self._correlation_spin.setEnabled(_corr_on)
+        self._correlation_lbl.setEnabled(_corr_on)
         # Unified ignored-process list: suppressed_overlay_apps (auto, full path)
         # + any legacy ignored_processes entries that have a path separator
         self._load_unified_ignored_list()
@@ -870,9 +908,15 @@ class SettingsPage(QWidget):
         config.set("show_overlay_on_backup", self._overlay_backup_cb.isChecked())
         config.set("max_local_backups",      self._max_backups_spin.value())
         config.set("backup_retention_days",  self._retention_spin.value())
+        config.set("save_edit_copies",       self._edit_copies_spin.value())
+        config.set("save_edit_copy_days",    self._edit_copy_days_spin.value())
         config.set("min_kept_backups",       self._min_kept_spin.value())
         config.set("max_backup_size_mb",     self._max_size_spin.value())
         config.set("process_poll_interval",  self._poll_spin.value())
+        config.set("backup_verify_enabled",      self._verify_cb.isChecked())
+        config.set("backup_verify_interval_days", self._verify_days_spin.value())
+        config.set("save_correlation_enabled",   self._correlation_cb.isChecked())
+        config.set("save_correlation_window_ms", self._correlation_spin.value())
 
         # ignored_processes: keep existing entries untouched; removals happen
         # via _unblock_selected which removes from both lists atomically.
@@ -1159,11 +1203,10 @@ class SettingsPage(QWidget):
         dlg.exec()
 
     def _on_export_config(self):
-        from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getSaveFileName(
-            self, t("settings.export_config"), "savesync_config.savesync",
-            "SaveSync Config (*.savesync)",
-        )
+        from ui.widgets.file_pickers import pick_save_path
+        path = pick_save_path(
+            self, t("settings.export_config"), "SaveSync Config (*.savesync)",
+            default_name="savesync_config.savesync")
         if not path:
             return
         from core.config_transfer import export_config_to_file, save_config_snapshot
@@ -1185,11 +1228,9 @@ class SettingsPage(QWidget):
                                 t("settings.export_failed", error="I/O error"))
 
     def _on_import_config(self):
-        from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getOpenFileName(
-            self, t("settings.import_config"), "",
-            "SaveSync Config (*.savesync)",
-        )
+        from ui.widgets.file_pickers import pick_file
+        path = pick_file(self, t("settings.import_config"),
+                         "SaveSync Config (*.savesync)")
         if not path:
             return
         from core.config_transfer import import_config_from_file, preview_import, apply_import
@@ -1301,6 +1342,10 @@ class SettingsPage(QWidget):
             "min_kept_backups":       3,
             "max_backup_size_mb":     512,
             "process_poll_interval":  1,
+            "backup_verify_enabled":      True,
+            "backup_verify_interval_days": 7,
+            "save_correlation_enabled":   False,
+            "save_correlation_window_ms": 1000,
             "ignored_processes":      [],
             "save_folder_hints":      [],
             "suppressed_overlay_apps": [],
@@ -1349,26 +1394,14 @@ class SettingsPage(QWidget):
             self._mark_dirty()
 
     def _refresh_styles(self):
-        for g in self._groups:
-            g.setStyleSheet(f"""
-                QGroupBox {{ color: {palette('text_muted')}; font-size: 11px; font-weight: 600;
-                            letter-spacing: 0.5px; border: 1px solid {palette('border')};
-                            border-radius: 8px; margin-top: 8px;
-                            padding: 16px 16px 16px 16px; }}
-                QGroupBox::title {{ subcontrol-origin: margin; left: 12px; top: -6px;
-                                   background: {palette('bg')}; padding: 0 4px; }}
-            """)
+        # The section boxes need nothing: their look is the theme's QGroupBox
+        # rule, already re-resolved by the stylesheet swap.
         self._apply_suppressed_list_style()
         self._apply_prefs_section_styles()
         self._apply_inline_row_style()
         self._apply_footer_style()
-        self._apply_save_btn_style(self._inline_save)
-        self._apply_save_btn_style(self._save_btn)
-        self._apply_save_btn_style(self._export_btn)
-        self._apply_save_btn_style(self._import_btn)
-        self._apply_cancel_btn_style(self._inline_cancel)
-        self._apply_cancel_btn_style(self._cancel_btn)
-        self._apply_cancel_btn_style(self._history_btn)
+        # The form buttons need nothing: #form_primary_btn/#form_secondary_btn
+        # come from the theme. Only the reset button still carries its own.
         self._apply_reset_btn_style(self._inline_reset)
         self._saved_lbl.setStyleSheet(f"color: {palette('success')};")
         if not self._hotkey_edit._capturing:
@@ -1392,12 +1425,29 @@ class SettingsPage(QWidget):
         self._backup_on_exit_cb.setToolTip(t("settings.backup_on_exit_tooltip"))
         self._auto_sync_cb.setText(t("settings.auto_sync_after_backup"))
         self._auto_scan_cb.setText(t("settings.auto_scan_on_exit"))
-        self._auto_scan_help_btn.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
+        self._auto_scan_cb.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
+        self._lang_combo.setToolTip(t("settings.language_tooltip"))
+        self._theme_combo.setToolTip(t("settings.theme_tooltip"))
+        self._startup_cb.setToolTip(t("settings.launch_on_startup_tooltip"))
+        self._tray_cb.setToolTip(t("settings.minimize_to_tray_tooltip"))
+        self._auto_sync_cb.setToolTip(t("settings.auto_sync_after_backup_tooltip"))
+        self._overlay_launch_cb.setToolTip(t("settings.show_overlay_on_launch_tooltip"))
+        self._overlay_cloud_cb.setToolTip(t("settings.show_overlay_on_cloud_tooltip"))
+        self._overlay_backup_cb.setToolTip(t("settings.show_overlay_on_backup_tooltip"))
+        self._max_backups_spin.setToolTip(t("settings.max_backups_tooltip"))
+        self._retention_spin.setToolTip(t("settings.backup_retention_tooltip"))
+        self._max_size_spin.setToolTip(t("settings.max_size_mb_tooltip"))
+        self._hints_edit.setToolTip(t("settings.save_hints_tooltip"))
         self._overlay_launch_cb.setText(t("settings.show_overlay_on_launch"))
         self._overlay_cloud_cb.setText(t("settings.show_overlay_on_cloud"))
         self._overlay_backup_cb.setText(t("settings.show_overlay_on_backup"))
         self._max_backups_lbl.setText(t("settings.max_backups"))
         self._retention_lbl.setText(t("settings.backup_retention"))
+        self._edit_copies_lbl.setText(t("settings.save_edit_copies"))
+        self._edit_copies_spin.setToolTip(t("settings.save_edit_copies_tooltip"))
+        self._edit_copy_days_lbl.setText(t("settings.save_edit_copy_days"))
+        self._edit_copy_days_spin.setToolTip(t("settings.save_edit_copy_days_tooltip"))
+        self._edit_copy_days_spin.setSuffix(" " + t("settings.days_suffix"))
         self._min_kept_lbl.setText(t("settings.min_kept_backups"))
         self._min_kept_spin.setToolTip(t("settings.min_kept_backups_tooltip"))
         self._max_size_lbl.setText(t("settings.max_size_mb"))
@@ -1417,6 +1467,15 @@ class SettingsPage(QWidget):
 
         self._hints_lbl.setText(t("settings.save_hints"))
         self._hints_edit.setPlaceholderText(t("settings.save_hints_desc"))
+        self._verify_cb.setText(t("settings.backup_verify"))
+        self._verify_cb.setToolTip(t("settings.backup_verify_tooltip"))
+        self._verify_days_lbl.setText(t("settings.backup_verify_interval"))
+        self._verify_days_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._verify_days_spin.setToolTip(t("settings.backup_verify_interval_tooltip"))
+        self._correlation_cb.setText(t("settings.save_correlation"))
+        self._correlation_cb.setToolTip(t("settings.save_correlation_tooltip"))
+        self._correlation_lbl.setText(t("settings.save_correlation_window"))
+        self._correlation_spin.setToolTip(t("settings.save_correlation_window_tooltip"))
         self._excluded_paths_group.setTitle(t("settings.excluded_paths_title"))
         self._excluded_paths_search.setPlaceholderText(t("settings.search_list"))
         self._suppression_search.setPlaceholderText(t("settings.search_list"))

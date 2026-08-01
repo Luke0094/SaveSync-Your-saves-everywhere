@@ -10,7 +10,7 @@ from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Slot, Signal
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -29,6 +29,7 @@ from ui.pages.library_page import LibraryPage
 from ui.pages.sync_page import SyncPage
 from ui.pages.backups_page import BackupsPage
 from ui.pages.settings_page import SettingsPage
+from ui.pages.cheats_page import CheatsPage
 from ui.dialogs.add_game_dialog import AddGameDialog
 from ui.dialogs.auto_scan_dialog import show_auto_scan_dialog
 from core.config_manager import get_config
@@ -65,6 +66,12 @@ class NavButton(QPushButton):
 
 
 class MainWindow(CloudFlowsMixin, QMainWindow):
+    # Emitted from the integrity-sweep worker thread; the slot that shows the
+    # notice must run on the GUI thread, which a signal guarantees.
+    backup_verify_problems = Signal(int, int)   # bad, total
+    # Same reason: the regression check runs on a worker thread.
+    save_regression_found = Signal(str, str, bool)  # game_id, newest_backup_id, after_restore
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(t("app.name"))
@@ -171,6 +178,31 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._connect_orchestrator()
         self._connect_i18n()
         self._setup_cleanup()
+        self.backup_verify_problems.connect(self._on_backup_verify_problems)
+        self.save_regression_found.connect(self._on_save_regression)
+        # backup_id SaveSync itself last restored, per game — landing on that
+        # state is the intended outcome, not something to warn about.
+        self._last_restored: dict[str, str] = {}
+        # Games already warned about in the current episode. The post-restore
+        # check samples several times, and a regression that persists would
+        # otherwise raise the same prompt at every sample.
+        self._regression_warned: set = set()
+        # Shown but not yet acknowledged, per game: game_id -> (backup_id,
+        # after_restore). A warning the player never saw — the overlay was
+        # missed, or something else took the screen — must not be lost, so the
+        # hotkey re-summons it for as long as it sits here. Only the
+        # acknowledge button and an actual restore take it out.
+        self._pending_regression: dict[str, tuple[str, bool]] = {}
+        self._setup_backup_verify()
+        # A previous run may have died between suspending a game for a forced
+        # restore and resuming it. The game would still be frozen, with
+        # nothing on screen to explain why.
+        try:
+            from core.backup import resume_orphaned_process
+            if resume_orphaned_process():
+                self._status_bar.showMessage(t("backup.resumed_frozen_game"), 8000)
+        except Exception as e:
+            logger.debug(f"Orphaned-process resume check failed: {e}")
         
         # Store original window flags after all setup is complete
         self._original_window_flags = self.windowFlags()
@@ -244,6 +276,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._style_credits_btn()
         sl.addWidget(self._credits_btn)
 
+        # Under Credits, but a page like any other: same NavButton, same
+        # stack, same active highlight — only the position differs.
+        self._cheats_nav_btn = NavButton(t("cheats.nav"), "🎲")
+        _cheats_idx = 5
+        self._cheats_nav_btn.clicked.connect(
+            lambda _=False, idx=_cheats_idx: self._switch_page(idx))
+        self._nav_buttons.append(self._cheats_nav_btn)
+        sl.addWidget(self._cheats_nav_btn)
+
         # Status dot at bottom of sidebar
         self._sidebar_status = QLabel(t("status.offline"))
         self._sidebar_status.setStyleSheet(
@@ -267,9 +308,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._sync_page      = SyncPage()
         self._backups_page   = BackupsPage()
         self._settings_page  = SettingsPage()
+        self._cheats_page    = CheatsPage()
 
         for page in (self._overview_page, self._library_page,
-                     self._sync_page, self._backups_page, self._settings_page):
+                     self._sync_page, self._backups_page, self._settings_page,
+                     self._cheats_page):
             self._stack.addWidget(page)
 
         root.addWidget(self._stack, 1)
@@ -277,6 +320,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Wire library page signals
         self._library_page.add_game_requested.connect(self._show_add_game)
         self._library_page.scan_folder_requested.connect(self._show_scan_folder)
+        self._library_page.cheats_requested.connect(self._open_cheats_for)
         self._library_page.backup_requested.connect(self._backup_game)
         self._library_page.restore_requested.connect(self._restore_game_latest)
         self._library_page.remove_requested.connect(self._remove_game)
@@ -311,7 +355,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             f"QPushButton{{color:{palette('text_secondary')};background:transparent;"
             f"border:none;font-size:12px;font-weight:600;padding:9px 16px;"
             f"text-align:left;}}"
-            f"QPushButton:hover{{color:{palette('accent')};"
+            # Hovering must make the label EASIER to read, not harder. Turning
+            # it accent-green did the opposite in the light theme: green on
+            # the hover background reads at 3.3:1, so the text faded just as
+            # the pointer reached it. The theme's own text colour is what
+            # every other sidebar button uses — near-black on light, bright on
+            # dark — and it lands at fifteen to one either way.
+            f"QPushButton:hover{{color:{palette('text')};"
             f"background:{palette('bg_elevated')};}}"
         )
 
@@ -490,6 +540,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if config.get("window_maximized", False):
             self.showMaximized()
 
+    def _open_cheats_for(self, game_id: str):
+        """The library's "Cheats" entry: open the editor already on that
+        game, so the search step is skipped."""
+        if self._cheats_page.open_for_game(game_id):
+            self._switch_page(5)
+
     def _switch_page(self, idx: int):
         # If leaving settings page, auto-cancel unsaved changes
         if self._active_nav_idx == 4 and idx != 4:
@@ -499,12 +555,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             btn.set_active(i == idx)
         self._stack.setCurrentIndex(idx)
         self._active_nav_idx = idx
+        # A theme switch that happened while this page was hidden left its
+        # inline, palette-dependent styles on the old palette — apply them now,
+        # before it is painted.
+        page = self._stack.widget(idx)
+        if getattr(page, "_styles_stale", False):
+            self._refresh_page_styles(page)
         # Refresh overview when navigating to it
         if idx == 0:
             self._overview_page.refresh()
         # Refresh per-game suppression list when navigating to settings
         elif idx == 4 and hasattr(self._settings_page, '_load_suppression_list'):
             self._settings_page._load_suppression_list()
+        elif idx == 5:
+            self._cheats_page.on_page_enter()
 
     # ── Overlay ───────────────────────────────────────────────────────────────
 
@@ -568,6 +632,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._pending_unverified.pop((proc_name, game_id), None)   # answered
             get_monitor().confirm_unverified_match(
                 proc_name, game_id, accept=(action == "confirm_process_match"))
+            return
+        # Same shape ("game_id|backup_id"), so it is matched before anything
+        # that would read the context as an executable path.
+        if action in ("restore_newest", "force_restore"):
+            game_id, _, backup_id = context.partition("|")
+            self._pending_regression.pop(game_id, None)   # acted on
+            self._restore_after_regression(game_id, backup_id,
+                                           freeze=(action == "force_restore"))
+            return
+        # The player says they have seen it: stop re-summoning it. Same
+        # context shape, so it is matched here rather than falling through to
+        # a branch that would read the context as an executable path.
+        if action == "regression_ack":
+            game_id, _, _bk = context.partition("|")
+            self._pending_regression.pop(game_id, None)
             return
         if action == "add_game":
             self._auto_add_game_from_overlay(context)
@@ -774,6 +853,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             game_name = ""
             bk = mgr.get_backup(backup_id)
             if bk:
+                # Remember what WE put there: landing on that exact state is
+                # the intended outcome, and must not read as a regression.
+                # Only here — the game id comes from the backup, not from the
+                # overlay context, which carries just the backup id.
+                self._last_restored[bk.game_id] = backup_id
                 entry = get_library().get_by_id(bk.game_id)
                 game_name = entry.name if entry else ""
             # Thread-safe append with lock
@@ -1195,7 +1279,30 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if not self._overlay:
             return
 
-        # Highest priority: an unresolved cloud notification for a game
+        # Ahead of everything else: an unacknowledged warning that something
+        # is putting older saves back. It stays re-summonable for as long as
+        # the game is running and the player has not acknowledged it — a
+        # warning about saves being overwritten right now outranks a question
+        # about where to sync from.
+        if self._pending_regression:
+            muted = get_config().get("suppressed_ingame_notifs", {})
+            for gid in {g.id for g in get_monitor().currently_playing()}:
+                pending = self._pending_regression.get(gid)
+                # Muted from the notification itself while it was on screen:
+                # the pending record predates that choice, so drop it here
+                # rather than letting the hotkey resurrect a muted warning.
+                if pending and "regression" in muted.get(gid, []):
+                    self._pending_regression.pop(gid, None)
+                    continue
+                entry = get_library().get_by_id(gid) if pending else None
+                if entry is None:
+                    continue
+                backup_id, after_restore = pending
+                self._overlay.show_save_reverted(entry.name, gid,
+                                                 backup_id, after_restore)
+                return
+
+        # Next: an unresolved cloud notification for a game
         # that's currently running. "Unresolved" means the user hasn't yet
         # clicked any of that notification's own buttons (download,
         # decline, or don't-show-again — see the action handlers in
@@ -1346,15 +1453,28 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         covers the inline styles the QSS can't reach. Each page exposes
         refresh_styles() (ui.styles.theme.ThemedMixin) which cascades into its
         cards. SettingsPage keeps its own in-place _refresh_styles path and is
-        intentionally not in this list."""
+        intentionally not in this list.
+
+        Only the page on screen is refreshed now. The others are flagged and
+        catch up in _switch_page, on the way in: over 90% of the app's widgets
+        belong to pages nobody is looking at, and restyling them all was the
+        larger half of what made the switch pause."""
         for page in (self._overview_page, self._library_page,
                      self._sync_page, self._backups_page):
-            fn = getattr(page, "refresh_styles", None)
-            if callable(fn):
-                try:
-                    fn()
-                except Exception:
-                    logger.debug("Page refresh_styles failed", exc_info=True)
+            if not callable(getattr(page, "refresh_styles", None)):
+                continue
+            if page is not self._stack.currentWidget():
+                page._styles_stale = True
+                continue
+            self._refresh_page_styles(page)
+
+    def _refresh_page_styles(self, page):
+        """Run a page's style cascade and clear its stale flag."""
+        page._styles_stale = False
+        try:
+            page.refresh_styles()
+        except Exception:
+            logger.debug("Page refresh_styles failed", exc_info=True)
 
         self._update_sidebar_status()
 
@@ -1366,6 +1486,186 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._machine_lbl.setStyleSheet(f"color: {palette('text_hint')}; font-size: 10px; padding: 0 16px 12px;")
         if self._overlay:
             self._overlay.refresh_styles()
+
+    # ── Save-state regression ────────────────────────────────────────────────
+
+    def _check_save_regression(self, game_id: str, after_restore: bool = False):
+        """Has something put an older save state back for this game?
+
+        Runs at game launch and again just after a restore — the two moments
+        a launcher's own cloud sync gets a chance to overwrite what is on
+        disk. Never on a timer: the check is per-game and event-driven on
+        purpose, so a hundred games in the library cost nothing.
+        """
+        entry = get_library().get_by_id(game_id)
+        if entry is None or not entry.save_paths:
+            return
+        if not after_restore:
+            self._regression_warned.discard(game_id)   # a launch is a new episode
+            self._pending_regression.pop(game_id, None)
+        if game_id in self._regression_warned:
+            return
+        import threading
+        from core.backup import get_backup_manager
+
+        def _run():
+            try:
+                mgr = get_backup_manager()
+                expected = self._last_restored.get(game_id, "")
+                older = mgr.detect_regression(game_id, list(entry.save_paths),
+                                              expected_backup_id=expected)
+                if older is None:
+                    return
+                backups = mgr.get_backups_for_game(game_id)
+                newest = backups[0].backup_id if backups else ""
+                self.save_regression_found.emit(game_id, newest, after_restore)
+            except Exception as e:
+                logger.debug(f"Save regression check failed for {game_id}: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @Slot(str, str, bool)
+    def _on_save_regression(self, game_id: str, newest_backup_id: str,
+                            after_restore: bool):
+        entry = get_library().get_by_id(game_id)
+        if entry is None or self._overlay is None:
+            return
+        if game_id in self._regression_warned:
+            return
+        # "Don't show again" is per game, like every other in-game notification.
+        # Checked here rather than in the overlay so a muted game never even
+        # becomes a pending warning the hotkey could bring back.
+        if "regression" in get_config().get(
+                "suppressed_ingame_notifs", {}).get(game_id, []):
+            return
+        self._regression_warned.add(game_id)
+        self._pending_regression[game_id] = (newest_backup_id, after_restore)
+        logger.warning(f"Save state for '{entry.name}' regressed"
+                       + (" right after a restore" if after_restore else ""))
+        self._overlay.show_save_reverted(entry.name, game_id,
+                                         newest_backup_id, after_restore)
+
+    def _restore_after_regression(self, game_id: str, backup_id: str, freeze: bool):
+        """Put the newest backup back, optionally with the game frozen.
+
+        Freezing is what wins the race against a launcher that re-syncs the
+        moment it sees the files change: the game cannot write (nor can its
+        in-process sync), so the files stay as they were written.
+        """
+        if not backup_id:
+            return
+        from core.backup import get_backup_manager
+        import threading
+
+        pid = self._find_game_pid(game_id) if freeze else 0
+        self._regression_warned.discard(game_id)
+        self._status_bar.showMessage(t("backup.restoring"), 0)
+
+        def _run():
+            try:
+                get_backup_manager().restore_backup(backup_id, freeze_pid=pid,
+                                                    lib_game_id=game_id)
+                self._last_restored[game_id] = backup_id
+            except Exception as e:
+                logger.error(f"Forced restore failed for {game_id}: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ── Periodic backup integrity check ──────────────────────────────────────
+
+    # Deliberately late and slow: the check is a safety net, not something the
+    # user is waiting on. Starting it minutes after launch keeps it clear of
+    # the startup burst, and re-checking the due date hourly means a machine
+    # left running for days still runs it on time without a long-lived timer
+    # that has to survive suspend.
+    _VERIFY_FIRST_DELAY_MS = 5 * 60 * 1000
+    _VERIFY_RECHECK_MS = 60 * 60 * 1000
+
+    def _setup_backup_verify(self):
+        self._verify_timer = QTimer(self)
+        self._verify_timer.setInterval(self._VERIFY_RECHECK_MS)
+        self._verify_timer.timeout.connect(self._maybe_run_backup_verify)
+        self._verify_timer.start()
+        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._maybe_run_backup_verify)
+        self._verify_thread = None
+        # The save editor's own copies age out on their own schedule. Doing it
+        # here, once, is what makes "delete after N days" true for a save
+        # nobody has opened since — the editor itself only ever sees the files
+        # somebody goes back to.
+        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._prune_save_edit_copies)
+
+    @staticmethod
+    def _prune_save_edit_copies():
+        try:
+            from core.save_editor import prune_all
+            prune_all()
+        except Exception as e:              # never let housekeeping stop startup
+            logger.debug(f"Could not clear old save-editor copies: {e}")
+
+    def _maybe_run_backup_verify(self):
+        """Run the integrity sweep if it is enabled and due.
+
+        Skipped while a game is running: the check is pure reading, but it
+        competes for disk with the in-game backups, and nothing is lost by
+        waiting an hour.
+        """
+        from core.config_manager import get_config
+        cfg = get_config()
+        if not cfg.get("backup_verify_enabled", True):
+            return
+        if self._verify_thread is not None and self._verify_thread.is_alive():
+            return
+        if get_monitor().currently_playing():
+            logger.debug("Backup verify postponed — a game is running")
+            return
+
+        days = max(1, int(cfg.get("backup_verify_interval_days", 7)))
+        last = cfg.get("backup_verify_last", "") or ""
+        if last:
+            try:
+                from datetime import datetime, timedelta
+                if datetime.utcnow() - datetime.fromisoformat(last) < timedelta(days=days):
+                    return
+            except (ValueError, TypeError):
+                pass        # unreadable stamp — treat as never run
+
+        import threading
+        from datetime import datetime
+
+        def _run():
+            from core.backup import get_backup_manager
+            mgr = get_backup_manager()
+            ids = [b.backup_id for b in mgr.get_all_backups()]
+            if not ids:
+                return
+            bad = 0
+            for bid in ids:
+                try:
+                    state, _detail = mgr.verify_backup(bid, deep=False)
+                    if state != "ok":
+                        bad += 1
+                except Exception as e:
+                    logger.debug(f"Scheduled verify failed for {bid}: {e}")
+            get_config().set("backup_verify_last", datetime.utcnow().isoformat())
+            logger.info(f"Scheduled backup verification: {len(ids) - bad}/{len(ids)} intact")
+            if bad:
+                self.backup_verify_problems.emit(bad, len(ids))
+
+        self._verify_thread = threading.Thread(target=_run, daemon=True)
+        self._verify_thread.start()
+
+    @Slot(int, int)
+    def _on_backup_verify_problems(self, bad: int, total: int):
+        """Surface a failed sweep where the user will see it."""
+        msg = t("backups.verify_result_bad", bad=bad, total=total)
+        self._status_bar.showMessage(msg, 15000)
+        try:
+            if self._tray is not None:
+                self._tray.showMessage(t("app.name"), msg,
+                                       self._tray.icon(), 10000)
+        except Exception:
+            logger.debug("Could not raise a tray notice for the verify result",
+                         exc_info=True)
 
     # ── Monitor ───────────────────────────────────────────────────────────────
 
@@ -1507,6 +1807,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if not entry:
             return
 
+        # Bring back the notes and images that were pinned for THIS game.
+        try:
+            from ui.widgets.pins import get_pin_manager
+            get_pin_manager().restore_open(entry.id)
+        except Exception as e:
+            logger.debug(f"Could not restore this game's pins: {e}")
+
         # Launching is the one moment a game is GUARANTEED to have its
         # executable — that is what makes a save destination registered by
         # hand ("www/save under the game") placeable at all. So any such
@@ -1570,6 +1877,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         entry = get_library().get_by_id(game_id)
         if entry is None:
             return
+
+        # Did anything put an older save state back while we weren't looking?
+        self._check_save_regression(game_id)
 
         # Start watching save paths for this specific game now that it's running.
         # We also watch common save roots for games without configured paths so
@@ -1922,6 +2232,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if lt:
             lt.stop()
             lt.deleteLater()
+
+        # A note started during the session and never saved anywhere has
+        # nothing to be restored from, so it goes with the session. The saved
+        # ones come off the screen too, but are remembered against this game.
+        try:
+            from ui.widgets.pins import get_pin_manager
+            _pins = get_pin_manager()
+            _pins.discard_unsaved()
+            _pins.stow_game(entry.id)
+        except Exception as e:
+            logger.debug(f"Could not put this game's pins away: {e}")
 
         # If the app is still in modal/blur mode when the game closes, dismiss it
         if self._is_modal_mode:
@@ -2816,6 +3137,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         def _do_restore():
             result = get_backup_manager().restore_backup(backup_id)
+            # Remember what WE put there: landing on that exact state is
+            # the intended outcome, and must not read as a regression.
+            self._last_restored[game_id] = backup_id
             with self._restore_lock:
                 self._restore_results.append(("step1", game_id, backup_id, result))
             from PySide6.QtCore import QMetaObject, Qt
@@ -2979,6 +3303,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if self._overlay and get_config().get("show_overlay_on_backup", True):
             self._overlay.show_restore_result(True, game_name)
 
+        # A launcher's automatic sync reacts on its own schedule: some
+        # overwrite within a second of seeing the files change, others only
+        # when their client next talks to the server. One sample would catch
+        # the fast ones and miss the rest, so the state is looked at a few
+        # times over the first minute. The check stops at the first hit, and
+        # the next game launch remains the backstop for anything slower.
+        for delay in self._REGRESSION_AFTER_RESTORE_MS:
+            QTimer.singleShot(
+                delay,
+                lambda gid=game_id: self._check_save_regression(gid, after_restore=True))
+
+    _REGRESSION_AFTER_RESTORE_MS = (3000, 10000, 30000, 60000)
+
     def _find_game_pid(self, game_id: str) -> int:
         """Find the PID of a running game using the monitor's public API.
         Handles launcher→child process scenarios (e.g., launcher.exe spawns game.exe)."""
@@ -3112,6 +3449,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _on_language_changed(self, locale: str):
         self.setWindowTitle(t("app.name"))
+        # Pins are top-level windows of their own: nothing else in the tree
+        # walk below reaches them.
+        try:
+            from ui.widgets.pins import get_pin_manager
+            get_pin_manager().update_locale()
+        except Exception as e:
+            logger.debug(f"Pin locale refresh failed: {e}")
         # Sidebar
         self._sidebar_logo.setText(t("app.name").upper())
         self._sidebar_tagline.setText(t("app.tagline"))
@@ -3123,6 +3467,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Nav buttons
         for i, (key, icon) in enumerate(self._nav_defs):
             self._nav_buttons[i].update_label(t(key))
+        # Not in _nav_defs — it sits under Credits, not with the others.
+        self._cheats_nav_btn.update_label(t('cheats.nav'))
+        if hasattr(self._cheats_page, 'update_locale'):
+            self._cheats_page.update_locale()
         # Tray menu — rebuild with translated strings
         if hasattr(self, '_tray') and self._tray:
             self._tray.setToolTip(t("app.name"))
@@ -3142,7 +3490,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._status_bar.showMessage(t("status.ready"), 1000)
         # All pages
         for page in (self._overview_page, self._library_page,
-                     self._sync_page, self._backups_page, self._settings_page):
+                     self._sync_page, self._backups_page, self._settings_page,
+                     self._cheats_page):
             if hasattr(page, "update_locale"):
                 page.update_locale()
         name = t(f"languages.{locale}")
@@ -3154,6 +3503,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         QApplication.instance().aboutToQuit.connect(self._on_quit)
 
     def _on_quit(self):
+        # Never leave the pointer raised on the way out: the counter belongs
+        # to this process, and quitting with it up outlives the panel it was
+        # raised for.
+        try:
+            from ui.helpers import SystemCursor
+            SystemCursor.release_all()
+        except Exception as e:
+            logger.debug(f"Cursor restore on quit failed: {e}")
+        # Take the pins down without forgetting them — they come back on the
+        # next start, which is the point of pinning something.
+        try:
+            from ui.widgets.pins import get_pin_manager
+            get_pin_manager().shutdown()
+        except Exception as e:
+            logger.debug(f"Pin shutdown failed: {e}")
         # Stop all in-game backup timers
         for gid in list(self._ingame_backup_timers):
             self._stop_ingame_backup_timer(gid)

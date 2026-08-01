@@ -558,7 +558,7 @@ class EnrichmentMergeDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
-        content.setStyleSheet("background:transparent;")
+        content.setObjectName("transparent_bg")
         col = QVBoxLayout(content)
         col.setSpacing(4)
         col.setContentsMargins(0, 0, 6, 0)

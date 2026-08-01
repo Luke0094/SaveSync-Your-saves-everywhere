@@ -29,7 +29,8 @@ _FADE_IN_MS    = 200
 _FADE_OUT_MS   = 280
 
 
-from ui.helpers import force_topmost as _force_topmost, ScreenSignalMixin
+from ui.helpers import (force_topmost as _force_topmost, popup_is_open,
+                        ScreenSignalMixin, SystemCursor, TRACE_Z, z_report)
 
 
 def _remote_game_folder(orch, provider, entry, game_id: str) -> str:
@@ -48,6 +49,10 @@ def _remote_game_folder(orch, provider, entry, game_id: str) -> str:
         if fn and fn not in candidates:
             candidates.append(fn)
     return orch.resolve_remote_game_folder(provider, candidates) or candidates[0]
+
+
+# Recent pins beyond this many scroll instead of growing the menu.
+_PIN_MENU_ROWS = 5
 
 
 class OverlayWidget(QWidget, ScreenSignalMixin):
@@ -176,6 +181,17 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         )
         self._info_btn.clicked.connect(lambda: self._on_action("open_auto_scan"))
         self._info_btn.setVisible(False)
+        # 📌: the recently pinned notes/images, plus a way to pin a new one,
+        # reachable without leaving the game. Same visibility rule as [i] —
+        # only on the manual (hotkey) overlay, see _clear_buttons.
+        self._pin_btn = QPushButton("📌")
+        self._pin_btn.setFixedSize(20, 20)
+        self._pin_btn.setToolTip(t("pin.menu_tooltip"))
+        self._pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pin_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pin_btn.setObjectName("icon_btn")
+        self._pin_btn.clicked.connect(self._show_pin_menu)
+        self._pin_btn.setVisible(False)
         close_btn = QPushButton("✕")
         close_btn.setObjectName("icon_btn")
         close_btn.setFixedSize(20, 20)
@@ -184,6 +200,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         header.addWidget(self._unknown_badge)
         header.addWidget(self._title, 1)
+        header.addWidget(self._pin_btn)
         header.addWidget(self._info_btn)
         header.addWidget(close_btn)
         layout.addLayout(header)
@@ -195,19 +212,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         msg_row.setSpacing(4)
         msg_row.setContentsMargins(0, 0, 0, 0)
 
-        _arrow_style = (
-            f"QPushButton{{background:{palette('bg_elevated')};"
-            f"color:{palette('text')};border:1px solid {palette('border')};"
-            f"border-radius:4px;font-size:15px;font-weight:bold;padding:0;}}"
-            f"QPushButton:hover{{background:{palette('accent')};border-color:{palette('accent')};color:#fff;}}"
-            f"QPushButton:disabled{{color:{palette('text_muted')};border-color:{palette('border')};"
-            f"background:{palette('bg_elevated')};}}"
-        )
-
         self._carousel_prev = QPushButton("‹")
         self._carousel_prev.setFixedSize(18, 48)
         self._carousel_prev.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._carousel_prev.setStyleSheet(_arrow_style)
         self._carousel_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._carousel_prev.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self._carousel_prev.setVisible(False)
@@ -216,11 +223,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._carousel_next = QPushButton("›")
         self._carousel_next.setFixedSize(18, 48)
         self._carousel_next.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._carousel_next.setStyleSheet(_arrow_style)
         self._carousel_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._carousel_next.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self._carousel_next.setVisible(False)
         self._carousel_next.clicked.connect(self._carousel_go_next)
+        self._style_carousel_arrows()
 
         # Centre column: icon + message stack
         centre_col = QVBoxLayout()
@@ -257,7 +264,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         # Dashboard widget (for quick-restore list etc.)
         self._dashboard = QWidget()
-        self._dashboard.setStyleSheet("background: transparent;")
+        self._dashboard.setObjectName("transparent_bg")
         self._dashboard.setVisible(False)
         self._dashboard.setMaximumHeight(0)
         dl = QVBoxLayout(self._dashboard)
@@ -267,8 +274,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         for _ in range(4):
             row = QHBoxLayout()
             row.setSpacing(8)
-            k = QLabel(); k.setStyleSheet(f"color:{palette('text_hint')};font-size:11px;min-width:90px;")
-            v = QLabel(); v.setStyleSheet(f"color:{palette('text_secondary')};font-size:11px;font-weight:600;")
+            # Named, not styled here: the look is fixed (#dash_key /
+            # #dash_value in the theme). A highlighted row still overrides the
+            # value's colour inline — see set_dash_row below.
+            k = QLabel(); k.setObjectName("dash_key")
+            v = QLabel(); v.setObjectName("dash_value")
             row.addWidget(k); row.addWidget(v, 1)
             dl.addLayout(row)
             self._dash_rows.append((k, v))
@@ -332,6 +342,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # show_manual re-enables it after this reset.
         if hasattr(self, "_info_btn"):
             self._info_btn.setVisible(False)
+        if hasattr(self, "_pin_btn"):
+            self._pin_btn.setVisible(False)
         for layout in (self._btn_area, self._quick_area, self._restore_area):
             while layout.count():
                 item = layout.takeAt(0)
@@ -400,10 +412,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         k, v = self._dash_rows[idx]
         k.setText(key)
         v.setText(val)
-        v.setStyleSheet(
-            f"color:{accent};font-size:11px;font-weight:600;" if accent
-            else f"color:{palette('text_secondary')};font-size:11px;font-weight:600;"
-        )
+        # Only a highlighted row needs a sheet of its own; clearing it lets
+        # the theme's #dash_value take over again.
+        v.setStyleSheet(f"color:{accent};font-size:11px;font-weight:600;" if accent else "")
 
     # Restore list sizing: cap the scrollable area so the overlay stays compact
     _RESTORE_ROW_H = 28
@@ -445,7 +456,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._restore_source_btns = {}
         if len(sources) > 1:
             sel_w = QWidget()
-            sel_w.setStyleSheet("background: transparent;")
+            sel_w.setObjectName("transparent_bg")
             sel_row = QHBoxLayout(sel_w)
             sel_row.setContentsMargins(0, 0, 0, 0)
             sel_row.setSpacing(4)
@@ -465,10 +476,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        scroll.setStyleSheet("background: transparent;")
+        scroll.setObjectName("transparent_bg")
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         inner = QWidget()
-        inner.setStyleSheet("background: transparent;")
+        inner.setObjectName("transparent_bg")
         inner_lay = QVBoxLayout(inner)
         inner_lay.setContentsMargins(0, 0, 0, 0)
         inner_lay.setSpacing(3)
@@ -868,6 +879,140 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             pass
         self._suppress_btn.clicked.connect(handler)
 
+    def _suppress_regression_notif(self, game_id: str) -> None:
+        """Mute the save-interference alert for this game.
+
+        Its own handler, not _suppress_ingame_notif: that one assumes the
+        thing being muted is the notification currently rendered FROM
+        _notif_queue, and pops-and-re-renders that queue. This alert is a
+        priority prompt and is not in the queue, so sharing the handler would
+        dismiss an unrelated notification, leave the alert on screen, and
+        keep the priority lock held with nothing to release it.
+        """
+        from core.config_manager import get_config
+        config = get_config()
+        suppressed: dict = dict(config.get("suppressed_ingame_notifs", {}))
+        kinds = list(suppressed.get(game_id, []))
+        if "regression" not in kinds:
+            kinds.append("regression")
+        suppressed[game_id] = kinds
+        config.set("suppressed_ingame_notifs", suppressed)
+        logger.info(f"Muted save-interference alerts for game {game_id}")
+        self.hide_animated()
+
+    def _build_pin_menu(self):
+        """Build the 📌 menu. Separate from showing it so its contents can be
+        checked without opening a modal menu loop.
+
+        The recent entries are widget rows rather than plain actions: each
+        carries a pin marker on the left for what is already on screen, and a
+        bin on the right that drops it from the list without pinning it first.
+        """
+        from PySide6.QtWidgets import QMenu, QScrollArea, QWidgetAction
+        from ui.widgets.pins import get_pin_manager, PinMenuRow
+
+        mgr = get_pin_manager()
+        menu = QMenu(self)
+        recent = mgr.recent()          # this game's list, not everyone's
+        if recent:
+            rows = []
+            body = QWidget()
+            body.setObjectName("pin_menu_body")
+            col = QVBoxLayout(body)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(0)
+            for path in recent:
+                label, tip, unsaved = mgr.menu_entry(path)
+                row = PinMenuRow(path, mgr.is_open(path), body, label, tip,
+                                 unsaved)
+                # Every one of these closes the menu FIRST and acts after.
+                # All three can take a pin off the screen or put a dialog up,
+                # and doing that from inside a menu's own event loop — while
+                # it holds the mouse — is what makes the menu misbehave
+                # rather than simply close.
+                row.activated.connect(lambda p, m=menu: (
+                    m.close(), QTimer.singleShot(0, lambda q=p: mgr.toggle(q))))
+                row.removed.connect(lambda p, m=menu: (
+                    m.close(), QTimer.singleShot(0, lambda q=p: mgr.forget(q))))
+                row.save.connect(lambda p, m=menu: (
+                    m.close(), QTimer.singleShot(0, lambda q=p: mgr.save_now(q))))
+                col.addWidget(row)
+                rows.append(row)
+            holder = body
+            # Past a handful the list stops being a menu and becomes a wall.
+            if len(rows) > _PIN_MENU_ROWS:
+                area = QScrollArea()
+                area.setObjectName("pin_menu_scroll")
+                area.setWidgetResizable(True)
+                area.setWidget(body)
+                area.setHorizontalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                area.setFixedHeight(rows[0].sizeHint().height() * _PIN_MENU_ROWS + 4)
+                area.setFixedWidth(max(r.sizeHint().width() for r in rows) + 20)
+                holder = area
+            act = QWidgetAction(menu)
+            act.setDefaultWidget(holder)
+            menu.addAction(act)
+        if not recent:
+            empty = menu.addAction(t("pin.none"))
+            empty.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction(t("pin.new_note"), lambda: mgr.new_note())
+        menu.addAction(t("pin.capture_action"), self._pin_capture)
+        menu.addAction(t("pin.add"), self._pin_add_file)
+        if mgr.open_paths() or mgr.unsaved_pins():
+            menu.addAction(t("pin.close_all"), mgr.close_all)
+        return menu
+
+    def _show_pin_menu(self) -> None:
+        """The 📌 menu: what was pinned recently, and a way to pin something
+        new. Ticking an entry pins it, unticking closes it."""
+        # The overlay fades itself out on a timer. A player reading this menu
+        # must not have the window under it disappear mid-choice.
+        self._auto_hide_timer.stop()
+        menu = self._build_pin_menu()
+        menu.exec(self._pin_btn.mapToGlobal(QPoint(0, self._pin_btn.height())))
+        if self._pending_auto_hide:
+            self._auto_hide_timer.start(self._pending_auto_hide)
+
+    def _pin_capture(self) -> None:
+        """Grab a piece of the screen and pin it.
+
+        SaveSync's own overlay goes first: the shot is taken of what the
+        player is looking at, and the panel they opened this from is not part
+        of that.
+        """
+        from ui.widgets.pins import get_pin_manager
+        from ui.widgets.screen_capture import capture_region
+
+        was_visible = self.isVisible()
+        self.hide()
+        QApplication.processEvents()
+        piece = None
+        try:
+            piece = capture_region(None)
+        finally:
+            # Only when nothing was captured — cancelled, or a display mode we
+            # cannot read. On success the player got what they opened this for,
+            # and bringing the panel back would just cover the new pin.
+            if piece is None and was_visible and not self.isVisible():
+                self.show()
+        if piece is not None:
+            # The panel stays down, so _do_hide never runs: let go here, or
+            # the overlay's hold would outlive the overlay itself.
+            SystemCursor.release("overlay")
+            get_pin_manager().new_capture(piece)
+
+    def _pin_add_file(self) -> None:
+        # The app's own picker, not the plain Qt one: same shortcut handling
+        # and same sidebar places as everywhere else in SaveSync.
+        from ui.widgets.file_pickers import pick_file
+        from ui.widgets.pins import get_pin_manager, pin_name_filter
+
+        path = pick_file(self, t("pin.add_title"), pin_name_filter())
+        if path:
+            get_pin_manager().pin(path)
+
     def _hide_suppress_btn(self) -> None:
         self._suppress_btn.setVisible(False)
         self._suppress_btn.setMaximumHeight(0)
@@ -1184,6 +1329,60 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._hide_suppress_btn()
         self._show_priority_prompt()
 
+    def show_save_reverted(self, game_name: str, game_id: str,
+                           newest_backup_id: str = "", after_restore: bool = False):
+        """The game's saves went back to a state we had already recorded.
+
+        Playing produces content that never existed before, so landing exactly
+        on an older backup's state is not something play can do — something
+        put an earlier state back. Two wordings, because the two moments call
+        for different advice:
+
+        - at launch: state the fact, offer to put the newest state back;
+        - right after a restore: name the likely cause (a launcher's automatic
+          sync racing the restore) and offer to force it with the game frozen,
+          which is the thing that actually wins that race.
+        """
+        context = f"{game_id}|reverted"
+        if self._defer_if_priority(
+                lambda: self.show_save_reverted(game_name, game_id,
+                                                newest_backup_id, after_restore),
+                context=context, is_priority=True):
+            return
+        self._set_mode("cloud")          # decision-prompt chrome
+        self._context_exe = f"{game_id}|{newest_backup_id}"
+        self._priority_context = context
+        self._icon_label.setText("↩")
+        self._title.setText(t("overlay.save_reverted_title"))
+        msg_key = "overlay.restore_undone_msg" if after_restore else "overlay.save_reverted_msg"
+        hint_key = "overlay.restore_undone_hint" if after_restore else "overlay.save_reverted_hint"
+        self._message.setText(
+            f"{t(msg_key, game=game_name)}<br>"
+            f"<span style='color:{palette('text_hint')};font-size:11px;'>"
+            f"{t(hint_key)}</span>"
+        )
+        self._hide_dashboard()
+        self._clear_buttons()
+        if newest_backup_id:
+            self._add_btn(
+                self._btn_area,
+                t("overlay.restore_force") if after_restore
+                else t("overlay.save_reverted_restore"),
+                "force_restore" if after_restore else "restore_newest",
+                primary=True)
+        # An alert holds priority and never auto-hides, so it MUST carry a way
+        # out: without it nothing behind it would ever be shown again.
+        # Its own action, not the shared "dismiss": losing this alert must not
+        # mean losing the warning, so it stays re-summonable by the hotkey
+        # until the player actually acknowledges it — and THIS button is what
+        # says they did. Worded as an acknowledgement for the same reason.
+        self._add_btn(self._btn_area, t("overlay.got_it"), "regression_ack")
+        self._set_suppress_link(
+            "dont_show_ingame",
+            lambda _checked=False, gid=game_id:
+                self._suppress_regression_notif(gid))
+        self._show_priority_prompt()
+
     def dismiss_unverified_match(self, proc_name: str, game_id: str) -> None:
         """Withdraw an unanswered unverified-match prompt whose process has
         exited. Without this the prompt sits there asking about something that
@@ -1211,7 +1410,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         NOT deferred against itself; it refreshes in place. A DIFFERENT
         priority prompt, and every interruptible notification, is deferred.
         """
-        if not (self._priority_active and self.isVisible() and self.windowOpacity() > 0.1):
+        # Opacity is deliberately NOT part of this test. A prompt is still
+        # fading in for the first fraction of its animation, and a
+        # notification landing in that window used to REPLACE it instead of
+        # queueing behind it — the one moment a prompt is most likely to be
+        # interrupted is right after it was raised. _priority_active is the
+        # honest signal: hide_animated drops it before the fade-out starts,
+        # so a prompt on its way out never holds the lock here.
+        if not (self._priority_active and self.isVisible()):
             return False
         if is_priority and context and context == self._priority_context:
             return False
@@ -1510,7 +1716,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._clear_buttons()
         # [i] shortcut to the save-path scan panel (accept detected files
         # without leaving the game)
-        self._info_btn.setVisible(True)
+        # Both header shortcuts belong to a game SESSION, and both are
+        # meaningless without one:
+        #
+        # - [i] opens the save-path panel for the running game. With no game
+        #   it opens with no game context at all, so an Extended Scan from
+        #   there has nothing to attribute its results to — a confusing
+        #   dead end, especially next to the general search.
+        # - 📌 pins are per game, put away when it ends, and would otherwise
+        #   be filed under a bucket no game ever reads back.
+        in_session = self._game_is_running()
+        self._info_btn.setVisible(in_session)
+        self._pin_btn.setVisible(in_session)
         self._add_btn(self._quick_area, t('overlay.open_app'),   "open_app", primary=True)
         # In-game (a tracked game is running): a plain "Backup" of the
         # current game. Outside a session: "Backup all".
@@ -1571,6 +1788,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self.exclusive_blocked.emit(title, msg_plain)
             logger.info("Overlay skipped — exclusive fullscreen active")
             return
+
+        # A game may be hiding the mouse pointer and confining it to its own
+        # window; a panel that cannot be pointed at cannot be used. Undone in
+        # _do_hide, so the pointer goes away when this does.
+        if self._game_is_running():
+            SystemCursor.hold("overlay")
 
         # Cancel any pending hide first
         self._auto_hide_timer.stop()
@@ -1759,8 +1982,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 pass
             self._hide_anim_connected = False
         self.hide()
-        # Nothing is on screen — a hidden overlay must never hold priority.
+        # Nothing is on screen — a hidden overlay must never hold priority,
+        # nor keep a pointer raised for a panel that is no longer there.
         self._priority_active = False
+        SystemCursor.release("overlay")
         self.exclusive_blocked.emit(title, msg_plain)
         logger.info("Overlay hidden — exclusive fullscreen protected")
 
@@ -1779,9 +2004,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         if self._is_exclusive_fullscreen_hwnd(fg_hwnd):
             self._hide_for_exclusive()
-        else:
+        elif not popup_is_open():
             _force_topmost(self)
-            logger.debug("Re-asserted topmost after foreground change")
+            self._trace_z("the window in front changed")
 
     # ── Topmost helpers ──────────────────────────────────────────────────────
 
@@ -1819,6 +2044,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         """
         if not self.isVisible():
             return
+        # The 📌 menu opens inside the overlay's own rectangle. Putting the
+        # overlay back on top once a second while that menu is up is what
+        # buries it, so nothing is raised while a menu of ours is open.
+        if popup_is_open():
+            return
 
         if platform.system() != "Windows":
             # On Linux/macOS: unconditional raise_() via _force_topmost.
@@ -1831,13 +2061,32 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 self._hide_for_exclusive()
             else:
                 _force_topmost(self)
-                logger.debug("Re-asserted topmost (borderless fullscreen)")
+                self._trace_z("borderless fullscreen")
         elif self._is_overlay_obscured():
             _force_topmost(self)
-            logger.debug("Re-asserted topmost (obscured by window)")
+            self._trace_z("obscured by a window")
+
+    def _trace_z(self, why: str):
+        """Say where the overlay ended up, on the same switch as the pins.
+
+        The overlay and the pins share the raising mechanism, so they share
+        its failures; having both report in the same words is what makes a
+        log answer "which of the two was underneath" without guessing.
+        """
+        if TRACE_Z:
+            logger.info(f"overlay: put back on top ({why}) — {z_report(self)}")
+        else:
+            logger.debug(f"Re-asserted topmost ({why})")
+
+    def _game_is_running(self) -> bool:
+        from ui.helpers import game_is_running
+        return game_is_running()
 
     def _do_hide(self):
         """Slot called when hide animation finishes — resets the connection flag."""
+        # Let go of the pointer. It only actually goes down if nothing else
+        # still needs it — a note being typed into, or a pin mid-drag.
+        SystemCursor.release("overlay")
         self._hide_anim_connected = False
         self._topmost_timer.stop()
         self._uninstall_foreground_hook()
@@ -2011,6 +2260,27 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     # ── Paint & drag ──────────────────────────────────────────────────────────
 
+    def _style_carousel_arrows(self):
+        """The look of the two browse arrows, from the current palette.
+
+        A method rather than a local string because refresh_styles has to be
+        able to say it again: built once with whatever theme happened to be on
+        at the time, the arrows kept a dark box and pale glyph after a switch
+        to the light theme, which on a light card reads as two black blocks.
+        """
+        style = (
+            f"QPushButton{{background:{palette('bg_elevated')};"
+            f"color:{palette('text')};border:1px solid {palette('border')};"
+            f"border-radius:4px;font-size:15px;font-weight:bold;padding:0;}}"
+            f"QPushButton:hover{{background:{palette('accent')};"
+            f"border-color:{palette('accent')};color:#000;}}"
+            f"QPushButton:disabled{{color:{palette('text_muted')};"
+            f"border-color:{palette('border')};"
+            f"background:{palette('bg_elevated')};}}"
+        )
+        self._carousel_prev.setStyleSheet(style)
+        self._carousel_next.setStyleSheet(style)
+
     def refresh_styles(self):
         """Re-apply all inline styles after theme change."""
         from ui.styles.theme import get_theme_manager
@@ -2021,14 +2291,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if sep:
             sep.setStyleSheet(f"background:{palette('border_hover')};border:none;max-height:1px;")
         self._message.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        self._style_carousel_arrows()
         self._suppress_btn.setStyleSheet(
             f"QPushButton{{font-size:10px;color:{palette('text_muted')};padding:4px 8px;"
             f"border:1px solid {palette('border_hover')};border-radius:4px;background:transparent;}}"
             f"QPushButton:hover{{color:{palette('text')};border-color:{palette('accent')};background:{palette('bg_elevated')};}}"
         )
-        for k, v in self._dash_rows:
-            k.setStyleSheet(f"color:{palette('text_hint')};font-size:11px;min-width:90px;")
-            v.setStyleSheet(f"color:{palette('text_secondary')};font-size:11px;font-weight:600;")
+        # The dashboard rows need nothing: #dash_key / #dash_value come from
+        # the theme (a highlighted value keeps its own accent colour).
         self.update()  # trigger repaint
 
     def paintEvent(self, event):

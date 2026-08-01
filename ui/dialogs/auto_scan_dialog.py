@@ -19,7 +19,7 @@ from core.monitor import get_monitor
 from core.config_manager import get_config
 from i18n import t
 from ui.styles.theme import palette
-from ui.helpers import TopmostPinMixin, apply_game_friendly_flags
+from ui.helpers import ElidedCheckBox, TopmostPinMixin, apply_game_friendly_flags
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +39,20 @@ def filter_selectable_paths(game_id: str, paths: List[str]) -> List[str]:
     with zero selectable files must never appear.
     """
     from core.save_detector import path_has_backup_content
+    from core.game_engine import engine_for_game
+    from core.library import get_library
     config = get_config()
     deleted_paths = config.get("auto_scan_deleted_paths", {}).get(game_id, [])
+    # ".dat" is engine data in one engine and a save in another, so the
+    # exclusion has to know which game this is.
+    engine = engine_for_game(get_library().get_by_id(game_id)) if game_id else ""
 
     result: List[str] = []
     for path in paths:
         if path in deleted_paths:
             logger.debug(f"Skipping previously deleted path: {path}")
             continue
-        if not path_has_backup_content(path):
+        if not path_has_backup_content(path, engine=engine):
             logger.debug(f"Skipping path with no selectable files: {path}")
             continue
         result.append(path)
@@ -266,29 +271,20 @@ class SavePathItem(QWidget):
         self._rows_end_anchor.setFixedHeight(0)
         layout.addWidget(self._rows_end_anchor)
 
-        # Ignored-paths recovery (same UX as Add/Edit Game): count of paths
-        # excluded from future scans — persisted store PLUS this session's
-        # trash-icon deletions — with a button to review and restore them
-        # immediately (a restored path re-enters the proposed list).
+        # Recovery of paths trashed in THIS confirmation: a counter plus the
+        # Manage dialog, which is where restoring now lives. Deliberately
+        # scoped to the session — a confirmation panel is about the paths just
+        # proposed, and the paths ignored in earlier runs only added noise
+        # here. They remain reviewable in Settings → excluded paths.
         ignored_row = QHBoxLayout()
         ignored_row.setContentsMargins(20, 0, 2, 0)
         self._ignored_count_lbl = QLabel()
         self._ignored_count_lbl.setStyleSheet(
             f"color:{palette('text_hint')};font-size:10px;")
-        # One-click undo for THIS session's trash clicks: the Manage dialog
-        # below is a two-step review (open, tick, confirm), which is the wrong
-        # weight for "I just misclicked the bin". Shown only while there is
-        # something to put back.
-        self._restore_deleted_btn = QPushButton(t("add_game.restore_deleted_btn"))
-        self._restore_deleted_btn.setToolTip(t("add_game.restore_deleted_tooltip"))
-        self._restore_deleted_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
-        self._restore_deleted_btn.clicked.connect(self._restore_locally_deleted)
-        self._restore_deleted_btn.setVisible(False)
         manage_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
         manage_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
         manage_btn.clicked.connect(self._open_ignored_dialog)
         ignored_row.addWidget(self._ignored_count_lbl, 1)
-        ignored_row.addWidget(self._restore_deleted_btn)
         ignored_row.addWidget(manage_btn)
         layout.addLayout(ignored_row)
         self._refresh_ignored_count()
@@ -301,44 +297,32 @@ class SavePathItem(QWidget):
         layout.addWidget(self._separator_line)
 
     def _refresh_ignored_count(self):
-        """Update the excluded-paths counter: persisted + session deletions."""
+        """Update the counter of paths trashed during THIS confirmation."""
         if not hasattr(self, "_ignored_count_lbl"):
             return
-        from core.config_manager import get_config
-        persisted = get_config().get("auto_scan_deleted_paths", {}).get(self.game_id, [])
-        n = len(set(persisted) | set(self._locally_deleted_paths))
+        n = len(self._locally_deleted_paths)
         if n:
-            self._ignored_count_lbl.setText(t("add_game.ignored_paths_count", count=n))
+            self._ignored_count_lbl.setText(t("add_game.session_ignored_count", count=n))
         else:
-            self._ignored_count_lbl.setText(t("add_game.ignored_paths_none"))
-        # The one-click undo only ever concerns THIS session's deletions;
-        # persisted ones belong to the Manage dialog.
-        if hasattr(self, "_restore_deleted_btn"):
-            self._restore_deleted_btn.setVisible(bool(self._locally_deleted_paths))
+            self._ignored_count_lbl.setText(t("add_game.session_ignored_none"))
 
-    def _restore_locally_deleted(self):
-        """Put every path trashed in this session straight back into the list.
+    def _open_ignored_dialog(self):
+        """Review and restore the paths trashed during this confirmation.
+
+        Restoring lives here rather than on a button of its own: the rows
+        already carry an open and a delete button, and a third one competing
+        with them for a width the paths themselves need was the wrong trade.
 
         add_paths() refuses anything still listed in _locally_deleted_paths
         (an in-session deletion must survive a later scan pass re-finding the
-        path), so the list is cleared FIRST — otherwise the button would
-        silently do nothing.
+        path), so a restored path is dropped from that list FIRST — otherwise
+        it would silently fail to come back.
         """
-        to_restore = list(self._locally_deleted_paths)
-        if not to_restore:
-            return
-        self._locally_deleted_paths.clear()
-        self.add_paths(to_restore)
-        logger.info(f"Restored {len(to_restore)} just-deleted path(s) for {self.game_name}")
-        self._refresh_ignored_count()
-
-    def _open_ignored_dialog(self):
-        """Review/restore ignored paths — including this session's trash
-        deletions, recoverable straight back into the proposed list."""
         from PySide6.QtWidgets import QDialog
         from ui.dialogs.add_game_dialog import IgnoredPathsDialog
         dlg = IgnoredPathsDialog(self.game_id, self.game_name, parent=self,
-                                 extra_paths=list(self._locally_deleted_paths))
+                                 extra_paths=list(self._locally_deleted_paths),
+                                 session_only=True)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             restored = list(getattr(dlg, "restored_paths", []) or [])
             for p in restored:
@@ -346,6 +330,7 @@ class SavePathItem(QWidget):
                     self._locally_deleted_paths.remove(p)
             if restored:
                 self.add_paths(restored)
+                logger.info(f"Restored {len(restored)} just-deleted path(s) for {self.game_name}")
         self._refresh_ignored_count()
 
     def _build_path_row(self, path: str):
@@ -359,16 +344,23 @@ class SavePathItem(QWidget):
         path_layout = QHBoxLayout()
         path_layout.setContentsMargins(20, 2, 2, 2)
 
+        # The path is the checkbox's own label and save paths are routinely
+        # longer than the panel, so it is elided in the middle: without that
+        # the row sizes itself to the whole string and pushes the open and
+        # delete buttons off to the right, behind a horizontal scrollbar.
+        # Display only — the real path lives in self.paths, never read back
+        # off the label.
         from core.registry_saves import is_registry_path, registry_display
-        if is_registry_path(path):
-            checkbox = QCheckBox(f"\U0001f5dd {registry_display(path)}")
-            checkbox.setToolTip(t('auto_scan.registry_key_tooltip'))
-        else:
-            checkbox = QCheckBox(f"\U0001f4c1 {path}")
-        checkbox.setChecked(True)
+        checkbox = ElidedCheckBox()
         checkbox.setStyleSheet("QCheckBox { font-size: 11px; }")
+        if is_registry_path(path):
+            checkbox.setTooltipSuffix(t('auto_scan.registry_key_tooltip'))
+            checkbox.setFullText(f"\U0001f5dd {registry_display(path)}")
+        else:
+            checkbox.setFullText(f"\U0001f4c1 {path}")
+        checkbox.setChecked(True)
         self.checkboxes.append(checkbox)
-        path_layout.addWidget(checkbox)
+        path_layout.addWidget(checkbox, 1)
 
         # Open button — deciding whether a detected path really holds this
         # game's saves is much easier with the folder (or the registry key)
@@ -631,7 +623,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.results_area.setFrameShape(QFrame.Shape.NoFrame)
 
         self.results_widget = QWidget()
-        self.results_widget.setStyleSheet("background: transparent;")
+        self.results_widget.setObjectName("transparent_bg")
         self.results_layout = QVBoxLayout(self.results_widget)
         self.results_area.setWidget(self.results_widget)
         

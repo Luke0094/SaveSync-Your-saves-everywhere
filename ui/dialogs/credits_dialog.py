@@ -135,11 +135,21 @@ class CreditsDialog(QDialog):
         github_btn.setFixedWidth(100)
         github_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         github_btn.setToolTip(t("credits.github_tooltip"))
+        # At rest: the ordinary border. It used to be border_hover, which in
+        # the light theme IS the accent — so the button sat there looking
+        # permanently hovered, and hovering it changed nothing.
+        #
+        # On hover: fill with the accent and put BLACK on it, the same as
+        # every primary button in the app. Turning the text accent-coloured
+        # instead left it green on near-white, which reads at 3.3:1 — under
+        # what small bold text needs. Black on either green is 8.7:1 and
+        # 5.7:1, and it is the one colour that works on both.
         github_btn.setStyleSheet(
             f"QPushButton{{color:{palette('text')};background:{palette('bg_elevated')};"
-            f"border:1px solid {palette('border_hover')};border-radius:4px;"
+            f"border:1px solid {palette('border')};border-radius:4px;"
             f"padding:4px 10px;font-size:11px;font-weight:600;}}"
-            f"QPushButton:hover{{border-color:{palette('accent')};color:{palette('accent')};}}"
+            f"QPushButton:hover{{background:{palette('accent')};"
+            f"border-color:{palette('accent')};color:#000000;}}"
         )
         github_btn.clicked.connect(lambda: webbrowser.open(_GITHUB_URL))
         dev_row.addWidget(github_btn)

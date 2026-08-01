@@ -95,7 +95,7 @@ class RestoreDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll_content = QWidget()
-        self._scroll_content.setStyleSheet("background: transparent;")
+        self._scroll_content.setObjectName("transparent_bg")
         self._list_layout = QVBoxLayout(self._scroll_content)
         self._list_layout.setContentsMargins(0, 0, 0, 0)
         self._list_layout.setSpacing(6)

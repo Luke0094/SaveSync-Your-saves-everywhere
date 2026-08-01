@@ -77,9 +77,25 @@ class BackupRow(QFrame, ThemedMixin):
         note_lbl = QLabel(self._entry.note or "")
         self._sty(note_lbl, lambda: f"color:{palette('text_muted')};font-size:10px;font-style:italic;")
 
+        # Integrity dot — grey until the backup has been checked. Clicking it
+        # checks this one; the page header checks them all. Colour-by-state is
+        # left inline on purpose: it IS the state, so it belongs with the code
+        # that knows it, not in the theme.
+        self._verify_dot = QPushButton("●")
+        self._verify_dot.setFixedSize(18, 18)
+        self._verify_dot.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._verify_dot.clicked.connect(self._on_verify_clicked)
+        self._apply_verify_dot()
+
         left_col = QVBoxLayout()
         left_col.setSpacing(2)
-        left_col.addWidget(date_lbl)
+        _date_row = QHBoxLayout()
+        _date_row.setSpacing(6)
+        _date_row.setContentsMargins(0, 0, 0, 0)
+        _date_row.addWidget(self._verify_dot)
+        _date_row.addWidget(date_lbl)
+        _date_row.addStretch()
+        left_col.addLayout(_date_row)
         sub = QHBoxLayout(); sub.setSpacing(10)
         sub.addWidget(size_lbl); sub.addWidget(origin_lbl); sub.addWidget(machine_lbl); sub.addWidget(note_lbl)
         sub.addStretch()
@@ -215,6 +231,66 @@ class BackupRow(QFrame, ThemedMixin):
         if reply == QMessageBox.StandardButton.Yes:
             self.delete_requested.emit(self._entry.backup_id)
 
+    def refresh_styles(self):
+        """Replay the registered styles, then the dot — its colour comes from
+        the entry's state, so it can't be a registered one-shot."""
+        super().refresh_styles()
+        if hasattr(self, "_verify_dot"):
+            self._apply_verify_dot()
+
+    # ── Integrity dot ────────────────────────────────────────────────────────
+
+    _VERIFY_LOOK = {
+        "ok":      ("success",   "backups.verify_ok"),
+        "corrupt": ("error",     "backups.verify_corrupt"),
+        "changed": ("warning",   "backups.verify_changed"),
+        "missing": ("error",     "backups.verify_missing"),
+        "":        ("text_hint", "backups.verify_unchecked"),
+    }
+
+    def _apply_verify_dot(self):
+        """Paint the dot for the entry's recorded state and explain it on hover."""
+        state = getattr(self._entry, "verify_state", "") or ""
+        colour_key, msg_key = self._VERIFY_LOOK.get(state, self._VERIFY_LOOK[""])
+        self._verify_dot.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;padding:0;"
+            f"font-size:11px;color:{palette(colour_key)};}}"
+        )
+        tip = t(msg_key)
+        detail = getattr(self._entry, "verify_detail", "")
+        if detail and state not in ("", "ok"):
+            tip += f"\n{detail}"
+        when = getattr(self._entry, "verify_at", "")
+        if when:
+            from core import to_local_dt
+            from i18n import format_dt
+            dt = to_local_dt(when)
+            if dt is not None:
+                tip += "\n" + t("backups.verify_checked_at",
+                                when=format_dt(dt, "%d %b %Y  %H:%M"))
+        else:
+            tip += "\n" + t("backups.verify_click")
+        self._verify_dot.setToolTip(tip)
+
+    def _on_verify_clicked(self):
+        """Check just this backup. Shallow: opening the archive and checking
+        every member's CRC is what catches a broken file, and it is quick
+        enough to run inline without freezing the list."""
+        from core.backup import get_backup_manager
+        self._verify_dot.setEnabled(False)
+        try:
+            state, detail = get_backup_manager().verify_backup(
+                self._entry.backup_id, deep=False)
+            self._entry.verify_state = state
+            self._entry.verify_detail = detail
+            from datetime import datetime
+            self._entry.verify_at = datetime.utcnow().isoformat()
+            self._apply_verify_dot()
+        except Exception as e:
+            logger.warning(f"Verify failed for {self._entry.backup_id}: {e}")
+        finally:
+            self._verify_dot.setEnabled(True)
+
     def _on_open_backup_folder(self):
         """Open the backup folder for this entry.
 
@@ -325,11 +401,19 @@ class BackupsPage(QWidget, ThemedMixin):
         # system font, so it reads at a glance next to the text buttons —
         # a bare glyph in the muted icon-button colour did not.
         self._add_paths_btn = QPushButton("➕")
-        self._add_paths_btn.setObjectName("icon_btn")
+        # Same chrome as the "Open folder" / "Backup now" buttons it sits
+        # next to — as a bare glyph it disappeared into the header.
+        self._add_paths_btn.setObjectName("toolbar_icon_btn")
         self._add_paths_btn.setFixedSize(30, 30)
         self._add_paths_btn.setToolTip(t("manual_path.button_tooltip"))
         self._add_paths_btn.clicked.connect(self._on_add_manual_paths)
         header_row.addWidget(self._add_paths_btn)
+
+        self._verify_btn = QPushButton(t("backups.verify_all"))
+        self._verify_btn.setFixedHeight(30)
+        self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
+        self._verify_btn.clicked.connect(self._on_verify_all)
+        header_row.addWidget(self._verify_btn)
 
         self._open_folder_btn = QPushButton(t("buttons.open_folder"))
         self._open_folder_btn.setFixedHeight(30)
@@ -424,7 +508,7 @@ class BackupsPage(QWidget, ThemedMixin):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._list_widget = QWidget()
-        self._list_widget.setStyleSheet("background: transparent;")
+        self._list_widget.setObjectName("transparent_bg")
         self._list_layout = QVBoxLayout(self._list_widget)
         self._list_layout.setContentsMargins(0, 0, 0, 0)
         self._list_layout.setSpacing(6)
@@ -1151,6 +1235,72 @@ class BackupsPage(QWidget, ThemedMixin):
         self._refresh_list()
 
 
+    def _on_verify_all(self):
+        """Check every backup currently listed, on a worker thread.
+
+        Threaded rather than inline: opening each archive and CRC-checking
+        every member is I/O bound and a game with many large backups would
+        otherwise freeze the window for seconds. The dots update as results
+        arrive, so progress is visible without a separate progress bar.
+        """
+        from core.backup import get_backup_manager
+        mgr = get_backup_manager()
+        gid = self._selected_game_id
+        entries = (mgr.get_backups_for_game(gid) if gid else mgr.get_all_backups())
+        ids = [b.backup_id for b in entries]
+        if not ids:
+            return
+
+        from PySide6.QtCore import QThread, Signal, QObject
+
+        class _VerifyWorker(QThread):
+            one = Signal(str, str, str)      # backup_id, state, detail
+            done = Signal(int, int)          # bad, total
+
+            def run(self):
+                bad = 0
+                for i, bid in enumerate(ids, 1):
+                    try:
+                        state, detail = mgr.verify_backup(bid, deep=False)
+                    except Exception as e:
+                        state, detail = "corrupt", str(e)[:60]
+                    if state != "ok":
+                        bad += 1
+                    self.one.emit(bid, state, detail)
+                self.done.emit(bad, len(ids))
+
+        self._verify_btn.setEnabled(False)
+        self._verify_worker = _VerifyWorker(self)
+
+        def _on_one(bid, state, detail):
+            self._verify_btn.setText(t("backups.verify_running",
+                                       done=_seen["n"], total=len(ids)))
+            _seen["n"] += 1
+            for row in list(getattr(self, "_backup_rows", ())):
+                try:
+                    if row._entry.backup_id == bid:
+                        row._entry.verify_state = state
+                        row._entry.verify_detail = detail
+                        from datetime import datetime
+                        row._entry.verify_at = datetime.utcnow().isoformat()
+                        row._apply_verify_dot()
+                        break
+                except RuntimeError:
+                    pass      # row already gone (list rebuilt mid-run)
+
+        def _on_done(bad, total):
+            self._verify_btn.setEnabled(True)
+            self._verify_btn.setText(t("backups.verify_all"))
+            msg = (t("backups.verify_result_all_ok", total=total) if not bad
+                   else t("backups.verify_result_bad", bad=bad, total=total))
+            self._verify_btn.setToolTip(msg + "\n" + t("backups.verify_all_tooltip"))
+            logger.info(f"Backup verification: {msg}")
+
+        _seen = {"n": 1}
+        self._verify_worker.one.connect(_on_one)
+        self._verify_worker.done.connect(_on_done)
+        self._verify_worker.start()
+
     def _on_open_save_folder(self):
         """Open SaveSync's main backup directory in the file manager.
 
@@ -1182,8 +1332,7 @@ class BackupsPage(QWidget, ThemedMixin):
         # widgets like summary/empty stay — they're always live) so it can't
         # grow unbounded across refreshes.
         self._backup_rows = []
-        self._themed_styles = [(w, fn) for (w, fn) in getattr(self, "_themed_styles", [])
-                               if _safe(w)]
+        self.prune_themed_styles()
 
         # Remove non-permanent widgets and stale spacer items
         to_remove_widgets = []
@@ -1465,14 +1614,9 @@ class BackupsPage(QWidget, ThemedMixin):
         # Page selector at the top too (not just the bottom) — same pager
         # widget, so the two stay perfectly in sync since both are rebuilt
         # from the same _backups_page_num/total_pages on every refresh.
-        # btn_sink collects the pager buttons so refresh_styles can re-theme
-        # them in place (they're palette-dependent) on a theme switch, without
-        # waiting for the next list rebuild.
-        self._backups_pager_btns = []
         if total_pages > 1:
             self._list_layout.addWidget(
-                build_pager(self._backups_page_num, total_pages, _go_page,
-                            btn_sink=self._backups_pager_btns))
+                build_pager(self._backups_page_num, total_pages, _go_page))
 
         single_group = len(order) == 1
         for key in page_keys:
@@ -1487,8 +1631,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
         if total_pages > 1:
             self._list_layout.addWidget(
-                build_pager(self._backups_page_num, total_pages, _go_page,
-                            btn_sink=self._backups_pager_btns))
+                build_pager(self._backups_page_num, total_pages, _go_page))
 
         self._list_layout.addStretch()  # re-add stretch at end
 
@@ -1499,7 +1642,7 @@ class BackupsPage(QWidget, ThemedMixin):
         built list of BackupRow widgets. Rows are only created when the
         section is first expanded, so collapsed titles cost nothing."""
         wrap = QWidget()
-        wrap.setStyleSheet("background: transparent;")
+        wrap.setObjectName("transparent_bg")
         col = QVBoxLayout(wrap)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(6)
@@ -1515,20 +1658,14 @@ class BackupsPage(QWidget, ThemedMixin):
 
         header.setText(_header_text(expanded))
         header.setToolTip(t("backups.hide_saves") if expanded else t("backups.show_saves"))
-        # self is the page: the header registers on the page's ThemedMixin
-        # registry, so super().refresh_styles() re-applies it in place. These
-        # headers are dynamic (rebuilt per refresh); _refresh_list prunes dead
-        # entries so the registry stays bounded.
-        self._sty(header, lambda: (
-            f"QPushButton{{text-align:left;background:{palette('bg_card')};"
-            f"color:{palette('text')};border:1px solid {palette('border')};"
-            f"border-radius:6px;padding:8px 12px;font-size:12px;font-weight:700;}}"
-            f"QPushButton:hover{{border-color:{palette('border_hover')};background:{palette('bg_elevated')};}}"
-        ))
+        # Styled from the theme QSS by objectName: there is one of these per
+        # title, they are rebuilt on every refresh, and the look never varies
+        # between them — so it belongs in the theme, not on each instance.
+        header.setObjectName("backup_group_header")
         col.addWidget(header)
 
         body = QWidget()
-        body.setStyleSheet("background: transparent;")
+        body.setObjectName("transparent_bg")
         body_lay = QVBoxLayout(body)
         body_lay.setContentsMargins(10, 0, 0, 0)
         body_lay.setSpacing(6)
@@ -1592,14 +1729,8 @@ class BackupsPage(QWidget, ThemedMixin):
                 row.refresh_styles()
             except RuntimeError:
                 pass   # underlying C++ row already deleted — skip
-        # Pager buttons (from library_page.build_pager) are palette-dependent
-        # and otherwise rebuilt only on a list refresh — re-theme in place.
-        from ui.pages.library_page import _pager_btn_style
-        for btn, active in list(getattr(self, "_backups_pager_btns", ())):
-            try:
-                btn.setStyleSheet(_pager_btn_style(active))
-            except RuntimeError:
-                pass   # underlying C++ widget already deleted — skip
+        # Pager buttons need nothing here: #pager_btn / #pager_btn_active come
+        # from the theme, already re-resolved by the stylesheet swap.
 
     def _on_backup_now(self):
         """Trigger backup.
@@ -1644,6 +1775,8 @@ class BackupsPage(QWidget, ThemedMixin):
             self._header.setText(t("backup.title"))
         if _safe(self._open_folder_btn):
             self._open_folder_btn.setText(t("buttons.open_folder"))
+            self._verify_btn.setText(t("backups.verify_all"))
+            self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
             self._open_folder_btn.setToolTip(t("tooltips.open_save_folder"))
         if _safe(self._backup_now_btn):
             self._backup_now_btn.setText(t("buttons.backup_now"))

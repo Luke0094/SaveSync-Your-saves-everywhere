@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.helpers import load_pixmap_any, open_in_file_manager
+from ui.helpers import ElidedCheckBox, load_pixmap_any, open_in_file_manager
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
 from core.library import GameEntry, get_library
@@ -56,15 +56,23 @@ class IgnoredPathsDialog(QDialog):
     """
 
     def __init__(self, game_id: str, game_name: str, parent=None,
-                 extra_paths: Optional[list] = None):
+                 extra_paths: Optional[list] = None,
+                 session_only: bool = False):
         """*extra_paths*: session-only deletions not yet persisted (the
-        confirmation panel deletes locally until Apply) — shown alongside
-        the persisted entries so a just-trashed path can be recovered
-        immediately. Restored paths (both kinds) are exposed to the caller
-        via ``self.restored_paths``."""
+        confirmation panel deletes locally until Apply) — so a just-trashed
+        path can be recovered immediately. Restored paths (both kinds) are
+        exposed to the caller via ``self.restored_paths``.
+
+        *session_only*: list ONLY those, leaving the persisted store out.
+        The save-confirmation panel opens the dialog this way — there, the
+        subject is the handful of paths just proposed, and entries ignored in
+        earlier runs were noise between the user and the one row they wanted
+        back. Those stay reachable from Settings → excluded paths.
+        """
         super().__init__(parent)
         self.game_id = game_id
         self._extra_paths: list = list(extra_paths or [])
+        self._session_only = session_only
         self.restored_paths: list = []
         self.setWindowTitle(t("add_game.ignored_paths_dialog_title"))
         self.setMinimumWidth(480)
@@ -75,7 +83,9 @@ class IgnoredPathsDialog(QDialog):
         from core.config_manager import get_config
         layout = QVBoxLayout(self)
 
-        desc = QLabel(t("add_game.ignored_paths_dialog_desc"))
+        desc = QLabel(t("add_game.ignored_paths_dialog_desc_session"
+                        if self._session_only
+                        else "add_game.ignored_paths_dialog_desc"))
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
         layout.addWidget(desc)
@@ -87,14 +97,18 @@ class IgnoredPathsDialog(QDialog):
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(0, 8, 0, 8)
 
-        config = get_config()
-        deleted = list(config.get("auto_scan_deleted_paths", {}).get(self.game_id, []))
-        for p in self._extra_paths:          # session-only deletions
-            if p not in deleted:
-                deleted.append(p)
+        if self._session_only:
+            deleted = list(self._extra_paths)
+        else:
+            config = get_config()
+            deleted = list(config.get("auto_scan_deleted_paths", {}).get(self.game_id, []))
+            for p in self._extra_paths:      # session-only deletions
+                if p not in deleted:
+                    deleted.append(p)
 
         if not deleted:
-            empty_lbl = QLabel(t("add_game.ignored_paths_none"))
+            empty_lbl = QLabel(t("add_game.session_ignored_none" if self._session_only
+                                 else "add_game.ignored_paths_none"))
             empty_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:12px;")
             inner_layout.addWidget(empty_lbl)
         else:
@@ -120,8 +134,13 @@ class IgnoredPathsDialog(QDialog):
 
     def _make_row(self, path: str) -> QHBoxLayout:
         row = QHBoxLayout()
-        cb = QCheckBox(path)
+        # Elided: the dialog is a fixed-width review list, and a path longer
+        # than it would otherwise widen the dialog until the "Deleted" tag
+        # fell off the right edge. Full path stays in the tooltip, and the
+        # restore logic reads it from self._checkboxes, not from the label.
+        cb = ElidedCheckBox()
         cb.setStyleSheet("QCheckBox { font-size: 11px; }")
+        cb.setFullText(path)
         tag = QLabel(t("add_game.ignored_paths_deleted_label"))
         tag.setStyleSheet(
             f"color:{palette('text_hint')};font-size:10px;"
@@ -815,7 +834,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._paths_scroll.setMinimumHeight(120)
         self._paths_scroll.setMaximumHeight(200)
         self._paths_container = QWidget()
-        self._paths_container.setStyleSheet("background: transparent;")
+        self._paths_container.setObjectName("transparent_bg")
         self._paths_layout = QVBoxLayout(self._paths_container)
         self._paths_layout.setContentsMargins(0, 0, 0, 0)
         self._paths_layout.setSpacing(4)
@@ -1040,12 +1059,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         img_lbl = QLabel()
         img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         img_lbl.setMinimumSize(400, 240)
-        img_lbl.setStyleSheet("background:transparent;")
+        img_lbl.setObjectName("transparent_bg")
         v.addWidget(img_lbl, 1)
 
         # ── Top bar: X button — floats over the top edge of the viewer ───────
         top_bar = QWidget(outer)
-        top_bar.setStyleSheet("background:transparent;")
+        top_bar.setObjectName("transparent_bg")
         top_row = QHBoxLayout(top_bar)
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.addStretch()
@@ -1091,22 +1110,41 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # thumbnail strip + nav (built after img_lbl so _update_thumbs can reference them)
         thumb_labels: list[QLabel] = []
 
+        # Source pixmap for the current image, kept unscaled so the view can
+        # be re-fitted to whatever space it actually gets.
+        _src: dict = {"px": None, "fitted": None}
+
+        def _fit_to_label():
+            """Scale the source to the LABEL's real size.
+
+            Deriving the size from dlg.width()/height() was the bug: on open,
+            and on entering or leaving fullscreen, the window manager grants
+            the new geometry asynchronously, so those numbers were still the
+            previous ones when the image was scaled — the picture came up at
+            the wrong size and only snapped into place if something later
+            happened to reload it. The label's own resize event IS the moment
+            the available space is known, so that is what drives this.
+            """
+            px = _src["px"]
+            if px is None or px.isNull():
+                return
+            avail = img_lbl.size()
+            if avail.width() < 40 or avail.height() < 40:
+                return
+            if _src["fitted"] == (avail.width(), avail.height()):
+                return                      # already fitted to this size
+            _src["fitted"] = (avail.width(), avail.height())
+            img_lbl.setPixmap(px.scaled(avail.width(), avail.height(),
+                                        Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation))
+            _position_fs_btn()
+
         def _load_modal_img():
             if 0 <= self._modal_idx < len(self._detected_images):
                 px = QPixmap(self._detected_images[self._modal_idx])
-                if not px.isNull():
-                    # Controls float OVER the image, so the available area
-                    # never depends on their visibility (no resize on hide).
-                    if _fs["on"]:
-                        max_w = max(dlg.width() - 32, 200)
-                        max_h = max(dlg.height() - 32, 160)
-                    else:
-                        max_w = max(dlg.width() - 80, 200)
-                        max_h = max(dlg.height() - 110, 160)
-                    px = px.scaled(max_w, max_h,
-                                   Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
-                    img_lbl.setPixmap(px)
+                _src["px"] = None if px.isNull() else px
+                _src["fitted"] = None
+                _fit_to_label()
             _update_thumbs()
             prev_btn.setEnabled(self._modal_idx > 0)
             next_btn.setEnabled(self._modal_idx < len(self._detected_images) - 1)
@@ -1156,7 +1194,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         thumb_scroll.setFrameShape(thumb_scroll.Shape.NoFrame)
         thumb_scroll.setStyleSheet("background:transparent;border:none;")
         thumb_container = QWidget()
-        thumb_container.setStyleSheet("background:transparent;")
+        thumb_container.setObjectName("transparent_bg")
         thumb_row = QHBoxLayout(thumb_container)
         thumb_row.setContentsMargins(4, 2, 4, 2)
         thumb_row.setSpacing(6)
@@ -1280,6 +1318,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     _wake_chrome()
                 elif ev.type() == QEvent.Type.Resize:
                     if obj is img_lbl:
+                        # Re-fit HERE, not after showFullScreen()/showNormal():
+                        # this is the first moment the granted geometry is real.
+                        _fit_to_label()
                         _position_fs_btn()
                     elif obj is outer:
                         _layout_chrome()
@@ -1355,10 +1396,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             logger.debug(f"Failed to open cache folder: {e}")
 
     def _browse_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, t('add_game.select_cover_image'),
-            filter="Images (*.png *.jpg *.jpeg *.webp *.bmp *.avif)"
-        )
+        from ui.widgets.file_pickers import pick_file
+        path = pick_file(self, t('add_game.select_cover_image'),
+                         "Images (*.png *.jpg *.jpeg *.webp *.bmp *.avif)")
         if path:
             # Use original path directly (no copy)
             self._image_path = path
@@ -2232,7 +2272,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             logger.debug(f"Auto image detection failed: {e}")
 
     def _browse_save(self):
-        path = QFileDialog.getExistingDirectory(self, t('add_game.select_save_folder'))
+        from ui.widgets.file_pickers import pick_folder
+        path = pick_folder(self, t('add_game.select_save_folder'))
         if path:
             self._add_path_with_validation(path)
 

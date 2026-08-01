@@ -222,7 +222,9 @@ class TagFilterPanel(QFrame, ThemedMixin):
         self._scroll.setMinimumHeight(40)
         self._scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._scroll_content = QWidget()
-        self._scroll_content.setStyleSheet("background:transparent;")
+        # Named, not styled: an own stylesheet here would outrank the theme
+        # for every chip inside and wipe out their include/exclude fill.
+        self._scroll_content.setObjectName("tag_scroll_body")
         self._tag_layout = QVBoxLayout(self._scroll_content)
         self._tag_layout.setContentsMargins(0, 0, 0, 0)
         self._tag_layout.setSpacing(1)
@@ -254,7 +256,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         self._selected_scroll.setSizePolicy(QSizePolicy.Policy.Expanding,
                                             QSizePolicy.Policy.Expanding)
         self._selected_wrap = QWidget()
-        self._selected_wrap.setStyleSheet("background:transparent;")
+        self._selected_wrap.setObjectName("tag_scroll_body")   # same reason
         self._selected_layout = QVBoxLayout(self._selected_wrap)
         self._selected_layout.setContentsMargins(0, 0, 0, 0)
         self._selected_layout.setSpacing(1)
@@ -275,23 +277,19 @@ class TagFilterPanel(QFrame, ThemedMixin):
 
         self._tag_buttons: dict[str, QPushButton] = {}
 
-    def _tag_btn_style(self, state: int) -> str:
-        if state == 1:   # include — green
-            return (f"QPushButton{{background:#1e5c2e;color:#6fcf7f;"
-                    f"border:1px solid #2e8b57;border-radius:3px;"
-                    f"font-size:11px;padding:1px 6px;text-align:left;}}"
-                    f"QPushButton:hover{{background:#2e7d45;}}")
-        elif state == 2: # exclude — red
-            return (f"QPushButton{{background:#5c1e1e;color:#cf6f6f;"
-                    f"border:1px solid #8b2e2e;border-radius:3px;"
-                    f"font-size:11px;padding:1px 6px;text-align:left;}}"
-                    f"QPushButton:hover{{background:#7d2e2e;}}")
-        else:            # off
-            return (f"QPushButton{{background:transparent;color:{palette('text_secondary')};"
-                    f"border:1px solid transparent;border-radius:3px;"
-                    f"font-size:11px;padding:1px 6px;text-align:left;}}"
-                    f"QPushButton:hover{{border-color:{palette('border_hover')};"
-                    f"color:{palette('text')};}}")
+    @staticmethod
+    def _style_tag_btn(btn: QPushButton, state: int):
+        """Tag a chip with its filter state and let the theme QSS paint it.
+
+        The look lives in DARK_THEME/LIGHT_THEME under ``#tag_chip``, keyed
+        on the ``tagState`` property (0 off, 1 include, 2 exclude), instead
+        of a per-button stylesheet: a library with a few hundred tags used
+        to hand every one of them its own sheet, which is what made a
+        light/dark switch pause. No unpolish needed anywhere — every state
+        change rebuilds these buttons from scratch.
+        """
+        btn.setObjectName("tag_chip")
+        btn.setProperty("tagState", str(state))
 
     def set_tags(self, tags: list[str]):
         # MERGE by tag_merge_key (case- AND separator-insensitive):
@@ -344,7 +342,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
             state = self._states.get(tag, 0)
             prefix = "✓ " if state == 1 else ("✕ " if state == 2 else "  ")
             btn = QPushButton(prefix + tag)
-            btn.setStyleSheet(self._tag_btn_style(state))
+            self._style_tag_btn(btn, state)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.clicked.connect(lambda _=False, t=tag: self._cycle_state(t))
@@ -366,7 +364,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
                         key=lambda x: (x[1], x[0].casefold()))
         for tag, s in active:
             btn = QPushButton(("✓ " if s == 1 else "✕ ") + tag)
-            btn.setStyleSheet(self._tag_btn_style(s))
+            self._style_tag_btn(btn, s)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setToolTip(t("library.active_tag_remove"))
@@ -513,21 +511,11 @@ class TagFilterPanel(QFrame, ThemedMixin):
         self._selected_lbl.setText(t("library.active_tag_filters"))
 
     def refresh_styles(self):
-        # Re-apply the registered one-shot styles (header/search/clear)…
+        # Re-apply the registered one-shot styles (header/search/clear). The
+        # tag chips are NOT re-styled here any more: their look comes from
+        # the theme QSS via #tag_chip, which the stylesheet swap has already
+        # re-resolved by the time this runs.
         super().refresh_styles()
-        # …then the tag chips, which are transient (rebuilt on every filter/
-        # cycle) and so are re-styled from their current 3-state value rather
-        # than registered. _tag_btn_style's off-state is palette-dependent.
-        for tag, btn in list(self._tag_buttons.items()):
-            try:
-                btn.setStyleSheet(self._tag_btn_style(self._states.get(tag, 0)))
-            except RuntimeError:
-                pass
-        for tag, btn in list(self._selected_buttons.items()):
-            try:
-                btn.setStyleSheet(self._tag_btn_style(self._states.get(tag, 0)))
-            except RuntimeError:
-                pass
         if hasattr(self._suggest, 'refresh_styles'):
             self._suggest.refresh_styles()
 

@@ -61,33 +61,29 @@ def page_numbers(current: int, total: int) -> list[int]:
     return [1] + middle + [total]
 
 
-def _pager_btn_style(active: bool) -> str:
-    """Palette-aware stylesheet for a single pager button. Kept as a module
-    helper (not an inline f-string on the setStyleSheet call) so LibraryPage
-    can re-apply it in place on a theme switch without rebuilding the pager."""
-    if active:
-        return (
-            f"QPushButton{{background:{palette('accent')};color:{palette('accent_text')};"
-            f"border:none;border-radius:4px;font-size:11px;font-weight:700;padding:0 8px;}}"
-        )
-    return (
-        f"QPushButton{{background:{palette('bg_card')};color:{palette('text_secondary')};"
-        f"border:1px solid {palette('border')};border-radius:4px;font-size:11px;padding:0 8px;}}"
-        f"QPushButton:hover{{border-color:{palette('accent')};color:{palette('accent')};}}"
-    )
+def _style_pager_btn(btn, active: bool):
+    """Name a pager button so the theme paints it.
+
+    Both looks live in DARK_THEME/LIGHT_THEME as #pager_btn_active and
+    #pager_btn. Naming beats a per-button stylesheet here: the pager is
+    rebuilt on every page change, in two different pages, and a theme switch
+    then needs to do nothing at all to these buttons.
+    """
+    btn.setObjectName("pager_btn_active" if active else "pager_btn")
 
 
-def build_pager(current: int, total: int, on_page, btn_sink=None) -> QWidget:
+def build_pager(current: int, total: int, on_page) -> QWidget:
     """Centered pager row: ‹  [1] … [N]  ›.
 
     - prev hidden on the first page, next hidden on the last;
     - with a single page the caller must not add the pager at all.
     *on_page* is called with the target page number.
-    *btn_sink*, if given, receives (button, active) tuples so the owner can
-    re-style the (palette-dependent) buttons in place on a theme switch.
+
+    The buttons take their look from the theme (see _style_pager_btn), so
+    callers no longer need to collect them for re-styling on a theme switch.
     """
     wrap = QWidget()
-    wrap.setStyleSheet("background: transparent;")
+    wrap.setObjectName("transparent_bg")
     row = QHBoxLayout(wrap)
     row.setContentsMargins(0, 4, 0, 4)
     row.setSpacing(6)
@@ -100,9 +96,7 @@ def build_pager(current: int, total: int, on_page, btn_sink=None) -> QWidget:
         b.setMinimumWidth(30)
         if tooltip:
             b.setToolTip(tooltip)
-        b.setStyleSheet(_pager_btn_style(active))
-        if btn_sink is not None:
-            btn_sink.append((b, active))
+        _style_pager_btn(b, active)
         b.clicked.connect(lambda _=False, p=page: on_page(p))
         return b
 
@@ -127,12 +121,12 @@ class LibraryPage(QWidget, ThemedMixin):
     sync_requested     = Signal(str)
     launch_requested   = Signal(str)
     review_provisional_requested = Signal(str)
+    cheats_requested   = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self._cards: dict[str, QWidget] = {}    # game_id → GameCard or GameRow
-        self._pager_btns: list = []               # (button, active) — reset each rebuild
         self._view_mode = "card"                  # default: card view
         self._last_per_row: int = 0               # track columns to avoid needless rebuilds
         self._current_page: int = 1               # library pagination (PAGE_SIZE per page)
@@ -242,9 +236,10 @@ class LibraryPage(QWidget, ThemedMixin):
 
         # Scan a folder for installed games — the bulk counterpart of "+ Add".
         self._scan_btn = QPushButton("🔍")
-        # icon_btn is the app's own transparent icon-button style; without it
-        # the default QPushButton QSS paints a filled square over the glyph.
-        self._scan_btn.setObjectName("icon_btn")
+        # toolbar_icon_btn, not the transparent icon_btn: this one sits beside
+        # "+ Add game" in the page header, and with no chrome the lone glyph
+        # read as part of the background rather than as a button.
+        self._scan_btn.setObjectName("toolbar_icon_btn")
         self._scan_btn.setFixedSize(34, 34)
         self._scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._scan_btn.setToolTip(t("exe_scan.button_tooltip"))
@@ -333,7 +328,7 @@ class LibraryPage(QWidget, ThemedMixin):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
 
         self._container = QWidget()
-        self._container.setStyleSheet("background: transparent;")
+        self._container.setObjectName("transparent_bg")
         self._layout = QVBoxLayout(self._container)
         self._layout.setSpacing(8)
         self._layout.setContentsMargins(8, 0, 0, 0)
@@ -372,7 +367,17 @@ class LibraryPage(QWidget, ThemedMixin):
         self._list_btn.setStyleSheet(_active if self._view_mode == "list" else _idle)
 
     def _rebuild_view(self):
-        """Destroy and recreate all widgets in the selected view mode."""
+        """Destroy and recreate all widgets in the selected view mode.
+
+        Wrapped in a "please wait" sheet: this runs on the GUI thread and
+        every card decodes its cover, so with large artwork the page can take
+        a noticeable moment and the window would otherwise just sit frozen.
+        """
+        from ui.widgets.busy_overlay import busy_over
+        with busy_over(self):
+            self._rebuild_view_inner()
+
+    def _rebuild_view_inner(self):
         # Remove all existing widgets
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -380,7 +385,6 @@ class LibraryPage(QWidget, ThemedMixin):
                 item.widget().deleteLater()
 
         self._cards.clear()
-        self._pager_btns = []   # fresh list each rebuild — no accumulation
         lib = get_library()
         all_games = lib.all_games()
 
@@ -446,8 +450,7 @@ class LibraryPage(QWidget, ThemedMixin):
         if total_pages > 1:
             self._layout.insertWidget(
                 self._layout.count(),
-                build_pager(self._current_page, total_pages, _go_page,
-                            btn_sink=self._pager_btns))
+                build_pager(self._current_page, total_pages, _go_page))
 
         if self._view_mode == "card":
             # Wrap cards in a flow-ish grid using nested HBoxLayouts.
@@ -462,7 +465,7 @@ class LibraryPage(QWidget, ThemedMixin):
                     if row_layout is not None:
                         row_layout.addStretch()  # pin previous row's cards to the left
                     row_widget = QWidget()
-                    row_widget.setStyleSheet("background: transparent;")
+                    row_widget.setObjectName("transparent_bg")
                     row_layout = QHBoxLayout(row_widget)
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(12)
@@ -484,8 +487,7 @@ class LibraryPage(QWidget, ThemedMixin):
         if total_pages > 1:
             self._layout.insertWidget(
                 self._layout.count(),
-                build_pager(self._current_page, total_pages, _go_page,
-                            btn_sink=self._pager_btns))
+                build_pager(self._current_page, total_pages, _go_page))
 
         self._layout.addStretch()
         self._update_empty_state()
@@ -497,7 +499,7 @@ class LibraryPage(QWidget, ThemedMixin):
             w = GameRow(entry)
         for sig in ("backup_requested","restore_requested","remove_requested",
                     "edit_requested","sync_requested","launch_requested",
-                    "review_provisional_requested"):
+                    "review_provisional_requested", "cheats_requested"):
             getattr(w, sig).connect(getattr(self, sig))
         w.detail_requested.connect(self._on_detail_requested)
         return w
@@ -787,12 +789,8 @@ class LibraryPage(QWidget, ThemedMixin):
         super().refresh_styles()
         # 2. State-dependent view-toggle button highlight.
         self._apply_view_btn_styles()
-        # 3. Pager buttons (transient, tracked per rebuild in self._pager_btns).
-        for btn, active in list(self._pager_btns):
-            try:
-                btn.setStyleSheet(_pager_btn_style(active))
-            except RuntimeError:
-                pass   # underlying C++ widget already deleted — skip
+        # 3. Pager buttons need nothing: #pager_btn / #pager_btn_active come
+        #    from the theme, which the stylesheet swap has already re-resolved.
         # 4. Folder tree: its own chrome + folder rows + tag-filter panel/chips.
         if getattr(self, "_folder_tree", None) is not None:
             try:

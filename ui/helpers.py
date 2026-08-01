@@ -8,9 +8,9 @@ import platform
 import subprocess
 
 import shiboken6 as sip
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap, QFontMetrics
-from PySide6.QtWidgets import QApplication, QLabel, QSizePolicy
+from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QSizePolicy, QStyle
 
 logger = logging.getLogger(__name__)
 
@@ -96,15 +96,215 @@ def open_in_file_manager(target) -> None:
         logger.warning(f"Could not open folder '{target}': {e}")
 
 
+def game_is_running() -> bool:
+    """True while SaveSync is tracking a live game session.
+
+    The one place this question is answered, because more than one thing acts
+    on it — the overlay and every pin — and they must not disagree about when
+    the pointer is SaveSync's business.
+    """
+    try:
+        from core.monitor import get_monitor
+        return bool(get_monitor().currently_playing())
+    except Exception:
+        return False
+
+
+class SystemCursor:
+    """Make the mouse pointer usable while a game is hiding it.
+
+    Plenty of games hide the pointer outright and confine it to their own
+    window. Both are done from the game's process, and neither can be undone
+    for the game from outside it — but neither has to be. Two things are
+    enough to make an overlay clickable:
+
+    - release the confinement (``ClipCursor(NULL)``), so the pointer can
+      actually travel to a window that is not the game's;
+    - raise THIS process's cursor display counter, which is what Windows
+      consults while the pointer is over one of our windows.
+
+    Every increment is counted so it can be undone exactly: leaving the
+    counter raised would leave a pointer sitting over the game after the
+    overlay is gone, which is precisely the thing the game turned off.
+
+    More than one thing needs the pointer, and they overlap: the overlay is
+    one, a note being typed into is another, a pin mid-drag a third. So this
+    counts HOLDERS, not calls — the pointer comes up for the first hold and
+    goes down only when the last one lets go. A single flag would have the
+    overlay's auto-hide yank the pointer out from under a note the player was
+    still writing in.
+
+    A no-op away from Windows: X11/Wayland/macOS have no equivalent global
+    hide for another process to undo.
+    """
+
+    _raised = 0
+    _holders: set = set()
+
+    @classmethod
+    def hold(cls, key: str) -> None:
+        """Keep the pointer up until *key* lets go. Re-holding is harmless."""
+        cls._holders.add(key)
+        cls._raise()
+
+    @classmethod
+    def release(cls, key: str) -> None:
+        cls._holders.discard(key)
+        if not cls._holders:
+            cls._lower()
+
+    @classmethod
+    def release_all(cls) -> None:
+        cls._holders.clear()
+        cls._lower()
+
+    @classmethod
+    def held_by(cls) -> set:
+        return set(cls._holders)
+
+    @classmethod
+    def _raise(cls) -> None:
+        if platform.system() != "Windows" or cls._raised:
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.ClipCursor(None)
+            # ShowCursor returns the NEW counter; visible at >= 0. Every call
+            # is counted, INCLUDING the one that reaches 0 — counting only the
+            # calls that stayed negative would under-record by one and leave
+            # the counter a notch higher after every show/restore cycle. The
+            # bound stops a runaway loop if the call ever stops incrementing.
+            raised = 0
+            while raised < 16:
+                counter = user32.ShowCursor(True)
+                raised += 1
+                if counter >= 0:
+                    break
+            cls._raised = raised
+        except Exception as e:
+            logger.debug(f"Could not raise the system cursor: {e}")
+
+    @classmethod
+    def _lower(cls) -> None:
+        if platform.system() != "Windows" or not cls._raised:
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            for _ in range(cls._raised):
+                user32.ShowCursor(False)
+        except Exception as e:
+            logger.debug(f"Could not restore the system cursor: {e}")
+        finally:
+            cls._raised = 0
+
+
+def above_foreground(hwnd: int) -> bool:
+    """Whether *hwnd* really sits above the window that is in front.
+
+    "I asked for topmost" and "I am on top" are different claims. A game in
+    borderless fullscreen carries the always-on-top flag too, so both windows
+    can hold it while only one of them is actually visible.
+    """
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetWindow.restype = wintypes.HWND
+        user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        front = user32.GetForegroundWindow()
+        if not front or front == hwnd:
+            return True
+        walk = hwnd
+        # Bounded: the chain is a few dozen windows on any real desktop, and
+        # a loop that cannot end is worse than an answer of "no".
+        for _ in range(500):
+            walk = user32.GetWindow(walk, 2)          # GW_HWNDNEXT
+            if not walk:
+                return False
+            if walk == front:
+                return True
+        return False
+    except Exception as e:
+        logger.debug(f"Could not read the window order: {e}")
+        return True
+
+
+# With SAVESYNC_TRACE=1 every attempt to put a window back on top says what
+# it found and what it achieved. Read once: the check costs a name lookup
+# rather than an environment read per round.
+TRACE_Z = os.environ.get("SAVESYNC_TRACE") == "1"
+
+
+def z_report(widget) -> str:
+    """Where a window actually sits right now, in words, for the trace log.
+
+    Used by the overlay and the pins alike, because they share the mechanism
+    and therefore share its failure: both can hold the always-on-top flag and
+    still be underneath a game that holds it too.
+    """
+    if platform.system() != "Windows":
+        return "not Windows"
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowLongW.restype = wintypes.DWORD
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        hwnd = int(widget.winId())
+        front = user32.GetForegroundWindow()
+        topmost = bool(user32.GetWindowLongW(hwnd, -20) & 0x00000008)
+        name = ctypes.create_unicode_buffer(96)
+        user32.GetWindowTextW(front, name, 96)
+        return (f"topmost={topmost} above_foreground={above_foreground(hwnd)} "
+                f"foreground={name.value[:48]!r}")
+    except Exception as e:
+        return f"z-order unreadable: {e}"
+
+
+def popup_is_open() -> bool:
+    """Whether one of our own menus is up.
+
+    Re-ordering a window to the top puts it over any menu that is open, and
+    the overlay does that every second while the 📌 menu opens inside the
+    overlay's own rectangle — so the menu you just asked for disappears
+    behind it. Nothing needs raising while a menu is up: a menu is only ever
+    open because the player is looking at SaveSync, not at the game.
+    """
+    try:
+        from PySide6.QtWidgets import QApplication
+        return QApplication.activePopupWidget() is not None
+    except Exception:
+        return False
+
+
 def force_topmost(widget) -> None:
     """Force a frameless always-on-top widget above all windows without
-    stealing focus — shared by the overlay and the blur modal.
+    stealing focus — shared by the overlay, the pins and the blur modal.
 
     - Windows: Win32 SetWindowPos with HWND_TOPMOST + NOACTIVATE, plus
       WS_EX_TOOLWINDOW so the widget never shows in taskbar/alt-tab.
     - Linux/macOS: Qt raise_() re-stacks the widget (X11 sends
       _NET_WM_STATE_ABOVE; on Wayland fullscreen it's a compositor no-op;
       macOS raises the NSWindow level).
+
+    Asking for HWND_TOPMOST does nothing to a window that ALREADY carries the
+    flag — and a borderless game carries it too. So the window keeps the flag,
+    the request succeeds, and it stays underneath the game all the same; the
+    trace showed exactly that, `topmost=True above_foreground=False` round
+    after round. HWND_TOP is what re-orders it, and it does so from INSIDE
+    the always-on-top group.
+
+    Not by leaving the group and re-entering it, which was the first attempt:
+    that works too, but for the moment it takes, the window is below
+    everything. With an overlay on one timer and a pin on another, both
+    stepping out and back in, the game — which never moves — ends up above
+    both. Staying in the group throughout leaves no such moment.
     """
     if platform.system() == "Windows":
         try:
@@ -116,11 +316,11 @@ def force_topmost(widget) -> None:
             SWP_NOACTIVATE = 0x0010
             SWP_NOOWNERZORDER = 0x0200
             HWND_TOPMOST = -1
-            user32.SetWindowPos(
-                hwnd, HWND_TOPMOST,
-                0, 0, 0, 0,
-                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            )
+            HWND_TOP = 0
+            flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            if not above_foreground(hwnd):
+                user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags)
             extended_style = user32.GetWindowLongW(hwnd, -20)   # GWL_EXSTYLE
             user32.SetWindowLongW(hwnd, -20, extended_style | 0x00000080)  # WS_EX_TOOLWINDOW
         except Exception as e:
@@ -155,6 +355,93 @@ def load_pixmap_any(path: str) -> QPixmap:
     except Exception as e:
         logger.debug(f"PIL fallback failed for '{path}': {e}")
     return px
+
+
+class ForegroundWatcher(QObject):
+    """Tells you the moment another window comes to the front.
+
+    A window that has to stay above a running game cannot wait for a poll to
+    come round. A game takes the foreground back on every alt-tab, every
+    loading screen, every time it is clicked, and it puts itself above
+    everything as it does — so a window re-asserting itself only once a
+    second spends most of that second behind the game. Re-asserting at the
+    instant the foreground changes is what the overlay does, and it is why
+    the overlay stays up where a timer alone does not.
+
+    Windows only: elsewhere the window manager honours "stays on top" without
+    help, and start() simply does nothing. One hook is shared by everyone who
+    asks for it, and it is taken down when the last of them stops.
+    """
+
+    changed = Signal(int)          # the window that came forward
+
+    _instance = None
+
+    @classmethod
+    def instance(cls) -> "ForegroundWatcher":
+        if cls._instance is None:
+            cls._instance = ForegroundWatcher()
+        return cls._instance
+
+    def __init__(self):
+        super().__init__()
+        self._hook = None
+        self._proc = None
+        self._users = 0
+
+    def start(self):
+        self._users += 1
+        if self._users == 1:
+            self._install()
+
+    def stop(self):
+        self._users = max(0, self._users - 1)
+        if self._users == 0:
+            self._remove()
+
+    def _install(self):
+        if platform.system() != "Windows" or self._hook is not None:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            from PySide6.QtCore import QTimer
+
+            EVENT_SYSTEM_FOREGROUND = 0x0003
+            WINEVENT_OUTOFCONTEXT = 0x0000
+            WINEVENTPROC = ctypes.WINFUNCTYPE(
+                None, ctypes.c_void_p, wintypes.DWORD, wintypes.HWND,
+                ctypes.c_long, ctypes.c_long, wintypes.DWORD, wintypes.DWORD)
+
+            def _fired(_hook, _event, hwnd, _obj, _child, _tid, _time):
+                # Back to the event loop before touching anything Qt owns:
+                # this runs from inside a Windows message, not from ours.
+                try:
+                    QTimer.singleShot(0, lambda h=int(hwnd or 0):
+                                      self.changed.emit(h))
+                except Exception:
+                    pass
+
+            self._proc = WINEVENTPROC(_fired)      # a ref, or it is collected
+            self._hook = ctypes.windll.user32.SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
+                self._proc, 0, 0, WINEVENT_OUTOFCONTEXT)
+            if not self._hook:
+                self._hook, self._proc = None, None
+        except Exception as e:
+            logger.debug(f"Could not watch the foreground window: {e}")
+            self._hook, self._proc = None, None
+
+    def _remove(self):
+        if self._hook is None:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.UnhookWinEvent(self._hook)
+        except Exception as e:
+            logger.debug(f"Could not stop watching the foreground: {e}")
+        finally:
+            self._hook, self._proc = None, None
 
 
 class TopmostPinMixin:
@@ -256,6 +543,56 @@ class ElidedLabel(QLabel):
     def _apply_elide(self):
         metrics = QFontMetrics(self.font())
         width = max(40, self.width() - 2)
+        super().setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideMiddle, width))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()
+
+
+class ElidedCheckBox(QCheckBox):
+    """Checkbox whose own label is a path: middle-elided to fit, full value in
+    the tooltip.
+
+    Same reasoning as ElidedLabel, applied where the path IS the label. A
+    plain QCheckBox sizes itself to its entire text, so one long path widens
+    the row past the viewport and pushes the buttons that follow it (open,
+    delete) out behind a horizontal scrollbar. Elision here is purely visual:
+    callers keep the real path themselves and must never read it back off the
+    label.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self._tooltip_suffix = ""
+        self.setMinimumWidth(80)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setFullText(text)
+
+    def setFullText(self, text: str):
+        self._full = text or ""
+        self.setToolTip("\n".join(p for p in (self._full, self._tooltip_suffix) if p))
+        self._apply_elide()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def setTooltipSuffix(self, suffix: str):
+        """Extra explanatory line kept under the full value in the tooltip."""
+        self._tooltip_suffix = suffix or ""
+        self.setFullText(self._full)
+
+    def _label_offset(self) -> int:
+        """Width the indicator and its spacing take away from the text."""
+        style = self.style()
+        return (style.pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth, None, self)
+                + style.pixelMetric(QStyle.PixelMetric.PM_CheckBoxLabelSpacing, None, self)
+                + 4)
+
+    def _apply_elide(self):
+        metrics = QFontMetrics(self.font())
+        width = max(40, self.width() - self._label_offset())
         super().setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideMiddle, width))
 
     def resizeEvent(self, event):
