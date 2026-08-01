@@ -32,8 +32,34 @@ _DEFAULTS: dict[str, Any] = {
     "backup_retention_days": 30,
     "min_kept_backups": 3,
     "max_backup_size_mb": 512,
+    # The copies the save editor keeps before it writes: how many of one save
+    # to hold on to, and for how long. Separate from the backup policy above,
+    # which is about whole save folders rather than single edited files.
+    "save_edit_copies": 3,
+    "save_edit_copy_days": 7,
     "process_poll_interval": 1,
     "save_scan_debounce": 5,
+    # Temporal correlation: claim a save-like write elsewhere on disk when it
+    # lands within the window of a write to an already-known path of the
+    # running game. Finds saves no name matching can (Ren'Py's roaming folder
+    # is named after the game's INTERNAL title), but it infers from timing
+    # alone, so it is opt-in — during a long session the false positives cost
+    # more than the occasional catch.
+    "save_correlation_enabled": False,
+    "save_correlation_window_ms": 1000,
+    # Periodic backup integrity check. Opens each archive and confirms every
+    # member still passes its CRC — the cheap check that catches a truncated
+    # upload or a half-written file, which otherwise surfaces only when a
+    # restore is attempted. Runs in the background, well after startup.
+    "backup_verify_enabled": True,
+    "backup_verify_interval_days": 7,
+    "backup_verify_last": "",      # ISO datetime of the last completed run
+    # Pinned notes/images: only paths and window geometry. The files stay
+    # where the player put them and are never copied into SaveSync.
+    "pins_recent": {},             # game_id -> recently pinned files, newest first
+    "pins_open": {},               # game_id -> re-pinned when that game runs
+    "pins_geometry": {},           # path -> [x, y, w, h]
+    "pins_opacity": {},            # path -> percent
     "save_folder_hints": list(SAVE_FOLDER_HINTS),  # sourced from constants to avoid duplication
     "extra_watch_paths": [],
     "sync_provider": None,             # deprecated: single provider (migrated to sync_providers)
@@ -80,9 +106,32 @@ _DEFAULTS: dict[str, Any] = {
 _VALIDATION_RULES: dict[str, Callable] = {
     "max_local_backups": lambda x: isinstance(x, int) and 1 <= x <= 100,
     "backup_retention_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    "save_edit_copies": lambda x: isinstance(x, int) and 1 <= x <= 50,
+    "save_edit_copy_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
     "min_kept_backups": lambda x: isinstance(x, int) and 0 <= x <= 50,
     "process_poll_interval": lambda x: isinstance(x, (int, float)) and 1 <= x <= 60,
     "save_scan_debounce": lambda x: isinstance(x, (int, float)) and 1 <= x <= 30,
+    "save_correlation_enabled": lambda x: isinstance(x, bool),
+    "save_correlation_window_ms": lambda x: isinstance(x, int) and 100 <= x <= 10000,
+    "backup_verify_enabled": lambda x: isinstance(x, bool),
+    "backup_verify_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    # A plain list is the pre-per-game shape; still accepted so an existing
+    # config loads and is migrated on first read instead of being reset.
+    "pins_recent": lambda x: (
+        isinstance(x, list) and all(isinstance(p, str) for p in x)) or (
+        isinstance(x, dict) and all(
+            isinstance(v, list) and all(isinstance(p, str) for p in v)
+            for v in x.values())),
+    "pins_opacity": lambda x: isinstance(x, dict) and all(
+        isinstance(v, int) and 0 <= v <= 100 for v in x.values()),
+    "pins_open": lambda x: (
+        isinstance(x, list) and all(isinstance(p, str) for p in x)) or (
+        isinstance(x, dict) and all(
+            isinstance(v, list) and all(isinstance(p, str) for p in v)
+            for v in x.values())),
+    "pins_geometry": lambda x: isinstance(x, dict) and all(
+        isinstance(v, list) and len(v) == 4
+        and all(isinstance(n, int) for n in v) for v in x.values()),
     "overlay_hotkey": lambda x: isinstance(x, str) and len(x.strip()) > 0,
     "unknown_game_history": lambda x: isinstance(x, list),
     "language": lambda x: isinstance(x, str) and x in ["en", "it"],

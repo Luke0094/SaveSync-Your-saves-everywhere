@@ -255,7 +255,7 @@ def _latest_write_ts(path_str: str, max_entries_scanned: int = 400) -> float:
 
 
 def correlated_engine_paths(exe_path: str, known_paths: list[str],
-                            since_ts: float, window_s: float = 2.0,
+                            since_ts: float, window_s: Optional[float] = None,
                             anchor_ts: Optional[float] = None,
                             own_game_id: str = "") -> list[str]:
     """Engine-container folders claimed by TEMPORAL correlation.
@@ -278,11 +278,27 @@ def correlated_engine_paths(exe_path: str, known_paths: list[str],
     core.watcher — event-precise claims of name-filter-rejected events
     (_record_unattributed / _claim_correlated_for_anchor).
 
-    Guards, in order: candidate must not already be covered by a known
-    path; its activity must postdate the session (*since_ts*); it must
-    correlate with the anchor; a folder whose name slug matches a DIFFERENT
-    library game is never claimed; and it must contain selectable content.
+    Guards, in order: correlation must be enabled in Settings (it is off by
+    default — see save_correlation_enabled); candidate must not already be
+    covered by a known path; its activity must postdate the session
+    (*since_ts*); it must correlate with the anchor; a folder whose name slug
+    matches a DIFFERENT library game is never claimed; and it must contain
+    selectable content.
+
+    *window_s* defaults to the configured save_correlation_window_ms; an
+    explicit value still wins, so a caller can correlate on its own terms.
     """
+    from core.game_engine import detect_engine
+    # Decides whether ".dat" counts as content here — see
+    # _selectable_skip_sets.
+    _engine = detect_engine(exe_path=exe_path) if exe_path else ""
+    from core.watcher import correlation_settings
+    _enabled, _strong_s, _weak_s = correlation_settings()
+    if not _enabled:
+        return []
+    if window_s is None:
+        window_s = _strong_s
+
     known_fs = [k for k in (known_paths or [])
                 if not k.lower().startswith("registry:")]
     if anchor_ts is None:
@@ -338,7 +354,7 @@ def correlated_engine_paths(exe_path: str, known_paths: list[str],
                     continue
                 if abs(cand_ts - anchor_ts) > window_s:
                     continue
-                if not path_has_backup_content(str(child)):
+                if not path_has_backup_content(str(child), engine=_engine):
                     continue
                 results.append(str(child))
                 logger.info(
@@ -855,6 +871,195 @@ def _live_save_paths(pid: int) -> list[str]:
 
 # ── Platform watch roots ──────────────────────────────────────────────────────
 
+# ── Wine / Proton prefixes (Linux, and Wine on macOS) ────────────────────────
+# A Windows game running under Proton or Wine writes exactly where it would on
+# Windows — only the whole C: drive is a folder inside a "prefix". So the saves
+# are not in any XDG location: they are under
+# <prefix>/drive_c/users/<user>/AppData/... and the existing Windows-shaped
+# heuristics find them unchanged, once pointed at the right root.
+#
+# Only the USER directory of each prefix is offered as a root, never the prefix
+# itself: the rest of it is a synthetic Windows install (windows/, Program
+# Files, the registry hives) that holds no player data and would multiply the
+# scan cost by the size of a Windows tree, per game.
+
+def _steam_library_roots() -> list[Path]:
+    """Every Steam library on this machine, from libraryfolders.vdf.
+
+    Games are routinely installed on a second drive, and their Proton prefix
+    lives beside them — looking only under ~/.steam would miss those.
+    """
+    roots: list[Path] = []
+    seen: set[str] = set()
+    home = Path.home()
+    candidates = [
+        home / ".steam" / "steam",
+        home / ".local" / "share" / "Steam",
+        home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+        home / "Library" / "Application Support" / "Steam",
+    ]
+    for base in candidates:
+        if not base.exists():
+            continue
+        if str(base) not in seen:
+            seen.add(str(base))
+            roots.append(base)
+        vdf = base / "steamapps" / "libraryfolders.vdf"
+        if not vdf.exists():
+            continue
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        # The file is Valve's KeyValues format; every library appears as a
+        # "path" entry. Matching that one key avoids depending on a parser
+        # for a format whose surrounding shape has changed between clients.
+        for m in re.finditer(r'"path"\s*"([^"]+)"', text):
+            p = Path(m.group(1))
+            if p.exists() and str(p) not in seen:
+                seen.add(str(p))
+                roots.append(p)
+    return roots
+
+
+# The save-bearing folders inside a prefix user directory. This mirrors the
+# Windows side of WATCH_PATHS_TEMPLATES on purpose: the scanner walks a bounded
+# number of levels below each root it is given, so handing it the user
+# directory instead of these leaves the real save folders out of reach — the
+# depth budget is spent crossing AppData/LocalLow/<publisher> before the game's
+# own folder is ever reached.
+_PREFIX_SAVE_SUBDIRS = (
+    "AppData/Roaming",          # {APPDATA}
+    "AppData/Local",            # {LOCALAPPDATA}
+    "AppData/LocalLow",
+    "Documents",
+    "Documents/My Games",
+    "Documents/Electronic Arts",
+    "Documents/Rockstar Games",
+    "Saved Games",
+)
+
+
+def _prefix_user_dirs(prefix: Path) -> list[Path]:
+    """Save-bearing directories inside a Wine/Proton prefix."""
+    users = prefix / "drive_c" / "users"
+    if not users.is_dir():
+        return []
+    out = []
+    try:
+        for d in users.iterdir():
+            # "Public" holds shared shell folders, not player data.
+            if not d.is_dir() or d.name.lower() == "public":
+                continue
+            for rel in _PREFIX_SAVE_SUBDIRS:
+                p = d.joinpath(*rel.split("/"))
+                if p.is_dir():
+                    out.append(p)
+    except OSError:
+        pass
+    return out
+
+
+# Without an appid every prefix on the machine is a candidate, and a library
+# can hold hundreds — each one walked several levels deep, for every search
+# term. Only the most recently written prefixes are kept: a prefix's mtime
+# moves when the game runs, so this is "what has actually been played".
+_MAX_SCANNED_PREFIXES = 16
+
+
+def _recent_dirs(dirs: list[Path], limit: int = _MAX_SCANNED_PREFIXES) -> list[Path]:
+    """The *limit* most recently modified directories, newest first."""
+    if len(dirs) <= limit:
+        return dirs
+    def when(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+    return sorted(dirs, key=when, reverse=True)[:limit]
+
+
+def _proton_prefix_dirs(appid: str = "") -> list[Path]:
+    """User directories of Proton prefixes.
+
+    With *appid* known this goes straight to that game's prefix — one stat
+    instead of walking every prefix on the machine, which matters because a
+    Steam library can hold hundreds.
+    """
+    out: list[Path] = []
+    for lib in _steam_library_roots():
+        compat = lib / "steamapps" / "compatdata"
+        if not compat.is_dir():
+            continue
+        if appid:
+            out.extend(_prefix_user_dirs(compat / str(appid) / "pfx"))
+            continue
+        try:
+            entries = [e for e in compat.iterdir() if e.is_dir()]
+        except OSError:
+            continue
+        for entry in _recent_dirs(entries):
+            out.extend(_prefix_user_dirs(entry / "pfx"))
+    return out
+
+
+def _wine_prefix_dirs() -> list[Path]:
+    """User directories of plain Wine prefixes and the common managers."""
+    home = Path.home()
+    out: list[Path] = []
+    explicit = os.getenv("WINEPREFIX", "")
+    if explicit:
+        out.extend(_prefix_user_dirs(Path(explicit)))
+    out.extend(_prefix_user_dirs(home / ".wine"))
+    # Managers keep one prefix per game under a predictable parent. The cap
+    # applies to the union, not to each parent: capping per parent would let
+    # five populated managers through at five times the intended ceiling.
+    managed: list[Path] = []
+    for parent in (home / ".local" / "share" / "bottles" / "bottles",
+                   home / "Games" / "Heroic" / "Prefixes",
+                   home / ".config" / "heroic" / "tools" / "wine",
+                   home / ".local" / "share" / "lutris" / "runners" / "winesteam" / "prefix",
+                   home / "Games"):
+        if not parent.is_dir():
+            continue
+        try:
+            managed.extend(e for e in parent.iterdir() if e.is_dir())
+        except OSError:
+            continue
+    for entry in _recent_dirs(managed):
+        out.extend(_prefix_user_dirs(entry))
+    return out
+
+
+def compat_prefix_roots(appid: str = "") -> list[Path]:
+    """Save roots inside Wine/Proton prefixes. Empty on Windows.
+
+    With *appid* this answers one question only — "where does THIS Steam game
+    save under Proton" — and leaves the standalone Wine prefixes out: they
+    belong to other games, and the caller adds them anyway through the
+    no-appid call that builds the general watch list.
+    """
+    if _SYSTEM == "Windows":
+        return []
+    try:
+        found = _proton_prefix_dirs(appid)
+        if not appid:
+            found += _wine_prefix_dirs()
+    except Exception as e:
+        logger.debug(f"Wine/Proton prefix lookup failed: {e}")
+        return []
+    out, seen = [], set()
+    for p in found:
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    if out:
+        logger.debug(f"Wine/Proton save roots: {len(out)}"
+                     + (f" (appid {appid})" if appid else ""))
+    return out
+
+
 def _resolve_watch_paths(config=None) -> list[Path]:
     paths: list[Path] = []
     if config is None:
@@ -887,6 +1092,14 @@ def _resolve_watch_paths(config=None) -> list[Path]:
         for d in [xdg_data, xdg_cfg, home/".steam"/"steam"/"userdata",
                   home/"snap", home/".var"/"app"]:
             if d.exists(): paths.append(d)
+        # Windows games under Proton/Wine save inside their prefix, which no
+        # XDG path covers. Without an appid here every prefix is offered; the
+        # detector narrows to the game's own when it knows it.
+        paths.extend(compat_prefix_roots())
+    for extra in config.get("extra_watch_paths", []):
+        p = Path(extra)
+        if _SYSTEM != "Windows" and p.exists() and p not in paths:
+            paths.append(p)
     return paths
 
 
@@ -1578,6 +1791,14 @@ def detect_save_paths(
 
     # Strategy 4: Filesystem scan
     search_roots: list[Path] = list(_resolve_watch_paths(config))
+    # With the appid known, this game's own Proton prefix goes to the FRONT:
+    # it is where a Windows game running under Proton actually saves, and
+    # searching it first is both cheaper and more likely to be right than
+    # walking every prefix on the machine.
+    if appid:
+        for _pfx in reversed(compat_prefix_roots(str(appid))):
+            if _pfx not in search_roots:
+                search_roots.insert(0, _pfx)
     if exe_path:
         exe_dir = Path(exe_path).parent
         for p in [exe_dir, exe_dir.parent]:
@@ -1676,15 +1897,24 @@ def detect_save_paths(
     return results
 
 
-def _selectable_skip_sets(include_detection_excluded: bool = True) -> tuple[set, set, set]:
+def _selectable_skip_sets(include_detection_excluded: bool = True,
+                          engine: str = "") -> tuple[set, set, set]:
     """(skip_extensions, skip_dirs, skip_filename_stems) shared by every
     "does this path contain anything worth showing/backing up?" check —
     single source of truth for auto-scan filtering, add-game general scan,
-    and path expansion."""
+    and path expansion.
+
+    *engine*, when known, narrows the detection-only exclusions: ".dat" is
+    engine data in RPG Maker and a save in Unity, so the same blanket rule
+    cannot be right for both. Unknown engine keeps the broad list, which is
+    the safe direction — a save that is merely not auto-detected can still
+    be added by hand, while noise proposed as a save cannot be un-seen.
+    """
     from core.backup import _BACKUP_SKIP_EXTENSIONS, _BACKUP_SKIP_DIRS
+    from core.game_engine import detection_skip_extensions
     exts = set(_BACKUP_SKIP_EXTENSIONS)
     if include_detection_excluded:
-        exts |= set(DETECTION_SKIP_EXTENSIONS)
+        exts |= detection_skip_extensions(engine)
     return exts, set(_BACKUP_SKIP_DIRS), set(SKIP_FILENAME_STEMS)
 
 
@@ -1695,7 +1925,8 @@ def _is_selectable_file(f: Path, skip_exts: set, skip_stems: set) -> bool:
     return f.suffix.lower() not in skip_exts and f.stem.lower() not in skip_stems
 
 
-def path_has_backup_content(path_str, include_detection_excluded: bool = True) -> bool:
+def path_has_backup_content(path_str, include_detection_excluded: bool = True,
+                            engine: str = "") -> bool:
     """True if *path_str* (file or directory, recursive) contains at least
     one file that would actually be backed up / shown as selectable.
 
@@ -1704,7 +1935,8 @@ def path_has_backup_content(path_str, include_detection_excluded: bool = True) -
     from core.registry_saves import is_registry_path, registry_has_values
     if is_registry_path(str(path_str)):
         return registry_has_values(str(path_str))
-    skip_exts, skip_dirs, skip_stems = _selectable_skip_sets(include_detection_excluded)
+    skip_exts, skip_dirs, skip_stems = _selectable_skip_sets(
+        include_detection_excluded, engine)
     p = Path(path_str)
     try:
         if p.is_file():
@@ -1984,7 +2216,10 @@ def general_scan_paths(game_name: str, exe_path: str, hints: list[str],
     combined set.
     """
     import time as _time
+    from core.game_engine import detect_engine
     start = _time.time()
+    # Read once per scan: the engine decides whether ".dat" is a save here.
+    _engine = detect_engine(exe_path=exe_path) if exe_path else ""
 
     def _stopped() -> bool:
         if should_stop is not None and should_stop():
@@ -2028,7 +2263,7 @@ def general_scan_paths(game_name: str, exe_path: str, hints: list[str],
         p = str(path)
         if p in already_set or p in out or score < MIN_GENERAL_THRESHOLD:
             continue
-        if require_backup_content and not path_has_backup_content(path):
+        if require_backup_content and not path_has_backup_content(path, engine=_engine):
             logger.debug(f"General scan skip (no backup content): {path}")
             continue
         out.append(p)

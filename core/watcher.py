@@ -145,9 +145,86 @@ from collections import deque as _deque
 _UNATTRIBUTED_EVENTS: "_deque" = _deque(maxlen=64)   # (ts, file_key, strong)
 _LAST_ANCHOR_TS: Dict[str, float] = {}               # game_id → last attributed ts
 _CLAIMED_EVENTS = _BoundedSet()                      # file_key già reclamati
-_CORR_WINDOW_STRONG_S = 2.0
-_CORR_WINDOW_WEAK_S = 0.8
+_CORR_DEFAULT_WINDOW_MS = 1000
+_CORR_WEAK_RATIO = 0.4   # weaker candidates get a stricter slice of the window
 _CORR_WEAK_CAP = 2       # max weak claims per anchor sweep
+
+# Only a real WRITE moves the correlation clock. This has to be enforced
+# explicitly, twice over, because neither check is sufficient alone:
+#
+#  - by event type, because a deletion or a rename away is not "the game
+#    saved" and must not open a window;
+#  - by mtime, because watchdog on Windows subscribes ReadDirectoryChangesW
+#    to LAST_ACCESS, ATTRIBUTES and SECURITY as well as LAST_WRITE, and maps
+#    every one of them onto FileModifiedEvent. A plain read of a save file,
+#    an antivirus scan or an archive-bit flip is therefore indistinguishable
+#    from the game writing — unless the file's modification time is checked
+#    to have actually moved.
+_CORR_WRITE_EVENT_TYPES = frozenset({"created", "modified", "moved"})
+
+# Floor for the mtime freshness probe. Deliberately NOT the correlation
+# window: this only answers "was this event backed by a real write?", while
+# the window answers "how close to the anchor?". FAT32/exFAT store mtimes at
+# 2-second granularity, so anything tighter would reject genuine writes on
+# removable drives.
+_CORR_MTIME_TOLERANCE_S = 2.0
+
+_CORR_SETTINGS_CACHE: dict = {"ts": 0.0, "enabled": False,
+                              "strong_s": _CORR_DEFAULT_WINDOW_MS / 1000.0,
+                              "weak_s": _CORR_DEFAULT_WINDOW_MS / 1000.0 * _CORR_WEAK_RATIO}
+_CORR_SETTINGS_TTL = 5.0
+
+
+def correlation_settings() -> tuple:
+    """(enabled, strong_window_s, weak_window_s) from the user's settings.
+
+    Cached for a few seconds: this is consulted on every filesystem event,
+    and a config read per event would put lock traffic on the watchdog
+    thread. The TTL is short enough that toggling the option in Settings
+    takes effect while the game is still running.
+    """
+    import time as _time
+    now = _time.time()
+    if now - _CORR_SETTINGS_CACHE["ts"] > _CORR_SETTINGS_TTL:
+        enabled = False
+        window_ms = _CORR_DEFAULT_WINDOW_MS
+        try:
+            from core.config_manager import get_config
+            cfg = get_config()
+            enabled = bool(cfg.get("save_correlation_enabled", False))
+            window_ms = int(cfg.get("save_correlation_window_ms",
+                                    _CORR_DEFAULT_WINDOW_MS))
+        except Exception:
+            pass
+        strong = max(0.05, window_ms / 1000.0)
+        _CORR_SETTINGS_CACHE.update({
+            "ts": now, "enabled": enabled,
+            "strong_s": strong, "weak_s": strong * _CORR_WEAK_RATIO,
+        })
+    return (_CORR_SETTINGS_CACHE["enabled"], _CORR_SETTINGS_CACHE["strong_s"],
+            _CORR_SETTINGS_CACHE["weak_s"])
+
+
+def _is_write_event(event) -> bool:
+    """True for create/modify/move — the events that mean "this file changed".
+
+    Excludes deletions and the read-only open/close events inotify emits.
+    """
+    return getattr(event, "event_type", "") in _CORR_WRITE_EVENT_TYPES
+
+
+def _has_fresh_write(src_path: str, now: float) -> bool:
+    """True when *src_path* carries a modification time that just moved.
+
+    The second half of the write test above. A file that vanished (a delete
+    slipping through as a modify) fails here too, which is what stops the
+    size-check OSError fallthrough in _unattributed_savelike_strength from
+    scoring a deleted .sav as a strong candidate.
+    """
+    try:
+        return (now - Path(src_path).stat().st_mtime) <= _CORR_MTIME_TOLERANCE_S
+    except (OSError, ValueError):
+        return False
 
 
 _CORR_SKIP_DIR_NAMES: Set[str] = set()
@@ -375,8 +452,14 @@ def _record_unattributed(src_path: str, game_id: str, inner_handler=None):
     anchor-less claiming: a write with no game-linked anchor could belong
     to any process on the machine (an antivirus update, a background
     updater) and the filesystem event carries no writer identity, so
-    "a game is running" alone is never enough evidence."""
+    "a game is running" alone is never enough evidence.
+
+    Callers gate on the setting too, but the check is repeated here first so
+    the opt-out holds for any caller and the disabled path costs no stat()."""
     import time as _time
+    enabled, strong_s, weak_s = correlation_settings()
+    if not enabled:
+        return
     try:
         fp = Path(src_path)
     except (OSError, ValueError):
@@ -385,13 +468,17 @@ def _record_unattributed(src_path: str, game_id: str, inner_handler=None):
     if strength == 0:
         return
     now = _time.time()
+    # The event said "modified"; the mtime has to agree. On Windows a read or
+    # an attribute change is delivered as the very same event.
+    if not _has_fresh_write(src_path, now):
+        return
     file_key = str(fp)
     with _CACHE_LOCK:
         if file_key in _BACKED_UP_FILES or file_key in _CLAIMED_EVENTS:
             return
         _UNATTRIBUTED_EVENTS.append((now, file_key, strength == 2))
         anchor = _LAST_ANCHOR_TS.get(game_id, 0.0)
-    window = _CORR_WINDOW_STRONG_S if strength == 2 else _CORR_WINDOW_WEAK_S
+    window = strong_s if strength == 2 else weak_s
     if anchor and (now - anchor) <= window:
         _claim_event_for_game(game_id, file_key,
                               f"Δ={(now - anchor) * 1000:.0f}ms from anchor")
@@ -420,6 +507,7 @@ def _claim_correlated_for_anchor(game_id: str, anchor_ts: float) -> int:
     """A game-linked anchor event just landed: sweep the buffer for events
     whose timestamps fall inside the window, in BOTH directions. Returns
     the number of NEW claims."""
+    _enabled, strong_s, weak_s = correlation_settings()
     strong: list = []
     weak: list = []
     with _CACHE_LOCK:
@@ -429,9 +517,9 @@ def _claim_correlated_for_anchor(game_id: str, anchor_ts: float) -> int:
         if file_key in already:
             continue
         delta = abs(anchor_ts - ts)
-        if is_strong and delta <= _CORR_WINDOW_STRONG_S:
+        if is_strong and delta <= strong_s:
             strong.append((delta, file_key))
-        elif not is_strong and delta <= _CORR_WINDOW_WEAK_S:
+        elif not is_strong and delta <= weak_s:
             weak.append((delta, file_key))
     for delta, file_key in strong:
         _claim_event_for_game(game_id, file_key,
@@ -722,18 +810,28 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
         # is writing at this instant. That timestamp is what lets a
         # simultaneous save-like write in an unrelated-named profile folder
         # be claimed — the association the name filters can't provide.
-        import time as _time
-        _anchor_now = _time.time()
-        with _CACHE_LOCK:
-            _LAST_ANCHOR_TS[self._game_id] = _anchor_now
-        try:
-            if _claim_correlated_for_anchor(self._game_id, _anchor_now):
-                # Claims must surface even when THIS event goes on to be
-                # rejected (the log itself is not a save — the claimed
-                # profile write is).
-                self.schedule_fire()
-        except Exception as _corr_err:
-            logger.debug(f"Correlation sweep failed: {_corr_err}")
+        #
+        # It must, however, be an actual write. Anchoring on every event
+        # regardless of type left the window permanently open during a long
+        # session: a running game touches its own tree constantly, and reads,
+        # attribute changes and deletions all arrive as FileModifiedEvent —
+        # so any unrelated save-like write anywhere on the machine correlated.
+        # Off by default; the guards are ordered so that costs one dict
+        # lookup and no stat() when it is.
+        if correlation_settings()[0] and _is_write_event(event):
+            import time as _time
+            _anchor_now = _time.time()
+            if _has_fresh_write(event.src_path, _anchor_now):
+                with _CACHE_LOCK:
+                    _LAST_ANCHOR_TS[self._game_id] = _anchor_now
+                try:
+                    if _claim_correlated_for_anchor(self._game_id, _anchor_now):
+                        # Claims must surface even when THIS event goes on to
+                        # be rejected (the log itself is not a save — the
+                        # claimed profile write is).
+                        self.schedule_fire()
+                except Exception as _corr_err:
+                    logger.debug(f"Correlation sweep failed: {_corr_err}")
 
         # Ignore files with non-save extensions/filenames
         try:
@@ -948,11 +1046,17 @@ class _PendingPathHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else obje
         self.on_created(event)
 
 
-def _get_common_save_roots() -> list[Path]:
+def _get_common_save_roots(appid: str = "") -> list[Path]:
     """Return OS-specific common save-data roots to watch for games with no
     configured save_paths. These cover engines (Godot, Unity, etc.) that write
     saves to AppData or similar locations without leaving persistent file handles
-    (which the open-file tracker would miss)."""
+    (which the open-file tracker would miss).
+
+    *appid* adds the game's own Proton prefix, where a Windows game running
+    under Proton actually writes — no XDG root covers it. Only that one game's
+    prefix, and only while it is running: watching every prefix on the machine
+    would burn one recursive inotify watch per installed Proton game, and
+    Linux caps those per user."""
     import platform as _plat
     roots: list[Path] = []
     system = _plat.system()
@@ -977,6 +1081,12 @@ def _get_common_save_roots() -> list[Path]:
             p = home / rel
             if p.exists():
                 roots.append(p)
+        if appid:
+            try:
+                from core.save_detector import compat_prefix_roots
+                roots.extend(compat_prefix_roots(str(appid)))
+            except Exception as e:
+                logger.debug(f"Could not add the Proton prefix for {appid}: {e}")
     elif system == "Darwin":
         home = Path.home()
         # macOS Ren'Py uses ~/.renpy and/or ~/Library/RenPy — neither is under
@@ -1034,8 +1144,11 @@ class _CommonRootSaveHandler:
                 # No nominal link — but don't just discard it: buffer it for
                 # TEMPORAL correlation. If this game saves in the same
                 # instant (double-write engines), the event gets claimed.
-                _record_unattributed(event.src_path, self._inner._game_id,
-                                     self._inner)
+                # Same two guards as the anchor side: opt-in, and only for
+                # events that really are a create/modify/move.
+                if correlation_settings()[0] and _is_write_event(event):
+                    _record_unattributed(event.src_path, self._inner._game_id,
+                                         self._inner)
                 return
         self._inner.on_any_event(event)
 
@@ -1176,7 +1289,8 @@ class SaveWatcher(QObject):
                 _identity_extra.append(strip_version_tokens(_install_dir.name))
             if _entry is not None and getattr(_entry, "exe_path", ""):
                 _identity_extra.append(strip_version_tokens(Path(_entry.exe_path).stem))
-            common_roots = _get_common_save_roots()
+            _appid = getattr(_entry, "appid", "") if _entry is not None else ""
+            common_roots = _get_common_save_roots(_appid or "")
             root_handler = _CommonRootSaveHandler(
                 game_id, game_name, self._on_save_changed, extra_terms=_identity_extra)
             for root in common_roots:

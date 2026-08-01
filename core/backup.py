@@ -19,7 +19,7 @@ _index_lock = threading.RLock()
 
 from PySide6.QtCore import QObject, Signal
 
-from core.constants import BACKUP_DIR, MAX_LOCAL_BACKUPS, BACKUP_RETENTION_DAYS, MIN_KEPT_BACKUPS, SKIP_EXTENSIONS, SKIP_FILENAME_STEMS, get_install_folder_name
+from core.constants import BACKUP_DIR, USER_DATA_DIR, MAX_LOCAL_BACKUPS, BACKUP_RETENTION_DAYS, MIN_KEPT_BACKUPS, SKIP_EXTENSIONS, SKIP_FILENAME_STEMS, get_install_folder_name
 from core.config_manager import get_config
 from core.machine import get_machine_id
 import i18n
@@ -210,12 +210,89 @@ def _set_process_suspended(pid: int, suspend: bool) -> bool:
         return False
 
 
+# A suspended game is invisible as a problem: it simply stops responding, with
+# nothing on screen to say why. restore_backup resumes it in a `finally`, which
+# covers exceptions — but not the app being killed, nor the machine losing
+# power, between the suspend and the resume. So the suspension is recorded on
+# disk first and cleared after, and whatever is left over is undone at the next
+# start. Identity is (pid, create_time), the same pair the monitor uses: a bare
+# PID would eventually be reused and we would resume a stranger's process.
+_FROZEN_MARKER = USER_DATA_DIR / "frozen_process.json"
+
+
+def _mark_frozen(pid: int) -> None:
+    try:
+        create_time = 0.0
+        try:
+            import psutil
+            create_time = psutil.Process(pid).create_time()
+        except Exception:
+            pass
+        _FROZEN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        with open(_FROZEN_MARKER, "w", encoding="utf-8") as f:
+            json.dump({"pid": pid, "create_time": create_time,
+                       "at": datetime.utcnow().isoformat()}, f)
+            f.flush()
+            os.fsync(f.fileno())     # the point is surviving a hard kill
+    except Exception as e:
+        logger.debug(f"Could not record the suspended process: {e}")
+
+
+def _clear_frozen() -> None:
+    try:
+        _FROZEN_MARKER.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.debug(f"Could not clear the suspended-process marker: {e}")
+
+
+def resume_orphaned_process() -> bool:
+    """Resume a process left suspended by a previous run. Returns True if one
+    was found and resumed. Safe to call unconditionally at startup."""
+    if not _FROZEN_MARKER.exists():
+        return False
+    try:
+        with open(_FROZEN_MARKER, encoding="utf-8") as f:
+            rec = json.load(f)
+        pid = int(rec.get("pid", 0))
+        want_ct = float(rec.get("create_time", 0.0))
+    except Exception as e:
+        logger.debug(f"Unreadable suspended-process marker: {e}")
+        _clear_frozen()
+        return False
+
+    resumed = False
+    if pid > 0:
+        same = True
+        if want_ct:
+            try:
+                import psutil
+                same = abs(psutil.Process(pid).create_time() - want_ct) < 1.0
+            except Exception:
+                same = False      # process gone, or unreadable — do not touch it
+        if same:
+            resumed = _resume_process(pid)
+            logger.warning(
+                f"Resumed process {pid}, left suspended by a previous run"
+                if resumed else
+                f"Could not resume process {pid} left suspended by a previous run")
+    _clear_frozen()
+    return resumed
+
+
 def _suspend_process(pid: int) -> bool:
-    return _set_process_suspended(pid, True)
+    _mark_frozen(pid)
+    ok = _set_process_suspended(pid, True)
+    if not ok:
+        _clear_frozen()      # never suspended, nothing to undo later
+    return ok
 
 
 def _resume_process(pid: int) -> bool:
-    return _set_process_suspended(pid, False)
+    ok = _set_process_suspended(pid, False)
+    _clear_frozen()
+    return ok
 
 
 from core import is_relative_to as _is_relative_to, atomic_replace as _atomic_replace
@@ -337,6 +414,18 @@ class BackupEntry:
     # destination is known to the library and to nobody else, so a restore
     # can only put the files back where they were copied from.
     content_chains: list[str] = field(default_factory=list)
+    # Integrity check state. Absent from older index files, which is exactly
+    # what "" means: never checked. from_dict drops unknown keys, so adding
+    # these does not invalidate an existing index.
+    #   ""        never checked
+    #   "ok"      archive opens, every member's CRC is good, manifest matches
+    #   "missing" the zip is gone
+    #   "corrupt" not a zip, or a member fails its CRC
+    #   "changed" archive is intact but its contents no longer match the
+    #             manifest recorded when the backup was made
+    verify_state: str = ""
+    verify_at: str = ""       # ISO datetime of the last check
+    verify_detail: str = ""   # short reason when not "ok"
 
     def chain_for(self, save_path: str) -> str:
         """The install-relative chain recorded for *save_path*, if any."""
@@ -713,6 +802,134 @@ class BackupManager(QObject):
         except OSError:
             return f"{size_mtime}|"      # unreadable → empty content hash
 
+    # ── Save-state derivation ────────────────────────────────────────────────
+    # These two used to live inline in create_backup. They are shared now
+    # because the regression check has to reproduce EXACTLY the same view of
+    # a game's saves — same file filtering, same archive names, same
+    # fingerprints — or the state hash it computes would not be comparable
+    # with the save_hash recorded on the backups it compares against. Two
+    # copies of this would drift on the first change to either, and the
+    # comparison would start lying rather than failing loudly.
+
+    @staticmethod
+    def _collect_save_files(valid_paths: list, chain_dirs, recent_file_set=None):
+        """Candidate save files as ``(file, relative_root)`` pairs.
+
+        *recent_file_set*, when given, restricts the result to files that were
+        modified recently (selective backups).
+        """
+        all_files: list[tuple[Path, Path]] = []
+        for sp in valid_paths:
+            if sp.is_dir():
+                for f in sp.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    if _is_skip_file(f):
+                        continue
+                    if _is_in_skipped_subdir(f, sp, chain_dirs):
+                        continue
+                    if recent_file_set is not None:
+                        try:
+                            if str(f.resolve()) not in recent_file_set:
+                                continue
+                        except OSError:
+                            continue
+                    try:
+                        all_files.append((f, sp.parent))
+                    except OSError:
+                        pass
+            elif sp.is_file():
+                if recent_file_set is not None:
+                    try:
+                        if str(sp.resolve()) in recent_file_set:
+                            all_files.append((sp, sp.parent))
+                    except OSError:
+                        pass
+                else:
+                    all_files.append((sp, sp.parent))
+        return all_files
+
+    def _build_manifest(self, all_files, valid_reg, prev_manifest: dict):
+        """Fingerprint every file and registry key, and hash the whole state.
+
+        Returns ``(manifest, resolved_files, reg_exports, changed, state_hash)``.
+
+        Each file's fingerprint is ``size|mtime|sha256``; a file counts as
+        changed only when its CONTENT hash differs from *prev_manifest*'s — a
+        rewrite with identical bytes but a fresh mtime is not a change (that
+        mtime-only false positive is what produced redundant backups).
+        Unchanged files are never re-read: _file_fingerprint reuses the stored
+        content hash while size and mtime still match, which is what makes
+        this cheap enough to run outside of taking a backup.
+        """
+        import hashlib
+        manifest: dict[str, str] = {}     # arc_name → "size|mtime|sha256"
+        resolved_files: list[tuple[Path, Path, str]] = []  # (file, rel_root, arc_name)
+        changed_arc_names: list[str] = []
+        seen_arc_names: set[str] = set()
+
+        for f, rel_root in all_files:
+            try:
+                arc_name = str(f.relative_to(rel_root))
+                if arc_name in seen_arc_names:
+                    prefix = f"_{hashlib.sha256(str(rel_root).encode()).hexdigest()[:8]}"
+                    parts = Path(arc_name).parts
+                    if len(parts) > 1:
+                        arc_name = str(Path(parts[0] + prefix) / Path(*parts[1:]))
+                    else:
+                        p = Path(parts[0])
+                        arc_name = f"{p.stem}{prefix}{p.suffix}"
+                seen_arc_names.add(arc_name)
+
+                fp = self._file_fingerprint(f, prev_manifest.get(arc_name, ""))
+                manifest[arc_name] = fp
+                resolved_files.append((f, rel_root, arc_name))
+
+                if self._fp_content(fp) != self._fp_content(prev_manifest.get(arc_name, "")):
+                    changed_arc_names.append(arc_name)
+            except (OSError, ValueError) as e:
+                logger.warning(f"Skipping file {f}: {e}")
+
+        # ── Registry exports (state INSIDE registry values) ────────────────
+        # Canonical JSON per key: identical registry state ⇒ identical bytes
+        # ⇒ the same content-hash change detection files get.
+        reg_exports: list[tuple[str, bytes]] = []   # (arc_name, data)
+        for rp in valid_reg:
+            data = export_registry_key(rp)
+            if data is None:
+                logger.warning(f"Registry export failed, key skipped: {rp}")
+                continue
+            arc_name = registry_arc_name(rp)
+            if arc_name in seen_arc_names:
+                continue        # two keys sanitizing identically — keep first
+            seen_arc_names.add(arc_name)
+            fp = registry_export_fingerprint(data)
+            manifest[arc_name] = fp
+            reg_exports.append((arc_name, data))
+            if self._fp_content(fp) != self._fp_content(prev_manifest.get(arc_name, "")):
+                changed_arc_names.append(arc_name)
+
+        # Files that were DELETED since the previous backup
+        deleted_files = set(prev_manifest.keys()) - set(manifest.keys())
+        if deleted_files:
+            changed_arc_names.extend(f"[deleted] {d}" for d in deleted_files)
+
+        return (manifest, resolved_files, reg_exports, changed_arc_names,
+                self.state_hash_of(manifest))
+
+    def state_hash_of(self, manifest: dict) -> str:
+        """The whole-state content hash for a manifest.
+
+        Derived from the per-file content hashes, so it needs no extra read
+        pass. This is what create_backup stores as ``save_hash`` and what the
+        regression check compares against — one definition, both callers.
+        """
+        import hashlib
+        h = hashlib.sha256()
+        for arc in sorted(manifest):
+            h.update(f"{arc}|{self._fp_content(manifest[arc])}\n".encode())
+        return h.hexdigest()
+
     @staticmethod
     def _fp_content(fp: str) -> str:
         """Content-hash component of a ``size|mtime|sha256`` fingerprint. Empty
@@ -856,8 +1073,6 @@ class BackupManager(QObject):
 
         backup_id = f"{game_id}_{now.strftime('%Y%m%d_%H%M%S')}"
         zip_path = game_backup_dir / f"{backup_id}.zip"
-        all_files: list[tuple[Path, Path]] = []   # (file_path, relative_root)
-
         # Build set of recently modified files for selective mode
         recent_file_set: set[str] | None = None
         if selective:
@@ -871,36 +1086,7 @@ class BackupManager(QObject):
                 return _ret(None, False)
             recent_file_set = {str(f.resolve()) for f in recent_files}
 
-        # Collect all candidate save files (filtered)
-        for sp in valid_paths:
-            if sp.is_dir():
-                for f in sp.rglob("*"):
-                    if not f.is_file():
-                        continue
-                    if _is_skip_file(f):
-                        continue
-                    if _is_in_skipped_subdir(f, sp, chain_dirs):
-                        continue
-                    # In selective mode, skip files not recently modified
-                    if recent_file_set is not None:
-                        try:
-                            if str(f.resolve()) not in recent_file_set:
-                                continue
-                        except OSError:
-                            continue
-                    try:
-                        all_files.append((f, sp.parent))
-                    except OSError:
-                        pass
-            elif sp.is_file():
-                if recent_file_set is not None:
-                    try:
-                        if str(sp.resolve()) in recent_file_set:
-                            all_files.append((sp, sp.parent))
-                    except OSError:
-                        pass
-                else:
-                    all_files.append((sp, sp.parent))
+        all_files = self._collect_save_files(valid_paths, chain_dirs, recent_file_set)
 
         if not all_files and not valid_reg:
             logger.warning(f"No files found to backup for '{game_name}'")
@@ -915,68 +1101,11 @@ class BackupManager(QObject):
         # self-contained), but we skip creating a new one if nothing changed.
         # Unchanged files are never re-read: _file_fingerprint reuses the
         # stored content hash when size+mtime still match.
-        import hashlib
         recent = self.get_backups_for_game(game_id) if not force else []
         prev_manifest = (recent[0].cloud_metadata or {}).get("file_manifest", {}) if recent else {}
-        new_manifest: dict[str, str] = {}     # arc_name → "size|mtime|sha256"
-        resolved_files: list[tuple[Path, Path, str]] = []  # (file, rel_root, arc_name)
-        changed_arc_names: list[str] = []
-        seen_arc_names: set[str] = set()
-
-        for f, rel_root in all_files:
-            try:
-                arc_name = str(f.relative_to(rel_root))
-                if arc_name in seen_arc_names:
-                    prefix = f"_{hashlib.sha256(str(rel_root).encode()).hexdigest()[:8]}"
-                    parts = Path(arc_name).parts
-                    if len(parts) > 1:
-                        arc_name = str(Path(parts[0] + prefix) / Path(*parts[1:]))
-                    else:
-                        p = Path(parts[0])
-                        arc_name = f"{p.stem}{prefix}{p.suffix}"
-                seen_arc_names.add(arc_name)
-
-                fp = self._file_fingerprint(f, prev_manifest.get(arc_name, ""))
-                new_manifest[arc_name] = fp
-                resolved_files.append((f, rel_root, arc_name))
-
-                if self._fp_content(fp) != self._fp_content(prev_manifest.get(arc_name, "")):
-                    changed_arc_names.append(arc_name)
-            except (OSError, ValueError) as e:
-                logger.warning(f"Skipping file {f}: {e}")
-
-        # ── Registry exports (state INSIDE registry values) ────────────────
-        # Canonical JSON per key: identical registry state ⇒ identical bytes
-        # ⇒ the same content-hash change detection files get.
-        reg_exports: list[tuple[str, bytes]] = []   # (arc_name, data)
-        for rp in valid_reg:
-            data = export_registry_key(rp)
-            if data is None:
-                logger.warning(f"Registry export failed, key skipped: {rp}")
-                continue
-            arc_name = registry_arc_name(rp)
-            if arc_name in seen_arc_names:
-                continue        # two keys sanitizing identically — keep first
-            seen_arc_names.add(arc_name)
-            fp = registry_export_fingerprint(data)
-            new_manifest[arc_name] = fp
-            reg_exports.append((arc_name, data))
-            if self._fp_content(fp) != self._fp_content(prev_manifest.get(arc_name, "")):
-                changed_arc_names.append(arc_name)
-
-        # Also detect files that were DELETED since the previous backup
-        # (present in prev_manifest but absent now)
-        deleted_files = set(prev_manifest.keys()) - set(new_manifest.keys())
-        if deleted_files:
-            changed_arc_names.extend(f"[deleted] {d}" for d in deleted_files)
-
-        # Whole-state content hash, derived from the per-file content hashes —
-        # one read pass, no separate scan. Stored as save_hash and used as the
-        # fast "nothing changed" early-out below.
-        _state = hashlib.sha256()
-        for _arc in sorted(new_manifest):
-            _state.update(f"{_arc}|{self._fp_content(new_manifest[_arc])}\n".encode())
-        current_hash = _state.hexdigest()
+        (new_manifest, resolved_files, reg_exports,
+         changed_arc_names, current_hash) = self._build_manifest(
+            all_files, valid_reg, prev_manifest)
 
         # Dedup gates (skipped entirely when force=True → recent is empty):
         if recent:
@@ -1035,9 +1164,10 @@ class BackupManager(QObject):
             zip_path_tmp.replace(zip_path)
 
             changed_real = [c for c in changed_arc_names if not c.startswith("[deleted]")]
+            n_deleted = len(changed_arc_names) - len(changed_real)
             logger.info(
                 f"Backup: {len(changed_real)}/{len(new_manifest)} files changed, "
-                f"{len(deleted_files)} deleted since previous backup"
+                f"{n_deleted} deleted since previous backup"
             )
 
             metadata = {
@@ -2197,6 +2327,203 @@ class BackupManager(QObject):
         with _index_lock:
             entry = next((b for b in self._index if b.backup_id == backup_id), None)
             return copy.deepcopy(entry) if entry else None
+
+    # ── Save-state regression ────────────────────────────────────────────────
+
+    def current_state_hash(self, game_id: str, save_paths: list) -> str:
+        """The state hash of a game's saves AS THEY ARE NOW.
+
+        Comparable with the hash recorded on its backups because it goes
+        through the same derivation. The newest backup's manifest is passed in
+        as the previous one so unchanged files are never re-read — that is
+        what keeps this in the milliseconds and lets it run at game launch
+        instead of needing a watcher.
+        """
+        from core.registry_saves import is_registry_path, registry_key_exists
+        try:
+            fs_paths = [Path(p) for p in save_paths
+                        if not is_registry_path(p) and Path(p).exists()]
+            valid_reg = [p for p in save_paths
+                         if is_registry_path(p) and registry_key_exists(p)]
+            if not fs_paths and not valid_reg:
+                return ""
+            backups = self.get_backups_for_game(game_id)
+            prev = ((backups[0].cloud_metadata or {}).get("file_manifest", {})
+                    if backups else {})
+            files = self._collect_save_files(fs_paths, _declared_chain_dirs(game_id))
+            manifest, _rf, _re, _ch, state = self._build_manifest(
+                files, valid_reg, prev)
+            return state if manifest else ""
+        except Exception as e:
+            logger.debug(f"Could not hash current save state for {game_id}: {e}")
+            return ""
+
+    @staticmethod
+    def _manifest_is_comparable(manifest: dict) -> bool:
+        """True when every fingerprint carries a content hash.
+
+        A manifest written before per-file content hashing holds only
+        ``size|mtime``, so its state hash depends on the file NAMES alone —
+        two completely different states with the same file list would hash
+        identically. Comparing against one of those could report a regression
+        that never happened, so they are left out entirely.
+        """
+        if not manifest:
+            return False
+        return all(len(str(fp).split("|")) == 3 and str(fp).split("|")[2]
+                   for fp in manifest.values())
+
+    def detect_regression(self, game_id: str, save_paths: list,
+                          expected_backup_id: str = "") -> Optional[BackupEntry]:
+        """Have the saves gone BACK to a state recorded in an older backup?
+
+        Returns that older backup, or None.
+
+        The reasoning: playing a game produces save content that has never
+        existed before, so the current state matching an OLD backup exactly
+        cannot be the result of play. Something put an earlier state back —
+        a launcher's cloud sync, a manual copy, an external tool.
+
+        *expected_backup_id* is the backup SaveSync itself last restored for
+        this game: landing on that state is the intended outcome, not a
+        regression.
+
+        Only backups whose manifest is comparable take part; see
+        _manifest_is_comparable for why.
+        """
+        backups = self.get_backups_for_game(game_id)
+        usable = [b for b in backups
+                  if self._manifest_is_comparable(
+                      (b.cloud_metadata or {}).get("file_manifest") or {})]
+        if len(usable) < 2:
+            return None      # nothing to regress FROM
+
+        current = self.current_state_hash(game_id, save_paths)
+        if not current:
+            return None
+
+        # get_backups_for_game returns newest first.
+        newest = usable[0]
+        if current == self.state_hash_of(
+                (newest.cloud_metadata or {}).get("file_manifest") or {}):
+            return None      # up to date with the latest backup
+
+        for older in usable[1:]:
+            if older.backup_id == expected_backup_id:
+                continue
+            if current == self.state_hash_of(
+                    (older.cloud_metadata or {}).get("file_manifest") or {}):
+                logger.warning(
+                    f"Save state for {game_id} matches an older backup "
+                    f"({older.backup_id}, {older.created_at}) — something put "
+                    f"an earlier state back")
+                return older
+        return None
+
+    # ── Integrity ────────────────────────────────────────────────────────────
+
+    def verify_backup(self, backup_id: str, deep: bool = False) -> tuple[str, str]:
+        """Check that a backup is still what it claims to be.
+
+        Returns ``(state, detail)`` and records both on the entry, so the list
+        can show it without re-checking. States are documented on BackupEntry.
+
+        Two levels, because they cost very differently:
+
+        - shallow (default): the archive opens and EVERY member passes its
+          CRC32 — zipfile.testzip() does that natively, and it is what catches
+          the realistic failures (a truncated upload, a half-written file, bit
+          rot). Then the manifest's file list is checked against the archive's,
+          which catches a member that went missing.
+        - deep: additionally re-hashes every member and compares it with the
+          sha256 recorded when the backup was made. That catches an archive
+          that is internally consistent but no longer holds the same bytes —
+          rare, and it costs a full read of the archive, so it is opt-in.
+
+        A backup made before per-file manifests existed has nothing to compare
+        against; it still gets the CRC check, and "ok" then means exactly that.
+        """
+        import hashlib
+        import zipfile
+
+        entry = self.get_backup(backup_id)
+        if entry is None:
+            return "missing", "no such backup"
+
+        zp = Path(entry.zip_path)
+        state, detail = "ok", ""
+        try:
+            if not zp.exists():
+                state, detail = "missing", zp.name
+            elif not zipfile.is_zipfile(zp):
+                state, detail = "corrupt", "not a zip archive"
+            else:
+                with zipfile.ZipFile(zp) as zf:
+                    bad = zf.testzip()
+                    if bad is not None:
+                        state, detail = "corrupt", bad
+                    else:
+                        manifest = (entry.cloud_metadata or {}).get("file_manifest") or {}
+                        # Manifest keys are built with os.sep (backslash on
+                        # Windows); zip entries are always stored with "/".
+                        # Comparing them raw reports every nested file as
+                        # missing — which is to say, it condemns almost every
+                        # healthy backup on Windows.
+                        by_norm = {n.replace("\\", "/"): n for n in zf.namelist()}
+                        gone = [n for n in manifest
+                                if n.replace("\\", "/") not in by_norm]
+                        if gone:
+                            state = "changed"
+                            detail = f"{len(gone)} file(s) missing, e.g. {gone[0]}"
+                        elif deep and manifest:
+                            for arc, fp in manifest.items():
+                                want = self._fp_content(fp)
+                                if not want:
+                                    continue      # legacy fingerprint, nothing to compare
+                                real = by_norm.get(arc.replace("\\", "/"), arc)
+                                got = hashlib.sha256(zf.read(real)).hexdigest()
+                                if got != want:
+                                    state, detail = "changed", arc
+                                    break
+        except zipfile.BadZipFile as e:
+            state, detail = "corrupt", str(e)[:80]
+        except OSError as e:
+            state, detail = "corrupt", str(e)[:80]
+
+        stamp = datetime.utcnow().isoformat()
+        with _index_lock:
+            for b in self._index:
+                if b.backup_id == backup_id:
+                    b.verify_state, b.verify_at, b.verify_detail = state, stamp, detail
+                    break
+        self._save_game_index(entry.game_id)
+        if state != "ok":
+            logger.warning(f"Backup {backup_id} verify: {state} ({detail})")
+        else:
+            logger.info(f"Backup {backup_id} verified ok"
+                        + (" (deep)" if deep else ""))
+        return state, detail
+
+    def verify_backups(self, backup_ids: list, deep: bool = False,
+                       cancel=None, on_one=None) -> dict:
+        """Verify several backups. Returns ``{backup_id: (state, detail)}``.
+
+        *cancel* is anything with ``is_set()`` (a threading.Event): checked
+        between backups so a long run stops promptly. *on_one* is called with
+        ``(backup_id, state, detail)`` after each one, for progress.
+        """
+        out: dict = {}
+        for bid in backup_ids:
+            if cancel is not None and cancel.is_set():
+                break
+            state, detail = self.verify_backup(bid, deep=deep)
+            out[bid] = (state, detail)
+            if on_one is not None:
+                try:
+                    on_one(bid, state, detail)
+                except Exception:
+                    logger.debug("verify progress callback failed", exc_info=True)
+        return out
 
     @staticmethod
     def compute_deletions(
