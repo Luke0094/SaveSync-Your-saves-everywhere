@@ -467,7 +467,7 @@ always-on-top flag, whether it really ended up above the window in front, and
 what that window is. That distinguishes "nothing tried to raise it" from "it
 was raised and something put it back down".
 
-$env:SAVESYNC_TRACE = "1"
+$env:SAVESYNC_TRACE = "1" 
 python main.py
 
 ---
