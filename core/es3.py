@@ -32,9 +32,33 @@ _SETTINGS_MARKER = b"ES3Defaults"
 # Asset files worth opening, and how far past the marker to keep reading.
 _ASSET_NAMES = ("resources.assets", "globalgamemanagers.assets",
                 "sharedassets0.assets")
+# …and then every other asset file in the same folder. The three above are
+# where Easy Save's settings usually land and are tried first because they
+# usually answer, but a game is free to put them in sharedassets7 or in a
+# numbered level, and looking only at three names left those unopenable.
+_ASSET_GLOBS = ("*.assets", "level*", "globalgamemanagers")
+# Bundles, which are the same data squeezed — see core/unityfs. Only reached
+# when the plain files above have not answered, because unpacking one costs
+# real time where reading a plain file costs almost none.
+_BUNDLE_GLOBS = ("data.unity3d", "*.bundle")
+# An archive larger than this is left alone: at roughly 11 MB a second it
+# would be minutes on its own, and the settings object being looked for is a
+# few hundred bytes that games do not bury in their largest archive.
+_MAX_BUNDLE_FILE = 64 << 20
+_MAX_BUNDLES = 12
+# There is no time limit on the search. Unpacking is around 11 MB a second,
+# so a game shipped as archives can take a while — but stopping early means
+# reporting a save as unopenable when the key was there to be found, which is
+# the worse answer. Instead the caller is told how long it has been going and
+# decides: see the *progress* argument to find_password.
+#
+# Whatever is found is written down against that game (see _KEY_DIR), so the
+# cost is paid once and never again for it.
 _MAX_ASSET = 256 << 20
 _MAX_CANDIDATES = 12
 _MAX_PASSWORD = 200
+# How far above the save to look for the game it belongs to.
+_MAX_CLIMB = 3
 # A key the player dropped in themselves, as the published dumper writes it.
 _KEY_FILE = "es3.key"
 # Passwords already worked out, by save file. Holding a value re-opens the
@@ -42,6 +66,18 @@ _KEY_FILE = "es3.key"
 # time would be absurd.
 _PASSWORDS = {}
 _PASSWORD_KEEP = 32
+
+# A password, remembered against the GAME it belongs to.
+#
+# Finding one can mean unpacking a game's archives, which is seconds of work,
+# and doing that again for the next save of the same game would be paying
+# twice for an answer already known. So it is written down — but per game,
+# not in one list of them all: two games' passwords have nothing to do with
+# each other, and trying every password ever seen against every save would be
+# work that can only fail.
+#
+# Kept by core/game_keys, which every engine with this problem shares.
+_KIND = "es3"
 
 
 class Es3Error(Exception):
@@ -156,66 +192,225 @@ def _walk_strings(blob) -> list:
 
 
 def _asset_files(game_dir: Path):
-    for data in sorted(game_dir.glob("*_Data")):
+    """The asset files worth searching, at or under *game_dir*.
+
+    The folder ITSELF counts when it is the game's data folder, and that is
+    not a corner case: Unity's own save location is under the user's profile,
+    but plenty of games keep the save inside ``<Game>_Data`` instead, right
+    beside the very assets the password is in. Looking only for a ``*_Data``
+    CHILD missed those — the file was one directory listing away and the save
+    was reported as unopenable.
+    """
+    folders = []
+    if game_dir.name.lower().endswith("_data"):
+        folders.append(game_dir)
+    folders.extend(sorted(game_dir.glob("*_Data")))
+
+    for folder in folders:
+        seen = set()
+        # The likely three first, so the common case is answered without
+        # listing the folder at all.
         for name in _ASSET_NAMES:
-            candidate = data / name
+            candidate = folder / name
             if candidate.is_file():
+                seen.add(candidate.name.lower())
                 yield candidate
+        for pattern in _ASSET_GLOBS:
+            try:
+                for candidate in sorted(folder.glob(pattern)):
+                    if (candidate.is_file()
+                            and candidate.name.lower() not in seen
+                            and candidate.suffix.lower() != ".resS".lower()):
+                        seen.add(candidate.name.lower())
+                        yield candidate
+            except OSError:
+                continue
 
 
-def find_password(raw: bytes, save_path=None, game_dir=None) -> str:
+def _bundle_files(game_dir: Path):
+    """The squeezed archives worth unpacking, biggest cost last."""
+    folders = []
+    if game_dir.name.lower().endswith("_data"):
+        folders.append(game_dir)
+    folders.extend(sorted(game_dir.glob("*_Data")))
+    out = []
+    for folder in folders:
+        for pattern in _BUNDLE_GLOBS:
+            try:
+                for candidate in folder.glob(pattern):
+                    if candidate.is_file() and candidate.stat().st_size <= _MAX_BUNDLE_FILE:
+                        out.append(candidate)
+            except OSError:
+                continue
+    # Smallest first: the settings object is tiny and often in a small
+    # bundle, and a miss then costs the least.
+    out.sort(key=lambda p: p.stat().st_size)
+    return out[:_MAX_BUNDLES]
+
+
+def _bundle_candidates(path: Path, on_tick=None) -> list:
+    """Strings from Easy Save's settings inside a squeezed archive."""
+    from core.unityfs import SIGNATURE, UnityFsError, unpack
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
+    if not raw.startswith(SIGNATURE):
+        return []
+    try:
+        blob = unpack(raw, stop_after=_SETTINGS_MARKER, on_tick=on_tick)
+    except (UnityFsError, Exception) as e:
+        logger.debug(f"{path.name}: could not unpack ({e})")
+        return []
+    if _SETTINGS_MARKER not in blob:
+        return []
+    logger.info(f"Easy Save 3: settings found inside {path.name}")
+    return _walk_strings(blob)
+
+
+def stored_key(place) -> str:
+    """The password remembered for this game, or an empty string."""
+    from core.game_keys import stored_key as _stored
+    return _stored(_KIND, place)
+
+
+def _store_key(place, password: str) -> None:
+    """Remember *password* as this game's, so it is never hunted for twice."""
+    from core.game_keys import store_key
+    store_key(_KIND, place, password)
+
+
+def find_password(raw: bytes, save_path=None, game_dir=None,
+                  progress=None) -> str:
     """A password that actually opens *raw*, or an empty string.
 
-    Looked for in the order that costs least: one already worked out, then a
-    key file someone put beside the save, then the game's own settings.
+    Looked for in the order that costs least: one already worked out this
+    run, then the ones written down from before, then a key file someone put
+    beside the save, then the game's own settings, and only then the archives
+    — which are the only step that takes real time.
+
+    *progress*, when given, is called as the search goes on with the seconds
+    elapsed so far. Returning False from it stops the search and reports no
+    password; anything else carries on. It exists so the person waiting can
+    see that something is happening and call it off, rather than having a
+    limit chosen for them.
     """
     key = str(save_path).lower() if save_path else ""
     if key and key in _PASSWORDS:
         return _PASSWORDS[key]
 
+    def _accepts(password: str) -> bool:
+        try:
+            return decrypt(raw, password)[:1] in (b"{", b"[")
+        except (Es3Error, ValueError):
+            return False
+
+    def _keep(password: str, place=None) -> str:
+        if len(_PASSWORDS) >= _PASSWORD_KEEP:
+            _PASSWORDS.clear()
+        if key:
+            _PASSWORDS[key] = password
+        if place is not None:
+            _store_key(place, password)
+        logger.info(f"Easy Save 3: found the password for "
+                    f"{Path(save_path).name if save_path else 'a save'}")
+        return password
+
     tried = []
     places = []
     if save_path:
-        places.append(Path(save_path).parent)
+        # The save's own folder, and a couple above it. A game that keeps its
+        # save inside its own tree puts the assets one or two directories up
+        # — "<Game>/<Game>_Data/SaveFile.es3" is the common shape — and
+        # without climbing, a save that came in on its own could never be
+        # opened even with the whole game sitting around it. Bounded at three
+        # so this stays a look at the game and never becomes a disk search.
+        here = Path(save_path).parent
+        places.append(here)
+        for parent in list(here.parents)[:_MAX_CLIMB]:
+            places.append(parent)
     if game_dir:
         places.append(Path(game_dir))
+    # Same folder reached two ways is the same folder: opening its assets
+    # twice would double the cost of every miss.
+    seen_places, unique = set(), []
+    for place in places:
+        try:
+            marker = str(place.resolve()).lower()
+        except OSError:
+            marker = str(place).lower()
+        if marker not in seen_places:
+            seen_places.add(marker)
+            unique.append(place)
+    places = unique
+
+    # This game's own key, if it was worked out before. Only ITS key is
+    # tried — a password belongs to one game, and trying every game's would
+    # be work that can only fail.
+    for place in places:
+        remembered = stored_key(place)
+        if remembered and _accepts(remembered):
+            return _keep(remembered)
+
     for place in places:
         try:
             keyfile = place / _KEY_FILE
             if keyfile.is_file():
-                tried.append(keyfile.read_text(encoding="utf-8",
-                                               errors="replace").strip())
+                tried.append((keyfile.read_text(encoding="utf-8",
+                                                errors="replace").strip(), place))
         except OSError:
             pass
     for place in places:
         try:
             for asset in _asset_files(place):
-                tried.extend(_candidates(asset))
+                tried.extend((p, place) for p in _candidates(asset))
         except OSError:
             continue
 
-    seen = set()
-    for password in tried:
-        if not password or password in seen:
-            continue
-        seen.add(password)
+    for password, place in tried:
+        if password and _accepts(password):
+            return _keep(password, place)
+
+    # The squeezed archives are only opened when nothing above has answered:
+    # unpacking one is seconds where reading a plain file is milliseconds, so
+    # it is a last resort rather than part of the sweep. It runs to the end
+    # unless the person waiting calls it off.
+    import time
+    started = time.monotonic()
+
+    def _carry_on() -> bool:
+        if progress is None:
+            return True
         try:
-            if decrypt(raw, password)[:1] in (b"{", b"["):
-                if len(_PASSWORDS) >= _PASSWORD_KEEP:
-                    _PASSWORDS.clear()
-                if key:
-                    _PASSWORDS[key] = password
-                logger.info(f"Easy Save 3: found the password for "
-                            f"{Path(save_path).name if save_path else 'a save'}")
-                return password
-        except (Es3Error, ValueError):
+            return progress(time.monotonic() - started) is not False
+        except Exception as e:
+            logger.debug(f"Easy Save 3: the progress callback raised ({e})")
+            return True
+
+    for place in places:
+        try:
+            bundles = _bundle_files(place)
+        except OSError:
             continue
+        for bundle in bundles:
+            if not _carry_on():
+                logger.info("Easy Save 3: the search was called off")
+                return ""
+            for password in _bundle_candidates(bundle, on_tick=_carry_on):
+                if password and _accepts(password):
+                    return _keep(password, place)
     return ""
 
 
-def remember(save_path, password: str) -> None:
-    """Keep a password the player supplied, for as long as the app runs."""
+def remember(save_path, password: str, game_dir=None) -> None:
+    """Keep a password the player supplied.
+
+    Written down against the game as well as held for the session, so a key
+    typed in once does not have to be typed in again — the same promise the
+    search itself makes.
+    """
     if save_path and password:
+        _store_key(game_dir or Path(save_path).parent, password)
         if len(_PASSWORDS) >= _PASSWORD_KEEP:
             _PASSWORDS.clear()
         _PASSWORDS[str(save_path).lower()] = password

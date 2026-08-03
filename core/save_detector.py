@@ -21,7 +21,7 @@ from typing import Optional
 from core.constants import (
     SAVE_FOLDER_HINTS, WATCH_PATHS_TEMPLATES, SKIP_EXTENSIONS,
     DETECTION_SKIP_EXTENSIONS, SKIP_FILENAME_STEMS, USER_DATA_DIR,
-    strip_version_tokens, CAMEL_SPLIT_RE,
+    strip_version_tokens, CAMEL_SPLIT_RE, match_slug, slug_weight,
 )
 from core.config_manager import get_config
 from core import is_relative_to as _is_relative_to
@@ -322,7 +322,7 @@ def correlated_engine_paths(exe_path: str, known_paths: list[str],
             if own_game_id and g.id == own_game_id:
                 continue
             for term in (g.name, Path(g.exe_path).stem if g.exe_path else ""):
-                s = re.sub(r"[^a-z0-9]", "", (term or "").lower())
+                s = match_slug((term or "").lower())
                 if len(s) >= 4:
                     other_slugs.add(s)
     except Exception:
@@ -346,7 +346,7 @@ def correlated_engine_paths(exe_path: str, known_paths: list[str],
                     continue
                 # Trailing numeric build suffix dropped before slugging
                 base = re.sub(r'-\d+$', '', child.name)
-                cslug = re.sub(r"[^a-z0-9]", "", base.lower())
+                cslug = match_slug(base)
                 if cslug and cslug in other_slugs:
                     continue
                 cand_ts = _latest_write_ts(str(child))
@@ -365,6 +365,29 @@ def correlated_engine_paths(exe_path: str, known_paths: list[str],
     return results
 
 
+# TyranoScript's own save names, written beside the executable: the system
+# flags, the numbered slots, and the quick and auto slots — all built from a
+# prefix the game chooses for itself.
+_TYRANO_SAVE_RE = re.compile(r"_(sf|tyrano_[a-z0-9_]*)\.sav$", re.IGNORECASE)
+
+def _engine_allows_skipped_path(path_str: str, exe_path: str) -> bool:
+    """Whether *path_str* is a folder this game's engine genuinely saves into.
+
+    Only asked about a path the name-based skip list would otherwise throw
+    away, so a "no" here changes nothing and a "yes" rescues a folder the
+    engine really writes into. What counts is in core.game_engine, beside the
+    table saying which EXTENSIONS an engine saves into — one place for "what
+    does this engine save", rather than two.
+    """
+    if not exe_path:
+        return False
+    try:
+        from core.game_engine import detect_engine, saves_in_skipped_dir
+        return saves_in_skipped_dir(detect_engine(exe_path=exe_path), path_str)
+    except (OSError, ValueError):
+        return False
+
+
 def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                   extra_terms: Optional[list[str]] = None) -> list[tuple[int, str]]:
     """
@@ -379,13 +402,13 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
 
     exe     = Path(exe_path)
     exe_dir = exe.parent
-    game_slug = re.sub(r"[^a-z0-9]", "", game_name.lower())
+    game_slug = match_slug(game_name)
     results: list[tuple[int, str]] = []
 
     # All slugs to match against: display name + extra terms (exe stem etc.)
     all_slugs: list[str] = [game_slug] if game_slug else []
     for t_ in (extra_terms or []):
-        s = re.sub(r"[^a-z0-9]", "", t_.lower())
+        s = match_slug(t_)
         if s and s not in all_slugs:
             all_slugs.append(s)
 
@@ -408,23 +431,23 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
         for child in sorted(renpy_roaming.iterdir()):
             if not child.is_dir():
                 continue
-            cslug = re.sub(r"[^a-z0-9]", "", child.name.lower())
+            cslug = match_slug(child.name)
             # Match: any of our slugs starts the folder slug, or is
             # contained within it (handles version suffixes like v0.1.8)
             matched = False
             for slug in all_slugs:
-                if not slug or len(slug) < 2:
+                if not slug or slug_weight(slug) < 2:
                     continue
                 if cslug == slug:              # exact
                     matched = True; break
                 if cslug.startswith(slug):     # "solv018".startswith("sol")
                     matched = True; break
-                if slug.startswith(cslug) and len(cslug) >= 2:
+                if slug.startswith(cslug) and slug_weight(cslug) >= 2:
                     matched = True; break
                 # Substring match: only for slugs ≥ 4 chars; shorter
                 # slugs (e.g. "ps", "fs") match too many unrelated
                 # Ren'Py folders via random 2-letter substrings.
-                if len(slug) >= 4 and slug in cslug:
+                if slug_weight(slug) >= 4 and slug in cslug:
                     matched = True; break
             if matched:
                 results.append((92, str(child)))
@@ -434,7 +457,11 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
     # MV/MZ:  exe_dir/www/save/  or  AppData/Roaming/<company>/<game>/
     if _SYSTEM == "Windows":
         appdata = os.getenv("APPDATA", "")
-        if appdata:
+        # A nameless game would make this "APPDATA / ''", which is APPDATA
+        # itself — and it exists and is never empty, so the whole of Roaming
+        # would be offered as one game's save folder. Same shape as the
+        # LOCALAPPDATA guard below.
+        if appdata and game_name:
             rpg_direct = Path(appdata) / game_name
             try:
                 if rpg_direct.exists() and any(rpg_direct.iterdir()):
@@ -446,8 +473,21 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                 for child in Path(appdata).iterdir():
                     if not child.is_dir():
                         continue
-                    cslug = re.sub(r"[^a-z0-9]", "", child.name.lower())
-                    if game_slug and len(game_slug) >= 6 and (game_slug in cslug or cslug in game_slug) and len(cslug) <= len(game_slug) * 2:
+                    cslug = match_slug(child.name)
+                    # Anchored at the START, not merely contained. A folder
+                    # that is the game's name plus something is a version or
+                    # an edition of it — "MyGame v0.8", "MyGame_R18". A
+                    # folder that merely ENDS with the name is usually a
+                    # different game that happens to contain the word, and
+                    # containment alone could not tell the two apart: a
+                    # one-word title was claimed by any longer name ending in
+                    # that word. The size ratio hid most of it for English
+                    # simply because English names are long; a short name in
+                    # any script went straight through.
+                    if (game_slug and slug_weight(game_slug) >= 6
+                            and (cslug.startswith(game_slug)
+                                 or game_slug.startswith(cslug))
+                            and len(cslug) <= len(game_slug) * 2):
                         if child != rpg_direct:
                             results.append((82, str(child)))
             except OSError:
@@ -476,7 +516,7 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                     if not company.is_dir(): continue
                     for game_dir2 in company.iterdir():
                         if not game_dir2.is_dir(): continue
-                        dslug = re.sub(r"[^a-z0-9]", "", game_dir2.name.lower())
+                        dslug = match_slug(game_dir2.name)
                         
                         # STRONGER MATCHING: Require better similarity for Unity LocalLow paths
                         if game_slug:
@@ -496,10 +536,64 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
         localappdata = os.getenv("LOCALAPPDATA", "")
         if localappdata:
             for child_name in [game_name, game_slug]:
+                # A game whose name is entirely non-Latin — plenty of them —
+                # slugs down to nothing, and "base / ''" is base itself. That
+                # exists, so LOCALAPPDATA as a whole was offered as this
+                # game's save folder, and taking it would have put every
+                # program's data on the machine into one backup.
+                if not child_name:
+                    continue
                 for base in [Path(localappdata), Path(localappdata) / "Godot" / "app_userdata"]:
                     candidate = base / child_name
                     if candidate.exists():
                         results.append((86, str(candidate)))
+
+    # ── AliceSoft ────────────────────────────────────────────────────────────
+    # Its System 3/4 games all share one container under Documents, each game
+    # a folder of its own with a SaveData inside. The folder carries the
+    # game's own title, which is not always the folder it was installed in, so
+    # it is matched by slug the way the Ren'Py container is above.
+    if _SYSTEM == "Windows" and game_slug and slug_weight(game_slug) >= 6:
+        alice = Path(os.getenv("USERPROFILE", str(Path.home()))) / "Documents" / "AliceSoft"
+        try:
+            for child in alice.iterdir():
+                if not child.is_dir():
+                    continue
+                cslug = match_slug(child.name)
+                if not cslug or (game_slug not in cslug and cslug not in game_slug):
+                    continue
+                save_data = child / "SaveData"
+                results.append((90, str(save_data if save_data.is_dir() else child)))
+        except OSError:
+            pass
+
+    # ── Bakin ────────────────────────────────────────────────────────────────
+    # Bakin keeps the runtime in data/ and the player's saves beside it, so
+    # this one is under the install rather than the user's profile.
+    bakin_saves = exe_dir / "data" / "savedata"
+    if bakin_saves.is_dir():
+        results.append((92, str(bakin_saves)))
+
+    # ── TyranoScript ─────────────────────────────────────────────────────────
+    # It saves into the install folder ITSELF, beside the executable, under
+    # names built from the game's own prefix — <prefix>_sf.sav for the system
+    # flags and <prefix>_tyrano_data.sav for the slots. Checked against a game
+    # that had just been played, which is the only way to know this: an
+    # unplayed TyranoScript install has no save anywhere.
+    #
+    # The loose-file scan further down would pick them up anyway, but only at
+    # the score any .sav beside an executable gets. These are not any .sav —
+    # the name is the engine's own convention — so they are worth saying so
+    # about.
+    from core.game_engine import TYRANO, detect_engine as _detect
+    engine_here = _detect(exe_path=exe_path)
+    if engine_here == TYRANO:
+        try:
+            for child in exe_dir.iterdir():
+                if child.is_file() and _TYRANO_SAVE_RE.search(child.name):
+                    results.append((92, str(child)))
+        except OSError:
+            pass
 
     # ── Generic relative paths near exe ──────────────────────────────────────
     for rel, sc in [("saves", 72), ("save", 70), ("SaveData", 70),
@@ -587,10 +681,22 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                 except OSError:
                     pass
 
-    return results
+    # One path, one score — its best. Several rules above can land on the same
+    # folder or file (a TyranoScript save is claimed by name AND by being a
+    # .sav beside the executable; an RPG Maker folder by its exact name AND by
+    # slug), and the caller then runs its checks twice over to reach the same
+    # answer it already had.
+    # Matched without regard to case, because Windows is: "SaveData" reached
+    # by one rule and "savedata" by another are one folder, not two.
+    best: dict[str, tuple] = {}
+    for score, p in results:
+        key = p.lower() if _SYSTEM == "Windows" else p
+        if score > best.get(key, (-1, ""))[0]:
+            best[key] = (score, p)
+    return list(best.values())
 
 
-# ── Process open-file tracking ────────────────────────────────────────────────
+# ── Process open-file tracking ───────────────────────────────────────────────
 
 # Extensions that are never save files even when opened by the game process
 _NON_SAVE_EXTENSIONS = frozenset({
@@ -1125,7 +1231,7 @@ def _registry_save_paths(game_name: str, hkcu_only: bool = False) -> list[str]:
     except ImportError:
         return []
     
-    slug = re.sub(r"[^a-z0-9]", "", game_name.lower())
+    slug = match_slug(game_name)
     found: list[str] = []
 
     def _scan_key(hkey, sub_key: str, depth: int = 0):
@@ -1134,10 +1240,10 @@ def _registry_save_paths(game_name: str, hkcu_only: bool = False) -> list[str]:
         try:
             with winreg.OpenKey(hkey, sub_key, 0, winreg.KEY_READ) as key:
                 key_name = sub_key.split("\\")[-1].lower()
-                key_slug = re.sub(r"[^a-z0-9]", "", key_name)
+                key_slug = match_slug(key_name)
                 
                 # STRICTER MATCHING: Require stronger similarity for registry keys
-                if slug and len(slug) >= 4:
+                if slug and slug_weight(slug) >= 4:
                     # Exact match or very close match
                     if slug == key_slug:
                         # Check values for save paths
@@ -1202,7 +1308,7 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
             return 0
     except (OSError, ValueError):
         pass
-    game_slug = re.sub(r"[^a-z0-9]", "", game_name.lower())
+    game_slug = match_slug(game_name)
 
     # Skip obvious non-save directories
     if name in _SKIP_DIRS:
@@ -1211,33 +1317,33 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
         if f"/{skip}/" in path_str:
             return 0
 
-    path_parts_slugged = [re.sub(r"[^a-z0-9]", "", part) for part in path_str.split("/")]
-    path_slug = re.sub(r"[^a-z0-9]", "", path_str)
+    path_parts_slugged = [match_slug(part) for part in path_str.split("/")]
+    path_slug = match_slug(path_str)
 
     # Build context slugs: game name + exe stem + parent folder
     context_slugs = []
-    if game_slug and len(game_slug) >= 2:
+    if game_slug and slug_weight(game_slug) >= 2:
         context_slugs.append(game_slug)
     if exe_path:
         exe_stem = Path(exe_path).stem.lower()
         if exe_stem not in _GENERIC_EXE_STEMS:
-            exe_slug = re.sub(r"[^a-z0-9]", "", exe_stem)
-            if exe_slug and len(exe_slug) > 3:
+            exe_slug = match_slug(exe_stem)
+            if exe_slug and slug_weight(exe_slug) > 3:
                 context_slugs.append(exe_slug)
             else:
                 # Stem too short or 3 chars (e.g. "ps", "pro", "run") — would hit
                 # unrelated words like "apocalypse".  Use parent folder instead.
-                _short_parent = re.sub(r"[^a-z0-9]", "", Path(exe_path).parent.name.lower())
-                if _short_parent and len(_short_parent) >= 3:
+                _short_parent = match_slug(Path(exe_path).parent.name.lower())
+                if _short_parent and slug_weight(_short_parent) >= 3:
                     context_slugs.append(_short_parent)
         else:
-            parent_slug = re.sub(r"[^a-z0-9]", "", Path(exe_path).parent.name.lower())
+            parent_slug = match_slug(Path(exe_path).parent.name.lower())
             if parent_slug:
                 context_slugs.append(parent_slug)
 
     # HIGH PRIORITY: Exact game name or developer match in path
     for slug in context_slugs:
-        if len(slug) < 3:  # ≥3 chars required: prevents "ps" matching inside "apocalypse"
+        if slug_weight(slug) < 3:  # ≥3 chars required: prevents "ps" matching inside "apocalypse"
             continue
         if path_parts_slugged and slug == path_parts_slugged[-1]:  # Exact folder name match
             score += 120
@@ -1264,7 +1370,7 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
         'capcom', 'konami', 'sega', 'nintendo', 'sony', 'microsoft'
     }
     
-    has_any_context = any(slug in path_slug for slug in context_slugs if len(slug) >= 3)
+    has_any_context = any(slug in path_slug for slug in context_slugs if slug_weight(slug) >= 3)
     if has_any_context:
         for dev in known_developers:
             if dev in path_str:
@@ -1283,7 +1389,7 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
     for engine_path in engine_validated_paths:
         if engine_path in path_str:
             # Only give engine points if there's also some game name context
-            if any(slug in path_str for slug in context_slugs if len(slug) >= 3):
+            if any(slug in path_str for slug in context_slugs if slug_weight(slug) >= 3):
                 score += 40
             else:
                 score += 15  # Lower without game context
@@ -1293,7 +1399,7 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
     # AND there's game-relevant context in the path).
     # Without game context, a save folder from a completely different game
     # must not receive hint-based points and should be penalised.
-    has_context = any(slug in path_slug for slug in context_slugs if len(slug) >= 3)
+    has_context = any(slug in path_slug for slug in context_slugs if slug_weight(slug) >= 3)
     if has_context:  # Only consider hints with game context
         for hint in hints:
             if hint == name or hint in name.split("_") or name.startswith(hint):
@@ -1382,13 +1488,13 @@ def _is_valid_save_context(path: Path, game_name: str, exe_path: Optional[str] =
         return True
 
     path_str = str(path).lower()
-    game_slug = re.sub(r"[^a-z0-9]", "", game_name.lower())
+    game_slug = match_slug(game_name)
 
     generic_names = {'game', 'app', 'application', 'program', 'main'}
     is_generic_name = game_name.lower() in generic_names
 
     has_game_context = False
-    if game_slug and game_slug in re.sub(r"[^a-z0-9]", "", path_str):
+    if game_slug and game_slug in match_slug(path_str):
         has_game_context = True
 
     # Standard user-data roots where game folders often live without a "saves" subdirectory
@@ -1546,6 +1652,14 @@ def detect_save_paths(
     seen: set[str] = set()
     results: list[str] = []
 
+    # What this game was built with, read once. It decides which extensions
+    # count as saves at all, and the last step of this function throws away
+    # any folder it thinks holds nothing — so a game whose saves are all
+    # ".dat" (Artemis, Unity, Godot, GameMaker) needs it or it ends with no
+    # save path at all.
+    from core.game_engine import detect_engine as _detect_engine
+    game_engine = _detect_engine(exe_path=exe_path) if exe_path else ""
+
     # Build ranked search terms: display name, exe stem (CamelCase-split),
     # install folder stem, and appid number.
     search_terms: list[str] = [game_name] if game_name else []
@@ -1553,8 +1667,8 @@ def detect_save_paths(
     if exe_path:
         import re as _re
         exe_stem = Path(exe_path).stem
-        _exe_clean = _re.sub(r'[^a-z0-9]', '', exe_stem.lower())
-        if exe_stem.lower() not in _GENERIC_EXE_STEMS and len(_exe_clean) > 3:
+        _exe_clean = match_slug(exe_stem)
+        if exe_stem.lower() not in _GENERIC_EXE_STEMS and slug_weight(_exe_clean) > 3:
             # CamelCase → spaced (e.g. "SuperGameStoryRV" → "Super Game Story RV")
             spaced = _re.sub(CAMEL_SPLIT_RE, ' ', exe_stem).strip()
             for t_ in [exe_stem, spaced]:
@@ -1619,10 +1733,13 @@ def detect_save_paths(
         except (OSError, ValueError):
             pass
 
-        # Skip paths whose components match _SKIP_DIRS (lib, savesync, etc.)
+        # Skip paths whose components match _SKIP_DIRS (lib, savesync, etc.),
+        # unless the engine this game was built with is one that genuinely
+        # saves under such a folder — see _engine_allows_skipped_path.
         try:
             p_parts = set(part.lower() for part in Path(path_str).parts)
-            if p_parts & _SKIP_DIRS:
+            if p_parts & _SKIP_DIRS and not _engine_allows_skipped_path(
+                    path_str, exe_path or ""):
                 logger.debug(f"Skipping path with skip dir: {path_str}")
                 return
         except (OSError, ValueError):
@@ -1752,7 +1869,7 @@ def detect_save_paths(
         # parents always do — they're the parents of written files), so the
         # precision of Strategy 1 is preserved; what this adds is exact-dup
         # removal and never returning both "game" and "game/save".
-        results = expand_selectable_paths(results)
+        results = expand_selectable_paths(results, engine=game_engine)
         logger.info(
             f"Live-only tracking found {len(results)} save paths for '{game_name}'"
         )
@@ -1888,7 +2005,7 @@ def detect_save_paths(
     # a subtree is merged into one entry only when the main folder itself
     # holds selectable files; duplicates like "game" + "game/save" collapse
     # to just "game/save".
-    results = expand_selectable_paths(results)
+    results = expand_selectable_paths(results, engine=game_engine)
 
     logger.info(
         f"Detected {len(results)} save paths for '{game_name}' "
@@ -1960,11 +2077,11 @@ def path_has_backup_content(path_str, include_detection_excluded: bool = True,
     return False
 
 
-def _dir_has_direct_selectable_file(p: Path) -> bool:
+def _dir_has_direct_selectable_file(p: Path, engine: str = "") -> bool:
     """True if *p* directly (non-recursively) contains at least one file
     that would actually be shown/backed up (not a skip-extension or
     skip-filename-stem file)."""
-    skip_exts, _, skip_stems = _selectable_skip_sets()
+    skip_exts, _, skip_stems = _selectable_skip_sets(engine=engine)
     try:
         for child in p.iterdir():
             if child.is_file() and _is_selectable_file(child, skip_exts, skip_stems):
@@ -1974,8 +2091,17 @@ def _dir_has_direct_selectable_file(p: Path) -> bool:
     return False
 
 
-def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3) -> list[str]:
+def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3,
+                            engine: str = "") -> list[str]:
     """Normalize detected save paths into independent, selectable entries.
+
+    *engine*, when the caller knows it, decides which extensions count as
+    files at all. It matters here more than anywhere: Artemis writes every
+    one of its saves as a ``.dat``, and ``.dat`` is on the broad skip list
+    because for most engines it is game data. Without the engine, a folder
+    holding nothing but Artemis saves looks empty, is expanded instead of
+    kept, has no subfolders to expand into, and the game ends up with no save
+    path at all. The same is true of Unity, Godot and GameMaker.
 
     Rules (per explicit product requirement — no path "compaction"):
     - Each folder is its own entry; entries are never silently merged into
@@ -2067,7 +2193,7 @@ def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3) -> list
                               key=lambda c: c.name.lower()):
                 _expand(sub, depth + 1, out)
             return
-        if _dir_has_direct_selectable_file(p):
+        if _dir_has_direct_selectable_file(p, engine):
             out.append(p)               # merged entry: files live right here
             return
         if depth >= max_expand_depth:

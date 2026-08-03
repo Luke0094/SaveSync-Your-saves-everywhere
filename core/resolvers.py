@@ -164,9 +164,18 @@ def executable_name_filter(all_files_label: str = "All Files") -> str:
 
 
 def fuzzy_slug(s: str) -> str:
-    """Normalize string for fuzzy matching."""
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    """Normalize string for fuzzy matching.
+
+    Folds accents as it always did, but no longer discards everything that
+    is not Latin — see core.constants.match_slug.
+    """
+    from core.constants import match_slug
+    return match_slug(s)
+
+
+def _has_latin(slug: str) -> bool:
+    """Whether a slug holds anything the substring scores can read."""
+    return any("a" <= ch <= "z" or "0" <= ch <= "9" for ch in slug)
 
 
 def fuzzy_score(query: str, target: str) -> float:
@@ -183,7 +192,16 @@ def fuzzy_score(query: str, target: str) -> float:
     
     if query_slug == target_slug:
         return 100.0
-    
+
+    # Everything below scores by substring and by shared characters, which is
+    # reasoning about an alphabet of twenty-six letters written in separate
+    # words. Japanese is neither, and scoring it this way was measured
+    # against a live title database and made the answers worse rather than
+    # better. An exact match above still counts in any script; a partial one
+    # is only judged where the judging means something.
+    if not (_has_latin(query_slug) and _has_latin(target_slug)):
+        return 0.0
+
     # Exact substring match (query inside target or vice versa)
     if query_slug in target_slug:
         return 85.0 * len(query_slug) / len(target_slug)

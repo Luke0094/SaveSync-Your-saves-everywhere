@@ -8,7 +8,7 @@ import platform
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_ID = "com.savesync.app"
 
 # Paths — platform-aware data directory
@@ -176,11 +176,87 @@ def strip_version_tokens(name: str) -> str:
     return cleaned or name
 
 
+# The kana voiced/semi-voiced sound marks. Combining characters, but part of
+# the letter rather than an accent on it — see match_slug.
+_KANA_VOICING = ("゙", "゚")
+
+
+def match_slug(name: str) -> str:
+    """A name reduced to its letters and digits, for comparing two names.
+
+    Keeps letters and digits in ANY script, which is the whole point. The
+    rule this replaces was ``[^a-z0-9]`` — it deleted every character that
+    was not a plain ASCII letter or digit, so a title written entirely in
+    Japanese, Chinese, Korean, Russian or Greek slugged down to the empty
+    string and could never be matched against the folder it saves into,
+    however exactly the two names agreed.
+
+    Accents are FOLDED rather than kept, and that is not a detail. A game
+    called ``Café`` very often installs into a folder called ``Cafe``, and a
+    slug that kept the accent would stop matching the two — worse than the
+    rule it replaces, which at least reduced both to something shared. So
+    the name is decomposed and its combining marks dropped first: ``Café``
+    and ``Cafe`` both become ``cafe``. Full-width and ligature forms fold the
+    same way, which is what NFKD is for.
+
+    Japanese voicing marks are the one exception, and they have to be. A
+    dakuten is a combining mark like an acute accent is, but it is not
+    decoration: ``ゲ`` and ``ケ`` are different kana, the way ``b`` and ``p``
+    are different letters. Dropping it with the accents would fold apart
+    games that merely sound alike, so it is kept and put back.
+
+    ASCII names come out exactly as they did before.
+    """
+    import unicodedata
+    text = unicodedata.normalize("NFKD", (name or "").lower())
+    kept = "".join(ch for ch in text
+                   if ch in _KANA_VOICING or not unicodedata.combining(ch))
+    return "".join(ch for ch in unicodedata.normalize("NFC", kept)
+                   if ch.isalnum())
+
+
+# Scripts that pack a word into far fewer characters than Latin does: the
+# kana, the CJK ideographs, and the hangul syllables. Used by slug_weight.
+_DENSE_SCRIPTS = (
+    (0x3040, 0x30FF),   # hiragana and katakana
+    (0x3400, 0x4DBF),   # CJK unified ideographs, extension A
+    (0x4E00, 0x9FFF),   # CJK unified ideographs
+    (0xF900, 0xFAFF),   # CJK compatibility ideographs
+    (0xAC00, 0xD7AF),   # hangul syllables
+)
+
+
+def slug_weight(slug: str) -> int:
+    """How distinctive a slug is, measured in Latin-equivalent characters.
+
+    Every "is this name specific enough to match on?" test used to count
+    characters, which was the same thing as counting Latin letters because a
+    slug could not hold anything else. Now that it can, counting characters
+    measures the wrong thing: a three-character Japanese title carries about
+    as much as a six-letter English one, so a plain length test rejects names
+    that are perfectly distinctive and would quietly stop matching them.
+
+    A kana, an ideograph or a hangul syllable therefore counts double.
+    Cyrillic and Greek do NOT — a letter there is a letter, the same as in
+    Latin — so they keep counting one, and ASCII is unchanged.
+    """
+    return sum(2 if any(lo <= ord(ch) <= hi for lo, hi in _DENSE_SCRIPTS)
+               else 1
+               for ch in (slug or ""))
+
+
 def version_insensitive_slug(name: str) -> str:
     """Lowercase alphanumeric slug with version/build tokens removed — the
-    comparison key for "same game, different version suffix"."""
-    import re
-    return re.sub(r'[^a-z0-9]', '', strip_version_tokens(name or '').lower())
+    comparison key for "same game, different version suffix".
+
+    Built on match_slug, so a game named in a non-Latin script has a key at
+    all. It did not before, and the consequence was not cosmetic: this is how
+    a game is matched to the cloud folder holding its backups, and an empty
+    key matched nothing, so those backups could not be found. Nothing stores
+    this value — every caller computes it fresh on both sides of a
+    comparison — so widening it matches more without stranding anything.
+    """
+    return match_slug(strip_version_tokens(name or ''))
 
 
 def _normalize_folder_name(name: str) -> str:

@@ -24,11 +24,34 @@ logger = logging.getLogger(__name__)
 
 
 def _fuzzy_slug(s: str) -> str:
-    """Normalize string for fuzzy matching."""
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    """Normalize string for fuzzy matching.
+
+    Was NFKD followed by ``encode("ascii", "ignore")``, which folded accents
+    correctly and then threw away every character that was not Latin. A
+    Japanese title came out empty, and an empty slug scores zero against
+    everything — including against ITSELF, so a game named in Japanese could
+    not be matched to its own store entry however exactly the two agreed.
+    match_slug folds the accents the same way and keeps the rest.
+    """
+    from core.constants import match_slug
+    return match_slug(s)
+
+
+def _has_latin(slug: str) -> bool:
+    """Whether a slug holds anything the word/character scores can read."""
+    return any("a" <= ch <= "z" or "0" <= ch <= "9" for ch in slug)
+
+
+def can_score(query: str) -> bool:
+    """Whether _fuzzy_score can say anything useful about *query* at all.
+
+    False for a query written entirely in a script the scorer declines to
+    judge. That distinction matters to callers: a zero from _fuzzy_score
+    normally means "a poor match", but for such a query it means "no
+    opinion", and treating the two the same throws away results the source
+    itself was confident about.
+    """
+    return _has_latin(_fuzzy_slug(query))
 
 
 def _fuzzy_words(s: str) -> set[str]:
@@ -110,6 +133,21 @@ def _fuzzy_score(query: str, target: str) -> float:
     if query_slug == target_slug:
         return 100.0
 
+    # Past this point every measure assumes a script written in separate
+    # words out of a small alphabet. Japanese is neither: it has no spaces to
+    # split on, and two unrelated titles routinely share kana.
+    #
+    # This was measured against the live database rather than reasoned about,
+    # and the reasoning lost. Allowing only the exact-substring tests through
+    # — which look strong, being exact — still picked a spin-off over the
+    # game asked for in three lookups out of five, because a short title is
+    # contained in every longer one built on it. Nothing partial is reliable
+    # here. An exact match above still counts in any script; anything less is
+    # left to the search engine's own ranking rather than overruled by a
+    # number that does not mean what it says.
+    if not (_has_latin(query_slug) and _has_latin(target_slug)):
+        return 0.0
+
     query_words = _fuzzy_words(query)
     target_words = _fuzzy_words(target)
 
@@ -183,7 +221,19 @@ def _find_best_match(query: str, candidates: list[dict], name_field: str = "name
     # Only return if score is reasonable (above 25 for better recall)
     if best_score >= 25:
         return best_match
-    
+
+    # Nothing scored — but for a query the scorer declines to judge, that is
+    # not the same statement. The source searched in the query's own script
+    # and returned these in its own order; its first hit is the only opinion
+    # anyone has, and discarding it means finding nothing for a game that was
+    # in fact found. Only reached when the score cannot mean what it says.
+    if not can_score(query):
+        first = next((c for c in candidates if c.get(name_field)), None)
+        if first is not None:
+            logger.debug(f"Unscoreable query {query!r} — deferring to the "
+                         f"source's own first hit: {first.get(name_field)!r}")
+            return first
+
     logger.debug("No candidate scored >= 25 — returning None instead of first result")
     return None
 
@@ -239,12 +289,37 @@ class GameInfo:
     store_url: str = ""          # link to store page / official site
     source: str = ""             # which API provided the info
     extra_urls: Optional[list[str]] = None   # additional site pages (e.g. the VNDB entry)
+    # The other titles this same game is known by — its original title, its
+    # romanization, the name it was released under elsewhere.
+    #
+    # A source searches ALL of them and hands back the one entry that matched;
+    # the caller then scores what came back against what was asked for, and
+    # without this it can only score the DISPLAY name. That threw away
+    # perfectly good answers: a game asked for by the name it was released
+    # under is found by a source that lists it under its original title, and
+    # the score between those two strings can be 10 out of 100 — so the game
+    # the source had already identified was rejected. Carrying the titles it
+    # matched on is what lets the answer be recognised as the right one.
+    alt_names: Optional[list[str]] = None
 
     def __post_init__(self):
         if self.genres is None:
             self.genres = []
         if self.extra_urls is None:
             self.extra_urls = []
+        if self.alt_names is None:
+            self.alt_names = []
+        # Deduplicated, and never repeating the display name: several steps
+        # can arrive at the same alternative — the store search matched on it
+        # and the store details returned it — and one name listed twice is
+        # scored twice for no gain.
+        seen, uniq = {self.name}, []
+        for n in self.alt_names:
+            n = _decode_entities(n)
+            if n and n not in seen:
+                seen.add(n)
+                uniq.append(n)
+        self.alt_names = uniq
         # Sanitise web-sourced text so every source (Steam, Wikipedia,
         # DLsite, itch, generic web…) stores clean values — decode entities
         # for name/developer/publisher, and additionally strip the DLsite
@@ -526,6 +601,135 @@ def _parse_forum_description(text: str) -> dict:
     return out
 
 
+# Words a release folder carries that are never part of a game's title: what
+# language the files are in, whether they were machine-translated, whether
+# the art was uncensored. The same class as the version markers stripped
+# below, and left in they do real damage — they are searched for as if they
+# were words of the title, and a stray Latin one on an otherwise Japanese
+# name also makes it look like a name this module can score, when it cannot.
+#
+# Spelled out rather than pattern-matched, and three letters or more: "EN",
+# "JP" and "CN" are too short to strike out of somebody's title on suspicion.
+#
+# Several of these are also ordinary English words that begin real titles —
+# a game may genuinely be called "Censored …", "Crack …", "Patched …". They
+# are safe to list because a marker is never stripped from the FIRST word of
+# a name: a release folder carries them as suffixes, and a title carries them
+# as its opening word. Position tells the two apart, which is better than
+# dropping the word from the list and never stripping it at all.
+#
+# "DLC" is deliberately absent: it does not describe the same files in
+# another language, it describes different content.
+_RELEASE_MARKERS = frozenset({
+    "jap", "jpn", "eng", "chs", "cht", "kor", "rus",
+    "mtl", "unc", "uncen", "uncensored", "decensored", "censored",
+    "repack", "cracked", "patched", "crack", "hotfix",
+})
+
+# Words that are release noise only in company. A release folder writes one
+# of these beside something that is already noise — a version, a language, a
+# publisher — while a game genuinely named with the word has ordinary words
+# either side of it. Struck out on its own, each would take a word off some
+# real title, so each is struck out only when a neighbour is noise too.
+#
+# "Steam" is here rather than among the trailing markers for exactly that
+# reason: it names the store, but it is also an ordinary English word, and a
+# title can plausibly end on it. "Kagura" and "GOG" cannot, so they need no
+# such care and are taken off the end unconditionally.
+_CONTEXTUAL_MARKERS = frozenset({
+    "fix", "fixed", "steam",
+})
+
+# Who a release came from — the store it was bought from, or the publisher
+# who localised it. Stripped ONLY from the end of a name, and that
+# restriction is the whole point: these are ordinary words that appear in the
+# middle of real titles, and stripping one there would cut a game's name in
+# half. Where the word sits is what separates the title from the label stuck
+# on the end of it.
+_TRAILING_MARKERS = frozenset({
+    "kagura", "gog",
+})
+
+# "Hot fix" written as two words, folded into the one word the marker list
+# already knows. Only ever as that pair: "hot" on its own opens plenty of
+# real titles and is never touched.
+_TWO_WORD_MARKERS = re.compile(r"\bhot[\s._-]+fix\b", re.IGNORECASE)
+
+
+def _is_punctuation(w: str) -> bool:
+    """A token that is only a separator — a dash, a bullet, a bar."""
+    return not any(ch.isalnum() for ch in w)
+
+
+def _is_version_token(w: str) -> bool:
+    """A version string — needs a v/b prefix or a decimal point, so the bare
+    sequel number in "Example Game 1" survives."""
+    return bool(re.match(r'^(?:[vb]\d+(?:\.\d+)*|\d+\.\d+)$', w, re.IGNORECASE))
+
+
+def _is_product_code(w: str) -> bool:
+    """A shop's product code — letters then digits, or a long bare number."""
+    return bool(re.match(r'^(?:[A-Z]{2,4}\d{4,15}|\d{6,15})$', w))
+
+
+def _drop_contextual_markers(text: str) -> str:
+    """Remove the words that are release noise only in company.
+
+    Run BEFORE the version markers are taken out, because a version beside a
+    word is one of the things that identifies it: "<title> v1.0 fix" is a
+    fixed release, while "<title> Fix" is a game with that word in its name,
+    and by the time the version has been removed the two look alike.
+
+    A word qualifies when a neighbour is itself noise — a version, a product
+    code, a language marker, a store. Repeated to a fixed point, so a run
+    resolves from the outside in: the one beside the version settles first,
+    and only then can it settle the next.
+    """
+    words = [w for w in text.split() if w]
+    noise = [False] * len(words)
+    for i, w in enumerate(words):
+        bare = w.strip("-_.").lower()
+        noise[i] = bool(
+            _is_version_token(w) or _is_product_code(w)
+            or (i > 0 and bare in _RELEASE_MARKERS)
+            or (i > 0 and bare in _TRAILING_MARKERS))
+
+    def neighbour(i: int, step: int):
+        """The nearest word either side that is a word at all.
+
+        A lone dash between two of these is punctuation, not a neighbour, and
+        treating it as one would hide a version sitting right behind it. What
+        counts as punctuation is "carries no letter or digit", rather than a
+        list of the characters people separate things with — that list would
+        have to be right about every dash there is.
+        """
+        j = i + step
+        while 0 <= j < len(words):
+            if not _is_punctuation(words[j]):
+                return j
+            j += step
+        return None
+
+    changed = True
+    while changed:
+        changed = False
+        for i, w in enumerate(words):
+            if noise[i] or i == 0:
+                continue
+            if w.strip("-_.").lower() not in _CONTEXTUAL_MARKERS:
+                continue
+            before, after = neighbour(i, -1), neighbour(i, 1)
+            if (before is not None and noise[before]) or \
+                    (after is not None and noise[after]):
+                noise[i] = True
+                changed = True
+
+    kept = [w for i, w in enumerate(words)
+            if not (noise[i]
+                    and w.strip("-_.").lower() in _CONTEXTUAL_MARKERS)]
+    return " ".join(kept)
+
+
 def _clean_game_name(game_name: str) -> str:
     """Strip brackets, version strings and product codes from a game name.
     
@@ -534,24 +738,39 @@ def _clean_game_name(game_name: str) -> str:
     variations are desired.
     """
     stripped = re.sub(r'[\[\]\(\)\{\}]', ' ', game_name).strip()
+    stripped = _TWO_WORD_MARKERS.sub("hotfix", stripped)
     # Shared normalizer handles multi-word markers too ("version 2",
     # "Build 15") and the b/build family — bare sequel numbers survive.
     from core.constants import strip_version_tokens
+    # Before the version markers are taken out, because a version is exactly
+    # the sort of neighbour that identifies one of these — see _in_company.
+    stripped = _drop_contextual_markers(stripped)
     stripped = strip_version_tokens(stripped)
-    words = stripped.split()
     filtered = []
-    for w in words:
+    for w in stripped.split():
         w_clean = w.strip()
         if not w_clean:
             continue
-        # Version strings (must have v/b prefix OR decimal point — preserves the bare sequel "1" in "Example Game 1")
-        if re.match(r'^(?:[vb]\d+(?:\.\d+)*|\d+\.\d+)$', w_clean, re.IGNORECASE):
+        if _is_version_token(w_clean) or _is_product_code(w_clean):
             continue
-        # Product codes like RJ + digits or long digit-only strings
-        if re.match(r'^(?:[A-Z]{2,4}\d{4,15}|\d{6,15})$', w_clean):
+        # Release markers, but never the opening word — see _RELEASE_MARKERS.
+        if filtered and w_clean.strip("-_.").lower() in _RELEASE_MARKERS:
             continue
         filtered.append(w_clean)
-    return ' '.join(filtered).strip()
+    # Store and publisher labels come off the END, and keep coming off while
+    # the end is one: a name can carry two of them, or a label followed by a
+    # language marker the pass above has just removed. Never the first word,
+    # which is the title itself.
+    while len(filtered) > 1 and (
+            filtered[-1].strip("-_.").lower() in _TRAILING_MARKERS
+            # …and the separator a removed label leaves behind with it.
+            or _is_punctuation(filtered[-1])):
+        filtered.pop()
+    cleaned = ' '.join(filtered).strip(" ._-")
+    # Never strip a name down to nothing: a game genuinely called by one of
+    # these words keeps it, since having the wrong name is still better than
+    # having none to search with.
+    return cleaned or stripped.strip()
 
 
 def _build_search_queries(game_name: str) -> list[str]:

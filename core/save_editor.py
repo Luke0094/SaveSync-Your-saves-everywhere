@@ -42,7 +42,37 @@ _RECOGNISED_ONLY = {
              "it is encrypted and its password is not in the game's files "
              "where Easy Save usually leaves it — put the key in an "
              "es3.key file beside the save and it will open"),
+    # AliceSoft .asd carries several things in the same container, and all
+    # the ones with values in them open (see AliceSoftFormat). What reaches
+    # here is one that has none to offer, or one that is encrypted.
+    ".asd": ("AliceSoft System 4",
+             "it carries no values that can be named — the gallery lists are "
+             "a run of numbers with nothing saying what they unlock, and the "
+             "engine scrambles some of the rest"),
+    ".vsf": ("AliceSoft System 4",
+             "it is the flag file beside the save, and it carries no names to "
+             "show a value under"),
+    # RPG Developer Bakin — "YUKRDATA", then its Yukar runtime's own object
+    # stream. Same reason: read, not described.
+    ".sgs": ("RPG Developer Bakin",
+             "its values are written as a plain object stream with nothing "
+             "naming or typing them"),
 }
+
+
+def _is_alicesoft(data: bytes) -> bool:
+    """An AliceSoft container this reader could not open.
+
+    Reached only once AliceSoftFormat has already declined the file, so what
+    is left is a numbered save slot, an encrypted one, or the smaller "CSD"
+    container the engine keeps its common settings in. All of them are worth
+    naming rather than calling a mystery. The CSD check carries the deflate
+    marker that has to follow it, because three bytes alone would claim files
+    that are nothing of the sort.
+    """
+    if data[:4] == b"GD\x01\x01":
+        return True
+    return data[:4] == b"CSD\x00" and data[16:17] == b"\x78"
 
 # How deep to walk a Ruby object graph looking for values. RPG Maker nests a
 # few levels; past this it is the engine's own bookkeeping.
@@ -152,9 +182,41 @@ def _unique(names: list) -> list:
     return out
 
 
+def _paired_dict(node) -> list:
+    """A dictionary written as two parallel lists, or [].
+
+    Unity's own JSON writer cannot express a dictionary, so everything that
+    uses one — and Naninovel's variables are the case in point — comes out
+    as ``{"keys": [...], "values": [...]}``. Read literally that gives rows
+    called "values.0" and "values.1"; read as the pairing it is, it gives
+    rows called by the names the game uses.
+    """
+    if not isinstance(node, dict) or set(node) != {"keys", "values"}:
+        return []
+    keys, values = node["keys"], node["values"]
+    if not isinstance(keys, list) or not isinstance(values, list):
+        return []
+    if len(keys) != len(values) or not all(isinstance(k, str) for k in keys):
+        return []
+    return list(zip(keys, values))
+
+
 def _walk(node, prefix=(), group="") -> list:
     """Every scalar leaf of a JSON-shaped structure, with its path."""
     out = []
+    pairs = _paired_dict(node)
+    if pairs:
+        depth = len(prefix) + 2          # the path of the value itself
+        for i, (name, val) in enumerate(pairs):
+            found = _walk(val, prefix + ("values", i), group)
+            for f in found:
+                # The value itself takes the name it is filed under. Anything
+                # nested INSIDE it keeps its own trail after that name, so a
+                # structure under one key stays distinguishable.
+                tail = [str(p) for p in f.path[depth:]]
+                f.label = ".".join([name] + tail)
+            out.extend(found)
+        return out
     if isinstance(node, dict):
         for key, val in node.items():
             out.extend(_walk(val, prefix + (key,), group or str(key)))
@@ -206,6 +268,385 @@ class JsonFormat(_Format):
         for key in path[:-1]:
             node = node[key]
         node[path[-1]] = value
+
+
+class XmlFormat(_Format):
+    """Plain XML — what .NET's own serializer writes, so Unity and Godot
+    games that save through it, and anything else that picked XML.
+
+    Read with the standard library's parser, which does not resolve external
+    entities, so a save cannot talk this into fetching anything.
+
+    Values live in two places in XML and both are offered: the text inside an
+    element, and the attributes on it. Everything else about the document —
+    its elements, their order, their nesting — is carried through untouched,
+    the same bargain the JSON reader makes: the file is not reproduced byte
+    for byte, it is reproduced value for value, and that is checked on the
+    way out.
+    """
+    name = "XML"
+    engine = "XML"
+    verify_exact = False
+
+    def __init__(self):
+        self._tree = None
+        self._spots = []          # (element, attribute name or None)
+        self._declaration = b""
+        self._encoding = "utf-8"
+
+    def load(self, data: bytes) -> None:
+        import xml.etree.ElementTree as ET
+        head = data[:200].lstrip()
+        if head.startswith(b"<?xml"):
+            end = data.find(b"?>")
+            if end > 0:
+                self._declaration = data[:end + 2]
+                match = re.search(rb'encoding=["\']([\w-]+)["\']',
+                                  self._declaration)
+                if match:
+                    self._encoding = match.group(1).decode("ascii", "ignore")
+        try:
+            self._tree = ET.fromstring(data.decode(self._encoding, "replace"))
+        except ET.ParseError as e:
+            raise SaveEditorError(f"this XML will not parse: {e}") from e
+        self._spots = []
+        self._gather(self._tree, "")
+        if not self._spots:
+            raise SaveEditorError("this XML holds no values to edit")
+
+    def _gather(self, node, prefix: str) -> None:
+        where = f"{prefix}/{node.tag}" if prefix else str(node.tag)
+        for name in node.attrib:
+            self._spots.append((node, name, where))
+        children = list(node)
+        text = (node.text or "").strip()
+        # An element with children has no value of its own: whatever sits
+        # between its tags is the layout of the file, not a value anybody set.
+        if text and not children:
+            self._spots.append((node, None, where))
+        for child in children:
+            self._gather(child, where)
+
+    def dump(self) -> bytes:
+        import xml.etree.ElementTree as ET
+        body = ET.tostring(self._tree, encoding="unicode")
+        raw = body.encode(self._encoding, "xmlcharrefreplace")
+        if self._declaration:
+            return self._declaration + b"\n" + raw
+        return raw
+
+    def fields(self) -> list:
+        out = []
+        for i, (node, attr, where) in enumerate(self._spots):
+            text = node.attrib[attr] if attr else (node.text or "").strip()
+            label = f"{node.tag}@{attr}" if attr else str(node.tag)
+            group = where.rsplit("/", 1)[0] if "/" in where else "(root)"
+            out.append(SaveField((i,), label, _kind_of_text(text),
+                                 _value_of_text(text), group))
+        return out
+
+    def set_field(self, path: tuple, value) -> None:
+        node, attr, _where = self._spots[path[0]]
+        text = "true" if value is True else "false" if value is False \
+            else str(value)
+        if attr:
+            node.attrib[attr] = text
+        else:
+            node.text = text
+
+
+def _kind_of_text(text: str) -> str:
+    """What a piece of text in a save is: a number, a flag, or words."""
+    low = text.strip().lower()
+    if low in ("true", "false"):
+        return "bool"
+    try:
+        int(text)
+        return "int"
+    except ValueError:
+        pass
+    try:
+        float(text)
+        return "float"
+    except ValueError:
+        return "str"
+
+
+def _value_of_text(text: str):
+    kind = _kind_of_text(text)
+    if kind == "bool":
+        return text.strip().lower() == "true"
+    if kind == "int":
+        return int(text)
+    if kind == "float":
+        return float(text)
+    return text
+
+
+class PlayerPrefsFormat(_Format):
+    """Unity PlayerPrefs — a save that is not a file at all.
+
+    On Windows, Unity's PlayerPrefs live in the registry under
+    ``HKCU\\Software\\<company>\\<product>``, and a great many games keep
+    their whole save there. SaveSync already backs those up, exporting the
+    key as JSON (see core/registry_saves); this reads that same export, so
+    the two agree by construction about what a key contains.
+
+    Unity mangles the names: a preference called "gold" is stored as
+    ``gold_h3096647``, the number being a checksum of the name. The checksum
+    cannot be turned back into anything, but it does not need to be — the
+    name is in front of it, and only the suffix is hidden for display. It is
+    kept, because writing the value back under a different name would leave
+    the game unable to find it.
+
+    A value's type is whatever the registry says it is, and it is written
+    back as that same type: an integer as a DWORD, a string as the bytes
+    Unity writes, terminator included.
+    """
+    name = "Unity PlayerPrefs"
+    engine = "Unity"
+    verify_exact = False
+
+    def __init__(self):
+        self._doc = None
+        self._spots = []          # (values dict, registry name, kind)
+
+    def load(self, data: bytes) -> None:
+        try:
+            self._doc = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise SaveEditorError(f"this registry export will not read: {e}") \
+                from e
+        self._spots = []
+        self._gather(self._doc.get("tree") or {}, "")
+        if not self._spots:
+            raise SaveEditorError("this registry key holds no values to edit")
+
+    def _gather(self, node: dict, where: str) -> None:
+        values = node.get("values") or {}
+        for regname in sorted(values):
+            kind = _prefs_kind(values[regname])
+            if kind:
+                self._spots.append((values, regname, where))
+        for child in sorted(node.get("subkeys") or {}):
+            self._gather(node["subkeys"][child],
+                         f"{where}\\{child}" if where else child)
+
+    def dump(self) -> bytes:
+        return json.dumps(self._doc, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+
+    def fields(self) -> list:
+        out = []
+        for i, (values, regname, where) in enumerate(self._spots):
+            kind, value = _prefs_read(values[regname])
+            out.append(SaveField((i,), _prefs_label(regname), kind, value,
+                                 where or "(this game)"))
+        return out
+
+    def set_field(self, path: tuple, value) -> None:
+        values, regname, _where = self._spots[path[0]]
+        values[regname] = _prefs_write(values[regname], value)
+
+
+# Unity hides a preference's name behind a checksum of it: "gold" is stored
+# as "gold_h3096647". Only the tail is dropped, and only for display.
+_PREFS_SUFFIX = re.compile(r"_h\d+$")
+# Registry value types, from winreg. Named here so this module reads without
+# importing winreg, which does not exist off Windows.
+_REG_SZ, _REG_BINARY, _REG_DWORD, _REG_QWORD = 1, 3, 4, 11
+
+
+def _prefs_label(regname: str) -> str:
+    return _PREFS_SUFFIX.sub("", regname) or regname
+
+
+def _prefs_kind(spec: dict) -> str:
+    return _prefs_read(spec)[0]
+
+
+def _prefs_read(spec: dict) -> tuple:
+    """(kind, value) for one exported registry value, or ("", None)."""
+    import base64
+    import struct
+    vtype = int(spec.get("t", _REG_BINARY))
+    if "i" in spec and vtype in (_REG_DWORD, _REG_QWORD):
+        return "int", int(spec["i"])
+    if "s" in spec and vtype == _REG_SZ:
+        return "str", str(spec["s"])
+    if "b" not in spec or vtype != _REG_BINARY:
+        return "", None
+    try:
+        raw = base64.b64decode(spec["b"])
+    except Exception:
+        return "", None
+    # Unity writes a string as its UTF-8 bytes with a terminator, and a
+    # float as its four bytes. A terminator is what tells them apart; four
+    # bytes that do not end in one are the only other thing it writes.
+    if raw.endswith(b"\0"):
+        try:
+            return "str", raw[:-1].decode("utf-8")
+        except UnicodeDecodeError:
+            return "", None
+    if len(raw) == 4:
+        return "float", struct.unpack("<f", raw)[0]
+    return "", None
+
+
+def _prefs_write(spec: dict, value) -> dict:
+    """The same value re-encoded, keeping the type the registry had."""
+    import base64
+    import struct
+    kind, _old = _prefs_read(spec)
+    vtype = int(spec.get("t", _REG_BINARY))
+    if kind == "int":
+        return {"t": vtype, "i": int(value)}
+    if kind == "str" and vtype == _REG_SZ:
+        return {"t": vtype, "s": str(value)}
+    if kind == "str":
+        raw = str(value).encode("utf-8") + b"\0"
+    elif kind == "float":
+        raw = struct.pack("<f", float(value))
+    else:
+        raise SaveEditorError("this preference is of a kind SaveSync leaves "
+                              "alone")
+    return {"t": vtype, "b": base64.b64encode(raw).decode("ascii")}
+
+
+class NaninovelFormat(JsonFormat):
+    """Naninovel (``.nson``) — JSON deflated with no wrapper around it.
+
+    Naninovel can write its saves as plain text or as binary, and the binary
+    one is a raw deflate stream: no zlib header, no gzip header, nothing
+    naming it. Handing such a file to anything that expects one of those
+    fails, which is why a `.nson` read as plain JSON does not open.
+
+    The deflate settings are the ones that reproduce the file byte for byte,
+    found by trying: an unchanged save has to come back out unchanged, and
+    for a compressed format that means matching the compressor as well as
+    the contents. The plain-text form is left to the JSON reader.
+    """
+    name = "Naninovel"
+    engine = "Naninovel"
+    verify_exact = True
+
+    # Raw deflate: a negative window size is what says "no header".
+    _WINDOW = -15
+    _LEVEL = 6
+    _MEMORY = 8
+
+    def __init__(self):
+        super().__init__()
+        self._inner = []
+
+    def load(self, data: bytes) -> None:
+        import zlib
+        try:
+            plain = zlib.decompressobj(self._WINDOW).decompress(data)
+        except zlib.error as e:
+            raise SaveEditorError(f"not a deflated save: {e}") from e
+        if not plain:
+            raise SaveEditorError("the save unpacks to nothing")
+        super().load(plain)
+        self._unwrap()
+        # Whether THIS file can be put back exactly as it came. Most can:
+        # the settings above reproduce them to the byte. A save written by a
+        # build that packed it differently cannot be, and says so here
+        # rather than being refused — it still opens, and is still checked,
+        # by reading back what was written and comparing the values.
+        self.verify_exact = self._repack(plain) == data
+
+    def _unwrap(self) -> None:
+        """Open the JSON that Naninovel keeps inside its own JSON.
+
+        The outer file is a map from a .NET type name to that manager's
+        state, and each state is not an object but a STRING with the object
+        written inside it. The game's own variables — what anyone opening a
+        save is looking for — live one level down there, so a reader that
+        stops at the outer layer offers the file's plumbing and none of its
+        contents.
+
+        Each inner text is kept exactly as it arrived and only re-written if
+        something in it was changed. Re-encoding one that nobody touched
+        would risk spelling it differently from the way the game did, and
+        that is the difference between a save rebuilt byte for byte and one
+        merely rebuilt.
+        """
+        self._inner = []
+        node = self.data if isinstance(self.data, dict) else {}
+        chunk = node.get("objectJsonMap")
+        if not isinstance(chunk, dict):
+            return
+        values = chunk.get("values")
+        keys = chunk.get("keys")
+        if not isinstance(values, list):
+            return
+        for i, text in enumerate(values):
+            if not isinstance(text, str) or not text.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                continue
+            name = keys[i] if isinstance(keys, list) and i < len(keys) else ""
+            self._inner.append({"at": i, "data": parsed, "dirty": False,
+                                "name": _naninovel_manager(str(name))})
+
+    def _repack(self, plain: bytes) -> bytes:
+        import zlib
+        packer = zlib.compressobj(self._LEVEL, zlib.DEFLATED, self._WINDOW,
+                                  self._MEMORY)
+        return packer.compress(plain) + packer.flush()
+
+    def dump(self) -> bytes:
+        for slot in getattr(self, "_inner", []):
+            if slot["dirty"]:
+                self.data["objectJsonMap"]["values"][slot["at"]] = json.dumps(
+                    slot["data"], ensure_ascii=False, separators=(",", ":"))
+        return self._repack(super().dump())
+
+    def fields(self) -> list:
+        # A state that was opened is offered by its contents, not as the
+        # thousands of characters of JSON it is written as. Offering both
+        # would show the same value twice, and let one be edited through a
+        # view that the other would then overwrite.
+        opened = {slot["at"] for slot in self._inner}
+        out = []
+        for f in super().fields():
+            if (len(f.path) >= 3 and f.path[0] == "objectJsonMap"
+                    and f.path[1] == "values" and f.path[2] in opened):
+                continue
+            out.append(SaveField(("outer",) + f.path, f.label, f.kind,
+                                 f.value, f.group))
+        for n, slot in enumerate(self._inner):
+            for f in _walk(slot["data"]):
+                out.append(SaveField(("inner", n) + f.path, f.label, f.kind,
+                                     f.value, slot["name"] or f.group))
+        return out
+
+    def set_field(self, path: tuple, value) -> None:
+        if path and path[0] == "outer":
+            super().set_field(path[1:], value)
+            return
+        slot = self._inner[path[1]]
+        node = slot["data"]
+        for key in path[2:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        slot["dirty"] = True
+
+
+def _naninovel_manager(type_name: str) -> str:
+    """The readable half of a .NET type name, for use as a heading.
+
+    Naninovel writes the whole assembly-qualified name — the type, the
+    assembly, its version, culture and public key. Only the first is worth
+    showing, and only its last part.
+    """
+    head = type_name.split(",", 1)[0]
+    head = head.split("+", 1)[0]
+    head = head.rsplit(".", 1)[-1]
+    return head.split("`", 1)[0]
 
 
 class _LzStringJson(JsonFormat):
@@ -601,6 +1042,102 @@ class GvasFormat(_Format):
             raise SaveEditorError(str(e)) from e
 
 
+class UnrealEncryptedFormat(GvasFormat):
+    """An Unreal save the game locked with a key of its own.
+
+    The same file GvasFormat reads, with everything — the magic included —
+    under encryption. See core/unreal_crypt: the key is never guessed at, it
+    is supplied, and it is accepted only when what comes out starts with
+    GVAS. So this either opens the real save or declines; there is no middle
+    where it might produce something plausible and wrong.
+    """
+    name = "Unreal Engine (encrypted)"
+    engine = "Unreal Engine (GVAS)"
+
+    def __init__(self):
+        super().__init__()
+        self.source_path = None
+        self.game_dir = None
+        # Told how long the hunt has been going, and able to call it off —
+        # see open_save. None means let it run.
+        self.progress = None
+        self._started = None
+        self._key = ""
+        self._how = ""
+
+    def _places(self) -> list:
+        """Where a key for this save might be kept, nearest first."""
+        out = []
+        if self.source_path is not None:
+            here = Path(self.source_path).parent
+            out.append(here)
+            out.extend(list(here.parents)[:3])
+        if self.game_dir:
+            out.append(Path(self.game_dir))
+        return out
+
+    def _find_key(self, data: bytes) -> tuple:
+        """A key that opens this save: remembered, given, or hunted for.
+
+        In that order, because that is the order of what they cost — the
+        first two are instant and the third reads the game's compiled code.
+        """
+        from core.game_keys import key_from_file, stored_key
+        from core.unreal_crypt import KEY_FILE, decrypt, find_key, game_binaries
+        places = self._places()
+        for place in places:
+            for candidate in (stored_key("unreal", place),
+                              key_from_file(place, KEY_FILE)):
+                if not candidate:
+                    continue
+                plain, how = decrypt(data, candidate)
+                if plain:
+                    return plain, candidate, how, place
+        # Nothing to hand, so look in the game itself — the same thing Easy
+        # Save does, except that an Unreal key has no marker to look up and
+        # has to be found by trying. Only possible with the game in reach:
+        # its saves live under the user's profile, nowhere near it.
+        if not self.game_dir:
+            return b"", "", "", None
+        binaries = game_binaries(self.game_dir)
+        if not binaries:
+            return b"", "", "", None
+        key, how = find_key(data, binaries, on_tick=self._tick)
+        if key:
+            plain, how2 = decrypt(data, key)
+            if plain:
+                # Written down against the save, not against the game that
+                # yielded it: the save is what will be opened next time, and
+                # it may well be opened with the game out of reach.
+                return plain, key, how2 or how, places[0] if places else None
+        return b"", "", "", None
+
+    def _tick(self):
+        """Report how long the hunt has run, and whether to carry on."""
+        if self.progress is None:
+            return True
+        import time
+        if self._started is None:
+            self._started = time.monotonic()
+        return self.progress(time.monotonic() - self._started) is not False
+
+    def load(self, data: bytes) -> None:
+        from core.game_keys import store_key
+        plain, key, how, place = self._find_key(data)
+        if not plain:
+            raise SaveEditorError(
+                "this Unreal save is encrypted by the game and no key for it "
+                "was found, in the save's own folders or in the game")
+        self._key, self._how = key, how
+        super().load(plain)
+        if place is not None:
+            store_key("unreal", place, key)
+
+    def dump(self) -> bytes:
+        from core.unreal_crypt import encrypt
+        return encrypt(super().dump(), self._key, self._how)
+
+
 class RenpyFormat(_Format):
     """Ren'Py ``.save`` — a zip around a pickle. See core/renpy_save for why
     the pickle is read opcode by opcode instead of being unpickled, and why an
@@ -761,6 +1298,9 @@ class Es3Format(JsonFormat):
         super().__init__()
         self.source_path = None
         self.game_dir = None
+        # Told how long the hunt for a password has been going, and able to
+        # call it off — see open_save. None means let it run.
+        self.progress = None
         self._iv = b""
         self._password = ""
 
@@ -769,7 +1309,8 @@ class Es3Format(JsonFormat):
         if not is_encrypted(data):
             # Encryption is optional, and most games leave it off.
             return super().load(data)
-        self._password = find_password(data, self.source_path, self.game_dir)
+        self._password = find_password(data, self.source_path, self.game_dir,
+                                       progress=self.progress)
         if not self._password:
             raise SaveEditorError(
                 "this Easy Save 3 file is encrypted and its password is not "
@@ -907,14 +1448,158 @@ class WolfFormat(_Format):
         self._save.set_value(path[0], value)
 
 
+class AliceSoftFormat(_Format):
+    """AliceSoft System 4 global data (``.asd``, and ``.sav``).
+
+    See core/alicesoft, which is written from the engine reimplementation the
+    format is described in rather than from staring at bytes. Two different
+    things arrive in the same container: the global data, which is named and
+    typed, and the numbered save slots, which are a dump of the virtual
+    machine. Both open — from a slot it is the game's own global variables
+    that are offered, and with the game in the library they carry the names
+    the game gave them.
+    """
+    name = "AliceSoft System 4"
+    engine = "AliceSoft System"
+
+    def __init__(self):
+        self._save = None
+        self.game_dir = None
+
+    def load(self, data: bytes) -> None:
+        from core.alicesoft import AliceSoftError, loads
+        try:
+            self._save = loads(data, game_dir=self.game_dir)
+        except AliceSoftError as e:
+            raise SaveEditorError(str(e)) from e
+
+    def dump(self) -> bytes:
+        return self._save.dump()
+
+    def fields(self) -> list:
+        groups = self._save.groups()
+        return [SaveField((i,), name, kind, value, groups[i])
+                for i, name, kind, value in self._save.values()]
+
+    def set_field(self, path: tuple, value) -> None:
+        from core.alicesoft import AliceSoftError
+        try:
+            self._save.set_value(path[0], value)
+        except AliceSoftError as e:
+            raise SaveEditorError(str(e)) from e
+
+
+class ArtemisFormat(_Format):
+    """Artemis Engine settings (``system.dat``).
+
+    See core/artemis, including why the numbered slots beside this file are
+    named rather than opened.
+    """
+    name = "Artemis"
+    engine = "Artemis"
+
+    def __init__(self):
+        self._save = None
+
+    def load(self, data: bytes) -> None:
+        from core.artemis import ArtemisError, loads
+        try:
+            self._save = loads(data)
+        except ArtemisError as e:
+            raise SaveEditorError(str(e)) from e
+
+    def dump(self) -> bytes:
+        return self._save.dump()
+
+    def fields(self) -> list:
+        groups = self._save.groups()
+        return [SaveField((i,), name, kind, value, groups[i])
+                for i, name, kind, value in self._save.values()]
+
+    def set_field(self, path: tuple, value) -> None:
+        from core.artemis import ArtemisError
+        try:
+            self._save.set_value(path[0], value)
+        except ArtemisError as e:
+            raise SaveEditorError(str(e)) from e
+
+
+class TyranoFormat(JsonFormat):
+    """TyranoScript / TyranoBuilder saves (``.sav``).
+
+    JSON behind JavaScript's ``escape()`` — see core/tyrano, which carries the
+    one part that is not obvious (``escape()`` counts in UTF-16 code units, so
+    an emoji is a surrogate PAIR and not one five-digit sequence).
+
+    What is OFFERED is a small part of what is read. A TyranoScript save holds
+    the label map, the macro map, the script buffer and the line currently on
+    screen as well as the game's own values, and in a long game that is most
+    of the file — one of these samples is 11 MB and holds 774 values worth
+    editing. So the same rule as RAGS applies: read the whole file, offer the
+    part the game itself set.
+    """
+    name = "TyranoScript"
+    engine = "TyranoScript / TyranoBuilder"
+    # The wrapper rebuilds exactly and every sample proves it, but the JSON
+    # inside is re-serialised, and JavaScript and Python do not have to spell
+    # every float the same way. Checking the VALUES is the claim that actually
+    # holds for a text format; see open_save().
+    verify_exact = False
+
+    def load(self, data: bytes) -> None:
+        from core.tyrano import TyranoError, loads
+        try:
+            self.data = loads(data)
+        except TyranoError as e:
+            raise SaveEditorError(str(e)) from e
+        if not self._roots():
+            raise SaveEditorError("no game values in this TyranoScript save")
+
+    def dump(self) -> bytes:
+        from core.tyrano import dumps
+        return dumps(self.data)
+
+    def _roots(self) -> list:
+        from core.tyrano import state_roots
+        return state_roots(self.data)
+
+    def fields(self) -> list:
+        from core.tyrano import at
+        roots = self._roots()
+        out = []
+        for path, group in roots:
+            node = at(self.data, path)
+            if node is None:
+                continue
+            cut = len(path)
+            for f in _walk(node, path, group):
+                f.label = ".".join(str(p) for p in f.path[cut:])
+                # Slots hold the same names as each other, and a value is held
+                # by its name — so with more than one slot the slot has to be
+                # part of the name, or none of them could be held at all.
+                if len(roots) > 1:
+                    f.label = f"{group}.{f.label}"
+                    f.group = group
+                else:
+                    f.group = _leading_group(f.label)
+                out.append(f)
+        labels = _unique([f.label for f in out])
+        for f, label in zip(out, labels):
+            f.label = label
+        return out
+
+
 # ── Detection ────────────────────────────────────────────────────────────────
 
 _BY_EXTENSION = {
     ".json": JsonFormat,
-    ".nson": JsonFormat,          # Naninovel
+    # Naninovel writes either a deflate stream or plain text; the deflated
+    # reader is tried first and the JSON one catches the rest.
+    ".nson": NaninovelFormat,
     ".es3": Es3Format,            # JSON, encrypted or not, in Easy Save's layout
     ".rpgsave": RpgMakerMvFormat,
     ".rmmzsave": RpgMakerMzFormat,   # MZ deflates; MV's LZString is tried after
+    ".xml": XmlFormat,            # .NET's serializer, so Unity and Godot too
     ".ini": KeyValueFormat,
     ".cfg": KeyValueFormat,
     ".conf": KeyValueFormat,
@@ -927,6 +1612,25 @@ _BY_EXTENSION = {
     ".rvdata": RubyMarshalFormat,
     ".rxdata": RubyMarshalFormat,
 }
+
+
+def _in_unreal_save_folder(path: Path) -> bool:
+    """Whether *path* sits where Unreal itself puts a game's saves.
+
+    ``<Game>/Saved/SaveGames`` is the engine's own layout, not something a
+    game chooses, so it identifies an Unreal save even when the file will not
+    identify itself.
+    """
+    parts = [p.lower() for p in Path(path).parts]
+    return "savegames" in parts and "saved" in parts
+
+
+def _looks_encrypted_unreal(data: bytes) -> bool:
+    try:
+        from core.unreal_crypt import looks_encrypted
+        return looks_encrypted(data)
+    except Exception:
+        return False
 
 
 def _candidates(path: Path, data: bytes) -> list:
@@ -963,6 +1667,29 @@ def _candidates(path: Path, data: bytes) -> list:
                 out.append(WolfFormat)
         except Exception:
             pass
+    # AliceSoft names itself in its first four bytes, which is just as well:
+    # it puts the same container behind .asd and behind .sav, and what is
+    # INSIDE decides whether it can be opened at all.
+    if data[:4] in (b"GD\x01\x01", b"PSR\x00"):
+        out.append(AliceSoftFormat)
+    # An Unreal save whose game encrypted it says nothing about itself — the
+    # magic is under the encryption with everything else. Where it SITS says
+    # it instead: "Saved/SaveGames" is Unreal's own folder, written by the
+    # engine and not by the game. Tried last, and only ever with a key that
+    # then has to produce the magic, so a file that merely lives there and is
+    # something else costs one failed decryption.
+    if _in_unreal_save_folder(path) and _looks_encrypted_unreal(data):
+        out.append(UnrealEncryptedFormat)
+    # Artemis writes settings, global data and slots all into a .dat, and all
+    # three name themselves in the first four bytes.
+    if data[:3] == b"BOW":
+        out.append(ArtemisFormat)
+    # TyranoScript also writes .sav, so the extension cannot tell it from
+    # Unreal or Wolf. What can is that its JSON arrives escaped: the opening
+    # brace is on disk as the three characters "%7B", which nothing else here
+    # starts with.
+    if data[:3] in (b"%7B", b"%5B"):
+        out.append(TyranoFormat)
     # QSP names itself in the clear, in either of the two encodings it uses.
     if (data.startswith(b"QSPSAVEDGAME")
             or data.startswith("QSPSAVEDGAME".encode("utf-16-le"))):
@@ -975,6 +1702,10 @@ def _candidates(path: Path, data: bytes) -> list:
     head = data[:1].lstrip()
     if head[:1] in (b"{", b"["):
         out.append(JsonFormat)
+    # XML, whatever the file is called: a game that saves through .NET's
+    # serializer often names the result .sav or .dat.
+    if data[:200].lstrip()[:1] == b"<":
+        out.append(XmlFormat)
     # A deflate stream opens with a marker whose two bytes are both under
     # 0x80, so it survives MZ's text wrapper and can be recognised as it is.
     if data[:1] == b"x" and len(data) > 8:
@@ -1005,6 +1736,11 @@ class SaveDocument:
     fields: list = _field(default_factory=list)
     _fmt: object = None
     _original: bytes = b""
+    # Set when the save is a registry key rather than a file — see open_save.
+    _registry: str = ""
+    # The values as they stand in the file, for the formats whose bytes
+    # cannot be compared — see dirty_against_disk.
+    _baseline: tuple = ()
 
     def set_value(self, path: tuple, value) -> None:
         self._fmt.set_field(path, value)
@@ -1013,7 +1749,22 @@ class SaveDocument:
                 f.value = value
 
     def dirty_against_disk(self) -> bool:
-        return self._fmt.dump() != self._original
+        """Whether anything here differs from what is in the file.
+
+        Comparing the bytes is right only for a format that rebuilds them
+        exactly. The others re-encode — LZString picks a different packing,
+        a zip is written afresh, JSON is spelled without its spacing — so an
+        untouched save comes out as different bytes carrying identical
+        values, and comparing bytes would call it modified when nobody
+        modified it. For those the values are what is compared, which is
+        what the question is actually asking.
+        """
+        if getattr(self._fmt, "verify_exact", True):
+            return self._fmt.dump() != self._original
+        return self._value_snapshot() != self._baseline
+
+    def _value_snapshot(self) -> tuple:
+        return tuple((f.path, f.value) for f in self._fmt.fields())
 
     def save(self) -> Path:
         """Write the edits back, keeping the original first.
@@ -1021,6 +1772,13 @@ class SaveDocument:
         Returns the path of the copy that was set aside — the thing "undo"
         needs. Writing happens only after that copy exists.
         """
+        if self._registry:
+            # Nothing to copy aside on disk, so the copy IS the export: the
+            # key exactly as it stands, written where a file's backup would
+            # go. Restoring it is the same import that writing uses.
+            backup = backup_original(self.path, self._original)
+            self.write_without_backup()
+            return backup
         backup = backup_original(self.path)
         self.write_without_backup()
         return backup
@@ -1038,10 +1796,19 @@ class SaveDocument:
         half of each.
         """
         data = self._fmt.dump()
+        if self._registry:
+            from core.registry_saves import import_registry_tree
+            if not import_registry_tree(self._registry, data):
+                raise SaveEditorError(
+                    "the changes could not be written back to the registry")
+            self._original = data
+            self._baseline = self._value_snapshot()
+            return
         tmp = self.path.with_suffix(self.path.suffix + ".savesync-tmp")
         tmp.write_bytes(data)
         tmp.replace(self.path)
         self._original = data
+        self._baseline = self._value_snapshot()
 
 
 def describe(path) -> str:
@@ -1056,22 +1823,40 @@ def why_not(path) -> str:
     return known[1] if known else ""
 
 
-def open_save(path, game_dir=None) -> SaveDocument:
+def open_save(path, game_dir=None, progress=None) -> SaveDocument:
     """Open *path* for editing, or explain why it cannot be.
 
     *game_dir* is where the game itself is installed, when that is known. A
     save does not always sit with its game — Unity puts them under the user's
     profile — and one format needs to look in the game's own files.
+
+    *progress* is for the one format whose search can run long: it is called
+    with the seconds elapsed and stops the search by returning False. Every
+    other format ignores it.
     """
-    p = Path(path)
-    try:
-        data = p.read_bytes()
-    except OSError as e:
-        raise SaveEditorError(f"cannot read {p.name}: {e}",
-                              "cheats.err_cannot_read", name=p.name,
-                              reason=str(e)) from e
-    if not data:
-        raise SaveEditorError("the file is empty", "cheats.err_empty")
+    # Unity's PlayerPrefs are a save that is not a file: SaveSync proposes
+    # them as "registry:HKCU\..." and backs them up already, so the same
+    # export is what gets edited here. Everything downstream then works on
+    # bytes exactly as it does for a file.
+    from core.registry_saves import (export_registry_key, is_registry_path,
+                                     registry_display)
+    registry = str(path) if is_registry_path(str(path)) else ""
+    if registry:
+        p = Path(registry_display(registry).replace("\\", "/"))
+        data = export_registry_key(registry)
+        if not data:
+            raise SaveEditorError(
+                "that registry key could not be read, or holds nothing")
+    else:
+        p = Path(path)
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            raise SaveEditorError(f"cannot read {p.name}: {e}",
+                                  "cheats.err_cannot_read", name=p.name,
+                                  reason=str(e)) from e
+        if not data:
+            raise SaveEditorError("the file is empty", "cheats.err_empty")
 
     def prepare(cls):
         """A reader, told where the file came from.
@@ -1087,9 +1872,11 @@ def open_save(path, game_dir=None) -> SaveDocument:
             fmt.source_path = p
         if game_dir and hasattr(fmt, "game_dir"):
             fmt.game_dir = game_dir
+        if progress is not None and hasattr(fmt, "progress"):
+            fmt.progress = progress
         return fmt
 
-    for cls in _candidates(p, data):
+    for cls in ([PlayerPrefsFormat] if registry else _candidates(p, data)):
         fmt = prepare(cls)
         try:
             fmt.load(data)
@@ -1107,7 +1894,11 @@ def open_save(path, game_dir=None) -> SaveDocument:
             rebuilt = fmt.dump()
         except Exception:
             continue
-        if not cls.verify_exact:
+        # Asked of the reader, not of its class: a format can only know
+        # which guarantee it can offer once it has seen the file. Naninovel
+        # is the case — most of its saves are rebuilt byte for byte, and the
+        # odd one written by a different build of the game is not.
+        if not fmt.verify_exact:
             # Re-serialised formats differ in whitespace or compression, so
             # equality is checked where it means something: reading the
             # rebuilt bytes must give back the same values.
@@ -1125,16 +1916,28 @@ def open_save(path, game_dir=None) -> SaveDocument:
         fields = fmt.fields()
         if not fields:
             continue
-        return SaveDocument(path=p, format_name=cls.name, engine=cls.engine,
-                            fields=fields, _fmt=fmt, _original=data)
+        doc = SaveDocument(path=p, format_name=cls.name, engine=cls.engine,
+                           fields=fields, _fmt=fmt, _original=data,
+                           _registry=registry)
+        doc._baseline = doc._value_snapshot()
+        return doc
 
     known = describe(p)
     if known:
+        reason = why_not(p)
+        # The missing piece for some of these is not in the save at all — it
+        # is in the GAME, and a save dropped in on its own arrives with no
+        # game behind it. Then "cannot be opened" is not the whole answer:
+        # adding the game is a step that gets somewhere, and leaving it out
+        # hides it. Once the game IS known, the reader has already looked, so
+        # the offer is dropped rather than repeated at someone who took it.
+        if not game_dir:
+            reason = _KEY_LIVES_IN_THE_GAME.get(p.suffix.lower(), reason)
         raise SaveEditorError(
             f"{p.name} looks like a {known} save, which SaveSync cannot edit "
-            f"yet: {why_not(p)}",
+            f"yet: {reason}",
             "cheats.err_known_not_editable", name=p.name, engine=known,
-            reason=why_not(p))
+            reason=reason)
     # An Unreal save that GVAS could not read is worth saying so about, rather
     # than calling it unrecognised: the file IS one, and what stopped the
     # reader is something inside it rather than the format being a mystery.
@@ -1143,8 +1946,103 @@ def open_save(path, game_dir=None) -> SaveDocument:
             f"{p.name} is an Unreal Engine save, but SaveSync could not read "
             f"all the way through it",
             "cheats.err_unreal_new", name=p.name)
+    # An encrypted Unreal save, which by then is one whose key was not found:
+    # saying so is the difference between a file nobody can identify and one
+    # that only needs its key.
+    if _in_unreal_save_folder(p) and _looks_encrypted_unreal(data):
+        from core.unreal_crypt import KEY_FILE
+        reason = (f"the game encrypted it with a key of its own, and none was "
+                  f"found — put the key in a {KEY_FILE} file beside the save")
+        if not game_dir:
+            reason += ", or add the game to the library"
+        raise SaveEditorError(
+            f"{p.name} is an Unreal Engine save, which SaveSync cannot edit "
+            f"yet: {reason}",
+            "cheats.err_known_not_editable", name=p.name,
+            engine="Unreal Engine", reason=reason)
+    # Artemis puts its settings, its across-playthroughs data and its slots
+    # all into a .dat. Only the first opens; the other two are worth naming.
+    if data[:3] == b"BOW":
+        reason = ("its values sit in a tagged tree, and following one wrongly "
+                  "would write a number into the wrong place")
+        raise SaveEditorError(
+            f"{p.name} looks like an Artemis save, which SaveSync cannot edit "
+            f"yet: {reason}",
+            "cheats.err_known_not_editable", name=p.name, engine="Artemis",
+            reason=reason)
+    # AliceSoft puts the same container behind a .sav as often as behind a
+    # .asd, and the extension map cannot see that. Its own header can.
+    if _is_alicesoft(data):
+        engine, reason = _RECOGNISED_ONLY[".asd"]
+        raise SaveEditorError(
+            f"{p.name} looks like a {engine} save, which SaveSync cannot edit "
+            f"yet: {reason}",
+            "cheats.err_known_not_editable", name=p.name, engine=engine,
+            reason=reason)
+    # Some engines encrypt their saves outright, and an encrypted file has
+    # nothing in it to recognise — every byte is as likely as every other. The
+    # only thing that can name one is the game it belongs to, which is what
+    # the engine detector is for. Asked last, and only about a file nothing
+    # else claimed, so it cannot take a save away from a reader that works.
+    engine_said, have_game = _engine_that_encrypts(p, game_dir)
+    if engine_said:
+        reason = ("the engine encrypts it, and the key is inside the game's "
+                  "own program rather than in the save")
+        if not have_game:
+            reason += (" — add the game to the library so SaveSync has its "
+                       "executable to look in")
+        raise SaveEditorError(
+            f"{p.name} looks like a {engine_said} save, which SaveSync cannot "
+            f"edit yet: {reason}",
+            "cheats.err_known_not_editable", name=p.name, engine=engine_said,
+            reason=reason)
     raise SaveEditorError(f"{p.name} is not a save format SaveSync can read",
                           "cheats.err_unreadable", name=p.name)
+
+
+# Engines whose saves are encrypted with a key that lives in the game, so
+# that no amount of looking at the file will identify or open it.
+_ENCRYPTING_ENGINES = ("srpgstudio",)
+
+# What to say instead, for formats whose missing piece is inside the GAME,
+# when SaveSync does not know where the game is.
+#
+# A separate sentence rather than a line tacked onto the usual one, because
+# the usual one is not true in this case: _RECOGNISED_ONLY says the password
+# "is not in the game's files", and with no game to look in, nothing looked.
+# Saying so, and naming the step that would fix it, is the difference between
+# a dead end and an instruction.
+_KEY_LIVES_IN_THE_GAME = {
+    ".es3": ("it is encrypted, and the password is baked into the game's own "
+             "build rather than kept in the save — add the game to the "
+             "library and SaveSync will read it out of there, or put the key "
+             "in an es3.key file beside the save"),
+}
+
+
+def _engine_that_encrypts(path: Path, game_dir=None) -> tuple:
+    """(engine name, whether the game itself was found) for an encrypted save.
+
+    ("", False) for every other file.
+
+    The game folder is used when it is known, and the save's own folder is
+    tried when it is not — these engines keep their saves under the game, so
+    the detector's walk upward usually reaches it either way. Which of the two
+    answered matters: the key to one of these saves is inside the game's own
+    program file, so a game SaveSync cannot see is a game whose saves it could
+    not open even once it knows how. Saying which case it is turns a dead end
+    into something the player can act on — add the game, and the executable
+    comes with it.
+    """
+    from core.game_engine import detect_engine, label
+    if game_dir:
+        engine = detect_engine(game_dir=str(game_dir))
+        if engine in _ENCRYPTING_ENGINES:
+            return label(engine), True
+    engine = detect_engine(game_dir=str(path.parent))
+    if engine in _ENCRYPTING_ENGINES:
+        return label(engine), bool(game_dir)
+    return "", False
 
 
 # ── Keeping the original ─────────────────────────────────────────────────────
@@ -1166,8 +2064,13 @@ def _slot_dir(path: Path, create: bool = True) -> Path:
     return d
 
 
-def backup_original(path) -> Path:
-    """Put a dated copy of *path* aside and return where it went."""
+def backup_original(path, contents: bytes = None) -> Path:
+    """Put a dated copy of *path* aside and return where it went.
+
+    *contents* is for a save that is not a file — a registry key, whose
+    "original" is the export taken when it was opened. Everything else about
+    keeping copies, naming them and pruning them is the same either way.
+    """
     p = Path(path)
     d = _slot_dir(p)
     # Milliseconds AND a collision guard: saving and then undoing happen
@@ -1179,7 +2082,10 @@ def backup_original(path) -> Path:
     while dest.exists():
         dest = d / f"{stamp}-{n}__{p.name}"
         n += 1
-    shutil.copy2(p, dest)
+    if contents is None:
+        shutil.copy2(p, dest)
+    else:
+        dest.write_bytes(contents)
     (d / "origin.txt").write_text(str(p), encoding="utf-8")
     prune_backups(p)
     logger.info(f"Kept the original of {p.name} at {dest.name}")

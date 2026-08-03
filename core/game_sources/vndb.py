@@ -28,6 +28,26 @@ _VNDB_FIELDS = (
 )
 
 
+def _title_variants(entry: dict) -> list[str]:
+    """Every title one VNDB entry is known by, in every script it carries.
+
+    A Japanese game is listed under its original title, its romanization and
+    often an English release title, and a search may legitimately match any
+    of them. Both the search and the result use this, so the titles a match
+    was FOUND on are the same ones the caller gets to see it by.
+    """
+    out: list[str] = [entry.get("title", ""), entry.get("alttitle", "")]
+    for t in entry.get("titles", []) or []:
+        out.append(t.get("title", ""))
+        out.append(t.get("latin", ""))
+    seen, uniq = set(), []
+    for t in out:
+        if t and t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
+
+
 def search_vndb(game_name: str) -> Optional[GameInfo]:
     """Search VNDB Kana API v2.
 
@@ -65,26 +85,18 @@ def search_vndb(game_name: str) -> Optional[GameInfo]:
             logger.debug(f"VNDB: no results for {game_name!r}")
             return None
 
-        # Build candidate list that includes all title variants so fuzzy
-        # matching can find the romanized title even when the main title
-        # is written in Japanese
-        def _all_titles(entry: dict) -> list[str]:
-            out: list[str] = []
-            if entry.get("title"):
-                out.append(entry["title"])
-            if entry.get("alttitle"):
-                out.append(entry["alttitle"])
-            for t in entry.get("titles", []):
-                if t.get("title"):
-                    out.append(t["title"])
-                if t.get("latin"):
-                    out.append(t["latin"])
-            return [t for t in out if t]
-
         best_entry = None
         best_score = -1.0
         for entry in results:
-            score = max(_fuzzy_score(game_name, t) for t in _all_titles(entry))
+            score = max(_fuzzy_score(game_name, t)
+                        for t in _title_variants(entry))
+            # Strictly greater, so equal scores keep the EARLIER entry — and
+            # that is load-bearing rather than incidental. A query written in
+            # a script the scorer will not judge (see common._fuzzy_score)
+            # leaves every candidate on zero, and the first of them is VNDB's
+            # own top hit, which measured better than anything computed here.
+            # Relaxing this to >= would silently hand every such query to the
+            # LAST result instead.
             if score > best_score:
                 best_score = score
                 best_entry = entry
@@ -160,6 +172,12 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
         elif vndb_url != store_url:
             extra_urls.append(vndb_url)
 
+    # Every other name this game is known by. The search above already looks
+    # at all of them; carrying them on the result is what lets the caller see
+    # WHY this entry was chosen, instead of judging it on a display title the
+    # query never mentioned. See GameInfo.alt_names.
+    alt_names = [n for n in _title_variants(entry) if n != display_title]
+
     return GameInfo(
         name=display_title,
         description=clean_desc,
@@ -170,6 +188,7 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
         store_url=store_url,
         source="vndb",
         extra_urls=extra_urls,
+        alt_names=alt_names,
     )
 
 

@@ -29,6 +29,16 @@ UNREAL = "unreal"
 RENPY = "renpy"
 GODOT = "godot"
 GAMEMAKER = "gamemaker"
+TYRANO = "tyrano"
+BAKIN = "bakin"
+SRPGSTUDIO = "srpgstudio"
+ALICESOFT = "alicesoft"
+ARTEMIS = "artemis"
+# Not engines but packaging: a Chromium runtime with a game's HTML and
+# JavaScript inside it. They are the answer only when nothing more particular
+# is — see _engine_of_folder.
+NWJS = "nwjs"
+ELECTRON = "electron"
 
 # Extensions each engine genuinely WRITES SAVES into, and which therefore
 # must not be excluded from detection for a game built with it. One table so
@@ -54,7 +64,39 @@ _ENGINE_SAVE_EXTENSIONS = {
     # The opposite case, and the reason this table exists: RPG Maker ships
     # its game DATABASE as .dat/.rvdata. Excluding it here is correct.
     RPGMAKER:  set(),
+    # Artemis writes EVERY save as a .dat — the slots, the data kept across
+    # playthroughs and the settings alike — so for this engine the extension
+    # has to come off the skip list, or none of its saves is ever detected.
+    # This is the same case as Unity's .dat above, and the reason the table
+    # exists at all.
+    ARTEMIS:    {".dat"},
+    # The rest save into extensions nothing skips: TyranoScript, AliceSoft
+    # and SRPG Studio write .sav, Bakin .sgs. Listed to say so, as Ren'Py and
+    # Unreal are above.
+    TYRANO:     set(),
+    BAKIN:      set(),
+    SRPGSTUDIO: set(),
+    ALICESOFT:  set(),
+    # A wrapper says nothing about what the game inside it saves into, and
+    # .dat next to a Chromium runtime is as often the runtime's own as it is
+    # a save. Unknown is the conservative side and this is the same case.
+    NWJS:       set(),
+    ELECTRON:   set(),
 }
+
+# The folder an engine really saves into, when that folder's NAME is one the
+# detector otherwise throws away. The companion to the table above: that one
+# says which extensions are saves for an engine, this one says which folders
+# are — same question, same shape, same reason for existing.
+#
+# "data" is skipped everywhere because for most engines it is the game's own
+# content; for TyranoScript it IS the whole game. Bakin puts the player's
+# saves in data/savedata, so no single rule can be right for both, and the
+# engine is what tells them apart.
+_ENGINE_SAVE_DIRS = {
+    BAKIN: (("data", "savedata"),),
+}
+
 
 _LABELS = {
     RPGMAKER: "RPG Maker",
@@ -63,6 +105,13 @@ _LABELS = {
     RENPY: "Ren'Py",
     GODOT: "Godot",
     GAMEMAKER: "GameMaker",
+    TYRANO: "TyranoScript",
+    BAKIN: "RPG Developer Bakin",
+    SRPGSTUDIO: "SRPG Studio",
+    ALICESOFT: "AliceSoft System",
+    ARTEMIS: "Artemis",
+    NWJS: "NW.js",
+    ELECTRON: "Electron",
 }
 
 _cache: dict = {}
@@ -130,6 +179,55 @@ def _engine_of_folder(folder: Path) -> str:
     # Unreal: the engine tree, or the cooked content packs.
     if "engine" in names and (folder / "Engine" / "Binaries").is_dir():
         return UNREAL
+    # TyranoScript keeps its runtime in a folder of its own. Where that folder
+    # sits depends on how the game was exported — TyranoBuilder puts the game
+    # under data/, a plain TyranoScript export puts the runtime at the top,
+    # and an Electron build buries both under resources/app. So it is looked
+    # for rather than listed, and it must be found BEFORE the wrappers below:
+    # a Tyrano game is packaged with NW.js or Electron, and answering with the
+    # wrapper would be answering with the box instead of what is in it.
+    for probe in (folder / "data" / "tyrano", folder / "tyrano",
+                  folder / "www" / "tyrano",
+                  folder / "resources" / "app" / "data" / "tyrano",
+                  folder / "resources" / "app" / "tyrano"):
+        if probe.is_dir():
+            return TYRANO
+    # Bakin ships its runtime beside the game rather than as the game: the
+    # executable at the top is the title's own, and bakinplayer is under data.
+    if "bakinengine.dll" in names or "bakinplayer.exe" in names:
+        return BAKIN
+    if (folder / "data" / "bakinengine.dll").exists() \
+            or (folder / "data" / "data.rbpack").exists():
+        return BAKIN
+    # AliceSoft: the archives its System 3/4 games are built out of, and the
+    # ini its launcher reads.
+    if "alicestart.ini" in names or ".ald" in suffixes or ".alk" in suffixes:
+        return ALICESOFT
+    if any(n.startswith("system4") and n.endswith(".ini") for n in names):
+        return ALICESOFT
+    # Artemis packs its content into .pfs archives, root.pfs first.
+    #
+    # Every marker in this function has been checked against a real
+    # installation except one: the Electron branch at the end. It is written
+    # narrowly for that reason — a marker that is too tight only fails to
+    # recognise a game, which is where it already stood, while one that is too
+    # loose claims somebody else's.
+    if "root.pfs" in names or ".pfs" in suffixes:
+        return ARTEMIS
+    # SRPG Studio: its packed data, and only alongside the folders a published
+    # game carries — .dts on its own is too plain a name to claim a game with.
+    if ".dts" in suffixes and ("material" in names or "resource" in names
+                              or "save" in names):
+        return SRPGSTUDIO
+    # The wrappers, last of all. NW.js and Electron are a Chromium runtime
+    # with somebody's game inside, and every engine above that ships as one —
+    # RPG Maker MV on NW.js, TyranoScript on either — would be answered with
+    # the wrapper instead of with itself if this ran any earlier.
+    if "nw.dll" in names or "package.nw" in names:
+        return NWJS
+    if (folder / "resources" / "app.asar").exists() \
+            or (folder / "resources" / "app").is_dir():
+        return ELECTRON
     return ""
 
 
@@ -148,18 +246,28 @@ def detect_engine(exe_path: str = "", game_dir: str = "") -> str:
 
     start = Path(game_dir) if game_dir else Path(exe_path).parent
     engine = ""
+    # A wrapper is the answer only when nothing more particular is, and that
+    # has to hold across the WHOLE walk rather than within one folder: a game
+    # whose executable sits in a subfolder keeps the Chromium runtime beside
+    # it and its own engine a level up, so stopping at the first answer would
+    # stop on the wrapper and never reach the engine. Remember it and keep
+    # walking; it is returned only if the levels above have nothing to say.
+    wrapper = ""
     folder = start
     for _ in range(_MAX_UP):
         try:
             if folder.is_dir():
                 engine = _engine_of_folder(folder)
-                if engine:
+                if engine and engine not in (NWJS, ELECTRON):
                     break
+                if engine:
+                    wrapper, engine = wrapper or engine, ""
         except OSError:
             break
         if folder.parent == folder:
             break
         folder = folder.parent
+    engine = engine or wrapper
 
     # Only a POSITIVE answer is remembered. "Unknown" is often just "not
     # reachable yet" — an unplugged drive, a game added before it was
@@ -188,6 +296,19 @@ def detection_skip_extensions(engine: str = "") -> set:
 def engine_save_extensions(engine: str = "") -> set:
     """The extensions this engine actually saves into — see the table."""
     return set(_ENGINE_SAVE_EXTENSIONS.get(engine, set()))
+
+
+def saves_in_skipped_dir(engine: str, path) -> bool:
+    """Whether *path* is a folder this engine genuinely saves into, even
+    though its name is on the skip list — see _ENGINE_SAVE_DIRS."""
+    from pathlib import Path as _Path
+
+    tails = _ENGINE_SAVE_DIRS.get(engine)
+    if not tails:
+        return False
+    parts = [p.lower() for p in _Path(str(path)).parts]
+    return any(len(parts) >= len(tail) and parts[-len(tail):] == list(tail)
+               for tail in tails)
 
 
 def engine_for_game(entry) -> str:

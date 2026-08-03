@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # here is importable (and monkeypatchable) exactly as before, while the
 # implementations live in core/game_sources/*.
 from core.game_sources.common import (   # noqa: F401
-    GameInfo, _fuzzy_slug, _fuzzy_words, _fuzzy_score, _find_best_match,
+    GameInfo, _fuzzy_slug, _fuzzy_words, _fuzzy_score, _find_best_match, can_score,
     _normalize_numerals, _decode_entities, _clean_description,
     _fetch_json, _expand_search_terms, _clean_game_name,
     _build_search_queries, _is_non_game_media_title, _is_favicon_like,
@@ -139,6 +139,24 @@ def fetch_info_from_url(url: str) -> Optional[GameInfo]:
     return info
 
 
+def _result_names(result) -> list[str]:
+    """Every name a result may legitimately be recognised by.
+
+    A source searches a game's original title, its romanization and its
+    release titles, and hands back the entry that matched. Judging that entry
+    on its DISPLAY name alone rejected answers the source had already got
+    right — see GameInfo.alt_names.
+    """
+    names = [getattr(result, "name", "") or ""]
+    names += list(getattr(result, "alt_names", None) or [])
+    return [n for n in names if n]
+
+
+def _best_over_names(score_fn, result) -> float:
+    """The best a result scores under *score_fn*, over all its names."""
+    return max((score_fn(n) for n in _result_names(result)), default=0.0)
+
+
 def _score_against_hints(result_name: str, primary: str, secondary_hints: list[str]) -> float:
     """Score a result name against the primary query and secondary hints.
 
@@ -231,9 +249,11 @@ def search_game_info_multi(game_name: str, appid: Optional[str] = None,
             continue
         # Filter out very short hints (≤ 3 alphanum chars): "ps", "pro", "run" etc.
         # all match too many unrelated results (e.g. "ps" in "apocalypse").
-        _term_clean = re.sub(r'[^a-z0-9]', '', term.lower())
-        if len(_term_clean) <= 3:
-            logger.debug(f"Skipping too-short secondary hint ({len(_term_clean)} chars): {term!r}")
+        from core.constants import match_slug, slug_weight
+        _term_clean = match_slug(term)
+        if slug_weight(_term_clean) <= 3:
+            logger.debug(f"Skipping too-short secondary hint "
+                         f"({slug_weight(_term_clean)}): {term!r}")
             continue
         spaced = re.sub(CAMEL_SPLIT_RE, ' ', term).strip()
         for t in [term, spaced]:
@@ -293,13 +313,32 @@ def search_game_info_multi(game_name: str, appid: Optional[str] = None,
             r = search_fn(hint)
             if not r:
                 return
-            score = _score_against_hints(r.name, primary_clean, secondary)
+            # Scored over every name the game is known by, not just the one
+            # it is displayed under: the source matched on one of the others
+            # and the display title may share nothing with what was asked.
+            score = _best_over_names(
+                lambda n: _score_against_hints(n, primary_clean, secondary), r)
             # Secondary-hint results need a minimum primary linkage
-            if is_secondary and _fuzzy_score(primary_clean, r.name) < MIN_PRIMARY:
+            if is_secondary:
+                primary_score = _best_over_names(
+                    lambda n: _fuzzy_score(primary_clean, n), r)
+                if primary_score < MIN_PRIMARY:
+                    logger.debug(
+                        f"Rejected secondary hit '{r.name}' (hint={hint!r}): "
+                        f"primary score {primary_score:.0f} < {MIN_PRIMARY}")
+                    return
+            # A query written in a script the scorer will not judge scores
+            # zero against everything, and zero here would be read as "a bad
+            # match" and dropped — even though the source searched that very
+            # script and picked this entry out of it. Its own ranking is the
+            # only opinion available, so it is taken at exactly the threshold:
+            # good enough to be offered, never enough to outrank a result that
+            # genuinely matched what was asked.
+            if score <= 0 and not can_score(primary_clean):
                 logger.debug(
-                    f"Rejected secondary hit '{r.name}' (hint={hint!r}): "
-                    f"primary score {_fuzzy_score(primary_clean, r.name):.0f} < {MIN_PRIMARY}"
-                )
+                    f"Candidate '{r.name}' via {search_fn.__name__}({hint!r}): "
+                    f"unscoreable query — deferring to the source's own ranking")
+                candidates.append((r, MIN_ACCEPT))
                 return
             logger.debug(f"Candidate '{r.name}' via {search_fn.__name__}({hint!r}): score={score:.0f}")
             candidates.append((r, score))
@@ -313,7 +352,8 @@ def search_game_info_multi(game_name: str, appid: Optional[str] = None,
         try:
             r = search_steam(primary_clean, str(appid))
             if r:
-                score = _score_against_hints(r.name, primary_clean, secondary)
+                score = _best_over_names(
+                    lambda n: _score_against_hints(n, primary_clean, secondary), r)
                 candidates.append((r, score + 20))  # bonus for known appid
         except Exception as e:
             logger.debug(f"Steam appid failed: {e}")

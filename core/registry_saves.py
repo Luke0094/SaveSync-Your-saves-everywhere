@@ -28,6 +28,8 @@ import json
 import logging
 import platform
 import re
+
+from core.constants import match_slug
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -449,14 +451,14 @@ def find_registry_value_keys(terms: list[str]) -> list[str]:
     import winreg
     slugs = set()
     for t in terms or []:
-        s = re.sub(r"[^a-z0-9]", "", (t or "").lower())
+        s = match_slug((t or "").lower())
         if len(s) >= 4:
             slugs.add(s)
     if not slugs:
         return []
 
     def _slug(name: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", name.lower())
+        return match_slug(name)
 
     def _qualifies(sk: str) -> bool:
         try:

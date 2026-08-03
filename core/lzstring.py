@@ -7,21 +7,35 @@ lz-string, MIT), kept deliberately close to it: the two must agree
 bit-for-bit or the game will not load what we write back.
 
 Only the base64 variant is here, because that is the only one MV uses.
+
+**Which base64 variant matters.** The library has been written two ways. The
+older one compresses into sixteen-bit characters and then base64-encodes
+those bytes; the newer one packs six bits straight into the base64 alphabet.
+Both carry the SAME bit stream, so their output agrees character for
+character — until the very end, where they pad differently.
+
+That tail is not cosmetic. A game holding the older reader can return an
+empty string from a save written the newer way, which is a save it will not
+load. Every RPG Maker MV game checked ships the older one, and the older
+form is read correctly by the newer reader as well, so that is the form
+written here: the one both understand.
 """
+import base64
 
 _KEY_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 _B64_INDEX = {c: i for i, c in enumerate(_KEY_B64)}
+# The width the older form packs into before it base64-encodes the result.
+_WIDE = 16
 
 
 def compress_to_base64(uncompressed: str) -> str:
     if uncompressed is None:
         return ""
-    res = _compress(uncompressed, 6, lambda a: _KEY_B64[a])
-    # Pad to a multiple of 4, as the reference does.
-    pad = len(res) % 4
-    if pad:
-        res += "=" * (4 - pad)
-    return res
+    # Sixteen bits per character, then those characters as big-endian bytes,
+    # then ordinary base64 — which is what the engine's own library does.
+    packed = _compress(uncompressed, _WIDE, chr)
+    raw = b"".join(ord(c).to_bytes(2, "big") for c in packed)
+    return base64.b64encode(raw).decode("ascii")
 
 
 def decompress_from_base64(compressed: str) -> "str | None":
