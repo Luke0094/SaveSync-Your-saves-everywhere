@@ -23,8 +23,8 @@ from PySide6.QtWidgets import (
 from core.library import GameEntry, get_library
 from core.config_manager import get_config
 from i18n import t
-from ui.helpers import (load_pixmap_any as _load_pixmap_any,
-                        open_in_file_manager)
+from ui.helpers import (display_scale, load_pixmap_any as _load_pixmap_any,
+                        open_in_file_manager, scaled_for_screen)
 from ui.styles.theme import palette, ThemedMixin
 from ui.widgets.library_drag import _active_drag, DragProxy
 from ui.widgets.library_folders import (FolderRow, _clean_tag_display,
@@ -273,7 +273,8 @@ def format_cover_focus(mode: str, zoom: float, x: float, y: float) -> str:
     return f"custom:{mode}:{zoom:.3f}:{x:.4f}:{y:.4f}"
 
 
-def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center") -> QPixmap:
+def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center",
+                 dpr: float = 1.0) -> QPixmap:
     """Frame *px* into a w×h cover according to *focus*.
 
     One path for all three modes — they differ only in how the source is
@@ -283,9 +284,18 @@ def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center") -
       stretch  distorted to fill exactly
     Position comes from (x, y): with the image larger than the frame it
     chooses which part shows, with it smaller it chooses where it sits.
+
+    *w* and *h* are Qt's coordinates — the size the cover will occupy. The
+    pixmap is built *dpr* times that in real pixels and told so, which is
+    what lets it be drawn one pixel to one pixel instead of stretched.
     """
     mode, zoom, x, y = parse_cover_focus(focus)
-    tw, th = max(1, int(round(w * zoom))), max(1, int(round(h * zoom)))
+    dpr = max(1.0, float(dpr or 1.0))
+    # Everything below is in real pixels; only the size stamped on the result
+    # is in Qt's.
+    pw, ph = max(1, int(round(w * dpr))), max(1, int(round(h * dpr)))
+    tw = max(1, int(round(pw * zoom)))
+    th = max(1, int(round(ph * zoom)))
     aspect = {
         "cover": Qt.AspectRatioMode.KeepAspectRatioByExpanding,
         "fit": Qt.AspectRatioMode.KeepAspectRatio,
@@ -293,17 +303,18 @@ def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center") -
     }[mode]
     scaled = px.scaled(tw, th, aspect, Qt.TransformationMode.SmoothTransformation)
 
-    canvas = QPixmap(w, h)
+    canvas = QPixmap(pw, ph)
     canvas.fill(Qt.GlobalColor.transparent)
     painter = QPainter(canvas)
     try:
         # int() truncates toward zero, which reproduces the old
         # `extra // 2` / `extra` crop offsets exactly for the 3x3 values.
-        dx = int((w - scaled.width()) * x)
-        dy = int((h - scaled.height()) * y)
+        dx = int((pw - scaled.width()) * x)
+        dy = int((ph - scaled.height()) * y)
         painter.drawPixmap(dx, dy, scaled)
     finally:
         painter.end()
+    canvas.setDevicePixelRatio(dpr)
     return canvas
 
 
@@ -311,6 +322,15 @@ def render_cover(px: QPixmap, w: int, h: int, focus: Optional[str] = "center") -
 # rebuilds — so both halves of that cost are worth cutting.
 _COVER_CACHE: "OrderedDict[tuple, QPixmap]" = OrderedDict()
 _COVER_CACHE_MAX = 192          # ~a page of cards in both view modes, plus slack
+# …but a cover on a scaled display is that scale SQUARED in bytes, so the
+# count comes down to keep the memory where it was. Never below a page of
+# cards, which is what the cache exists to hold.
+_COVER_CACHE_MIN = 48
+
+
+def _cover_cache_max(dpr: float) -> int:
+    scale = max(1.0, float(dpr or 1.0)) ** 2
+    return max(_COVER_CACHE_MIN, int(_COVER_CACHE_MAX / scale))
 
 # Above this many source pixels, decoding the file at full resolution costs
 # more than asking the decoder for a smaller image. BELOW it the reverse is
@@ -377,9 +397,13 @@ def _make_pixmap(path: Optional[str], w: int, h: int, focus: str = "center") -> 
     try:
         # Keyed on mtime and size too: an edited or replaced cover file must
         # not keep serving the old render.
+        # The screen's scale belongs in the key: the same cover at the same
+        # size is a different number of real pixels on a scaled display, and
+        # serving the smaller one would put the pixelation straight back.
+        dpr = display_scale()
         try:
             st = os.stat(path)
-            key = (path, st.st_mtime_ns, st.st_size, w, h, focus)
+            key = (path, st.st_mtime_ns, st.st_size, w, h, focus, dpr)
         except OSError:
             key = None
         if key is not None:
@@ -388,18 +412,19 @@ def _make_pixmap(path: Optional[str], w: int, h: int, focus: str = "center") -> 
                 _COVER_CACHE.move_to_end(key)
                 return hit
 
-        # render_cover scales to the card size times the framing zoom, so the
-        # decode has to be told the ZOOMED size, not the card size.
+        # render_cover scales to the card size times the framing zoom AND the
+        # screen's scale, so the decode has to be told that size — asking for
+        # the card size alone is what left a cover being blown back up.
         _mode, _zoom, _x, _y = parse_cover_focus(focus)
-        _z = max(1.0, _zoom)
+        _z = max(1.0, _zoom) * dpr
         px = _load_cover_source(path, int(round(w * _z)), int(round(h * _z)))
         if px.isNull():
             logger.debug(f"Pixmap load returned null for path: {path}")
             return None
-        out = render_cover(px, w, h, focus)
+        out = render_cover(px, w, h, focus, dpr)
         if key is not None and out is not None:
             _COVER_CACHE[key] = out
-            while len(_COVER_CACHE) > _COVER_CACHE_MAX:
+            while len(_COVER_CACHE) > _cover_cache_max(dpr):
                 _COVER_CACHE.popitem(last=False)
         return out
     except Exception as e:
@@ -822,11 +847,9 @@ class _GameItemMixin:
         
         scaled_px = None
         if original_px and not original_px.isNull():
-            scaled_px = original_px.scaled(
-                preview_w, preview_h,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            scaled_px = scaled_for_screen(
+                original_px, preview_w, preview_h,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding)
         
         # Event filter for hover effects
         buttons = []

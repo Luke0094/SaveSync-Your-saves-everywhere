@@ -182,6 +182,12 @@ savesync/
 │   ├── wolf.py                    # Wolf RPG obfuscation and checksum
 │   ├── wolf_save.py               # Wolf RPG values, named from the game's database
 │   ├── kirikiri.py                # KiriKiri .ksd (TJS dictionary in UTF-16)
+│   ├── tyrano.py                  # TyranoScript .sav (JSON behind JS escape())
+│   ├── alicesoft.py               # AliceSoft System 4 globals and slots (GSAVE/RSAVE)
+│   ├── artemis.py                 # Artemis Engine settings (BOWX container)
+│   ├── unityfs.py                 # Unity asset bundles, unpacked to search
+│   ├── unreal_crypt.py            # Unreal saves a game locked with its own key
+│   ├── game_keys.py               # Those keys, remembered per game
 │   ├── es3.py                     # Unity Easy Save 3, including encrypted
 │   ├── rags.py                    # RAGS .rsv (.NET objects behind fixed AES)
 │   ├── manual_paths.py            # Hand-registered save folders, single or in bulk
@@ -302,6 +308,16 @@ engine is read from the game's executable before they are judged:
 | Unity, Godot | `.dat`, `.bin` |
 | GameMaker | `.dat` |
 | RPG Maker, Unreal, Ren'Py, unknown | none — `.dat`/`.bin` stay engine data |
+| TyranoScript, Bakin, SRPG Studio, AliceSoft, Artemis | none — they save into extensions nothing skips |
+| NW.js, Electron | none — a wrapper says nothing about what the game inside saves into |
+
+The engines it knows are Ren'Py, RPG Maker (2000 through MZ), Unity, Unreal,
+Godot, GameMaker, TyranoScript, RPG Developer Bakin, SRPG Studio, AliceSoft
+System and Artemis. NW.js and Electron are recognised too, but only after
+every one of those has been ruled out: they are a Chromium runtime with
+somebody's game inside, and RPG Maker MV and TyranoScript both ship as one —
+answering "NW.js" for an MV game would be naming the box instead of what is
+in it.
 
 A game added with only a save folder has no executable to read, so it is
 treated as unknown: the conservative side, where a save that is merely not
@@ -333,15 +349,21 @@ Two rules it is built around:
 | Editable now | Recognised, not editable yet |
 |---|---|
 | JSON — Unity, Naninovel, Godot, HTML games, whatever the extension | Saves a game encrypts with a key of its own |
+| Naninovel (`.nson`), deflated or plain, down to the game's own variables | |
+| XML — .NET's serializer, so Unity and Godot games saving through it | |
+| Unity PlayerPrefs — a registry key rather than a file | |
 | RPG Maker MV (`.rpgsave`) and MZ (`.rmmzsave`) — they compress differently | One-off containers a single studio uses and nothing else does |
 | RPG Maker XP / VX / VX Ace (`.rxdata`, `.rvdata`, `.rvdata2`) | |
-| Unreal Engine (`.sav`, GVAS) — UE4 and UE5, including the 5.4 property tag | |
+| Unreal Engine (`.sav`, GVAS) — UE4 and UE5, including the 5.4 property tag | An Unreal save whose game encrypted it and does not keep the key plainly in its own files |
 | Ren'Py (`.save`) | |
 | RPG Maker 2000/2003 (`.lsd`) — switches, variables, steps | |
 | Adobe Flash shared objects (`.sol`), AMF0 and AMF3 | |
 | QSP (Quest Soft Player) | |
-| Wolf RPG (`.sav`) | |
-| KiriKiri / KAG (`.ksd`) | |
+| Wolf RPG (`.sav`) | AliceSoft gallery lists — numbers with nothing naming what they unlock |
+| KiriKiri / KAG (`.ksd`) | RPG Developer Bakin (`.sgs`) — an object stream with nothing naming or typing it |
+| TyranoScript / TyranoBuilder (`.sav`) | SRPG Studio — the engine encrypts its saves with a key kept in the game |
+| AliceSoft System 4 global data and numbered slots (`.asd`, `.sav`) | Artemis save slots and across-playthrough data — a tagged tree this cannot follow safely |
+| Artemis settings (`system.dat`) | |
 | Unity Easy Save 3 (`.es3`), encrypted or not | |
 | Twine / SugarCube and other LZString HTML games (`.save`) | |
 | RAGS (`.rsv`) — variables, objects, rooms, the player | |
@@ -412,6 +434,128 @@ arrives in three wrappers — the text on its own, deflated, or behind the
 thumbnail the game shows in its load menu — and all three are written back
 exactly as they came.
 
+**TyranoScript** saves are JSON that the engine ran through JavaScript's
+`escape()`, so the file is readable text with most of its punctuation written
+as `%XX`. The catch is that `escape()` counts in UTF-16 code units rather than
+characters, which makes an emoji a *pair* of sequences — get that wrong and
+every save holding one is quietly refused. A save also holds far more than the
+player's state: the label map, the macro map, the script buffer, the line
+currently on screen. One of the files this was built against is 11 MB and
+holds 774 values worth editing, so what is offered is the game's own
+variables, one group per save slot, and not the engine's bookkeeping.
+
+**AliceSoft** puts several different things in the same container, and they
+are only told apart once it is unpacked. The game's *global data* — the flags,
+counters and text a game keeps across playthroughs — is named and typed, and
+is read, edited and written back. The *numbered save slots* are a dump of the
+engine's virtual machine: its stack, its call frames, and a heap of tens of
+thousands of objects. All of it is read and written back byte for byte, and
+one part of it is offered for editing — the frame holding the game's own
+global variables. The rest is the engine's own bookkeeping, where a changed
+value is likelier to break the save than to help.
+
+Those variables are stored as a list of values and a list of types, in the
+order the game declared them, and with no names at all: the names live in the
+`.ain` file the game runs. So a slot behaves like a save whose key is in the
+game. On its own it offers every value by number; with the game in the library
+the names come from the game's own code, and are used only when it lists
+exactly as many globals with exactly the same types, which is what says the
+two are talking about the same build.
+
+The gallery and music-room lists arrive in a third container. They are a run
+of numbers saying which pictures and tracks have been unlocked, with nothing
+in the file to say what any one of them is, so they are named and left alone.
+
+The slots come in two series, which matters when picking one to edit. The low
+numbers are the save slots offered in the game, each written when the player
+asked for it. The high ones are the engine's own history for stepping back
+through the story: they are written together in a single moment, and the
+points inside them run backwards in game time. Both open the same way — the
+difference is that editing a high-numbered one changes a step in the history
+rather than a save anybody chose to keep.
+
+None of that layout was worked out by staring at bytes: it is written from
+nunuhara's libsys4, the engine reimplementation behind `alice-tools`, which is
+where the format is actually described. The file's own five section offsets
+are then checked as it is read, so a walk that goes wrong is refused instead
+of quietly producing values from the wrong places.
+
+**Artemis** writes three files into one container, and the same split applies:
+the engine's settings are a flat list of named values and are edited, while
+the save slots and the data kept across playthroughs are a tagged tree whose
+nesting this was not able to establish. Reading the settings ends exactly on
+the last of the entries the file says it has, which is what says the walk was
+right; the other two are named instead.
+
+**Naninovel** hides its saves twice over. A `.nson` is usually not text at all
+but a raw deflate stream — no zlib header, no gzip header, nothing announcing
+it — so anything expecting one of those refuses the file. Unpacked, it is a
+map from a .NET type name to that part of the engine's state, and each state
+is not an object but a *string* with the object written inside it. The game's
+own variables are down there, so a reader that stops at the outer layer offers
+the file's plumbing and none of its contents. Both layers are opened, and the
+states are shown by what is in them rather than as the thousands of characters
+they are stored as.
+
+An inner text is kept exactly as it arrived unless something in it was
+changed, because re-encoding one nobody touched risks spelling it differently
+from the way the game did. That, plus matching the deflate settings, is what
+lets most saves come back out byte for byte. A save packed by a build that
+compressed it differently cannot be, and says so rather than being refused:
+it opens, and is checked by reading back what was written and comparing the
+values.
+
+Naninovel also shows why dictionaries need care. Unity's own JSON writer
+cannot express one, so every dictionary in a Unity game arrives as two
+parallel lists of keys and values. Read literally that gives rows called
+"values.0" and "values.1"; read as the pairing it is, it gives rows called
+`money` and `day`. SaveSync reads it the second way, wherever it appears.
+
+**Unity PlayerPrefs** are a save with no file behind them. On Windows they
+live in the registry under the company and product the game was built with,
+and SaveSync has always backed them up, exporting the key as JSON. That same
+export is what the editor opens, so the two cannot disagree about what a key
+contains. Unity hides each preference's name behind a checksum of it, and the
+checksum cannot be turned back into anything — but it does not need to be,
+since the name is written in front of it. Only the tail is dropped, and only
+for display: a value goes back under the name it had, as the kind it was, or
+the game would not find it.
+
+**An encrypted Unreal save** is recognised by where it sits — `Saved/SaveGames`
+is the engine's own folder, and identifies the save even when the file will
+not, since the game's encryption covers the `GVAS` marker along with
+everything else.
+
+The key is looked for the way Easy Save's password is, with one difference
+that decides the method: Easy Save writes its password as a plain string
+beside a marker anyone can search for, while a game encrypting an Unreal save
+does it in its own code, with nothing naming it. So it cannot be looked up —
+it is looked for, in the game's own binaries, as a key written as text and
+then as one compiled in as a plain array of bytes. A key can also be given by
+hand in a `unreal.key` file beside the save.
+
+However it arrives, it is accepted only if what comes out actually starts with
+`GVAS`. That is what makes searching honest rather than guessing: millions of
+candidates can be tried because the save itself says which one was right, and
+a search that finds nothing says nothing rather than something wrong. The
+search reports how long it has run and can be called off; once a key works it
+is remembered against that save, so the next time costs nothing and the game
+need not even be installed. The save is locked again exactly as it was found,
+so opening one and changing nothing leaves the file untouched.
+
+Not every such game will give its key up. One whose key is assembled at run
+time, or kept anywhere but plainly in its own code, will simply not be found —
+and is reported as not found, rather than opened with something that looked
+close enough.
+
+**Bakin** and **SRPG Studio** saves are named but not edited. Bakin's is an
+object stream with nothing in it naming or typing the values. SRPG Studio
+encrypts its saves outright — every byte of one is as likely as every other,
+so nothing in the file can identify it, and the only thing that can is the
+game it sits in. That is what the engine detector is asked for, and when the
+game is not in the library SaveSync says so, since the key to such a save
+lives in the game's own program and there is no reaching it without one.
+
 **Wolf RPG** saves are scrambled on disk, so SaveSync unlocks one, reads the
 values out and locks it back. Names come from the game's own database when it
 sits beside the save — level, HP, attack, in the game's own words. A game that
@@ -467,7 +611,7 @@ always-on-top flag, whether it really ended up above the window in front, and
 what that window is. That distinguishes "nothing tried to raise it" from "it
 was raised and something put it back down".
 
-$env:SAVESYNC_TRACE = "1" 
+$env:SAVESYNC_TRACE = "1"
 python main.py
 
 ---

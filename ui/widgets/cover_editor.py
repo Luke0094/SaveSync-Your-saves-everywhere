@@ -274,6 +274,7 @@ class CoverCustomEditor(QWidget):
         return max(1, int(round(sw * ratio))), max(1, int(round(sh * ratio)))
 
     def _refresh(self):
+        from ui.helpers import display_scale
         from ui.widgets.game_items import render_cover
         for key, btn in self._mode_btns.items():
             btn.setChecked(key == self._mode)
@@ -285,8 +286,12 @@ class CoverCustomEditor(QWidget):
             self._zoom_slider.blockSignals(False)
         self._zoom_lbl.setText(t("library.cover_zoom", percent=slider_value))
         if not self._src.isNull():
+            # At the screen's own scale, like the card this is previewing —
+            # a preview drawn at fewer pixels than the thing it stands for
+            # would show framing that looks rougher than the result.
             self._preview.setPixmap(
-                render_cover(self._src, CARD_W, CARD_H, self.focus_string()))
+                render_cover(self._src, CARD_W, CARD_H, self.focus_string(),
+                             display_scale()))
         else:
             self._preview.setText("🖼️")
         self.changed.emit()

@@ -83,40 +83,73 @@ def _group_label(group: str) -> str:
     return t(f"cheats.groups.{key}") if key in _GROUP_KEYS else group
 
 
+def _short_labels(paths: list) -> dict:
+    """A short name per folder that still tells them apart.
+
+    A game's two save folders are very often both called the same thing —
+    "SaveData" beside the game and "SaveData" under the user's profile — so
+    naming them by their last part alone offers two identical choices. As
+    much of the path is used as it takes to make every name different, and
+    no more.
+    """
+    out = {}
+    for depth in range(1, 6):
+        # Rebuilt with Path rather than joined by hand: the first part of a
+        # Windows path is the drive WITH its separator, and pasting one on
+        # gives "C:\\\folder".
+        out = {p: (str(Path(*Path(p).parts[-depth:])) if Path(p).parts else p)
+               for p in paths}
+        if len(set(out.values())) == len(paths):
+            break
+    return out
+
+
+def _by_folder(files: list, when) -> list:
+    """The same files, one folder at a time, each folder's newest first.
+
+    A save path can hold folders of its own — a profile per player, a slot
+    per character — and ordering everything under it by date alone shuffles
+    them together exactly as mixing two save paths does. The folders come in
+    order of the newest thing in them, so the one last written to is still
+    the one at the top.
+    """
+    folders = {}
+    for f in files:
+        folders.setdefault(str(f.parent), []).append(f)
+    for group in folders.values():
+        group.sort(key=lambda f: (-when(f), f.name.lower()))
+    order = sorted(folders.values(), key=lambda g: -when(g[0]))
+    return [f for group in order for f in group]
+
+
 def _save_files(entry) -> list:
-    """Every file under a game's save paths, newest first.
+    """Every file under a game's save paths: one path at a time, newest first.
 
     Each path is walked on a budget of its own. A game often has more than
     one — Ren'Py keeps a copy beside the game and another under the user's
     profile — and with a single shared allowance the first path could use it
     all and leave the second showing nothing.
 
-    The cap on how many are shown is applied AFTER sorting, so what it drops
-    is the oldest rather than whatever the walk happened to reach last.
+    **The paths are kept apart.** A game with two save folders usually has
+    the same file names in both, and ordering the whole lot by date alone
+    interleaves them: the same six names twice over, in no order anyone can
+    follow. Each path's files are listed together instead, in the order the
+    paths themselves are recorded, so picking a save means picking a folder
+    and then a save in it.
+
+    Within a path the newest comes first, and files written in the same
+    second — which a game saving several at once produces constantly — are
+    put in name order rather than in whatever order the folder happened to
+    hand them over.
+
+    The cap on how many are shown is shared out between the paths rather
+    than spent in order. Grouping otherwise lets the first folder eat the
+    whole allowance and leave a later one showing nothing at all — which the
+    old date-ordered list never did, since it drew the newest from wherever
+    they were. Whatever a path does not use goes back to the others, so a
+    game with one folder is capped exactly as before.
     """
-    out = []
-
-    def walk(base: Path, depth: int, budget: list):
-        if depth > _SCAN_DEPTH or budget[0] <= 0:
-            return
-        try:
-            for child in base.iterdir():
-                if budget[0] <= 0:
-                    return
-                if child.is_dir():
-                    walk(child, depth + 1, budget)
-                elif child.is_file():
-                    out.append(child)
-                    budget[0] -= 1
-        except OSError:
-            return
-
-    for raw in (entry.save_paths or []):
-        p = Path(raw)
-        if p.is_file():
-            out.append(p)
-        elif p.is_dir():
-            walk(p, 0, [_MAX_PER_PATH])
+    from core.registry_saves import is_registry_path, registry_has_values
 
     def when(f: Path) -> float:
         try:
@@ -124,7 +157,71 @@ def _save_files(entry) -> list:
         except OSError:
             return 0.0
 
-    return sorted(set(out), key=when, reverse=True)[:_MAX_FILES]
+    def walk(base: Path, depth: int, budget: list, found: list):
+        if depth > _SCAN_DEPTH or budget[0] <= 0:
+            return
+        try:
+            for child in sorted(base.iterdir()):
+                if budget[0] <= 0:
+                    return
+                if child.is_dir():
+                    walk(child, depth + 1, budget, found)
+                elif child.is_file():
+                    found.append(child)
+                    budget[0] -= 1
+        except OSError:
+            return
+
+    groups, seen = [], set()
+    for raw in (entry.save_paths or []):
+        # A Unity game's save is often not a file: PlayerPrefs live in the
+        # registry, and SaveSync already records those as save paths. They
+        # are offered here like any other save — open_save knows the
+        # difference — but only when the key actually holds something.
+        if is_registry_path(str(raw)):
+            if registry_has_values(str(raw)):
+                found = [Path(str(raw))]
+            else:
+                continue
+        else:
+            p = Path(raw)
+            if p.is_file():
+                found = [p]
+            elif p.is_dir():
+                found = []
+                walk(p, 0, [_MAX_PER_PATH], found)
+            else:
+                continue
+        found = _by_folder(found, when)
+        kept = []
+        for f in found:
+            key = str(f).lower()
+            if key not in seen:
+                seen.add(key)
+                kept.append(f)
+        if kept:
+            groups.append(kept)
+
+    if not groups:
+        return []
+    # An equal share each, then round after round of one more apiece for
+    # whoever still has files, until the allowance runs out. A path with
+    # little in it simply stops asking, and what it did not take is there
+    # for the others.
+    share = max(1, _MAX_FILES // len(groups))
+    taken = [min(share, len(g)) for g in groups]
+    spare = _MAX_FILES - sum(taken)
+    while spare > 0 and any(t < len(g) for t, g in zip(taken, groups)):
+        for i, g in enumerate(groups):
+            if spare <= 0:
+                break
+            if taken[i] < len(g):
+                taken[i] += 1
+                spare -= 1
+    out = []
+    for n, g in zip(taken, groups):
+        out.extend(g[:n])
+    return out
 
 
 class _Row(QFrame, ThemedMixin):
@@ -267,6 +364,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._page = 0
         self._prefix = ""           # the part every row of a group repeats
         self._loose = None          # a save opened without a game behind it
+        self._all_files = []        # every save found, one folder at a time
         self._files = []            # the save list, newest first
         self._file_page = 0
         self._build()
@@ -352,9 +450,23 @@ class CheatsPage(QWidget, ThemedMixin):
         self._kept_area, self._kept_col = self._scroller()
         self._kept_area.setMaximumHeight(150)
         col.addWidget(self._kept_area)
+        head = QHBoxLayout()
+        head.setSpacing(8)
         self._files_lbl = QLabel(t("cheats.pick_save"))
         self._files_lbl.setObjectName("section_header")
-        col.addWidget(self._files_lbl)
+        head.addWidget(self._files_lbl)
+        head.addStretch(1)
+        # A game can save into more than one folder, and the list runs to
+        # hundreds. Narrowing it to one folder is the difference between
+        # paging through all of them and looking where you know it is. Same
+        # untouched QComboBox as the editor's, for the same reason: the theme
+        # already dresses it in both light and dark.
+        self._folder_combo = QComboBox()
+        self._folder_combo.setMaximumWidth(320)
+        self._folder_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._folder_combo.currentIndexChanged.connect(self._apply_folder)
+        head.addWidget(self._folder_combo)
+        col.addLayout(head)
         self._files_area, self._files_col = self._scroller()
         col.addWidget(self._files_area, 1)
         # A game with several save paths has every save listed once per path,
@@ -580,16 +692,52 @@ class CheatsPage(QWidget, ThemedMixin):
 
     def _show_saves(self, files, subtitle: str):
         self._doc = None
+        self._all_files = list(files)
         self._files = list(files)
         self._file_page = 0
         self.show_step(self.STEP_SAVES)
         self._subtitle.setText(subtitle)
+        self._fill_folders()
         # Arriving here is what applies the copy rules — "delete after N days"
         # has to hold for a save nobody has edited since, and writing is the
         # only other moment they run. Once per visit, not once per page turn:
         # paging back and forth is not a reason to go over the disk again.
         for f in self._files[:_SAVES_PAGE_SIZE]:
             prune_backups(f)
+        self._render_saves_page()
+
+    def _fill_folders(self):
+        """Offer the folders these saves came from, in the order they appear.
+
+        Only when there is more than one: a single folder makes the choice
+        meaningless, and a control with one option in it is furniture.
+        """
+        combo = self._folder_combo
+        folders = list(dict.fromkeys(str(f.parent) for f in self._all_files))
+        combo.blockSignals(True)
+        combo.clear()
+        if len(folders) > 1:
+            counts = {}
+            for f in self._all_files:
+                counts[str(f.parent)] = counts.get(str(f.parent), 0) + 1
+            combo.addItem(t("cheats.all_folders"), "")
+            names = _short_labels(folders)
+            for where in folders:
+                combo.addItem(
+                    f"{names[where]} · "
+                    f"{t('cheats.n_saves_in', count=counts[where])}", where)
+                combo.setItemData(combo.count() - 1, where,
+                                  Qt.ItemDataRole.ToolTipRole)
+            combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        combo.setVisible(len(folders) > 1)
+
+    def _apply_folder(self):
+        """Narrow the list to one folder, or widen it back to all of them."""
+        where = self._folder_combo.currentData()
+        self._files = ([f for f in self._all_files if str(f.parent) == where]
+                       if where else list(self._all_files))
+        self._file_page = 0
         self._render_saves_page()
 
     def _render_saves_page(self):
@@ -609,7 +757,17 @@ class CheatsPage(QWidget, ThemedMixin):
         shown = files[start:start + _SAVES_PAGE_SIZE]
 
         if not files:
-            self._add_note(self._files_col, t("cheats.no_saves"))
+            # Two different nothings, and only one of them is the player's to
+            # fix. A game with no save folder registered at all needs one
+            # added before there is anything here to edit; a game whose
+            # folders are known but empty has simply not been played yet.
+            # Saying "no save file found" to both hides the step that would
+            # actually get somewhere.
+            no_paths = self._entry is not None and not (self._entry.save_paths
+                                                        or [])
+            self._add_note(self._files_col,
+                           t("cheats.no_paths_yet" if no_paths
+                             else "cheats.no_saves"))
         # Where a file is only worth saying when it tells two rows apart. One
         # folder, and it is the same line under every row.
         show_where = len({f.parent for f in files}) > 1
@@ -713,8 +871,10 @@ class CheatsPage(QWidget, ThemedMixin):
             # Most saves open in a blink, but a big one — a 64 MB RAGS graph,
             # say — takes seconds, and a window that simply stops responding
             # reads as a crash.
-            with busy_over(self, t("common.please_wait")):
-                self._doc = open_save(path, game_dir=self._game_dir())
+            with busy_over(self, t("common.please_wait")) as busy:
+                self._doc = open_save(
+                    path, game_dir=self._game_dir(),
+                    progress=busy.tick if busy is not None else None)
         except SaveEditorError as e:
             warning_window_modal(self, t("cheats.title"), explain(e))
             return

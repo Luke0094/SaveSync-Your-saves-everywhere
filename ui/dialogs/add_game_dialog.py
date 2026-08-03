@@ -22,7 +22,9 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.helpers import ElidedCheckBox, load_pixmap_any, open_in_file_manager
+from ui.helpers import (ElidedCheckBox, display_scale, load_pixmap_any,
+                        open_in_file_manager, scaled_for_screen,
+                        thumbnail_pixmap, viewer_pixmap)
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
 from core.library import GameEntry, get_library
@@ -1131,17 +1133,29 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             avail = img_lbl.size()
             if avail.width() < 40 or avail.height() < 40:
                 return
-            if _src["fitted"] == (avail.width(), avail.height()):
+            # Scaled to REAL pixels, not to Qt's. On a display that magnifies
+            # everything, fitting to Qt's coordinates throws away the detail
+            # that magnification then has to invent back — which showed as a
+            # soft, blocky picture in the window and not at full screen,
+            # where almost nothing had been thrown away to begin with.
+            dpr = display_scale()
+            if _src["fitted"] == (avail.width(), avail.height(), dpr):
                 return                      # already fitted to this size
-            _src["fitted"] = (avail.width(), avail.height())
-            img_lbl.setPixmap(px.scaled(avail.width(), avail.height(),
-                                        Qt.AspectRatioMode.KeepAspectRatio,
-                                        Qt.TransformationMode.SmoothTransformation))
+            _src["fitted"] = (avail.width(), avail.height(), dpr)
+            shown = px.scaled(int(round(avail.width() * dpr)),
+                              int(round(avail.height() * dpr)),
+                              Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+            shown.setDevicePixelRatio(dpr)
+            img_lbl.setPixmap(shown)
             _position_fs_btn()
 
         def _load_modal_img():
             if 0 <= self._modal_idx < len(self._detected_images):
-                px = QPixmap(self._detected_images[self._modal_idx])
+                # Through the cache: this runs on every arrow AND on every
+                # fullscreen toggle, and decoding a large picture again is
+                # the whole of the pause that used to come with both.
+                px = viewer_pixmap(self._detected_images[self._modal_idx])
                 _src["px"] = None if px.isNull() else px
                 _src["fitted"] = None
                 _fit_to_label()
@@ -1201,15 +1215,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         thumb_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
         for i, img_path in enumerate(self._detected_images):
-            px_t = QPixmap(img_path)
             lbl = QLabel()
             lbl.setFixedSize(60, 40)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("border:2px solid rgba(255,255,255,0.25);border-radius:3px;")
             lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-            if not px_t.isNull():
-                lbl.setPixmap(px_t.scaled(60, 40, Qt.AspectRatioMode.KeepAspectRatio,
-                                           Qt.TransformationMode.SmoothTransformation))
             # Capture index for click
             def _make_click(idx):
                 def _click(event):
@@ -1219,6 +1229,27 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             lbl.mousePressEvent = _make_click(i)
             thumb_labels.append(lbl)
             thumb_row.addWidget(lbl)
+
+        def _fill_thumbs(i: int = 0):
+            """Draw the strip one picture at a time, after the viewer is up.
+
+            Decoding them all before showing anything is what kept the viewer
+            waiting on a folder of large images — and the picture the player
+            actually asked for was behind all of it. The frames are laid out
+            immediately, at their real size so nothing moves, and each fills
+            in as it is read. They are cached, so this is only ever paid once.
+            """
+            if i >= len(thumb_labels):
+                return
+            try:
+                px_t = thumbnail_pixmap(self._detected_images[i], 60, 40)
+                if not px_t.isNull():
+                    thumb_labels[i].setPixmap(px_t)
+            except Exception as e:
+                logger.debug(f"Thumbnail {i} failed: {e}")
+            QTimer.singleShot(0, lambda: _fill_thumbs(i + 1))
+
+        QTimer.singleShot(0, _fill_thumbs)
 
         thumb_scroll.setWidget(thumb_container)
         thumb_container.adjustSize()
@@ -1484,13 +1515,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
     def _update_image_preview(self, path: str):
         try:
-            px = load_pixmap_any(path)
+            px = viewer_pixmap(path)
             if not px.isNull():
-                px = px.scaled(
-                    90, 56,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
+                px = scaled_for_screen(px, 90, 56)
                 self._img_preview.setPixmap(px)
                 self._img_preview.setText("")
                 return
@@ -2150,11 +2177,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # Use pending pixmap pre-loaded from original bytes if available
         pending = getattr(self, '_pending_pixmap', None)
         if pending and not pending.isNull():
-            scaled = pending.scaled(
-                90, 56,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
+            scaled = scaled_for_screen(pending, 90, 56)
             self._img_preview.setPixmap(scaled)
             self._img_preview.setText("")
             self._pending_pixmap = None

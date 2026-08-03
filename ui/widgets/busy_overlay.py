@@ -23,12 +23,18 @@ from contextlib import contextmanager
 
 from PySide6.QtCore import Qt, QEvent, QEventLoop
 from PySide6.QtGui import QColor, QPainter
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QApplication, QLabel, QPushButton, QVBoxLayout,
+                               QWidget)
 
 from i18n import t
 from ui.styles.theme import palette
 
 logger = logging.getLogger(__name__)
+
+# How long a piece of work may run before it is worth offering to stop it.
+# Short enough that nobody sits through a minute wondering, long enough that
+# the button never appears for work that was always going to be quick.
+_OFFER_CANCEL_AFTER_S = 30
 
 
 class BusyOverlay(QWidget):
@@ -44,13 +50,58 @@ class BusyOverlay(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label = QLabel(text or t("common.please_wait"))
+        lay.setSpacing(10)
+        self._base_text = text or t("common.please_wait")
+        self._label = QLabel(self._base_text)
         self._label.setObjectName("busy_toast")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(self._label)
+        lay.addWidget(self._label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # Only ever shown once the work has gone on long enough to be worth
+        # calling off — see tick(). Built here so appearing costs nothing.
+        self._cancel_btn = QPushButton(t("common.cancel_search"))
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.hide()
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        lay.addWidget(self._cancel_btn, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self._cancelled = False
+        self._shown_seconds = -1
 
         parent.installEventFilter(self)
         self._fit()
+
+    def _on_cancel(self):
+        self._cancelled = True
+        self._cancel_btn.setEnabled(False)
+        self._label.setText(t("common.cancelling"))
+        self.repaint()
+
+    def tick(self, elapsed: float) -> bool:
+        """Show how long this has been going, and whether to carry on.
+
+        Called from inside work that is holding the GUI thread, so the event
+        loop is pumped here — otherwise the seconds would never be painted
+        and the button below could never be pressed. Returns False once the
+        person waiting has called it off.
+        """
+        if self._cancelled:
+            return False
+        seconds = int(elapsed)
+        if seconds != self._shown_seconds:
+            self._shown_seconds = seconds
+            self._label.setText(f"{self._base_text}  ({seconds}s)")
+            if seconds >= _OFFER_CANCEL_AFTER_S and not self._cancel_btn.isVisible():
+                self._cancel_btn.show()
+            self._label.repaint()
+        # User input is allowed through only once there is a button to press.
+        # Before that the overlay is deliberately deaf, so a stray click
+        # cannot re-enter whatever is being covered.
+        flags = (QEventLoop.ProcessEventsFlag.AllEvents
+                 if self._cancel_btn.isVisible()
+                 else QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        QApplication.processEvents(flags)
+        return not self._cancelled
 
     def _fit(self):
         p = self.parentWidget()
@@ -79,6 +130,10 @@ class BusyOverlay(QWidget):
 def busy_over(widget: QWidget, text: str = ""):
     """Dim *widget* with a "please wait" sheet for the duration of the block.
 
+    Yields the overlay, or None when there was nothing to cover. Work that
+    can run long should call ``overlay.tick(seconds)`` as it goes: that is
+    what paints the count and, past half a minute, offers to stop.
+
     Safe to use anywhere: with no visible widget to cover (startup, headless)
     it just runs the body.
     """
@@ -99,7 +154,7 @@ def busy_over(widget: QWidget, text: str = ""):
         logger.debug(f"Busy overlay could not be shown: {e}")
         overlay = None
     try:
-        yield
+        yield overlay
     finally:
         if overlay is not None:
             try:

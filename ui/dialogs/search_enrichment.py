@@ -367,11 +367,8 @@ class CandidatePreviewDialog(QDialog):
     def _set_thumb(self, data: bytes):
         px = QPixmap()
         if px.loadFromData(data):
-            self._thumb_lbl.setPixmap(px.scaled(
-                112, 70,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            ))
+            from ui.helpers import scaled_for_screen
+            self._thumb_lbl.setPixmap(scaled_for_screen(px, 112, 70))
 
 
 class _FlowLayout(QLayout):
@@ -654,11 +651,8 @@ class EnrichmentMergeDialog(QDialog):
         try:
             px = QPixmap()
             if px.loadFromData(data):
-                chip.setIcon(QIcon(px.scaled(
-                    48, 30,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )))
+                from ui.helpers import scaled_for_screen
+                chip.setIcon(QIcon(scaled_for_screen(px, 48, 30)))
                 chip.setIconSize(QSize(48, 30))
                 chip.setFixedHeight(38)
         except RuntimeError:
