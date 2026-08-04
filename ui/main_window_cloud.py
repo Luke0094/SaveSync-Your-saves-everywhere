@@ -40,6 +40,30 @@ class CloudFlowsMixin:
             logger.info(f"Cloud-download prompt suppressed for {name or game_id!r} (user chose local saves)")
 
 
+    def _entry_has_local_backups(self, entry) -> bool:
+        """True if this game has at least one local SaveSync backup zip.
+
+        Primary lookup is by library game_id; falls back to the stable
+        name-derived backup folder (same belt-and-suspenders as
+        _restore_after_cloud_download) so a cross-PC or re-imported index
+        does not falsely look "backup-less" and trigger the no_local prompt.
+        """
+        from core.backup import get_backup_manager
+        bm = get_backup_manager()
+        if bm.get_backups_for_game(entry.id):
+            return True
+        try:
+            from core.constants import get_install_folder_name
+            folder = get_install_folder_name(
+                entry.exe_path or "", entry.name, entry.id,
+                entry.computed_folder_name,
+            )
+            if folder and bm.get_backups_for_folder(folder):
+                return True
+        except Exception:
+            pass
+        return False
+
     def _check_cloud_on_launch(self, game_id: str, on_resolved: Optional[Callable] = None):
         """Check for cloud saves when a game launches and, if appropriate,
         show an in-game yes/no prompt to download/restore them — the same
@@ -136,26 +160,38 @@ class CloudFlowsMixin:
         # is what caused a visible flicker: two show_animated() calls in the
         # same synchronous pass, each cancelling and restarting the other's
         # fade-in within milliseconds.
-        notification_kind = None   # "different_machine" | "no_local" | None
+        notification_kind = None   # "different_machine" | "no_local" | "sync_prompt" | None
         if entry is not None and self._overlay is not None:
             from core.machine import get_machine_id
             machine_id = get_machine_id()
             cloud_meta = entry.cloud_metadata or {}
             last_machine = cloud_meta.get("last_sync_machine", "")
             confirmed_machines: list = cloud_meta.get("download_confirmed_machines", [])
+            has_local = self._entry_has_local_backups(entry)
 
             if (last_machine and last_machine != machine_id
                     and machine_id not in confirmed_machines):
                 if get_config().get("show_overlay_on_cloud", True):
                     notification_kind = "different_machine"
             elif get_config().get("show_overlay_on_cloud", True):
-                from core.backup import get_backup_manager
-                has_local = bool(get_backup_manager().get_backups_for_game(entry.id))
                 if not has_local:
                     if entry.id not in get_config().get("suppressed_cloud_no_local", []):
                         notification_kind = "no_local"
-                elif entry.sync_status in ("local_only", "cloud_only", "pending"):
+                elif entry.sync_status in ("cloud_only", "pending"):
+                    # Local backups already exist — only prompt a download
+                    # when reconciliation is actually needed (cloud-only copy,
+                    # or local saves changed since the last sync). "local_only"
+                    # means the player has restorable data here; sync-up on
+                    # exit is enough — asking to download every launch is wrong.
                     notification_kind = "sync_prompt"
+
+            logger.info(
+                f"Cloud launch check for {entry.name!r}: "
+                f"has_cloud={has_cloud}, has_local={has_local}, "
+                f"sync_status={entry.sync_status!r}, "
+                f"last_sync_machine={last_machine!r}, "
+                f"prompt={notification_kind!r}"
+            )
 
         if on_resolved:
             on_resolved(show_toast=(notification_kind is None))
@@ -172,8 +208,7 @@ class CloudFlowsMixin:
             self._pending_cloud_notification[game_id] = "no_local"
             self._overlay.show_cloud_saves_no_local(entry.name, entry.exe_path)
         elif notification_kind == "sync_prompt":
-            # Anything other than a confirmed two-way "synced" state means
-            # the local copy hasn't been reconciled with the cloud copy.
+            self._pending_cloud_notification[game_id] = "sync_prompt"
             self._overlay.show_cloud_saves(entry.name, entry.exe_path)
 
 

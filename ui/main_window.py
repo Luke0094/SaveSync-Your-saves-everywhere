@@ -653,6 +653,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         elif action == "download_saves":
             entry = get_library().get_by_exe(context)
             if entry:
+                self._pending_cloud_notification.pop(entry.id, None)
                 get_orchestrator().sync_game(entry.id, entry.name, entry.save_paths, direction="down", exe_path=entry.exe_path, computed_folder_name=entry.computed_folder_name, name_history=list(entry.name_history))
                 self._show_tracking_toast_if_playing(entry.id)
         elif action == "dismiss":
@@ -660,6 +661,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # suppressed the launch toast, so hand over to it now.
             entry = get_library().get_by_exe(context)
             if entry:
+                self._pending_cloud_notification.pop(entry.id, None)
                 self._show_tracking_toast_if_playing(entry.id)
         elif action == "download_saves_unknown_game":
             # State A primary: download from the ACTUAL candidate folder (which
@@ -1322,6 +1324,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     self._overlay.show_cloud_saves_no_local(entry.name, entry.exe_path)
                 elif notif_type == "different_machine":
                     self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path)
+                elif notif_type == "sync_prompt":
+                    self._overlay.show_cloud_saves(entry.name, entry.exe_path)
                 else:
                     continue
                 return
