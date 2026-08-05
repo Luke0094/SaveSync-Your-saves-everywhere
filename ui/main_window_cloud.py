@@ -160,7 +160,9 @@ class CloudFlowsMixin:
         # is what caused a visible flicker: two show_animated() calls in the
         # same synchronous pass, each cancelling and restarting the other's
         # fade-in within milliseconds.
-        notification_kind = None   # "different_machine" | "no_local" | "sync_prompt" | None
+        # "different_machine" | "no_local" | "conflict_diverged"
+        # | "conflict_unreconciled" | "sync_prompt" | None
+        notification_kind = None
         if entry is not None and self._overlay is not None:
             from core.machine import get_machine_id
             machine_id = get_machine_id()
@@ -174,15 +176,36 @@ class CloudFlowsMixin:
                 if get_config().get("show_overlay_on_cloud", True):
                     notification_kind = "different_machine"
             elif get_config().get("show_overlay_on_cloud", True):
+                # One per-game "don't ask me to download at launch" list backs
+                # both cloud-download prompts (the no-local one and the
+                # not-reconciled one): they ask the same question, so muting
+                # one and still being asked the other made no sense.
+                _muted = entry.id in get_config().get("suppressed_cloud_no_local", [])
                 if not has_local:
-                    if entry.id not in get_config().get("suppressed_cloud_no_local", []):
+                    if not _muted:
                         notification_kind = "no_local"
+                elif _muted:
+                    pass
+                elif entry.sync_status == "conflict":
+                    # A conflict recorded in an earlier session and never
+                    # resolved: nothing used to bring it back, because the
+                    # comparison window only ever opened from a LIVE
+                    # detection during auto-sync.
+                    notification_kind = "conflict_diverged"
+                elif entry.sync_status == "local_only":
+                    # Never synced, yet a cloud copy exists — local backups
+                    # made by hand plus a cloud folder from elsewhere (or a
+                    # same-named different game). Neither side can be assumed
+                    # to win, so it is the reconcile decision, NOT a download
+                    # prompt: that is what made this ask every single launch
+                    # before, since nothing about the status ever changed.
+                    # Any resolution syncs, which moves the status off
+                    # local_only and stops the asking.
+                    notification_kind = "conflict_unreconciled"
                 elif entry.sync_status in ("cloud_only", "pending"):
                     # Local backups already exist — only prompt a download
                     # when reconciliation is actually needed (cloud-only copy,
-                    # or local saves changed since the last sync). "local_only"
-                    # means the player has restorable data here; sync-up on
-                    # exit is enough — asking to download every launch is wrong.
+                    # or local saves changed since the last sync).
                     notification_kind = "sync_prompt"
 
             logger.info(
@@ -210,6 +233,11 @@ class CloudFlowsMixin:
         elif notification_kind == "sync_prompt":
             self._pending_cloud_notification[game_id] = "sync_prompt"
             self._overlay.show_cloud_saves(entry.name, entry.exe_path)
+        elif notification_kind in ("conflict_diverged", "conflict_unreconciled"):
+            self._pending_cloud_notification[game_id] = notification_kind
+            self._overlay.show_cloud_conflict_resolve(
+                entry.name, entry.exe_path,
+                diverged=(notification_kind == "conflict_diverged"))
 
 
     def _mark_cloud_machine_confirmed(self, game_id: str):
@@ -378,7 +406,15 @@ class CloudFlowsMixin:
 
 
     def _on_conflict_detected(self, game_id: str, conflict_info: dict):
-        """Show ConflictDialog when auto-sync detects both sides changed."""
+        """Auto-sync found both sides changed — surface it as a notification.
+
+        The overlay prompt is the entry point (same treatment as every other
+        cloud decision), and the ConflictDialog behind it is reached from that
+        prompt's primary action. A modal appearing on its own could land
+        behind a fullscreen game, and it asked for a decision without the
+        player having been told a conflict existed. Falls back to opening the
+        dialog directly when there is no overlay to notify through.
+        """
         entry = get_library().get_by_id(game_id)
         if not entry:
             return
@@ -392,6 +428,25 @@ class CloudFlowsMixin:
                 name_history=list(entry.name_history),
             )
             return
+        # The two dates live here until the user asks to compare them.
+        self._pending_conflict_info[game_id] = dict(conflict_info or {})
+        if self._overlay is not None and entry.exe_path:
+            self._pending_cloud_notification[game_id] = "conflict_diverged"
+            self._overlay.show_cloud_conflict_resolve(
+                entry.name, entry.exe_path, diverged=True)
+            return
+        self._open_conflict_dialog(entry)
+
+    def _open_conflict_dialog(self, entry):
+        """The local-vs-cloud comparison window, with both versions dated.
+
+        Reached from the conflict notification's primary action; also the
+        direct path when no overlay is available. Timestamps come from
+        whatever the detection stashed — a conflict surfaced at launch (from
+        a status recorded in an earlier session) has none, and the dialog
+        renders those as unknown rather than refusing to open.
+        """
+        conflict_info = self._pending_conflict_info.get(entry.id) or {}
         from ui.dialogs.conflict_dialog import ConflictDialog
         from datetime import datetime
         local_time = None
@@ -429,7 +484,13 @@ class CloudFlowsMixin:
     def _handle_conflict_choice(self, entry, choice: str):
         """Handle user's conflict resolution choice."""
         if choice == "cancel":
+            # Closing the comparison without deciding means "later": the
+            # notification stays pending so the hotkey can bring it back.
             return
+        # Decided — the prompt has served its purpose and the stashed dates
+        # are spent.
+        self._pending_cloud_notification.pop(entry.id, None)
+        self._pending_conflict_info.pop(entry.id, None)
         orch = get_orchestrator()
         if choice in ("cloud", "both"):
             # Downloading the other machine's backups was accepted: persist

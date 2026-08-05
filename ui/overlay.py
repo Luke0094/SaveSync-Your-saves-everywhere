@@ -1222,9 +1222,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                                    context=exe_path, is_priority=True):
             return
         self._begin_cloud_prompt(game_name, exe_path, "cloud_available")
-        self._add_btn(self._btn_area, t("overlay.download_saves"), "download_saves", primary=True)
-        self._add_btn(self._btn_area, t("overlay.dismiss"), "dismiss")
-        self._hide_suppress_btn()
+        # Same shape as the other cloud prompts: a primary download plus a
+        # dropdown that says what the alternative actually DOES. A bare
+        # "Dismiss" here suggested nothing — the player could not tell
+        # whether closing it meant keeping local saves, postponing, or
+        # losing something.
+        self._add_split_btn(
+            self._btn_area, t("overlay.download_saves"), "download_saves",
+            menu_items=[(t("overlay.continue_local"), "dismiss")],
+            primary=True,
+        )
+        self._set_suppress_link(
+            "dont_show_again", lambda: self._on_action("suppress_cloud_no_local"))
         self._show_priority_prompt()
 
     def show_cloud_saves_unknown(self, game_name: str, exe_path: str):
@@ -1295,6 +1304,50 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._hide_suppress_btn()
         self._show_priority_prompt()
 
+    def show_cloud_conflict_resolve(self, game_name: str, exe_path: str,
+                                    diverged: bool = True):
+        """Local and cloud saves need reconciling — the notification IS the
+        entry point for resolving it, with every resolution in the dropdown.
+
+        The comparison window (ConflictDialog, with both dated versions) is
+        the PRIMARY action rather than one of the resolutions: this can pop
+        up mid-game, and a one-click "keep cloud" on an overlay would
+        overwrite local progress without ever showing the two dates the
+        decision rests on. The one-click paths are still there, one menu
+        away.
+
+        *diverged* tells the two situations apart: both sides changed since
+        the last sync (a real conflict), or a cloud copy exists that this
+        library entry has simply never reconciled with — same resolutions,
+        different explanation. Only the second one can be a HOMONYM (a cloud
+        folder named after a same-titled different game, from another
+        machine), so it alone offers that way out; a diverged game has
+        already synced with that folder, which settles whose it is.
+        """
+        if self._defer_if_priority(
+                lambda: self.show_cloud_conflict_resolve(game_name, exe_path, diverged),
+                context=exe_path, is_priority=True):
+            return
+        self._begin_cloud_prompt(
+            game_name, exe_path,
+            "cloud_conflict_diverged" if diverged else "cloud_conflict_unreconciled",
+        )
+        _items = [
+            (t("sync.keep_both"),  "conflict_keep_both"),
+            (t("sync.keep_local"), "conflict_keep_local"),
+            (t("sync.keep_cloud"), "conflict_keep_cloud"),
+        ]
+        if not diverged:
+            _items.append((t("overlay.is_homonym"), "homonym_library_game"))
+        self._add_split_btn(
+            self._btn_area, t("overlay.verify_conflicts"), "resolve_conflict_details",
+            menu_items=_items,
+            primary=True,
+        )
+        self._set_suppress_link(
+            "dont_show_again", lambda: self._on_action("suppress_cloud_no_local"))
+        self._show_priority_prompt()
+
     def show_unverified_match(self, game_name: str, proc_name: str, game_id: str):
         """A running process matched a library game by NAME ONLY — its own
         path could not be read (typically an elevated game), so nothing
@@ -1363,20 +1416,28 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         )
         self._hide_dashboard()
         self._clear_buttons()
+        # An alert holds priority and never auto-hides, so it MUST carry a way
+        # out: without it nothing behind it would ever be shown again.
+        # "regression_ack" is its own action, not the shared "dismiss":
+        # losing this alert must not mean losing the warning, so it stays
+        # re-summonable by the hotkey until the player actually acknowledges
+        # it — and THAT is what this action says. Worded as an
+        # acknowledgement for the same reason.
+        #
+        # Same shape as the cloud prompts: the repair is the primary button
+        # and the acknowledgement sits in its dropdown. With no backup to
+        # restore there is no primary to attach a menu to, so the
+        # acknowledgement stays a plain button — it is the only way out.
         if newest_backup_id:
-            self._add_btn(
+            self._add_split_btn(
                 self._btn_area,
                 t("overlay.restore_force") if after_restore
                 else t("overlay.save_reverted_restore"),
                 "force_restore" if after_restore else "restore_newest",
+                menu_items=[(t("overlay.got_it"), "regression_ack")],
                 primary=True)
-        # An alert holds priority and never auto-hides, so it MUST carry a way
-        # out: without it nothing behind it would ever be shown again.
-        # Its own action, not the shared "dismiss": losing this alert must not
-        # mean losing the warning, so it stays re-summonable by the hotkey
-        # until the player actually acknowledges it — and THIS button is what
-        # says they did. Worded as an acknowledgement for the same reason.
-        self._add_btn(self._btn_area, t("overlay.got_it"), "regression_ack")
+        else:
+            self._add_btn(self._btn_area, t("overlay.got_it"), "regression_ack")
         self._set_suppress_link(
             "dont_show_ingame",
             lambda _checked=False, gid=game_id:

@@ -37,19 +37,32 @@ def filter_selectable_paths(game_id: str, paths: List[str]) -> List[str]:
     Shared by add_found_paths() and by callers that must decide whether the
     dialog/notification is worth showing at all — a "1 path found" popup
     with zero selectable files must never appear.
+
+    Case/separator-equivalent spellings of one folder are collapsed first:
+    the watcher and the open-file scan legitimately report the same folder
+    with different casing ("…\\Save" vs "…\\save"), which would otherwise
+    show up as two identical-looking rows to confirm.
     """
-    from core.save_detector import path_has_backup_content
+    from core.save_detector import (
+        path_has_backup_content, dedupe_paths, path_identity,
+    )
     from core.game_engine import engine_for_game
     from core.library import get_library
     config = get_config()
-    deleted_paths = config.get("auto_scan_deleted_paths", {}).get(game_id, [])
+    paths = dedupe_paths(paths)
+    # Same identity rule as the dedupe above: a path the user deleted stays
+    # deleted even when it is re-detected with different casing.
+    deleted_paths = {
+        path_identity(p)
+        for p in config.get("auto_scan_deleted_paths", {}).get(game_id, [])
+    }
     # ".dat" is engine data in one engine and a save in another, so the
     # exclusion has to know which game this is.
     engine = engine_for_game(get_library().get_by_id(game_id)) if game_id else ""
 
     result: List[str] = []
     for path in paths:
-        if path in deleted_paths:
+        if path_identity(path) in deleted_paths:
             logger.debug(f"Skipping previously deleted path: {path}")
             continue
         if not path_has_backup_content(path, engine=engine):
@@ -411,10 +424,15 @@ class SavePathItem(QWidget):
         (respecting an in-session deletion rather than having it silently
         reappear because a slower/different scan pass re-found it).
         """
+        from core.save_detector import path_identity as _pid
+        _shown = {_pid(p) for p in self.paths}
+        _dropped = {_pid(p) for p in self._locally_deleted_paths}
         added = []
         for path in new_paths:
-            if path in self.paths or path in self._locally_deleted_paths:
+            _key = _pid(path)
+            if _key in _shown or _key in _dropped:
                 continue
+            _shown.add(_key)
             self.paths.append(path)
             # Guarded: a RESTORED path is already in _all_detected_paths
             # (delete_path() drops it from self.paths only). apply_changes()

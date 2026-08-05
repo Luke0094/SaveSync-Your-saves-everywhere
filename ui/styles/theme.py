@@ -816,8 +816,11 @@ QLineEdit#list_search {
     border-radius: 8px;
 }
 
+/* Empty states carry instructions ("add a save folder from the library
+   menu"), so they read as secondary text, not as a disabled control: the
+   old #2a2a38 was the panel-border tone on a #111114 card. */
 #empty_hint {
-    color: #2a2a38;
+    color: #c8c8d0;
     font-size: 12px;
     padding: 16px;
 }
@@ -1926,8 +1929,10 @@ QPushButton#card_more_btn:hover {
     border-radius: 8px;
 }
 
+/* Mirror of the dark rule: #b0b0c0 was the same disabled tone, and just as
+   washed out against a white card. */
 #empty_hint {
-    color: #b0b0c0;
+    color: #3a3a4a;
     font-size: 12px;
     padding: 16px;
 }

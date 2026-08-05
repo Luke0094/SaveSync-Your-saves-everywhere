@@ -146,6 +146,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._ingame_backup_timers: dict[str, "QTimer"] = {}
         # Pending "both" conflict resolution: chain upload after download
         self._pending_both_upload: Optional[GameEntry] = None
+        # game_id → the conflict's local/remote timestamps, kept from
+        # detection until the user opens the comparison window from the
+        # conflict notification (empty for a conflict surfaced at launch out
+        # of a status recorded in an earlier session).
+        self._pending_conflict_info: dict[str, dict] = {}
         # Games where the user answered "keep local" to the cross-machine
         # divergence dialog: for the rest of the session their auto syncs
         # silently go up-only instead of re-asking on every sync.
@@ -662,6 +667,34 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             entry = get_library().get_by_exe(context)
             if entry:
                 self._pending_cloud_notification.pop(entry.id, None)
+                self._show_tracking_toast_if_playing(entry.id)
+        elif action == "resolve_conflict_details":
+            # Conflict notification primary: open the local-vs-cloud
+            # comparison. The notification is NOT popped here — closing the
+            # window without choosing has to leave the question re-summonable
+            # (_handle_conflict_choice pops it once something is decided).
+            entry = get_library().get_by_exe(context)
+            if entry:
+                self._open_conflict_dialog(entry)
+        elif action in ("conflict_keep_local", "conflict_keep_cloud",
+                        "conflict_keep_both"):
+            # One-click resolutions from that notification's dropdown: same
+            # handler as the comparison window's buttons, so "keep both"
+            # still backs up locally before downloading, and "keep local"
+            # still goes up-only for the rest of the session.
+            entry = get_library().get_by_exe(context)
+            if entry:
+                self._handle_conflict_choice(entry, action.rsplit("_", 1)[1])
+                self._show_tracking_toast_if_playing(entry.id)
+        elif action == "homonym_library_game":
+            # "That cloud folder is a different game with the same title":
+            # move this game onto its own cloud-unique folder instead of
+            # syncing into the other one, and don't download anything.
+            entry = get_library().get_by_exe(context)
+            if entry:
+                self._pending_cloud_notification.pop(entry.id, None)
+                self._pending_conflict_info.pop(entry.id, None)
+                self._claim_unique_cloud_folder(entry)
                 self._show_tracking_toast_if_playing(entry.id)
         elif action == "download_saves_unknown_game":
             # State A primary: download from the ACTUAL candidate folder (which
@@ -1326,6 +1359,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path)
                 elif notif_type == "sync_prompt":
                     self._overlay.show_cloud_saves(entry.name, entry.exe_path)
+                elif notif_type in ("conflict_diverged", "conflict_unreconciled"):
+                    self._overlay.show_cloud_conflict_resolve(
+                        entry.name, entry.exe_path,
+                        diverged=(notif_type == "conflict_diverged"))
                 else:
                     continue
                 return
@@ -1758,11 +1795,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # other discovery.
             discovered = get_pending_save_paths(game_id, exe_dir)
             if discovered:
+                # Identity, not string equality: the watcher reports a folder
+                # with its on-disk casing while the open-file scan reports it
+                # as the game opened it, and both spellings used to be kept
+                # as two separate pending paths.
+                from core.save_detector import path_identity as _pid
                 added: list[str] = []
                 with self._bg_scan_lock:
                     merged = list(self._pending_auto_scans.get(game_id, []))
+                    known = {_pid(p) for p in merged}
                     for p in discovered:
-                        if p not in merged:
+                        if _pid(p) not in known:
+                            known.add(_pid(p))
                             merged.append(p)
                             added.append(p)
                     self._pending_auto_scans[game_id] = merged
@@ -1972,12 +2016,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     if not paths:
                         return
 
-                    # Merge newly found paths into pending
+                    # Merge newly found paths into pending (identity-based, so
+                    # a differently-cased spelling of a folder the watcher
+                    # already surfaced is not added a second time)
+                    from core.save_detector import path_identity as _pid
                     with _lock:
                         existing_pending = self._pending_auto_scans.get(game_id, [])
                         merged = list(existing_pending)
+                        known = {_pid(p) for p in merged}
                         for p in paths:
-                            if p not in merged:
+                            if _pid(p) not in known:
+                                known.add(_pid(p))
                                 merged.append(p)
                                 logger.info(f"Live tracking found new path for {game_name}: {p}")
                         self._pending_auto_scans[game_id] = merged
@@ -2471,6 +2520,54 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         from PySide6.QtCore import QTimer
         QTimer.singleShot(1500, _deferred_sync_and_restore)
+
+    def _claim_unique_cloud_folder(self, entry) -> bool:
+        """Move an ALREADY-ADDED game onto its own cloud-unique folder.
+
+        The library counterpart of _add_homonym_unknown: the cloud folder this
+        game's title resolves to turns out to hold a same-titled DIFFERENT
+        game (uploaded from another machine), so syncing into it would mix two
+        games' saves. The game keeps its saves and history and simply stops
+        aiming at that folder.
+
+        The old folder is deliberately NOT recorded in folder_history: that
+        history means "a folder that used to be mine", and the whole point
+        here is that it never was — the migration paths would otherwise walk
+        back into the other game's folder later.
+
+        Returns True when the folder actually changed.
+        """
+        from sync import get_orchestrator
+        from core.constants import get_folder_name_for_save
+        from core.backup import get_backup_manager
+        base = entry.computed_folder_name or get_folder_name_for_save(
+            entry.name, entry.exe_path, entry.id)
+        unique = get_orchestrator().cloud_unique_folder(base, exclude_id=entry.id)
+        if not unique or unique == base:
+            logger.info(f"{entry.name!r}: no same-name cloud folder to step "
+                        f"aside from ({base!r} is already unique)")
+            return False
+        # Local backups move first: the entry must never point at a folder
+        # whose zips are still elsewhere.
+        get_backup_manager().relocate_game_backups(entry.id, base, unique)
+        updated = get_library().update_game_fields(
+            entry.id, computed_folder_name=unique) or entry
+        # One-shot, not the permanent per-game mute: only the next launch check
+        # needs covering (it can run before the upload below lands and lifts
+        # local_only). Silencing the game forever would also hide a later,
+        # legitimate "cloud has saves, you have none" for its own folder.
+        self._suppress_cloud_prompt_once.add(updated.id)
+        logger.info(f"{updated.name!r} declared a homonym of the cloud folder "
+                    f"{base!r} — now syncing to {unique!r}")
+        # Upload into the (empty) new folder so the game leaves local_only and
+        # is no longer asked to reconcile with a folder that isn't its own.
+        get_orchestrator().sync_game(
+            updated.id, updated.name, updated.save_paths,
+            exe_path=updated.exe_path, direction="up",
+            computed_folder_name=unique,
+            name_history=list(updated.name_history),
+        )
+        return True
 
     def _add_homonym_unknown(self, exe_path: str, detected_name: str):
         """Add a same-name-but-different game with its OWN cloud-unique folder

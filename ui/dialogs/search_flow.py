@@ -383,60 +383,23 @@ class SearchFlowMixin:
 
         diff = self._compute_candidate_diff(result)
 
-        # ── Same source + same content → nothing to apply here; try the
-        # OTHER sources within the current tier before advancing (e.g.
-        # itch → skip → mobygames/wikipedia). ─────────────────────────────
-        if diff['same_origin_no_diff']:
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+        # ── Nothing at all to apply → say so and STOP ─────────────────────
+        # Confirming a candidate is never a request to keep searching: the
+        # popup's own hint promises "Yes applies this result and stops here"
+        # (No is what tries another source). This used to silently fire a
+        # fresh search — same tier minus this source, or the next tier —
+        # which read as "I pressed Yes and it went looking again, then told
+        # me nothing was found".
+        #
+        # Tested on has_changes rather than the narrower has_enrich /
+        # same_origin_no_diff pair those two branches used: a same-source
+        # candidate can still carry a new cover, tag or store link, and
+        # those were being discarded together with the duplicate text.
+        if not diff['has_changes']:
+            self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
             self._add_btn.setEnabled(True)
             self._web_search_btn.setEnabled(True)
-            _skip_src = [_raw_source.split('+')[0]]
-            if _current_phase == 'api':
-                self._status_lbl.setText(
-                    t('add_game.enrichment_step_status',
-                      source=t('add_game.enrich_api'), status=t('add_game.searching'))
-                )
-                self._web_search(
-                    skip_primary_apis=False, enable_targeted_fallback=False,
-                    enable_generic_fallback=False, skip_sources=_skip_src,
-                    extra_folder_hint=_hint_fwd,
-                )
-            elif _current_phase == 'targeted':
-                self._status_lbl.setText(
-                    t('add_game.enrichment_step_status',
-                      source=t('add_game.enrich_targeted'), status=t('add_game.searching'))
-                )
-                self._web_search(
-                    skip_primary_apis=True, enable_targeted_fallback=True,
-                    enable_generic_fallback=False, skip_sources=_skip_src,
-                    extra_folder_hint=_hint_fwd,
-                )
-            else:
-                # generic has no sub-sources to skip; nothing left to try
-                self._status_lbl.setText(t('add_game.search_not_found'))
-            return
-
-        # ── Case E (enrich) with nothing new to offer → silently advance ──
-        if diff['has_existing'] and not diff['is_overwrite'] and not diff['has_enrich']:
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
-            self._add_btn.setEnabled(True)
-            self._web_search_btn.setEnabled(True)
-            if _current_phase == 'api':
-                self._status_lbl.setText(
-                    t('add_game.enrichment_step_status',
-                      source=t('add_game.enrich_api'), status=t('add_game.search_not_found'))
-                )
-                self._web_search(skip_primary_apis=True, enable_targeted_fallback=True,
-                                 extra_folder_hint=_hint_fwd)
-            elif _current_phase == 'targeted':
-                self._status_lbl.setText(
-                    t('add_game.enrichment_step_status',
-                      source=t('add_game.enrich_targeted'), status=t('add_game.search_not_found'))
-                )
-                self._web_search(skip_primary_apis=True, enable_generic_fallback=True,
-                                 extra_folder_hint=_hint_fwd)
-            else:
-                self._status_lbl.setText(t('add_game.search_not_found'))
+            self._status_lbl.setText(t('add_game.candidate_no_changes'))
             return
 
         # ── Apply — the user already confirmed this exact candidate ───────

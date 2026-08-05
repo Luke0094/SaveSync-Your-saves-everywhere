@@ -266,14 +266,35 @@ The UI picks it up automatically.
 
 ## Conflict resolution
 
+Every decision is asked through the overlay notification, with the alternatives
+under the primary button's `▾` — never through a modal that could open behind a
+fullscreen game.
+
 | Condition | Result |
 |-----------|--------|
 | Only local modified since last sync | Auto-upload |
 | Only cloud modified | Auto-download |
-| Both modified, same machine | Auto-backup, ask user |
+| Both modified, same machine | Auto-backup, then ask |
 | Both modified, different machine | **Always ask** (even with auto-backup enabled) |
-| No local data, cloud has saves | Ask to download (overlay prompt) |
-| Unknown game, cloud folder with same name | Overlay prompt: download & add, keep local, or "it's a different game" (own folder) |
+| Conflict left unresolved in an earlier session | Asked again at the next launch |
+| Local saves never synced but a cloud copy exists | Asked to reconcile (same options, plus "it's a different game") |
+| No local data, cloud has saves | Ask to download |
+| Unknown game, cloud folder with same name | Download & add, keep local, or "it's a different game" (own folder) |
+
+Every "ask" above offers **keep local**, **keep cloud** and **keep both** (which
+backs up locally, downloads, then re-uploads), plus a dated local-vs-cloud
+comparison. Choosing any of them syncs, so the question doesn't come back. The
+per-game *don't show again* silences the launch prompts for that game.
+
+A never-synced game can also answer **"it's a different game"**: the cloud
+folder its title resolves to belongs to a same-titled game from another
+machine, so this one moves to its own folder (`Alpha_2`) with its backups, and
+the two stop sharing a destination. Not offered once the two sides have synced
+together — that already settles whose folder it is.
+
+A save that goes *backwards* without SaveSync doing it (a launcher's own cloud
+sync, another tool) is reported separately: it isn't a conflict, so the prompt
+offers to restore the newest backup, with acknowledgement in the dropdown.
 
 ---
 

@@ -2105,21 +2105,39 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
             # Save with correct extension based on actual content
             if _qt_ok:
-                from PIL import Image as _PILImage
-                import io as _io
                 try:
+                    # Imported INSIDE the try on purpose: a broken/absent PIL
+                    # (a frozen build missing PIL._imaging raises ImportError
+                    # here) must fall through to the Qt encoder below, not
+                    # abort the whole download — Qt has already decoded the
+                    # image at this point, so the only thing PIL adds is the
+                    # JPEG re-encode.
+                    from PIL import Image as _PILImage
+                    import io as _io
                     _pil_img = _PILImage.open(_io.BytesIO(image_data))
                     _encode_jpeg(_pil_img, str(cache_path))
                     logger.info(f"Saved as JPEG via PIL: {cache_path.name}")
-                except Exception:
-                    # PIL failed to re-encode — save as PNG via Qt (safe fallback)
-                    png_path = cache_path.with_suffix(".png")
-                    if self._pending_pixmap.save(str(png_path), "PNG"):
-                        cache_path = png_path
-                        logger.info(f"Saved as PNG via Qt: {png_path.name}")
+                except Exception as _pil_err:
+                    logger.info(f"PIL re-encode unavailable ({_pil_err}) — using Qt")
+                    # Qt encodes the already-decoded pixmap instead, applying
+                    # the same 1280px clamp so the cache stays comparable.
+                    _px_save = self._pending_pixmap
+                    if max(_px_save.width(), _px_save.height()) > 1280:
+                        _px_save = _px_save.scaled(
+                            1280, 1280,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    if _px_save.save(str(cache_path), "JPEG", 88):
+                        logger.info(f"Saved as JPEG via Qt: {cache_path.name}")
                     else:
-                        cache_path.write_bytes(image_data)
-                        logger.warning("Qt/PIL both failed to encode, saved raw bytes")
+                        png_path = cache_path.with_suffix(".png")
+                        if _px_save.save(str(png_path), "PNG"):
+                            cache_path = png_path
+                            logger.info(f"Saved as PNG via Qt: {png_path.name}")
+                        else:
+                            cache_path.write_bytes(image_data)
+                            logger.warning("Qt/PIL both failed to encode, saved raw bytes")
             else:
                 logger.warning(f"Qt could not decode (magic: {magic}) — trying PIL")
                 _saved = False
