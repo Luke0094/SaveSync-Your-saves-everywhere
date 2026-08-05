@@ -164,11 +164,17 @@ class SyncWorker(QThread):
                         except Exception as e:
                             logger.warning(f"[{provider.PROVIDER_ID}] Migration failed for {fname}: {e}")
 
-                    # Clean up old remote index.json if folder is now empty
+                    # Clean up old remote index.json once the folder is empty.
+                    # "Empty" has to mean empty of EVERYTHING, not just of our
+                    # own zips: a folder named after a shared title can be a
+                    # homonym's home on another machine, and deleting the index
+                    # that describes ITS backups would cost that game its
+                    # history — for a folder this game never even uploaded to.
                     try:
                         remaining = provider.list_files(old_remote_base)
-                        game_files = [f for f in remaining if game_id in f.path.split("/")[-1]]
-                        if not game_files:
+                        others = [f for f in remaining
+                                  if f.path.split("/")[-1] != "index.json"]
+                        if not others:
                             old_idx = f"{old_remote_base}/index.json"
                             if provider.remote_exists(old_idx):
                                 provider.delete_remote(old_idx)

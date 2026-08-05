@@ -2052,39 +2052,72 @@ class BackupManager(QObject):
                     continue
             except Exception:
                 pass
-            old_dir = BACKUP_DIR / old_folder
-            if not old_dir.is_dir():
-                continue
-
-            # Move every zip belonging to this game_id
-            for zip_file in list(old_dir.glob(f"{game_id}_*.zip")):
-                dest = current_dir / zip_file.name
-                try:
-                    current_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(zip_file), str(dest))
-                    logger.info(f"Migrated backup {zip_file.name}: {old_folder} → {current_folder}")
-                    # Patch in-memory index
-                    with _index_lock:
-                        for entry in self._index:
-                            if Path(entry.zip_path).name == zip_file.name:
-                                entry.zip_path = str(dest)
-                except Exception as e:
-                    logger.warning(f"Failed to migrate {zip_file}: {e}")
-
-            # Also move index.json if the old folder only contained this game
-            old_index = old_dir / "index.json"
-            if old_index.exists():
-                try:
-                    remaining_zips = list(old_dir.glob("*.zip"))
-                    if not remaining_zips:
-                        old_index.unlink(missing_ok=True)
-                        if not any(old_dir.iterdir()):
-                            old_dir.rmdir()
-                except Exception:
-                    pass
+            self._move_game_zips(game_id, old_folder, current_folder)
 
         # Persist updated paths
         self._save_index()
+
+    def _move_game_zips(self, game_id: str, old_folder: str,
+                        current_folder: str) -> int:
+        """Move *game_id*'s zips out of *old_folder* into *current_folder*.
+
+        Only this game's zips move (the glob is id-scoped), so a folder shared
+        with another game keeps its files. The old index.json goes only once
+        no zip at all is left there — anything remaining is somebody else's
+        history and its index still describes it.
+
+        Returns how many zips were relocated; does NOT persist the index (the
+        callers batch that).
+        """
+        old_dir = BACKUP_DIR / old_folder
+        current_dir = BACKUP_DIR / current_folder
+        if not old_dir.is_dir():
+            return 0
+        moved = 0
+        for zip_file in list(old_dir.glob(f"{game_id}_*.zip")):
+            dest = current_dir / zip_file.name
+            try:
+                current_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(zip_file), str(dest))
+                logger.info(f"Migrated backup {zip_file.name}: {old_folder} → {current_folder}")
+                with _index_lock:
+                    for entry in self._index:
+                        if Path(entry.zip_path).name == zip_file.name:
+                            entry.zip_path = str(dest)
+                moved += 1
+            except Exception as e:
+                logger.warning(f"Failed to migrate {zip_file}: {e}")
+
+        old_index = old_dir / "index.json"
+        if old_index.exists():
+            try:
+                if not list(old_dir.glob("*.zip")):
+                    old_index.unlink(missing_ok=True)
+                    if not any(old_dir.iterdir()):
+                        old_dir.rmdir()
+            except Exception:
+                pass
+        return moved
+
+    def relocate_game_backups(self, game_id: str, old_folder: str,
+                              new_folder: str) -> int:
+        """Re-home a game's local backups into *new_folder*.
+
+        For a folder change that must NOT go through folder_history — the
+        homonym case, where the old folder is a name shared with a DIFFERENT
+        game and the history-driven migration would later treat that shared
+        folder as ex-mine. Here the old folder is named explicitly and only
+        once.
+
+        Returns how many zips were relocated.
+        """
+        if not game_id or not old_folder or old_folder == new_folder:
+            return 0
+        moved = self._move_game_zips(game_id, old_folder, new_folder)
+        if moved:
+            self._save_game_index(game_id)
+            self._save_index()
+        return moved
 
     def delete_backup(self, backup_id: str) -> bool:
         entry = self.get_backup(backup_id)

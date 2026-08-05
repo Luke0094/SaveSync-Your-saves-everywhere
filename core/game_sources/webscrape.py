@@ -138,6 +138,46 @@ _DLSITE_WORK_RE = re.compile(
 )
 
 
+def _scrape_dlsite_en(product_url: str) -> Optional[GameInfo]:
+    """Scrape a DLsite work page in the ENGLISH locale.
+
+    Only the section a work actually belongs to honours ``?locale=en_US``.
+    Asking any other section for the same product code serves that work
+    from its canonical page with the parameter IGNORED — Japanese title,
+    Japanese circle name, Japanese UI. Since the product-code lookup tries
+    several sections, that is how one product came back as several
+    identical Japanese-titled candidates.
+
+    So: request with the locale, then follow ``<link rel=canonical>`` when
+    it points elsewhere and ask THAT page for the English locale. Whichever
+    section is tried first, the data comes from the localized page.
+
+    A work with no English title on DLsite still returns its Japanese one —
+    that is the only title the site has for it, not a locale failure.
+    """
+    base = (product_url or "").split("?")[0]
+    if not base:
+        return None
+    url = base + "?locale=en_US"
+    html = _fetch_html(url)
+    if not html:
+        return None
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)', html)
+    if m:
+        canon = m.group(1)
+        canon_base = canon.split("?")[0].rstrip("/")
+        # "locale=" already on the canonical link means this page IS the
+        # localized one; a canonical pointing at another section without it
+        # means we were served that section's Japanese page.
+        if "locale=" not in canon and canon_base != base.rstrip("/"):
+            canon_url = canon_base + "?locale=en_US"
+            canon_html = _fetch_html(canon_url)
+            if canon_html:
+                logger.debug(f"DLSite: followed canonical to {canon_url}")
+                return _scrape_opengraph(canon_url, html=canon_html)
+    return _scrape_opengraph(url, html=html)
+
+
 def _find_dlsite_url_via_search(keyword: str) -> Optional[str]:
     """Find a DLSite product work URL via web search (shared engine layer).
 
@@ -541,6 +581,18 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         dm = re.search(r'<th>(?:販売日|Release\s*date)</th>\s*<td>(?:<a[^>]*>)?([^<]+)(?:</a>)?', html)
         if dm and not release_date:
             release_date = dm.group(1).strip().replace("年", "-").replace("月", "-").replace("日", "")
+            # The cell can continue into a sale time ("Aug/02/2026 05:00"),
+            # and the markup splits it so the tail arrives truncated
+            # ("Aug/02/2026 0"). Keep the leading date and drop the rest;
+            # an unrecognised format is left untouched.
+            _dm = re.match(
+                r'\s*([A-Za-z]{3,9}[/\s.\-]\d{1,2}[/\s.\-]\d{4}'
+                r'|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}'
+                r'|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})',
+                release_date,
+            )
+            if _dm:
+                release_date = _dm.group(1)
 
         # Category type (作品形式 / Product format)
         cm = re.search(r'<th>(?:作品形式|Product\s*format|Category)</th>[\s\S]*?<span[^>]*title="([^"]+)"', html)
@@ -1698,26 +1750,37 @@ def _search_targeted_sites(primary: str,
             if code not in _dl_codes:
                 _dl_codes.append(code)
     if _dl_codes and 'dlsite' not in _skip:
-        for _dl_sub in ("maniax", "soft", "pro"):
-            try:
-                for code in _dl_codes:
-                    product_url = f"https://www.dlsite.com/{_dl_sub}/work/=/product_id/{code}.html"
-                    dlscrape_url = product_url + "?locale=en_US"
-                    info = _scrape_opengraph(dlscrape_url)
-                    if info and info.name:
-                        # Product code ensures we found the right game, but score
-                        # by name so better-matched sources (itch.io with English
-                        # name) win.  Floor at 40 so a code-only hit (Japanese
-                        # title vs English folder) is included but not dominant.
-                        name_score = max(_fuzzy_score(h, info.name) for h in all_hints)
-                        _score = max(name_score, 40.0)
-                        logger.info(
-                            f"Web fallback via DLSite product code {code}: "
-                            f"{info.name!r} (name_score={name_score:.0f}, final={_score:.0f})"
-                        )
-                        results.append((info, _score))
-            except Exception as e:
-                logger.debug(f"DLSite product direct ({_dl_sub}) failed: {e}")
+        # One candidate per product code. The section list is a fallback, not
+        # a set of distinct sources: a code is only listed in the one section
+        # that carries it, but ANY section answers for it by serving that
+        # same work, so carrying on after a hit produced two extra identical
+        # candidates. Which section is asked first no longer matters either —
+        # _scrape_dlsite_en follows the canonical link, so a work living in a
+        # section not even listed here (girls, bl, home…) still resolves.
+        for code in _dl_codes:
+            info = None
+            for _dl_sub in ("maniax", "soft", "pro"):
+                try:
+                    info = _scrape_dlsite_en(
+                        f"https://www.dlsite.com/{_dl_sub}/work/=/product_id/{code}.html"
+                    )
+                except Exception as e:
+                    logger.debug(f"DLSite product direct ({_dl_sub}) failed: {e}")
+                    info = None
+                if info and info.name:
+                    break
+            if info and info.name:
+                # Product code ensures we found the right game, but score
+                # by name so better-matched sources (itch.io with English
+                # name) win.  Floor at 40 so a code-only hit (Japanese
+                # title vs English folder) is included but not dominant.
+                name_score = max(_fuzzy_score(h, info.name) for h in all_hints)
+                _score = max(name_score, 40.0)
+                logger.info(
+                    f"Web fallback via DLSite product code {code}: "
+                    f"{info.name!r} (name_score={name_score:.0f}, final={_score:.0f})"
+                )
+                results.append((info, _score))
 
     # 3. DLSite keyword search (by name, no RJ code needed)
     #
@@ -1730,11 +1793,12 @@ def _search_targeted_sites(primary: str,
     if 'dlsite' not in _skip:
         _dl_url = _find_dlsite_url_via_search(_dl_keyword)
         if _dl_url:
-            _dl_scrape = _dl_url if "?" in _dl_url else _dl_url + "?locale=en_US"
             # No score_bonus here: web-indexed search may surface any DLSite page
             # that matches keywords.  The 40-pt bonus is reserved for direct
             # product-code hits (section 2 above) where the match is guaranteed.
-            _collect("DLSite (web)", _scrape_opengraph(_dl_scrape))
+            # Same English-locale handling as the code lookup — a search hit
+            # can land on any section, including one that ignores the locale.
+            _collect("DLSite (web)", _scrape_dlsite_en(_dl_url))
         else:
             logger.info(f"Targeted DLSite: no product for {_dl_keyword!r}")
 

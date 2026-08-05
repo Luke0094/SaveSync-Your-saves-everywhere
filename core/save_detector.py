@@ -132,6 +132,40 @@ _CONTAINER_DIR_NAMES = frozenset({
 })
 
 
+def path_identity(path_str: str) -> str:
+    """Identity key for a detected save path, for de-duplication.
+
+    Case and separator differences do NOT make two paths different on
+    Windows: the watcher reports a folder with its on-disk casing
+    ("…\\Save") while the open-file scan can report the same folder as the
+    game opened it ("…\\save"), and both used to survive as two entries —
+    listed twice in the confirmation panel, zipped twice into a backup.
+    normcase+normpath collapses exactly those spellings and nothing else
+    (a registry key normalises the same way: those are case-insensitive
+    too). Empty input maps to "" so it can never collide with a real path.
+    """
+    if not path_str:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(path_str.strip()))
+    except (OSError, ValueError, AttributeError):
+        return path_str.strip().lower()
+
+
+def dedupe_paths(paths) -> list[str]:
+    """*paths* with case/separator-equivalent duplicates removed, order and
+    first-seen spelling preserved (see path_identity)."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for p in paths or []:
+        key = path_identity(p)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(p)
+    return result
+
+
 def derive_display_name(exe_path: str, fallback: str = "") -> str:
     """Best human display name for a game executable.
 
