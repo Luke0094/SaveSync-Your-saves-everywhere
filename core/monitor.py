@@ -8,6 +8,7 @@ import copy
 import logging
 import os
 import platform
+import re
 import signal
 import sys
 import threading
@@ -62,15 +63,18 @@ _SYSTEM_STEMS: frozenset[str] = frozenset({
     "microsoftedgeupdate", "bravesoftware", "brave-browser",
     "egui", "eeclnt", "eservicehost", "ekrn",  # ESET antivirus
     "securityhealthservice", "sgrmbroker", "mpcmdrun",  # Windows Security
-    "onedrive", "filesyncshell64",  # OneDrive client (not a game)
+    "onedrive", "filesync", "filesyncshell64",  # OneDrive client (not a game)
     "onedrivestandaloneupdater", "filecoauth", "microsoft.sharepoint",  # OneDrive satellites
+    "msmpeng", "mpdefender", "mpdefendercoreservice",  # Defender engine
+    "epiconlineservices", "adguard",  # families, satellites covered by suffix
     "acrobat", "acrord32", "acrotray", "acrocef",  # Adobe Acrobat family
     "adobecollabsync", "adobearm", "armsvc", "adobeipcbroker",  # Adobe services
-    "epicwebhelper", "epiconlineserviceshost",  # Epic launcher helpers
+    "epicwebhelper", "epiconlineserviceshost", "crashreport",  # Epic launcher helpers
     "epiconlineservicesuihelper", "epiconlineservicesinstallhelper",
     "discord", "discordptb", "discordcanary",  # Chat apps
     "spotify", "slack", "teams", "telegram",
-    "winrar", "chrome", "firefox",  # Common utilities and browsers
+    "winrar", "7z", "7za", "7zfm", "7zg", "7zip",  # Archives
+    "chrome", "firefox",  # Common utilities and browsers
     # Only essential system processes - let runtime filter handle the rest
     # "rundll32", "conhost",
 })
@@ -84,6 +88,118 @@ ProcessKey = tuple[int, float]
 
 def _stem(name: str) -> str:
     return Path(name).stem.lower().strip()
+
+
+# Words a program appends to its OWN name for the satellites it ships. Used
+# ONLY to strip a tail off a stem and test what is left against the ignore
+# list, so "onedrivelauncher" can be recognised as OneDrive's while
+# "steamworlddig" stays a game: "worlddig" is not one of these.
+_HELPER_SUFFIXES: frozenset[str] = frozenset({
+    "update", "updater", "standaloneupdater", "autoupdate", "setup",
+    "installer", "install", "uninstall", "bootstrapper", "launcher",
+    "helper", "webhelper", "userhelper", "uihelper", "installhelper",
+    "service", "services", "svc", "host", "agent", "tray", "sync",
+    "broker", "monitor", "watcher", "daemon", "server", "client",
+    "crashhandler", "crashreporter", "crashpad", "reporter", "notifier",
+    "elevation", "elevationservice", "core", "coreservice", "config",
+    "shell", "ui", "gui", "cli", "console", "engine",
+    "delta", "patch", "runtime",
+    "browser", "extension",  # Adguard.BrowserExtensionHost and kin
+    "x64", "x86", "64", "32",
+})
+# Below this, a stem is too short to be a safe FAMILY name for the two
+# fuzzy rules: "sh", "wt", "main" and friends would start matching games.
+# They still work as exact matches, which is how they got on the list.
+_MIN_FAMILY_LEN = 5
+# A separator-cut prefix only counts when EVERY piece after it looks like a
+# satellite (helper word / version / install id). Without that, "brave-souls"
+# and "steam-hunters" would be swallowed by "brave"/"steam" — game titles,
+# not browser/launcher helpers. Edge Runner is already safe (the list has
+# msedge/microsoftedge, never bare "edge"), but the same shape of collision
+# is real for every short brand on the list.
+_SATELLITE_PART = re.compile(
+    r"^(?:"
+    r"[0-9]+(?:\.[0-9]+)*"   # 150 / 150.0.4078.99
+    r"|[0-9a-f]{8,}"         # install GUIDs, hex blobs
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _part_is_satellite(part: str) -> bool:
+    """One dotted/hyphenated piece of a satellite name.
+
+    Helpers are often glued together without a separator
+    (BrowserExtensionHost); peel known helper suffixes from the right until
+    nothing is left. A leftover that is not itself a helper ("souls",
+    "hunters") means this is a title, not a satellite.
+    """
+    pl = (part or "").lower()
+    if not pl:
+        return True
+    if pl in _HELPER_SUFFIXES or _SATELLITE_PART.fullmatch(pl):
+        return True
+    # Longest suffix first so "webhelper" wins over "helper".
+    suffixes = sorted(_HELPER_SUFFIXES, key=len, reverse=True)
+    while pl:
+        if pl in _HELPER_SUFFIXES or _SATELLITE_PART.fullmatch(pl):
+            return True
+        for suffix in suffixes:
+            if len(pl) > len(suffix) and pl.endswith(suffix):
+                pl = pl[:-len(suffix)]
+                break
+        else:
+            return False
+    return True
+
+
+def _tail_is_satellite(tail: str) -> bool:
+    """True when *tail* is only helper/version tokens — not a game title."""
+    parts = [p for p in re.split(r"[._\-]+", tail) if p]
+    return all(_part_is_satellite(p) for p in parts) if parts else True
+
+
+def _stem_ignored(stem: str, *stem_sets) -> bool:
+    """True when *stem* names a listed program, or a satellite of one.
+
+    An exact match is not enough on Windows, where a program ships a small
+    fleet under its own name: OneDrive alone runs OneDrive.Sync.Service,
+    OneDriveLauncher, OneDriveSetup, FileSyncHelper. With "onedrive" listed
+    and only whole-stem equality tested, every one of those was announced as
+    a possible game — the ignore list looked ignored.
+
+    Two more rules, both anchored so a listed name can never swallow an
+    unrelated one that merely starts the same way:
+      • a leading part on a separator boundary whose REMAINDER is only
+        helper/version tokens ("microsoftedge_x64_151.0…" → microsoftedge,
+        "brave_installer-delta-x64" → brave) — "brave-souls" does NOT match;
+      • the name minus one of the suffixes programs give their own helpers
+        ("onedrivelauncher" → onedrive, "steamwebhelper" → steam).
+    """
+    if not stem:
+        return False
+
+    def _listed(value: str) -> bool:
+        return any(value in s for s in stem_sets)
+
+    if _listed(stem):
+        return True
+    # Leading segments, longest first. A SPACE is not a separator here —
+    # service executables don't use one, game titles do, and treating it as
+    # one made "System Shock 2.exe" a satellite of "system".
+    marks = [i for i, ch in enumerate(stem) if ch in "._-"]
+    for cut in reversed(marks):
+        head, tail = stem[:cut], stem[cut + 1:]
+        if (len(head) >= _MIN_FAMILY_LEN and _listed(head)
+                and _tail_is_satellite(tail)):
+            return True
+    # Whole name minus a helper suffix.
+    for suffix in _HELPER_SUFFIXES:
+        if len(stem) > len(suffix) and stem.endswith(suffix):
+            head = stem[:-len(suffix)].rstrip("._-")
+            if len(head) >= _MIN_FAMILY_LEN and _listed(head):
+                return True
+    return False
 
 
 def _get_launcher_appid(pid: int) -> Optional[str]:
@@ -530,7 +646,7 @@ class ProcessMonitor(QObject):
                                      and not name.lower().endswith(".exe")):
                         # Cheap stem-level rejection BEFORE the exe fetch.
                         s = _stem(name)
-                        if s not in _SYSTEM_STEMS and s not in self._ignored_cache:
+                        if not _stem_ignored(s, _SYSTEM_STEMS, self._ignored_cache):
                             try:
                                 exe = (proc.exe() or "").strip()
                             except (psutil.AccessDenied, psutil.ZombieProcess):
@@ -564,7 +680,7 @@ class ProcessMonitor(QObject):
         every poll.
         """
         s = _stem(name)
-        if s in _SYSTEM_STEMS or s in self._ignored_cache:
+        if _stem_ignored(s, _SYSTEM_STEMS, self._ignored_cache):
             return True
         if not exe:
             return False

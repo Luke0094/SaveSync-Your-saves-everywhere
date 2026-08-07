@@ -648,12 +648,24 @@ _CONTEXTUAL_MARKERS = frozenset({
 # on the end of it.
 _TRAILING_MARKERS = frozenset({
     "kagura", "gog",
+    # Concatenated store label (MangaGamer / mangagamer). The spaced form is
+    # handled by _TWO_WORD_TRAILING — "manga" or "gamer" alone must never
+    # come off a title that happens to end on either word.
+    "mangagamer",
 })
 
 # "Hot fix" written as two words, folded into the one word the marker list
 # already knows. Only ever as that pair: "hot" on its own opens plenty of
 # real titles and is never touched.
 _TWO_WORD_MARKERS = re.compile(r"\bhot[\s._-]+fix\b", re.IGNORECASE)
+
+# Publisher / store labels that are two words and must be stripped ONLY as
+# that pair, and ONLY from the end. "Some Game Manga Gamer" loses the store;
+# "Manga Quest" and "The Last Gamer" keep their titles.
+_TWO_WORD_TRAILING = re.compile(
+    r"(?:^|[\s._-]+)manga[\s._-]+gamer\s*$",
+    re.IGNORECASE,
+)
 
 
 def _is_punctuation(w: str) -> bool:
@@ -767,6 +779,14 @@ def _clean_game_name(game_name: str) -> str:
             or _is_punctuation(filtered[-1])):
         filtered.pop()
     cleaned = ' '.join(filtered).strip(" ._-")
+    # Two-word trailing labels (Manga Gamer): only the whole pair, never the
+    # individual words. Applied after the one-word pass so a concatenated
+    # "mangagamer" token is already gone and this only sees the spaced form.
+    # An empty result means the whole name WAS the label — keep it, same as
+    # the one-word fallback below.
+    _tw = _TWO_WORD_TRAILING.sub("", cleaned).strip(" ._-")
+    if _tw:
+        cleaned = _tw
     # Never strip a name down to nothing: a game genuinely called by one of
     # these words keeps it, since having the wrong name is still better than
     # having none to search with.

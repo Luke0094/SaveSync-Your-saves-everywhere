@@ -105,7 +105,7 @@ class SaveHold(QObject):
     def start(self):
         if self._timer.isActive() or not self._values:
             return
-        from core.save_editor import backup_original
+        from .save_editor import backup_original
         try:
             # ONE copy, when the hold starts. A copy per cycle would fill the
             # folder with near-identical files and bury the one that matters.
@@ -158,7 +158,7 @@ class SaveHold(QObject):
         self._reapply()
 
     def _reapply(self):
-        from core.save_editor import open_save, SaveEditorError
+        from .save_editor import open_save, SaveEditorError
 
         try:
             doc = open_save(self._path)

@@ -667,7 +667,7 @@ class _LzStringJson(JsonFormat):
         self.source_path = None
 
     def load(self, data: bytes) -> None:
-        from core.lzstring import decompress_from_base64
+        from core.engines.lzstring import decompress_from_base64
         text = decompress_from_base64(data.decode("ascii", errors="strict").strip())
         if not text:
             raise SaveEditorError("not an LZString payload")
@@ -680,7 +680,7 @@ class _LzStringJson(JsonFormat):
         return True
 
     def dump(self) -> bytes:
-        from core.lzstring import compress_to_base64
+        from core.engines.lzstring import compress_to_base64
         text = json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
         return compress_to_base64(text).encode("ascii")
 
@@ -868,19 +868,19 @@ class RubyMarshalFormat(_Format):
         self._streams = []
 
     def load(self, data: bytes) -> None:
-        from core.rubymarshal import load_all
+        from core.engines.rubymarshal import load_all
         self._streams = load_all(data)
         if not self._streams:
             raise SaveEditorError("no Marshal stream in the file")
 
     def dump(self) -> bytes:
-        from core.rubymarshal import dump_all
+        from core.engines.rubymarshal import dump_all
         return dump_all(self._streams)
 
     # ── walking ──
     def _children(self, node):
         """(step, label, child) for everything inside *node*."""
-        from core.rubymarshal import RHash, RObject, RStructVal, RUserMarshal
+        from core.engines.rubymarshal import RHash, RObject, RStructVal, RUserMarshal
 
         if isinstance(node, list):
             for i, v in enumerate(node):
@@ -902,7 +902,7 @@ class RubyMarshalFormat(_Format):
         return node
 
     def _child_at(self, node, step):
-        from core.rubymarshal import RHash, RObject, RStructVal, RUserMarshal
+        from core.engines.rubymarshal import RHash, RObject, RStructVal, RUserMarshal
         kind, idx = step
         if kind == "i":
             return node[idx]
@@ -914,7 +914,7 @@ class RubyMarshalFormat(_Format):
         return node.value
 
     def _set_child(self, node, step, value):
-        from core.rubymarshal import RHash, RObject, RStructVal
+        from core.engines.rubymarshal import RHash, RObject, RStructVal
         kind, idx = step
         if kind == "i":
             node[idx] = value
@@ -929,7 +929,7 @@ class RubyMarshalFormat(_Format):
             node.value = value
 
     def fields(self) -> list:
-        from core.rubymarshal import RFloat, RString
+        from core.engines.rubymarshal import RFloat, RString
 
         out, seen = [], set()
 
@@ -973,11 +973,11 @@ class RubyMarshalFormat(_Format):
         without the class name switch 12 and variable 12 are the same label,
         which makes them impossible to tell apart and impossible to hold.
         """
-        from core.rubymarshal import RObject
+        from core.engines.rubymarshal import RObject
         return stream.cls if isinstance(stream, RObject) else str(index)
 
     def set_field(self, path: tuple, value) -> None:
-        from core.rubymarshal import RFloat, RString
+        from core.engines.rubymarshal import RFloat, RString
 
         parent = self._get_parent(path)
         current = self._child_at(parent, path[-1])
@@ -996,7 +996,7 @@ class RubyMarshalFormat(_Format):
 
 
 def _key_label(key, index: int) -> str:
-    from core.rubymarshal import RString
+    from core.engines.rubymarshal import RString
     if isinstance(key, RString):
         return key.text()
     if isinstance(key, (str, int)):
@@ -1019,7 +1019,7 @@ class GvasFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.gvas import GvasError, loads
+        from core.engines.gvas import GvasError, loads
         try:
             self._save = loads(data)
         except GvasError as e:
@@ -1035,7 +1035,7 @@ class GvasFormat(_Format):
                 for n, (i, _name, kind, value) in enumerate(rows)]
 
     def set_field(self, path: tuple, value) -> None:
-        from core.gvas import GvasError
+        from core.engines.gvas import GvasError
         try:
             self._save.set_value(path[0], value)
         except GvasError as e:
@@ -1082,8 +1082,8 @@ class UnrealEncryptedFormat(GvasFormat):
         In that order, because that is the order of what they cost — the
         first two are instant and the third reads the game's compiled code.
         """
-        from core.game_keys import key_from_file, stored_key
-        from core.unreal_crypt import KEY_FILE, decrypt, find_key, game_binaries
+        from core.save_editor.game_keys import key_from_file, stored_key
+        from core.save_editor.unreal_crypt import KEY_FILE, decrypt, find_key, game_binaries
         places = self._places()
         for place in places:
             for candidate in (stored_key("unreal", place),
@@ -1122,7 +1122,7 @@ class UnrealEncryptedFormat(GvasFormat):
         return self.progress(time.monotonic() - self._started) is not False
 
     def load(self, data: bytes) -> None:
-        from core.game_keys import store_key
+        from core.save_editor.game_keys import store_key
         plain, key, how, place = self._find_key(data)
         if not plain:
             raise SaveEditorError(
@@ -1134,7 +1134,7 @@ class UnrealEncryptedFormat(GvasFormat):
             store_key("unreal", place, key)
 
     def dump(self) -> bytes:
-        from core.unreal_crypt import encrypt
+        from core.save_editor.unreal_crypt import encrypt
         return encrypt(super().dump(), self._key, self._how)
 
 
@@ -1165,14 +1165,14 @@ class RenpyFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.renpy_save import loads, RenpyError
+        from core.engines.renpy_save import loads, RenpyError
         try:
             self._save = loads(data)
         except RenpyError as e:
             raise SaveEditorError(str(e)) from e
 
     def dump(self) -> bytes:
-        from core.renpy_save import RenpyError
+        from core.engines.renpy_save import RenpyError
         try:
             return self._save.dump()
         except RenpyError as e:
@@ -1198,7 +1198,7 @@ class LcfFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.lcf import LcfError, loads
+        from core.engines.lcf import LcfError, loads
         try:
             self._save = loads(data)
         except LcfError as e:
@@ -1213,7 +1213,7 @@ class LcfFormat(_Format):
                 for i, name, kind, value in self._save.values()]
 
     def set_field(self, path: tuple, value) -> None:
-        from core.lcf import LcfError
+        from core.engines.lcf import LcfError
         try:
             self._save.set_value(path[0], value)
         except LcfError as e:
@@ -1233,7 +1233,7 @@ class SolFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.sol import loads, SolError
+        from core.engines.sol import loads, SolError
         try:
             self._save = loads(data)
         except SolError as e:
@@ -1263,7 +1263,7 @@ class QspFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.qsp import loads, QspError
+        from core.engines.qsp import loads, QspError
         try:
             self._save = loads(data)
         except QspError as e:
@@ -1305,7 +1305,7 @@ class Es3Format(JsonFormat):
         self._password = ""
 
     def load(self, data: bytes) -> None:
-        from core.es3 import Es3Error, decrypt, find_password, is_encrypted
+        from core.save_editor.es3 import Es3Error, decrypt, find_password, is_encrypted
         if not is_encrypted(data):
             # Encryption is optional, and most games leave it off.
             return super().load(data)
@@ -1323,7 +1323,7 @@ class Es3Format(JsonFormat):
             raise SaveEditorError(str(e)) from e
 
     def dump(self) -> bytes:
-        from core.es3 import dumps, encrypt
+        from core.save_editor.es3 import dumps, encrypt
         # Easy Save's own layout, not the compact one: a save that was opened
         # and left alone then comes back out as the identical file.
         plain = dumps(self.data)
@@ -1358,7 +1358,7 @@ class RagsFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.rags import RagsError, loads
+        from core.engines.rags import RagsError, loads
         try:
             self._save = loads(data)
         except RagsError as e:
@@ -1373,7 +1373,7 @@ class RagsFormat(_Format):
                 for i, name, kind, value in self._save.values()]
 
     def set_field(self, path: tuple, value) -> None:
-        from core.rags import RagsError
+        from core.engines.rags import RagsError
         try:
             self._save.set_value(path[0], value)
         except RagsError as e:
@@ -1395,7 +1395,7 @@ class KirikiriFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.kirikiri import KirikiriError, loads
+        from core.engines.kirikiri import KirikiriError, loads
         try:
             self._save = loads(data)
         except KirikiriError as e:
@@ -1430,8 +1430,8 @@ class WolfFormat(_Format):
 
     def load(self, data: bytes) -> None:
         import struct
-        from core.wolf import WolfError
-        from core.wolf_save import loads
+        from core.engines.wolf import WolfError
+        from core.save_editor.wolf_save import loads
         try:
             self._save = loads(data, save_path=self.source_path)
         except (WolfError, struct.error, IndexError, ValueError) as e:
@@ -1467,7 +1467,7 @@ class AliceSoftFormat(_Format):
         self.game_dir = None
 
     def load(self, data: bytes) -> None:
-        from core.alicesoft import AliceSoftError, loads
+        from core.engines.alicesoft import AliceSoftError, loads
         try:
             self._save = loads(data, game_dir=self.game_dir)
         except AliceSoftError as e:
@@ -1482,7 +1482,7 @@ class AliceSoftFormat(_Format):
                 for i, name, kind, value in self._save.values()]
 
     def set_field(self, path: tuple, value) -> None:
-        from core.alicesoft import AliceSoftError
+        from core.engines.alicesoft import AliceSoftError
         try:
             self._save.set_value(path[0], value)
         except AliceSoftError as e:
@@ -1502,7 +1502,7 @@ class ArtemisFormat(_Format):
         self._save = None
 
     def load(self, data: bytes) -> None:
-        from core.artemis import ArtemisError, loads
+        from core.engines.artemis import ArtemisError, loads
         try:
             self._save = loads(data)
         except ArtemisError as e:
@@ -1517,7 +1517,7 @@ class ArtemisFormat(_Format):
                 for i, name, kind, value in self._save.values()]
 
     def set_field(self, path: tuple, value) -> None:
-        from core.artemis import ArtemisError
+        from core.engines.artemis import ArtemisError
         try:
             self._save.set_value(path[0], value)
         except ArtemisError as e:
@@ -1547,7 +1547,7 @@ class TyranoFormat(JsonFormat):
     verify_exact = False
 
     def load(self, data: bytes) -> None:
-        from core.tyrano import TyranoError, loads
+        from core.engines.tyrano import TyranoError, loads
         try:
             self.data = loads(data)
         except TyranoError as e:
@@ -1556,15 +1556,15 @@ class TyranoFormat(JsonFormat):
             raise SaveEditorError("no game values in this TyranoScript save")
 
     def dump(self) -> bytes:
-        from core.tyrano import dumps
+        from core.engines.tyrano import dumps
         return dumps(self.data)
 
     def _roots(self) -> list:
-        from core.tyrano import state_roots
+        from core.engines.tyrano import state_roots
         return state_roots(self.data)
 
     def fields(self) -> list:
-        from core.tyrano import at
+        from core.engines.tyrano import at
         roots = self._roots()
         out = []
         for path, group in roots:
@@ -1627,7 +1627,7 @@ def _in_unreal_save_folder(path: Path) -> bool:
 
 def _looks_encrypted_unreal(data: bytes) -> bool:
     try:
-        from core.unreal_crypt import looks_encrypted
+        from core.save_editor.unreal_crypt import looks_encrypted
         return looks_encrypted(data)
     except Exception:
         return False
@@ -1662,7 +1662,7 @@ def _candidates(path: Path, data: bytes) -> list:
     # Wolf hides behind obfuscation, so only unlocking it can tell.
     if ext == ".sav" and len(data) > 0x20:
         try:
-            from core.wolf import is_wolf_save
+            from core.engines.wolf import is_wolf_save
             if is_wolf_save(data):
                 out.append(WolfFormat)
         except Exception:
@@ -1950,7 +1950,7 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
     # saying so is the difference between a file nobody can identify and one
     # that only needs its key.
     if _in_unreal_save_folder(p) and _looks_encrypted_unreal(data):
-        from core.unreal_crypt import KEY_FILE
+        from core.save_editor.unreal_crypt import KEY_FILE
         reason = (f"the game encrypted it with a key of its own, and none was "
                   f"found — put the key in a {KEY_FILE} file beside the save")
         if not game_dir:
@@ -2034,7 +2034,7 @@ def _engine_that_encrypts(path: Path, game_dir=None) -> tuple:
     into something the player can act on — add the game, and the executable
     comes with it.
     """
-    from core.game_engine import detect_engine, label
+    from core.engines.game_engine import detect_engine, label
     if game_dir:
         engine = detect_engine(game_dir=str(game_dir))
         if engine in _ENCRYPTING_ENGINES:

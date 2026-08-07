@@ -29,7 +29,7 @@ import struct
 from collections import Counter
 from pathlib import Path
 
-from core.wolf import WolfError, decrypt, encrypt, fix_checksum, START_OFFSET
+from core.engines.wolf import WolfError, decrypt, encrypt, fix_checksum, START_OFFSET
 
 logger = logging.getLogger(__name__)
 

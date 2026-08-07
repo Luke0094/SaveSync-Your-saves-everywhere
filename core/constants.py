@@ -8,7 +8,7 @@ import platform
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 APP_ID = "com.savesync.app"
 
 # Paths — platform-aware data directory

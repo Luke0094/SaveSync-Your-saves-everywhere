@@ -322,7 +322,7 @@ def correlated_engine_paths(exe_path: str, known_paths: list[str],
     *window_s* defaults to the configured save_correlation_window_ms; an
     explicit value still wins, so a caller can correlate on its own terms.
     """
-    from core.game_engine import detect_engine
+    from core.engines.game_engine import detect_engine
     # Decides whether ".dat" counts as content here — see
     # _selectable_skip_sets.
     _engine = detect_engine(exe_path=exe_path) if exe_path else ""
@@ -416,7 +416,7 @@ def _engine_allows_skipped_path(path_str: str, exe_path: str) -> bool:
     if not exe_path:
         return False
     try:
-        from core.game_engine import detect_engine, saves_in_skipped_dir
+        from core.engines.game_engine import detect_engine, saves_in_skipped_dir
         return saves_in_skipped_dir(detect_engine(exe_path=exe_path), path_str)
     except (OSError, ValueError):
         return False
@@ -619,7 +619,7 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
     # the score any .sav beside an executable gets. These are not any .sav —
     # the name is the engine's own convention — so they are worth saying so
     # about.
-    from core.game_engine import TYRANO, detect_engine as _detect
+    from core.engines.game_engine import TYRANO, detect_engine as _detect
     engine_here = _detect(exe_path=exe_path)
     if engine_here == TYRANO:
         try:
@@ -1691,7 +1691,7 @@ def detect_save_paths(
     # any folder it thinks holds nothing — so a game whose saves are all
     # ".dat" (Artemis, Unity, Godot, GameMaker) needs it or it ends with no
     # save path at all.
-    from core.game_engine import detect_engine as _detect_engine
+    from core.engines.game_engine import detect_engine as _detect_engine
     game_engine = _detect_engine(exe_path=exe_path) if exe_path else ""
 
     # Build ranked search terms: display name, exe stem (CamelCase-split),
@@ -2062,7 +2062,7 @@ def _selectable_skip_sets(include_detection_excluded: bool = True,
     be added by hand, while noise proposed as a save cannot be un-seen.
     """
     from core.backup import _BACKUP_SKIP_EXTENSIONS, _BACKUP_SKIP_DIRS
-    from core.game_engine import detection_skip_extensions
+    from core.engines.game_engine import detection_skip_extensions
     exts = set(_BACKUP_SKIP_EXTENSIONS)
     if include_detection_excluded:
         exts |= detection_skip_extensions(engine)
@@ -2376,7 +2376,7 @@ def general_scan_paths(game_name: str, exe_path: str, hints: list[str],
     combined set.
     """
     import time as _time
-    from core.game_engine import detect_engine
+    from core.engines.game_engine import detect_engine
     start = _time.time()
     # Read once per scan: the engine decides whether ".dat" is a save here.
     _engine = detect_engine(exe_path=exe_path) if exe_path else ""

@@ -20,6 +20,11 @@ _DEFAULTS: dict[str, Any] = {
     "launch_on_startup": False,
     "minimize_to_tray": True,
     "show_overlay_on_launch": True,
+    # Popup + hotkey queue when an unknown process looks like a game.
+    # Separate from the tracked-game launch toast. Off: no live popup, no
+    # history queue, no badge — but the hotkey on the focused unknown
+    # process still offers a quick add (session _pending_unknown).
+    "show_overlay_on_unknown": True,
     "show_overlay_on_cloud": True,
     "show_overlay_on_backup": True,
     "overlay_hotkey": "alt+ctrl+s",
@@ -95,11 +100,16 @@ _DEFAULTS: dict[str, Any] = {
     "library_sort_direction": "",           # "asc"/"desc" — empty = use criterion's natural default
     "library_folders": [],                  # [{name: str, color: str}, ...] user-defined folders
     # Unknown-game detections history — its OWN list, deliberately separate
-    # from the backup/sync notification flow: recallable at any moment via
-    # the overlay hotkey (queue-first routing while non-empty) so a game
-    # flagged while another program held the screen is never lost.
-    # [{name, exe, ts}, ...] newest first.
+    # from the backup/sync notification flow. Written only while
+    # show_overlay_on_unknown is on; the hotkey opens this queue first when
+    # non-empty. [{name, exe, ts}, ...] newest first.
     "unknown_game_history": [],
+    # How many items each paginated list shows: {scope: int} (see
+    # ui.widgets.page_size). Its companion holds the scope of a render that
+    # was in progress when the app went down, which is how a page size too
+    # big for the machine is undone instead of crashing on sight every time.
+    "page_sizes": {},
+    "page_size_render_guard": {},
 }
 
 # Configuration validation rules
@@ -134,11 +144,15 @@ _VALIDATION_RULES: dict[str, Callable] = {
         and all(isinstance(n, int) for n in v) for v in x.values()),
     "overlay_hotkey": lambda x: isinstance(x, str) and len(x.strip()) > 0,
     "unknown_game_history": lambda x: isinstance(x, list),
+    "page_sizes": lambda x: isinstance(x, dict) and all(
+        isinstance(v, int) and 1 <= v <= 500 for v in x.values()),
+    "page_size_render_guard": lambda x: isinstance(x, dict),
     "language": lambda x: isinstance(x, str) and x in ["en", "it"],
     "theme": lambda x: isinstance(x, str) and x in ["dark", "light"],
     "launch_on_startup": lambda x: isinstance(x, bool),
     "minimize_to_tray": lambda x: isinstance(x, bool),
     "show_overlay_on_launch": lambda x: isinstance(x, bool),
+    "show_overlay_on_unknown": lambda x: isinstance(x, bool),
     "show_overlay_on_cloud": lambda x: isinstance(x, bool),
     "show_overlay_on_backup": lambda x: isinstance(x, bool),
     "auto_sync_after_backup": lambda x: isinstance(x, bool),

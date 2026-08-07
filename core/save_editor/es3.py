@@ -250,7 +250,7 @@ def _bundle_files(game_dir: Path):
 
 def _bundle_candidates(path: Path, on_tick=None) -> list:
     """Strings from Easy Save's settings inside a squeezed archive."""
-    from core.unityfs import SIGNATURE, UnityFsError, unpack
+    from core.save_editor.unityfs import SIGNATURE, UnityFsError, unpack
     try:
         raw = path.read_bytes()
     except OSError:
@@ -270,13 +270,13 @@ def _bundle_candidates(path: Path, on_tick=None) -> list:
 
 def stored_key(place) -> str:
     """The password remembered for this game, or an empty string."""
-    from core.game_keys import stored_key as _stored
+    from core.save_editor.game_keys import stored_key as _stored
     return _stored(_KIND, place)
 
 
 def _store_key(place, password: str) -> None:
     """Remember *password* as this game's, so it is never hunted for twice."""
-    from core.game_keys import store_key
+    from core.save_editor.game_keys import store_key
     store_key(_KIND, place, password)
 
 
