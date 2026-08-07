@@ -17,10 +17,16 @@ cause, and an fsync per page change is not worth paying for them.
 import logging
 from contextlib import contextmanager
 
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QComboBox, QInputDialog
 
 from core.config_manager import get_config
 from i18n import t
+
+# Closed width: enough for a 3-digit size + arrow. The popup is sized
+# separately so "Personalizzato…" / "Custom…" is never clipped there.
+# Global QComboBox QSS uses min-width:120px — overridden via #page_size_combo.
+_COMBO_WIDTH = 52
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +131,12 @@ class PageSizeCombo(QComboBox):
         super().__init__(parent)
         self._scope = scope
         self._on_change = on_change
+        self.setObjectName("page_size_combo")
         self.setFixedHeight(26)
-        # Wide enough for "Personalizzato…" / "Custom…" plus the drop arrow;
-        # AdjustToContents alone still clipped the label on Windows.
-        self.setMinimumWidth(130)
+        self.setFixedWidth(_COMBO_WIDTH)
         self.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToContents)
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(2)
         self.setToolTip(t("common.per_page_tooltip"))
         self._reload_items()
         self.activated.connect(self._on_activated)
@@ -150,6 +156,16 @@ class PageSizeCombo(QComboBox):
         self.setCurrentIndex(idx if idx >= 0 else PAGE_SIZE_PRESETS.index(
             PAGE_SIZE_DEFAULT))
         self.blockSignals(False)
+        self._fit_popup()
+
+    def _fit_popup(self):
+        """Popup wider than the compact closed box so custom labels fit."""
+        fm = QFontMetrics(self.font())
+        widest = max(
+            (fm.horizontalAdvance(self.itemText(i))
+             for i in range(self.count())),
+            default=0)
+        self.view().setMinimumWidth(max(_COMBO_WIDTH, widest + 28))
 
     def _on_activated(self, index: int):
         data = self.itemData(index)

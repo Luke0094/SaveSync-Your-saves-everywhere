@@ -401,13 +401,19 @@ class BackupsPage(QWidget, ThemedMixin):
 
         # Caduceus next to the page title — a check on the archives that
         # title names, not another action beside "Backup now". Progress and
-        # outcome live in the tooltip; the per-backup dots update as it runs.
+        # outcome sit in the label beside it; the per-backup dots update too.
         self._verify_btn = QPushButton("⚕️")
         self._verify_btn.setObjectName("toolbar_icon_btn")
         self._verify_btn.setFixedSize(30, 30)
         self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
         self._verify_btn.clicked.connect(self._on_verify_all)
         header_row.addWidget(self._verify_btn)
+        self._verify_status_tone = "text_hint"
+        self._verify_status = QLabel("")
+        self._verify_status.setVisible(False)
+        self._sty(self._verify_status, lambda: (
+            f"color:{palette(self._verify_status_tone)};font-size:12px;"))
+        header_row.addWidget(self._verify_status)
         header_row.addStretch()
 
         # Add save folders that have no executable behind them — the only way
@@ -1249,13 +1255,25 @@ class BackupsPage(QWidget, ThemedMixin):
         self._refresh_list()
 
 
+    def _set_verify_status(self, text: str, tone: str = "text_hint"):
+        """Show (or clear) the in-header verify progress/result label."""
+        self._verify_status_tone = tone
+        if not text:
+            self._verify_status.clear()
+            self._verify_status.setVisible(False)
+            return
+        self._verify_status.setText(text)
+        self._verify_status.setVisible(True)
+        self._verify_status.setStyleSheet(
+            f"color:{palette(self._verify_status_tone)};font-size:12px;")
+
     def _on_verify_all(self):
         """Check every backup currently listed, on a worker thread.
 
         Threaded rather than inline: opening each archive and CRC-checking
         every member is I/O bound and a game with many large backups would
-        otherwise freeze the window for seconds. The dots update as results
-        arrive, so progress is visible without a separate progress bar.
+        otherwise freeze the window for seconds. Progress is shown next to
+        the health button; the per-backup dots update as results arrive.
         """
         from core.backup import get_backup_manager
         mgr = get_backup_manager()
@@ -1264,16 +1282,22 @@ class BackupsPage(QWidget, ThemedMixin):
         ids = [b.backup_id for b in entries]
         if not ids:
             return
+        names = {
+            b.backup_id: (b.game_name or "").strip()
+            for b in entries
+        }
 
-        from PySide6.QtCore import QThread, Signal, QObject
+        from PySide6.QtCore import QThread, Signal
 
         class _VerifyWorker(QThread):
+            progress = Signal(int, str)      # 1-based index, backup_id in hand
             one = Signal(str, str, str)      # backup_id, state, detail
             done = Signal(int, int)          # bad, total
 
             def run(self):
                 bad = 0
                 for i, bid in enumerate(ids, 1):
+                    self.progress.emit(i, bid)
                     try:
                         state, detail = mgr.verify_backup(bid, deep=False)
                     except Exception as e:
@@ -1284,12 +1308,27 @@ class BackupsPage(QWidget, ThemedMixin):
                 self.done.emit(bad, len(ids))
 
         self._verify_btn.setEnabled(False)
+        total = len(ids)
+        first = ids[0]
+        start_msg = (
+            t("backups.verify_running_named", done=1, total=total,
+              name=names[first])
+            if names.get(first) else
+            t("backups.verify_running", done=1, total=total))
+        self._set_verify_status(start_msg)
+        self._verify_btn.setToolTip(start_msg)
         self._verify_worker = _VerifyWorker(self)
 
+        def _on_progress(done: int, bid: str):
+            name = names.get(bid, "")
+            msg = (t("backups.verify_running_named",
+                     done=done, total=total, name=name)
+                   if name else
+                   t("backups.verify_running", done=done, total=total))
+            self._set_verify_status(msg)
+            self._verify_btn.setToolTip(msg)
+
         def _on_one(bid, state, detail):
-            self._verify_btn.setToolTip(t("backups.verify_running",
-                                         done=_seen["n"], total=len(ids)))
-            _seen["n"] += 1
             from datetime import datetime
             _at = datetime.utcnow().isoformat()
             # Remember the outcome for rows that DON'T exist yet: a collapsed
@@ -1309,14 +1348,17 @@ class BackupsPage(QWidget, ThemedMixin):
                 except RuntimeError:
                     pass      # row already gone (list rebuilt mid-run)
 
-        def _on_done(bad, total):
+        def _on_done(bad, total_done):
             self._verify_btn.setEnabled(True)
-            msg = (t("backups.verify_result_all_ok", total=total) if not bad
-                   else t("backups.verify_result_bad", bad=bad, total=total))
-            self._verify_btn.setToolTip(msg + "\n" + t("backups.verify_all_tooltip"))
+            msg = (t("backups.verify_result_all_ok", total=total_done) if not bad
+                   else t("backups.verify_result_bad", bad=bad, total=total_done))
+            self._set_verify_status(
+                msg, tone="success" if not bad else "error")
+            self._verify_btn.setToolTip(
+                msg + "\n" + t("backups.verify_all_tooltip"))
             logger.info(f"Backup verification: {msg}")
 
-        _seen = {"n": 1}
+        self._verify_worker.progress.connect(_on_progress)
         self._verify_worker.one.connect(_on_one)
         self._verify_worker.done.connect(_on_done)
         self._verify_worker.start()
@@ -1824,10 +1866,15 @@ class BackupsPage(QWidget, ThemedMixin):
             self._open_folder_btn.setText(t("buttons.open_folder"))
             self._open_folder_btn.setToolTip(t("tooltips.open_save_folder"))
         if _safe(self._verify_btn):
-            # Icon-only: the label is the emoji, so only the tooltip carries
-            # language. Retranslating it would wipe the last check's outcome,
-            # which is fine — it is stale the moment the language changes.
-            self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
+            # Icon-only: the label is the emoji. While a check is running the
+            # status text next to it is live; otherwise reset the tooltip.
+            if self._verify_btn.isEnabled():
+                self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
+        if _safe(self._verify_status) and self._verify_btn.isEnabled():
+            # A finished result was in the old language — clear rather than
+            # guess which key it came from.
+            if self._verify_status.isVisible():
+                self._set_verify_status("")
         if _safe(self._backup_now_btn):
             self._backup_now_btn.setText(t("buttons.backup_now"))
         if _safe(self._empty_lbl):

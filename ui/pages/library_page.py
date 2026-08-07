@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QFrame, QComboBox, QToolButton,
+    QSizePolicy,
 )
 
 from core.library import GameEntry, get_library
@@ -101,7 +102,10 @@ def build_pager(current: int, total: int, on_page,
         b = QPushButton(text)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.setFixedHeight(26)
-        b.setMinimumWidth(30)
+        # Fixed width from the glyph — Preferred + a 30px floor let the
+        # page-size combo squeeze two-digit numbers when space was tight.
+        b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        b.setFixedWidth(max(30, b.fontMetrics().horizontalAdvance(text) + 20))
         if tooltip:
             b.setToolTip(tooltip)
         _style_pager_btn(b, active)

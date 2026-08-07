@@ -260,6 +260,21 @@ QComboBox QAbstractItemView {
     border-radius: 6px;
 }
 
+/* Compact page-size control on pager rows — closed box shows a number;
+   the popup is widened in code so "Personalizzato…" / "Custom…" fits. */
+QComboBox#page_size_combo {
+    padding: 2px 18px 2px 6px;
+    min-width: 0px;
+    max-width: 52px;
+    border-radius: 4px;
+}
+QComboBox#page_size_combo::drop-down {
+    width: 16px;
+}
+QComboBox#page_size_combo::down-arrow {
+    margin-right: 4px;
+}
+
 /* ── Sliders & Spinboxes ──────────────────────────────────────────── */
 QSpinBox {
     background-color: #111114;
@@ -1418,6 +1433,20 @@ QComboBox QAbstractItemView {
     selection-background-color: #5a9400;
     selection-color: #ffffff;
     border-radius: 6px;
+}
+
+/* Compact page-size control — mirror of DARK_THEME. */
+QComboBox#page_size_combo {
+    padding: 2px 18px 2px 6px;
+    min-width: 0px;
+    max-width: 52px;
+    border-radius: 4px;
+}
+QComboBox#page_size_combo::drop-down {
+    width: 16px;
+}
+QComboBox#page_size_combo::down-arrow {
+    margin-right: 4px;
 }
 
 /* ── Sliders & Spinboxes ──────────────────────────────────────────── */

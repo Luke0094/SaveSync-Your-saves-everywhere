@@ -18,8 +18,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QScrollArea, QSpinBox, QStackedWidget,
-                               QVBoxLayout, QWidget)
+                               QScrollArea, QSizePolicy, QSpinBox,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from core.library import get_library
 from core.save_editor import (SaveEditorError, describe, explain,
@@ -507,6 +507,9 @@ class CheatsPage(QWidget, ThemedMixin):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
         lbl = QLabel("")
         lbl.setObjectName("cheats_page_lbl")
+        # Keep "pagina n di m · …" readable — without Minimum the page-size
+        # combo used to compress this label until the numbers clipped.
+        lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         bar.addStretch(1)
         bar.addWidget(prev)
         bar.addWidget(lbl)
