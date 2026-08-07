@@ -635,6 +635,7 @@
     "verify_all": "Check backups",
     "verify_all_tooltip": "Check backups: open every backup of this game and confirm it is still readable and complete.",
     "verify_running": "Checking {done}/{total}…",
+    "verify_running_named": "Checking {done}/{total}: {name}…",
     "verify_result_all_ok": "All {total} backups intact",
     "verify_result_bad": "{bad} of {total} backups have a problem"
   },

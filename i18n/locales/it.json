@@ -640,6 +640,7 @@
     "verify_all": "Verifica backup",
     "verify_all_tooltip": "Verifica backup: apre ogni backup di questo gioco e conferma che sia ancora leggibile e completo.",
     "verify_running": "Verifica {done}/{total}…",
+    "verify_running_named": "Verifica {done}/{total}: {name}…",
     "verify_result_all_ok": "Tutti i {total} backup sono integri",
     "verify_result_bad": "{bad} backup su {total} hanno un problema"
   },
