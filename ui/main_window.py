@@ -1397,6 +1397,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # one actually in the FOREGROUND (the game the user is looking at) over
         # an arbitrary dict-order entry — otherwise a stale unknown-game
         # notification that merely arrived later would hijack the prompt.
+        # This path stays alive even when show_overlay_on_unknown is off: that
+        # setting silences the live popup and the history queue, not the
+        # deliberate "add what I'm looking at" hotkey.
         config = get_config()
         running_unknown = [
             (name, exe) for exe, name in self._pending_unknown.items()
@@ -1408,12 +1411,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
 
         # Out of game with PENDING unknown-game detections: the same hotkey
-        # serves the queue first — shown as a browsable overlay notification
-        # (ui/unknown_history.py keeps the persisted list; the old dedicated
-        # panel is gone). Once the list is emptied it opens the manual
-        # overlay again. In game, the overlay branches above keep priority.
+        # serves the queue first — but ONLY while the unknown-process feature
+        # is on. With it off, dredging up every silenced detection would be
+        # the opposite of what the user asked for.
         from ui.unknown_history import pending_unknown_count
-        if not get_monitor().currently_playing() and pending_unknown_count() > 0:
+        if (config.get("show_overlay_on_unknown", True)
+                and not get_monitor().currently_playing()
+                and pending_unknown_count() > 0):
             self._overlay.show_unknown_queue()
             return
 
@@ -2406,19 +2410,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         config = get_config()
         if exe_path in config.get("suppressed_overlay_apps", []):
             return
-        # Persist EVERY detection in the recallable history (own list, not
-        # the backup/sync notifications) BEFORE any show-guard: even when
-        # the live notification is disabled or already shown this session,
-        # the detection must never be lost (ui/unknown_history.py).
+        # Session map first: even with the live popup off, the hotkey must
+        # still be able to offer "add this" for the unknown process in the
+        # foreground. The persisted queue is a separate concern.
+        self._pending_unknown[exe_path] = name
+        if not config.get("show_overlay_on_unknown", True):
+            return
+        # History + badge only while the feature is on — with it off the
+        # hotkey must not resurface a queue of silenced detections.
         from ui.unknown_history import record_unknown_game
         record_unknown_game(name, exe_path)
         if self._overlay and self._overlay.isVisible():
             self._overlay.refresh_unknown_badge()
         if exe_path in self._session_shown_exes:
-            return
-
-        self._pending_unknown[exe_path] = name
-        if not config.get("show_overlay_on_launch", True):
             return
         self._session_shown_exes.add(exe_path)
         self._overlay_shown_exes.add(exe_path)

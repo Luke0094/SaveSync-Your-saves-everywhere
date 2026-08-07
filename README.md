@@ -169,27 +169,29 @@ savesync/
 │   ├── monitor.py                 # Process monitor (cached snapshots, adaptive polling)
 │   ├── watcher.py                 # Real-time filesystem watcher, debounced events
 │   ├── save_detector.py           # Heuristic save folder detection and scoring
-│   ├── game_engine.py             # Which engine a game was built with
-│   ├── save_editor.py             # Reads/writes save files, keeps the original
-│   ├── save_hold.py               # Holds chosen values against the game
-│   ├── lzstring.py                # LZString codec (RPG Maker MV/MZ saves)
-│   ├── rubymarshal.py             # Ruby Marshal 4.8 (RPG Maker XP/VX/VX Ace)
-│   ├── gvas.py                    # Unreal Engine .sav (GVAS)
-│   ├── renpy_save.py              # Ren'Py .save (pickle, read never run)
-│   ├── lcf.py                     # RPG Maker 2000/2003 .lsd (LCF chunks)
-│   ├── sol.py                     # Flash shared objects (.sol, AMF0/AMF3)
-│   ├── qsp.py                     # QSP saves (line-based, obfuscated)
-│   ├── wolf.py                    # Wolf RPG obfuscation and checksum
-│   ├── wolf_save.py               # Wolf RPG values, named from the game's database
-│   ├── kirikiri.py                # KiriKiri .ksd (TJS dictionary in UTF-16)
-│   ├── tyrano.py                  # TyranoScript .sav (JSON behind JS escape())
-│   ├── alicesoft.py               # AliceSoft System 4 globals and slots (GSAVE/RSAVE)
-│   ├── artemis.py                 # Artemis Engine settings (BOWX container)
-│   ├── unityfs.py                 # Unity asset bundles, unpacked to search
-│   ├── unreal_crypt.py            # Unreal saves a game locked with its own key
-│   ├── game_keys.py               # Those keys, remembered per game
-│   ├── es3.py                     # Unity Easy Save 3, including encrypted
-│   ├── rags.py                    # RAGS .rsv (.NET objects behind fixed AES)
+│   ├── engines/                   # Engine recognition + save format readers
+│   │   ├── game_engine.py         # Which engine a game was built with
+│   │   ├── gvas.py                # Unreal Engine .sav (GVAS)
+│   │   ├── renpy_save.py          # Ren'Py .save (pickle, read never run)
+│   │   ├── lcf.py                 # RPG Maker 2000/2003 .lsd (LCF chunks)
+│   │   ├── lzstring.py            # LZString codec (RPG Maker MV/MZ)
+│   │   ├── rubymarshal.py         # Ruby Marshal 4.8 (XP/VX/VX Ace)
+│   │   ├── sol.py                 # Flash shared objects (.sol, AMF0/AMF3)
+│   │   ├── qsp.py                 # QSP saves (line-based, obfuscated)
+│   │   ├── kirikiri.py            # KiriKiri .ksd (TJS dictionary in UTF-16)
+│   │   ├── tyrano.py              # TyranoScript .sav (JSON behind JS escape())
+│   │   ├── alicesoft.py           # AliceSoft System 4 globals and slots
+│   │   ├── artemis.py             # Artemis Engine settings (BOWX container)
+│   │   ├── rags.py                # RAGS .rsv (.NET objects behind fixed AES)
+│   │   └── wolf.py                # Wolf RPG obfuscation and checksum
+│   ├── save_editor/               # Save-file editor + editor-only crypto tools
+│   │   ├── save_editor.py         # Reads/writes saves, keeps the original
+│   │   ├── save_hold.py           # Holds chosen values against the game
+│   │   ├── unreal_crypt.py        # Unreal saves locked with the game's own key
+│   │   ├── es3.py                 # Unity Easy Save 3, including encrypted
+│   │   ├── game_keys.py           # Remembered decrypt keys, per game
+│   │   ├── unityfs.py             # Unity asset bundles, unpacked to find keys
+│   │   └── wolf_save.py           # Wolf RPG values, named from the game DB
 │   ├── manual_paths.py            # Hand-registered save folders, single or in bulk
 │   ├── registry_saves.py          # Windows-registry save locations
 │   ├── skip_dirs.py               # Shared skip-list of noise directories

@@ -367,6 +367,11 @@ class BackupsPage(QWidget, ThemedMixin):
         # ThemedMixin registry via self._sty; each BackupRow owns a SEPARATE
         # registry, so live rows are cascaded explicitly in refresh_styles().
         self._backup_rows: list = []
+        # backup_id → (state, detail, when) from the last check run, for rows
+        # that were not on screen when it happened (collapsed titles build
+        # their rows only when opened). Cleared on every _refresh_list, where
+        # the entries are re-read from the index and already carry it.
+        self._verify_fresh: dict[str, tuple] = {}
         # Cache for _load_games(): game_ids that have cloud-only backups
         # (not yet downloaded locally), keyed to the "provider_only" filter.
         # None = not yet computed for this filter activation; invalidated
@@ -393,6 +398,16 @@ class BackupsPage(QWidget, ThemedMixin):
         self._header = QLabel(t("backup.title"))
         self._header.setObjectName("page_header")
         header_row.addWidget(self._header)
+
+        # Caduceus next to the page title — a check on the archives that
+        # title names, not another action beside "Backup now". Progress and
+        # outcome live in the tooltip; the per-backup dots update as it runs.
+        self._verify_btn = QPushButton("⚕️")
+        self._verify_btn.setObjectName("toolbar_icon_btn")
+        self._verify_btn.setFixedSize(30, 30)
+        self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
+        self._verify_btn.clicked.connect(self._on_verify_all)
+        header_row.addWidget(self._verify_btn)
         header_row.addStretch()
 
         # Add save folders that have no executable behind them — the only way
@@ -408,12 +423,6 @@ class BackupsPage(QWidget, ThemedMixin):
         self._add_paths_btn.setToolTip(t("manual_path.button_tooltip"))
         self._add_paths_btn.clicked.connect(self._on_add_manual_paths)
         header_row.addWidget(self._add_paths_btn)
-
-        self._verify_btn = QPushButton(t("backups.verify_all"))
-        self._verify_btn.setFixedHeight(30)
-        self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
-        self._verify_btn.clicked.connect(self._on_verify_all)
-        header_row.addWidget(self._verify_btn)
 
         self._open_folder_btn = QPushButton(t("buttons.open_folder"))
         self._open_folder_btn.setFixedHeight(30)
@@ -503,6 +512,11 @@ class BackupsPage(QWidget, ThemedMixin):
         self._sty(self._summary_lbl, lambda: f"color:{palette('text_hint')};font-size:11px;")
         sel_row.addWidget(self._summary_lbl)
         root.addLayout(sel_row)
+
+        # Lives on the (top) pager row with the page numbers — see _refresh_list.
+        from ui.widgets.page_size import PageSizeCombo, SCOPE_BACKUPS
+        self._page_size_combo = PageSizeCombo(
+            SCOPE_BACKUPS, self._on_page_size_changed)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1273,16 +1287,23 @@ class BackupsPage(QWidget, ThemedMixin):
         self._verify_worker = _VerifyWorker(self)
 
         def _on_one(bid, state, detail):
-            self._verify_btn.setText(t("backups.verify_running",
-                                       done=_seen["n"], total=len(ids)))
+            self._verify_btn.setToolTip(t("backups.verify_running",
+                                         done=_seen["n"], total=len(ids)))
             _seen["n"] += 1
+            from datetime import datetime
+            _at = datetime.utcnow().isoformat()
+            # Remember the outcome for rows that DON'T exist yet: a collapsed
+            # title holds no BackupRow at all, so the loop below has nothing to
+            # repaint for it. Expanding it later builds rows from the entry
+            # copies this page listed with, whose verify state predates the
+            # run — the dots came up grey for backups just checked.
+            self._verify_fresh[bid] = (state, detail, _at)
             for row in list(getattr(self, "_backup_rows", ())):
                 try:
                     if row._entry.backup_id == bid:
                         row._entry.verify_state = state
                         row._entry.verify_detail = detail
-                        from datetime import datetime
-                        row._entry.verify_at = datetime.utcnow().isoformat()
+                        row._entry.verify_at = _at
                         row._apply_verify_dot()
                         break
                 except RuntimeError:
@@ -1290,7 +1311,6 @@ class BackupsPage(QWidget, ThemedMixin):
 
         def _on_done(bad, total):
             self._verify_btn.setEnabled(True)
-            self._verify_btn.setText(t("backups.verify_all"))
             msg = (t("backups.verify_result_all_ok", total=total) if not bad
                    else t("backups.verify_result_bad", bad=bad, total=total))
             self._verify_btn.setToolTip(msg + "\n" + t("backups.verify_all_tooltip"))
@@ -1321,18 +1341,37 @@ class BackupsPage(QWidget, ThemedMixin):
             self._load_games()
             self._refresh_list()
 
+    def _on_page_size_changed(self, _size: int):
+        """Back to the first page: the titles have just been redistributed."""
+        self._backups_page_num = 1
+        self._refresh_list()
+
     def _refresh_list(self):
         """Refresh the backup list for the selected game."""
         if not _safe(self._list_layout):
             return
+        from ui.widgets.page_size import guarded_render, SCOPE_BACKUPS
+        with guarded_render(SCOPE_BACKUPS):
+            self._refresh_list_inner()
 
+    def _refresh_list_inner(self):
+        """Rebuild the listing. Split out of _refresh_list so the render (and
+        only the render) sits inside the page-size guard."""
         # Theme-restyle bookkeeping: the group headers + backup rows below are
         # all rebuilt, so drop last generation's tracked rows and prune dead
         # header entries from this page's ThemedMixin registry (permanent
         # widgets like summary/empty stay — they're always live) so it can't
         # grow unbounded across refreshes.
         self._backup_rows = []
+        # The listing below is re-read from the index, which verify_backup
+        # already wrote the results into — nothing left to patch by hand.
+        self._verify_fresh.clear()
         self.prune_themed_styles()
+
+        # Detach before the wipe — the combo lives inside the top pager and
+        # would otherwise be destroyed with it on every refresh.
+        if getattr(self, "_page_size_combo", None) is not None:
+            self._page_size_combo.setParent(self)
 
         # Remove non-permanent widgets and stale spacer items
         to_remove_widgets = []
@@ -1601,22 +1640,24 @@ class BackupsPage(QWidget, ThemedMixin):
             groups[key]["entries"].append(bk)
 
         # ── Pagination over titles: only the current page is rendered ─────
-        from ui.pages.library_page import PAGE_SIZE, build_pager
-        total_pages = max(1, -(-len(order) // PAGE_SIZE))
+        from ui.pages.library_page import build_pager
+        from ui.widgets.page_size import SCOPE_BACKUPS, page_size
+        per_page = page_size(SCOPE_BACKUPS)
+        total_pages = max(1, -(-len(order) // per_page))
         self._backups_page_num = max(1, min(getattr(self, "_backups_page_num", 1), total_pages))
-        start = (self._backups_page_num - 1) * PAGE_SIZE
-        page_keys = order[start:start + PAGE_SIZE]
+        start = (self._backups_page_num - 1) * per_page
+        page_keys = order[start:start + per_page]
 
         def _go_page(n: int):
             self._backups_page_num = n
             self._refresh_list()
 
-        # Page selector at the top too (not just the bottom) — same pager
-        # widget, so the two stay perfectly in sync since both are rebuilt
-        # from the same _backups_page_num/total_pages on every refresh.
-        if total_pages > 1:
-            self._list_layout.addWidget(
-                build_pager(self._backups_page_num, total_pages, _go_page))
+        # Top pager carries the page-size combo (same line as the numbers).
+        # Shown even on one page so the size control does not vanish.
+        # Bottom pager is numbers only — a combo can have one parent.
+        self._list_layout.addWidget(
+            build_pager(self._backups_page_num, total_pages, _go_page,
+                        size_combo=self._page_size_combo))
 
         single_group = len(order) == 1
         for key in page_keys:
@@ -1679,6 +1720,12 @@ class BackupsPage(QWidget, ThemedMixin):
                 return
             built["done"] = True
             for bk in entries:
+                # Apply any check that ran while this title was collapsed, so
+                # a freshly expanded group shows the dots it earned instead of
+                # the state its listing copy was made with.
+                _fresh = self._verify_fresh.get(bk.backup_id)
+                if _fresh:
+                    bk.verify_state, bk.verify_detail, bk.verify_at = _fresh
                 is_cloud = bk.backup_id in cloud_only_ids
                 row = BackupRow(bk, is_playing=is_playing, cloud_only=is_cloud)
                 _target_gid = gid if gid is not None else getattr(bk, "game_id", "")
@@ -1775,9 +1822,12 @@ class BackupsPage(QWidget, ThemedMixin):
             self._header.setText(t("backup.title"))
         if _safe(self._open_folder_btn):
             self._open_folder_btn.setText(t("buttons.open_folder"))
-            self._verify_btn.setText(t("backups.verify_all"))
-            self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
             self._open_folder_btn.setToolTip(t("tooltips.open_save_folder"))
+        if _safe(self._verify_btn):
+            # Icon-only: the label is the emoji, so only the tooltip carries
+            # language. Retranslating it would wipe the last check's outcome,
+            # which is fine — it is stale the moment the language changes.
+            self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
         if _safe(self._backup_now_btn):
             self._backup_now_btn.setText(t("buttons.backup_now"))
         if _safe(self._empty_lbl):

@@ -13,7 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize, QRectF
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QImageReader
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -1206,13 +1206,31 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
                 self._cover.setPixmap(final)
             return
         t = self._fade_t
+        # The blend canvas must carry the SAME scale as the frames going into
+        # it. QPixmap.size() is in real pixels while QPainter.drawPixmap and
+        # QLabel both work in Qt's coordinates, so a canvas left at scale 1
+        # was 2x too big on a scaled display: each frame landed in its
+        # top-left quarter and the label, which does not resize a pixmap,
+        # showed that quarter — the whole cover, shrunk, instead of the
+        # framing render_cover had just produced. Only the fade frames were
+        # affected, which is why the cover looked right until it changed.
+        dpr = max(1.0, float(self._fade_to.devicePixelRatio() or 1.0))
         blended = QPixmap(self._fade_to.size())
+        blended.setDevicePixelRatio(dpr)
         blended.fill(Qt.GlobalColor.transparent)
+        # Explicit source/target rects rather than a point: the two frames can
+        # differ in scale (one straight from the cache, one re-rendered), and
+        # both have to fill the same frame.
+        target = QRectF(0.0, 0.0,
+                        blended.width() / dpr, blended.height() / dpr)
         p = QPainter(blended)
-        p.setOpacity(1.0 - t)
-        p.drawPixmap(0, 0, self._fade_from)
+        # Outgoing frame opaque, incoming one faded over it. Fading BOTH (the
+        # obvious 1-t / t pair) blends them onto transparency instead of onto
+        # each other, so the canvas peaked at 75% alpha mid-fade and the card
+        # behind it showed through.
+        p.drawPixmap(target, self._fade_from, QRectF(self._fade_from.rect()))
         p.setOpacity(t)
-        p.drawPixmap(0, 0, self._fade_to)
+        p.drawPixmap(target, self._fade_to, QRectF(self._fade_to.rect()))
         p.end()
         self._cover.setPixmap(blended)
 

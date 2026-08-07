@@ -30,6 +30,9 @@ from ui.helpers import ElidedLabel
 from ui.modal_helpers import warning_window_modal
 from ui.styles.theme import palette, ThemedMixin
 from ui.widgets.search_inputs import GhostClearableLineEdit
+from ui.widgets.page_size import (PageSizeCombo, SCOPE_CHEATS_GAMES,
+                                  SCOPE_CHEATS_SAVES, guarded_render,
+                                  page_size)
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +44,6 @@ _SCAN_DEPTH = 3
 # single allowance let the first of them use the lot.
 _MAX_PER_PATH = 400
 _MAX_FILES = 600
-# Saves shown on one page. Fewer than the editor's, because a save row is
-# taller and a folder line under it taller still.
-_SAVES_PAGE_SIZE = 15
 # Values shown on one page of the editor. The filter and the pager together
 # are how the rest is reached, so nothing is ever hidden — only paged.
 _PAGE_SIZE = 40
@@ -367,6 +367,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._all_files = []        # every save found, one folder at a time
         self._files = []            # the save list, newest first
         self._file_page = 0
+        self._games_page = 0        # the library list has its own page number
         self._build()
         self.show_step(self.STEP_PICK)
 
@@ -425,14 +426,23 @@ class CheatsPage(QWidget, ThemedMixin):
         self._search.setPlaceholderText(t("cheats.search_placeholder"))
         self._search.setFixedHeight(32)
         self._search.setObjectName("list_search")
-        self._search.textChanged.connect(self._refresh_games)
+        self._search.textChanged.connect(self._on_game_search_changed)
         # ↓ or a click on the hint takes the game it is pointing at, the same
         # gesture as the library's tag search.
         self._search.ghost_accepted.connect(self._accept_ghost)
         self._search.returnPressed.connect(self._accept_ghost)
-        col.addWidget(self._search)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_row.addWidget(self._search, 1)
+        col.addLayout(search_row)
         self._games_area, self._games_col = self._scroller()
         col.addWidget(self._games_area, 1)
+        # Own page size on the pager row (with ← n/m →), not beside search.
+        bar, self._games_prev, self._games_page_lbl, self._games_next = self._pager(
+            PageSizeCombo(SCOPE_CHEATS_GAMES, self._on_games_page_size_changed))
+        self._games_prev.clicked.connect(lambda: self._step_games(-1))
+        self._games_next.clicked.connect(lambda: self._step_games(1))
+        col.addLayout(bar)
         self._drop = _DropZone()
         self._drop.chosen.connect(self._open_loose)
         self._drop.browse.connect(self._browse_for_save)
@@ -471,20 +481,22 @@ class CheatsPage(QWidget, ThemedMixin):
         col.addWidget(self._files_area, 1)
         # A game with several save paths has every save listed once per path,
         # so even a modest folder runs to a hundred rows. Same pager as the
-        # editor's, so the two read the same way.
-        bar, self._file_prev, self._file_page_lbl, self._file_next = self._pager()
+        # editor's, so the two read the same way. Page size sits on this row.
+        bar, self._file_prev, self._file_page_lbl, self._file_next = self._pager(
+            PageSizeCombo(SCOPE_CHEATS_SAVES, self._on_saves_page_size_changed))
         self._file_prev.clicked.connect(lambda: self._step_saves(-1))
         self._file_next.clicked.connect(lambda: self._step_saves(1))
         col.addLayout(bar)
         return page
 
     @staticmethod
-    def _pager():
+    def _pager(size_combo=None):
         """The ← n/m → strip: the layout and its three widgets.
 
         Each list that needs one keeps its own, with its own page number: a
         counter shared between the save list and the editor would jump about
-        as you moved from one to the other and back.
+        as you moved from one to the other and back. Optional *size_combo*
+        sits on the right of the same row.
         """
         bar = QHBoxLayout()
         bar.setSpacing(8)
@@ -500,6 +512,8 @@ class CheatsPage(QWidget, ThemedMixin):
         bar.addWidget(lbl)
         bar.addWidget(nxt)
         bar.addStretch(1)
+        if size_combo is not None:
+            bar.addWidget(size_combo)
         return bar, prev, lbl, nxt
 
     def _build_edit(self) -> QWidget:
@@ -616,7 +630,24 @@ class CheatsPage(QWidget, ThemedMixin):
         rest = [g for g in games if q in g.name.casefold() and g not in starts]
         return starts + rest
 
+    def _on_game_search_changed(self, _text: str = ""):
+        """A new search is a new list — page 2 of the old one means nothing."""
+        self._games_page = 0
+        self._refresh_games()
+
+    def _on_games_page_size_changed(self, _size: int):
+        self._games_page = 0
+        self._refresh_games()
+
+    def _step_games(self, delta: int):
+        self._games_page += delta
+        self._refresh_games()
+
     def _refresh_games(self):
+        with guarded_render(SCOPE_CHEATS_GAMES):
+            self._refresh_games_inner()
+
+    def _refresh_games_inner(self):
         self._clear(self._games_col)
         found = self._matches()
         q = self._search.text().strip()
@@ -627,10 +658,22 @@ class CheatsPage(QWidget, ThemedMixin):
             self._search.set_ghost(found[0].name[len(q):])
         else:
             self._search.set_ghost("")
+        # Paged rather than cut off at a fixed 200: a library past that lost
+        # its tail with nothing said, and the rows here are cheap enough that
+        # the only reason to limit them is how far anyone wants to scroll.
+        per_page = page_size(SCOPE_CHEATS_GAMES)
+        pages = max(1, (len(found) + per_page - 1) // per_page)
+        self._games_page = max(0, min(self._games_page, pages - 1))
+        start = self._games_page * per_page
+        self._games_page_lbl.setText(t("cheats.page_of_games",
+                                       page=self._games_page + 1,
+                                       pages=pages, total=len(found)))
+        self._games_prev.setEnabled(self._games_page > 0)
+        self._games_next.setEnabled(self._games_page < pages - 1)
         if not found:
             self._add_note(self._games_col, t("cheats.no_games"))
             return
-        for g in found[:200]:
+        for g in found[start:start + per_page]:
             n = len(g.save_paths or [])
             row = _Row(g.name, t("cheats.n_paths", count=n) if n else
                        t("cheats.no_paths"))
@@ -673,7 +716,7 @@ class CheatsPage(QWidget, ThemedMixin):
     def _open_game(self, entry):
         self._entry = entry
         self._loose = None
-        from core.game_engine import engine_for_game, label as engine_label
+        from core.engines.game_engine import engine_for_game, label as engine_label
         eng = engine_label(engine_for_game(entry))
         self._show_saves(_save_files(entry),
                          t("cheats.pick_save_engine", engine=eng) if eng
@@ -702,7 +745,7 @@ class CheatsPage(QWidget, ThemedMixin):
         # has to hold for a save nobody has edited since, and writing is the
         # only other moment they run. Once per visit, not once per page turn:
         # paging back and forth is not a reason to go over the disk again.
-        for f in self._files[:_SAVES_PAGE_SIZE]:
+        for f in self._files[:page_size(SCOPE_CHEATS_SAVES)]:
             prune_backups(f)
         self._render_saves_page()
 
@@ -740,7 +783,15 @@ class CheatsPage(QWidget, ThemedMixin):
         self._file_page = 0
         self._render_saves_page()
 
+    def _on_saves_page_size_changed(self, _size: int):
+        self._file_page = 0
+        self._render_saves_page()
+
     def _render_saves_page(self):
+        with guarded_render(SCOPE_CHEATS_SAVES):
+            self._render_saves_page_inner()
+
+    def _render_saves_page_inner(self):
         """One page of the save list, with the copies kept of what is on it.
 
         The copies follow the page rather than the whole list: reading them
@@ -751,10 +802,11 @@ class CheatsPage(QWidget, ThemedMixin):
         self._clear(self._kept_col)
         self._clear(self._files_col)
         files = self._files
-        pages = max(1, (len(files) + _SAVES_PAGE_SIZE - 1) // _SAVES_PAGE_SIZE)
+        per_page = page_size(SCOPE_CHEATS_SAVES)
+        pages = max(1, (len(files) + per_page - 1) // per_page)
         self._file_page = max(0, min(self._file_page, pages - 1))
-        start = self._file_page * _SAVES_PAGE_SIZE
-        shown = files[start:start + _SAVES_PAGE_SIZE]
+        start = self._file_page * per_page
+        shown = files[start:start + per_page]
 
         if not files:
             # Two different nothings, and only one of them is the player's to
@@ -1106,7 +1158,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._sync_hold_label()
 
     def _start_hold(self):
-        from core.save_hold import SaveHold
+        from core.save_editor import SaveHold
 
         if self._hold is not None:
             self._hold.set_values(self._held)

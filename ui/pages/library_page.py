@@ -20,6 +20,8 @@ from ui.styles.theme import palette, ThemedMixin
 
 from ui.widgets.library_folders import FolderTree, _clean_tag_display
 from ui.widgets.game_items import GameCard, GameRow, _display_sync_status
+from ui.widgets.page_size import (
+    PageSizeCombo, SCOPE_LIBRARY, guarded_render, page_size)
 
 _SORT_NATURAL_DIRECTION = {
     "date_added":  "desc",
@@ -43,8 +45,9 @@ _SORT_DIR_LABELS = {
     "status":      ("sort_descending", "sort_ascending"),
 }
 
-# Map status to palette key for theme-aware colors
-PAGE_SIZE = 20   # max cards/rows per library page (and titles per backups page)
+# Kept for callers that only need "how big is a page by default"; the live
+# value is per-list and user-chosen (ui.widgets.page_size).
+PAGE_SIZE = 20
 
 
 def page_numbers(current: int, total: int) -> list[int]:
@@ -72,15 +75,20 @@ def _style_pager_btn(btn, active: bool):
     btn.setObjectName("pager_btn_active" if active else "pager_btn")
 
 
-def build_pager(current: int, total: int, on_page) -> QWidget:
-    """Centered pager row: ‹  [1] … [N]  ›.
+def build_pager(current: int, total: int, on_page,
+                size_combo=None) -> QWidget:
+    """Pager row: ‹  [1] … [N]  ›, optional page-size combo on the right.
 
     - prev hidden on the first page, next hidden on the last;
-    - with a single page the caller must not add the pager at all.
+    - with a single page and no *size_combo*, the caller must not add this;
+    - with *size_combo*, the row is always useful (even on one page) so the
+      size control stays on the same line as the page numbers, not above them.
     *on_page* is called with the target page number.
 
     The buttons take their look from the theme (see _style_pager_btn), so
     callers no longer need to collect them for re-styling on a theme switch.
+    A combo may be attached to at most ONE pager (Qt: one parent) — typically
+    the top one when a page has two.
     """
     wrap = QWidget()
     wrap.setObjectName("transparent_bg")
@@ -100,14 +108,17 @@ def build_pager(current: int, total: int, on_page) -> QWidget:
         b.clicked.connect(lambda _=False, p=page: on_page(p))
         return b
 
-    if current > 1:
-        row.addWidget(_btn("‹", current - 1, tooltip=t("common.prev_page")))
-    for n in page_numbers(current, total):
-        row.addWidget(_btn(str(n), n, active=(n == current)))
-    if current < total:
-        row.addWidget(_btn("›", current + 1, tooltip=t("common.next_page")))
+    if total > 1:
+        if current > 1:
+            row.addWidget(_btn("‹", current - 1, tooltip=t("common.prev_page")))
+        for n in page_numbers(current, total):
+            row.addWidget(_btn(str(n), n, active=(n == current)))
+        if current < total:
+            row.addWidget(_btn("›", current + 1, tooltip=t("common.next_page")))
 
     row.addStretch()
+    if size_combo is not None:
+        row.addWidget(size_combo)
     return wrap
 
 # Singleton drag state shared between cards and folder tree
@@ -311,6 +322,10 @@ class LibraryPage(QWidget, ThemedMixin):
 
         root.addLayout(filter_row)
 
+        # Lives on the pager row (created in _rebuild_view_inner), not above it.
+        self._page_size_combo = PageSizeCombo(
+            SCOPE_LIBRARY, self._on_page_size_changed)
+
         # Body: folder sidebar + game grid
         body = QHBoxLayout()
         body.setSpacing(0)
@@ -374,10 +389,24 @@ class LibraryPage(QWidget, ThemedMixin):
         a noticeable moment and the window would otherwise just sit frozen.
         """
         from ui.widgets.busy_overlay import busy_over
-        with busy_over(self):
+        # guarded_render only writes anything for a page size the user pushed
+        # past the presets: if that render is what kills the app, the library
+        # comes back at the default instead of crashing again on sight.
+        with busy_over(self), guarded_render(SCOPE_LIBRARY):
             self._rebuild_view_inner()
 
+    def _on_page_size_changed(self, _size: int):
+        """Page 1 is the only sane place to land: every item has just moved to
+        a different page, and the old number can be past the end."""
+        self._current_page = 1
+        self._rebuild_view()
+        self._scroll.verticalScrollBar().setValue(0)
+
     def _rebuild_view_inner(self):
+        # Detach before the wipe — the combo lives inside the top pager and
+        # would otherwise be destroyed with it on every rebuild.
+        if getattr(self, "_page_size_combo", None) is not None:
+            self._page_size_combo.setParent(self)
         # Remove all existing widgets
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -434,23 +463,24 @@ class LibraryPage(QWidget, ThemedMixin):
                     games = [g for g in games if q_text in g.name.lower()]
 
         # ── Pagination: only the current page is ever rendered ────────────
-        total_pages = max(1, -(-len(games) // PAGE_SIZE))   # ceil division
+        per_page = page_size(SCOPE_LIBRARY)
+        total_pages = max(1, -(-len(games) // per_page))   # ceil division
         self._current_page = max(1, min(self._current_page, total_pages))
-        start = (self._current_page - 1) * PAGE_SIZE
-        page_games = games[start:start + PAGE_SIZE]
+        start = (self._current_page - 1) * per_page
+        page_games = games[start:start + per_page]
 
         def _go_page(n: int):
             self._current_page = n
             self._rebuild_view()
             self._scroll.verticalScrollBar().setValue(0)
 
-        # Pager at the TOP (both views) — inserted first, while the layout is
-        # still empty, so it lands above the cards/rows. The bottom pager is
-        # appended after the entries below.
-        if total_pages > 1:
-            self._layout.insertWidget(
-                self._layout.count(),
-                build_pager(self._current_page, total_pages, _go_page))
+        # Pager at the TOP (both views) — page-size combo rides this row so
+        # it sits with the page numbers, never on a band of its own. Shown
+        # even when there is only one page, or the size control would vanish.
+        self._layout.insertWidget(
+            self._layout.count(),
+            build_pager(self._current_page, total_pages, _go_page,
+                        size_combo=self._page_size_combo))
 
         if self._view_mode == "card":
             # Wrap cards in a flow-ish grid using nested HBoxLayouts.

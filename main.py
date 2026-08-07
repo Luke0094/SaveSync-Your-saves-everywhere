@@ -437,6 +437,12 @@ def main():
         # shared file.
         app.aboutToQuit.connect(_release_lock)
 
+        # Undo a per-list page size that took the app down while rendering,
+        # BEFORE any page is built with it — otherwise the same size crashes
+        # the same list again and the setting can never be reached to change.
+        from ui.widgets.page_size import recover_page_sizes
+        recover_page_sizes()
+
         # Create main window (splash still visible during construction)
         window = MainWindow()
 

@@ -185,6 +185,9 @@ class SettingsPage(QWidget):
         self._overlay_launch_cb = QCheckBox(t("settings.show_overlay_on_launch"))
         self._overlay_launch_cb.setToolTip(t("settings.show_overlay_on_launch_tooltip"))
         ov_form.addRow("", self._overlay_launch_cb)
+        self._overlay_unknown_cb = QCheckBox(t("settings.show_overlay_on_unknown"))
+        self._overlay_unknown_cb.setToolTip(t("settings.show_overlay_on_unknown_tooltip"))
+        ov_form.addRow("", self._overlay_unknown_cb)
         self._overlay_cloud_cb = QCheckBox(t("settings.show_overlay_on_cloud"))
         self._overlay_cloud_cb.setToolTip(t("settings.show_overlay_on_cloud_tooltip"))
         ov_form.addRow("", self._overlay_cloud_cb)
@@ -567,6 +570,7 @@ class SettingsPage(QWidget):
         self._auto_sync_cb.stateChanged.connect(self._mark_dirty)
         self._auto_scan_cb.stateChanged.connect(self._mark_dirty)
         self._overlay_launch_cb.stateChanged.connect(self._mark_dirty)
+        self._overlay_unknown_cb.stateChanged.connect(self._mark_dirty)
         self._overlay_cloud_cb.stateChanged.connect(self._mark_dirty)
         self._overlay_backup_cb.stateChanged.connect(self._mark_dirty)
         self._max_backups_spin.valueChanged.connect(self._mark_dirty)
@@ -603,6 +607,59 @@ class SettingsPage(QWidget):
                 item.setHidden(bool(needle) and needle not in item.text().lower())
         box.textChanged.connect(_filter)
 
+    # notif_type stored in suppressed_ingame_notifs → how to name it in the
+    # list. A dict rather than a chain of ifs so a type added to the overlay
+    # cannot silently vanish from here: unmapped ones are shown raw (see
+    # _suppression_kinds), which is ugly enough to get noticed and fixed.
+    _SUPPRESSION_LABELS = {
+        "backup":            "settings.suppression_backup_notif",
+        "provisional_backup": "settings.suppression_provisional_notif",
+        "sync":              "settings.suppression_sync_notif",
+        "regression":        "settings.suppression_regression_notif",
+    }
+
+    def _game_label(self, game_id: str) -> str:
+        """A name for *game_id* that means something to the reader.
+
+        The library is the first source, but these lists outlive it: removing
+        a game leaves its id behind in the config, and the label fell back to
+        the first 12 characters of a UUID ("805f3c38-540") — which names
+        nothing and cannot be matched to anything the user remembers. The
+        backup index still knows the title, so it is asked next; only when
+        even that is gone does the row say so in words.
+        """
+        from core.library import get_library
+        entry = get_library().get_by_id(game_id)
+        if entry is not None and entry.name:
+            return entry.name
+        try:
+            from core.backup import get_backup_manager
+            for b in get_backup_manager().get_backups_for_game(game_id):
+                if b.game_name:
+                    return b.game_name
+        except Exception:
+            logger.debug("Backup index unavailable for label lookup", exc_info=True)
+        return t("settings.removed_game", id=game_id[:8])
+
+    def _suppression_kinds(self, game_id: str, scan_accept: dict,
+                           notif_suppress: dict, cloud_no_local) -> list[str]:
+        """What is actually suppressed for *game_id*, named for the reader.
+
+        Empty when nothing is: a game whose entry survives with a falsy value
+        or an empty type list has no preference to show, and listing it as
+        "skip path confirmation" (the old fallback for an empty result) stated
+        the opposite of the truth.
+        """
+        kinds: list[str] = []
+        if scan_accept.get(game_id):
+            kinds.append(t("settings.suppression_scan"))
+        for notif_type in notif_suppress.get(game_id) or []:
+            key = self._SUPPRESSION_LABELS.get(notif_type)
+            kinds.append(t(key) if key else str(notif_type))
+        if game_id in (cloud_no_local or []):
+            kinds.append(t("settings.suppression_cloud_no_local"))
+        return kinds
+
     def _load_excluded_paths_list(self):
         """Populate the excluded-save-paths QListWidget from
         auto_scan_deleted_paths (deletions made in the confirmation panels)."""
@@ -622,10 +679,8 @@ class SettingsPage(QWidget):
             self._excluded_paths_list.addItem(placeholder)
             return
 
-        lib = get_library()
         for gid, path in sorted(entries, key=lambda e: (e[0], e[1].lower())):
-            entry = lib.get_by_id(gid)
-            game_name = entry.name if entry else gid[:12]
+            game_name = self._game_label(gid)
             item = QListWidgetItem(f"{game_name}  —  {path}")
             item.setData(_Qt.ItemDataRole.UserRole, (gid, path))
             item.setToolTip(f"{game_name}\n{path}")
@@ -670,7 +725,16 @@ class SettingsPage(QWidget):
         notif_suppress: dict    = config.get("suppressed_ingame_notifs", {})
         cloud_no_local: list    = config.get("suppressed_cloud_no_local", [])
 
-        all_game_ids: set[str] = set(scan_accept) | set(notif_suppress) | set(cloud_no_local)
+        # Only games that really have something suppressed: an id can outlive
+        # its preference (the value emptied, the game deleted), and such rows
+        # said "skip path confirmation" while suppressing nothing.
+        by_game = {}
+        for game_id in set(scan_accept) | set(notif_suppress) | set(cloud_no_local):
+            kinds = self._suppression_kinds(
+                game_id, scan_accept, notif_suppress, cloud_no_local)
+            if kinds:
+                by_game[game_id] = kinds
+        all_game_ids = set(by_game)
 
         self._suppression_list.clear()
         # Keep the excluded-paths box in sync (same refresh triggers:
@@ -684,25 +748,9 @@ class SettingsPage(QWidget):
             self._suppression_list.addItem(placeholder)
             return
 
-        lib = get_library()
-        for game_id in sorted(all_game_ids):
-            entry = lib.get_by_id(game_id)
-            game_name = entry.name if entry else game_id[:12]
-
-            kinds: list[str] = []
-            if scan_accept.get(game_id):
-                kinds.append(t("settings.suppression_scan"))
-            notif_types = notif_suppress.get(game_id, [])
-            if "backup" in notif_types:
-                kinds.append(t("settings.suppression_backup_notif"))
-            if "sync" in notif_types:
-                kinds.append(t("settings.suppression_sync_notif"))
-            if "regression" in notif_types:
-                kinds.append(t("settings.suppression_regression_notif"))
-            if game_id in cloud_no_local:
-                kinds.append(t("settings.suppression_cloud_no_local"))
-
-            detail = " · ".join(kinds) if kinds else t("settings.suppression_scan")
+        for game_id in sorted(all_game_ids, key=lambda g: self._game_label(g).lower()):
+            game_name = self._game_label(game_id)
+            detail = " · ".join(by_game[game_id])
             item = QListWidgetItem(f"{game_name}  —  {detail}")
             item.setData(_Qt.ItemDataRole.UserRole, game_id)
             item.setToolTip(f"{game_name}\n{detail}")
@@ -795,6 +843,7 @@ class SettingsPage(QWidget):
             "auto_sync": self._auto_sync_cb.isChecked(),
             "auto_scan": self._auto_scan_cb.isChecked(),
             "overlay_launch": self._overlay_launch_cb.isChecked(),
+            "overlay_unknown": self._overlay_unknown_cb.isChecked(),
             "overlay_cloud": self._overlay_cloud_cb.isChecked(),
             "overlay_backup": self._overlay_backup_cb.isChecked(),
             "max_backups": self._max_backups_spin.value(),
@@ -850,6 +899,7 @@ class SettingsPage(QWidget):
         self._auto_scan_cb.setChecked(config.get("auto_scan_on_exit", True))
         self._load_suppression_list()
         self._overlay_launch_cb.setChecked(config.get("show_overlay_on_launch", True))
+        self._overlay_unknown_cb.setChecked(config.get("show_overlay_on_unknown", True))
         self._overlay_cloud_cb.setChecked(config.get("show_overlay_on_cloud", True))
         self._overlay_backup_cb.setChecked(config.get("show_overlay_on_backup", True))
         self._max_backups_spin.setValue(config.get("max_local_backups", 6))
@@ -904,6 +954,7 @@ class SettingsPage(QWidget):
         config.set("auto_sync_after_backup", self._auto_sync_cb.isChecked())
         config.set("auto_scan_on_exit",      self._auto_scan_cb.isChecked())
         config.set("show_overlay_on_launch", self._overlay_launch_cb.isChecked())
+        config.set("show_overlay_on_unknown", self._overlay_unknown_cb.isChecked())
         config.set("show_overlay_on_cloud",  self._overlay_cloud_cb.isChecked())
         config.set("show_overlay_on_backup", self._overlay_backup_cb.isChecked())
         config.set("max_local_backups",      self._max_backups_spin.value())
@@ -1335,6 +1386,7 @@ class SettingsPage(QWidget):
             "auto_sync_after_backup": False,
             "auto_scan_on_exit":      True,
             "show_overlay_on_launch": True,
+            "show_overlay_on_unknown": True,
             "show_overlay_on_cloud":  True,
             "show_overlay_on_backup": True,
             "max_local_backups":      6,
@@ -1432,6 +1484,7 @@ class SettingsPage(QWidget):
         self._tray_cb.setToolTip(t("settings.minimize_to_tray_tooltip"))
         self._auto_sync_cb.setToolTip(t("settings.auto_sync_after_backup_tooltip"))
         self._overlay_launch_cb.setToolTip(t("settings.show_overlay_on_launch_tooltip"))
+        self._overlay_unknown_cb.setToolTip(t("settings.show_overlay_on_unknown_tooltip"))
         self._overlay_cloud_cb.setToolTip(t("settings.show_overlay_on_cloud_tooltip"))
         self._overlay_backup_cb.setToolTip(t("settings.show_overlay_on_backup_tooltip"))
         self._max_backups_spin.setToolTip(t("settings.max_backups_tooltip"))
@@ -1439,6 +1492,7 @@ class SettingsPage(QWidget):
         self._max_size_spin.setToolTip(t("settings.max_size_mb_tooltip"))
         self._hints_edit.setToolTip(t("settings.save_hints_tooltip"))
         self._overlay_launch_cb.setText(t("settings.show_overlay_on_launch"))
+        self._overlay_unknown_cb.setText(t("settings.show_overlay_on_unknown"))
         self._overlay_cloud_cb.setText(t("settings.show_overlay_on_cloud"))
         self._overlay_backup_cb.setText(t("settings.show_overlay_on_backup"))
         self._max_backups_lbl.setText(t("settings.max_backups"))

@@ -787,10 +787,16 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     def refresh_unknown_badge(self):
         """Sync the top-left badge with the pending unknown-game queue —
         called on every show and whenever a new detection is recorded
-        while the overlay is already visible."""
+        while the overlay is already visible. Hidden entirely when the
+        unknown-process feature is off: the queue is not offered then,
+        so a counter for it would only confuse."""
         try:
-            from ui.unknown_history import pending_unknown_count
-            n = pending_unknown_count()
+            from core.config_manager import get_config
+            if not get_config().get("show_overlay_on_unknown", True):
+                n = 0
+            else:
+                from ui.unknown_history import pending_unknown_count
+                n = pending_unknown_count()
         except Exception:
             n = 0
         self._unknown_badge.setText(f"🎮 {n}")
@@ -1070,6 +1076,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         """REPLACE the current notification with the pending unknown-game
         queue, browsable via the carousel arrows: the in-overlay successor
         of the old dedicated 'detected games (not in library)' panel."""
+        from core.config_manager import get_config
+        if not get_config().get("show_overlay_on_unknown", True):
+            self.refresh_unknown_badge()
+            return
         if self._defer_if_priority(self.show_unknown_queue):
             return
         entries = self._pending_unknown_entries()

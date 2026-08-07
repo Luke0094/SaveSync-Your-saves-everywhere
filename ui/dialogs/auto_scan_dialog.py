@@ -46,7 +46,7 @@ def filter_selectable_paths(game_id: str, paths: List[str]) -> List[str]:
     from core.save_detector import (
         path_has_backup_content, dedupe_paths, path_identity,
     )
-    from core.game_engine import engine_for_game
+    from core.engines.game_engine import engine_for_game
     from core.library import get_library
     config = get_config()
     paths = dedupe_paths(paths)
