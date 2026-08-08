@@ -910,6 +910,11 @@ class BackupManager(QObject):
         # ── Registry exports (state INSIDE registry values) ────────────────
         # Canonical JSON per key: identical registry state ⇒ identical bytes
         # ⇒ the same content-hash change detection files get.
+        # Import here: create_backup imports the same helpers for path split,
+        # but that local bind is not visible inside this method.
+        from core.registry_saves import (
+            export_registry_key, registry_arc_name, registry_export_fingerprint,
+        )
         reg_exports: list[tuple[str, bytes]] = []   # (arc_name, data)
         for rp in valid_reg:
             data = export_registry_key(rp)

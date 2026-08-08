@@ -113,6 +113,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._topmost_timer.timeout.connect(self._ensure_topmost)
         self._topmost_timer.setInterval(1000)  # Check every second
 
+        # Unity (and similar) re-clip the pointer every frame in fullscreen.
+        # Releasing ClipCursor once at show is not enough — keep undoing it
+        # for as long as the overlay holds the system cursor.
+        # ~60 Hz: Unity re-hides/re-clips every frame; 100 ms left a gap.
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.timeout.connect(SystemCursor.reassert)
+        self._cursor_timer.setInterval(16)
+
         # Foreground change hook — reacts instantly when another window
         # covers the overlay (e.g. game entering fullscreen while visible)
         self._fg_hook = None          # WinEventHook handle
@@ -165,6 +173,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus)  # Linux support
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        # Explicit arrow so immersive games that set a NULL cursor still get
+        # a pointer shape while the mouse is over this panel.
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setObjectName("overlay")
         self.setFixedWidth(340)
 
@@ -272,8 +283,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._message = QLabel()
         self._message.setObjectName("overlay_message")
         self._message.setWordWrap(True)
+        self._message.setTextFormat(Qt.TextFormat.RichText)
         self._message.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._message.setFixedHeight(48)     # fixed height prevents queue size variation
+        # Two lines for "in esecuzione / monitoraggio attivo" (and similar).
+        self._message.setFixedHeight(52)
         centre_col.addWidget(self._message)
 
         # Counter (e.g. "2 / 5") below message, centred
@@ -1034,6 +1047,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if piece is not None:
             # The panel stays down, so _do_hide never runs: let go here, or
             # the overlay's hold would outlive the overlay itself.
+            self._cursor_timer.stop()
             SystemCursor.release("overlay")
             get_pin_manager().new_capture(piece)
 
@@ -1213,13 +1227,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._icon_label.setText("🎮")
         self._title.setText(t("app.name"))
         eng = (engine or "").strip() or _engine_label_for_exe(exe_path)
-        # Two lines so the engine label stays visible beside the title even
-        # with the message's fixed height and word-wrap.
-        self._message.setText(
-            f"<span style='color:{palette('accent')};font-weight:700;'>"
-            f"{t('overlay.tracking_msg')}</span><br>"
+        # Game name + engine on one line; status on the line below.
+        game_html = (
             f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng)}"
         )
+        self._message.setText(t("overlay.game_launched", game=game_html))
         self._hide_dashboard()
         self._clear_buttons()
 
@@ -1915,6 +1927,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # _do_hide, so the pointer goes away when this does.
         if self._game_is_running():
             SystemCursor.hold("overlay")
+            self._cursor_timer.start()
+        else:
+            self._cursor_timer.stop()
 
         # Cancel any pending hide first
         self._auto_hide_timer.stop()
@@ -1943,6 +1958,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self.show()
         self._take_the_front()
         self._ensure_visible_on_screen()
+
+        # Immersive games leave the pointer trapped/invisible in their HWND.
+        # Drop the OS pointer onto this panel so the software arrow (and clicks)
+        # land where the user can actually use the overlay.
+        if self._game_is_running():
+            c = self.frameGeometry().center()
+            SystemCursor.warp_to(c.x(), c.y())
+            SystemCursor.reassert()
 
         # Periodic re-assert for z-order recovery.
         # On Windows, also install an instant foreground-change hook.
@@ -2106,6 +2129,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # Nothing is on screen — a hidden overlay must never hold priority,
         # nor keep a pointer raised for a panel that is no longer there.
         self._priority_active = False
+        self._cursor_timer.stop()
         SystemCursor.release("overlay")
         self.exclusive_blocked.emit(title, msg_plain)
         logger.info("Overlay hidden — exclusive fullscreen protected")
@@ -2223,6 +2247,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         """Slot called when hide animation finishes — resets the connection flag."""
         # Let go of the pointer. It only actually goes down if nothing else
         # still needs it — a note being typed into, or a pin mid-drag.
+        self._cursor_timer.stop()
         SystemCursor.release("overlay")
         self._hide_anim_connected = False
         self._topmost_timer.stop()

@@ -187,7 +187,7 @@
     "dismiss": "Dismiss",
     "got_it": "Got it",
     "game_exit_title": "Game closed",
-    "game_launched": "{game} running — monitoring active",
+    "game_launched": "{game}<br>running — monitoring active",
     "library": "Library",
     "last_backup": "Last backup",
     "sync": "Sync",

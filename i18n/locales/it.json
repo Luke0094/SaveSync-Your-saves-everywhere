@@ -187,7 +187,7 @@
     "dismiss": "Chiudi",
     "got_it": "Ho capito",
     "game_exit_title": "Gioco chiuso",
-    "game_launched": "{game} in esecuzione — monitoraggio attivo",
+    "game_launched": "{game}<br>in esecuzione — monitoraggio attivo",
     "library": "Libreria",
     "last_backup": "Ultimo backup",
     "sync": "Sync",

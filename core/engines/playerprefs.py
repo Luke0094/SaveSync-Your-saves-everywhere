@@ -25,6 +25,12 @@ class PlayerPrefsError(ValueError):
 # Unity hides a preference's name behind a checksum of it: "gold" is stored
 # as "gold_h3096647". Only the tail is dropped, and only for display.
 _PREFS_SUFFIX = re.compile(r"_h\d+$")
+# Unity's own display / session keys — not game progress. Shown nowhere in
+# the save editor so a PlayerPrefs dump is not half "Screenmanager …".
+_SYSTEM_PREF = re.compile(
+    r"^(Screenmanager\b|UnitySelectMonitor\b|unity\.player_session)",
+    re.IGNORECASE,
+)
 # Registry value types, from winreg. Named here so this module reads without
 # importing winreg, which does not exist off Windows.
 _REG_SZ, _REG_BINARY, _REG_DWORD, _REG_QWORD = 1, 3, 4, 11
@@ -32,6 +38,10 @@ _REG_SZ, _REG_BINARY, _REG_DWORD, _REG_QWORD = 1, 3, 4, 11
 
 def _prefs_label(regname: str) -> str:
     return _PREFS_SUFFIX.sub("", regname) or regname
+
+
+def _is_system_pref(regname: str) -> bool:
+    return bool(_SYSTEM_PREF.match(_prefs_label(regname)))
 
 
 def _prefs_read(spec: dict) -> tuple:
@@ -99,6 +109,8 @@ class PlayerPrefsDoc:
     def _gather(self, node: dict, where: str) -> None:
         values = node.get("values") or {}
         for regname in sorted(values):
+            if _is_system_pref(regname):
+                continue
             kind, _ = _prefs_read(values[regname])
             if kind:
                 self._spots.append((values, regname, where))
