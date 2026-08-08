@@ -83,6 +83,17 @@ def information_window_modal(parent, title: str, text: str):
     )
 
 
+def _translate_input_buttons(dlg: QInputDialog):
+    """Put the current locale on QInputDialog's own OK/Cancel buttons.
+
+    Qt ships its own translations for these and loads none by default, so
+    without this they stay English whatever the app language is.
+    """
+    from i18n import t
+    dlg.setOkButtonText(t("common.ok"))
+    dlg.setCancelButtonText(t("common.cancel"))
+
+
 def input_text_window_modal(parent, title: str, label: str, text: str = "") -> tuple[str, bool]:
     """Equivalente a QInputDialog.getText con solo la finestra padre bloccata."""
     dlg = QInputDialog(parent)
@@ -90,5 +101,28 @@ def input_text_window_modal(parent, title: str, label: str, text: str = "") -> t
     dlg.setWindowTitle(title)
     dlg.setLabelText(label)
     dlg.setTextValue(text)
+    _translate_input_buttons(dlg)
     ok = dlg.exec() == QDialog.DialogCode.Accepted
     return dlg.textValue(), ok
+
+
+def input_int_window_modal(parent, title: str, label: str, value: int,
+                           minimum: int, maximum: int,
+                           step: int = 1) -> tuple[int, bool]:
+    """Equivalente a QInputDialog.getInt, tradotto e window-modal.
+
+    The label is set on a dialog instance rather than through the static
+    helper so a multi-line explanation is laid out in full instead of being
+    squeezed onto one line.
+    """
+    dlg = QInputDialog(parent)
+    dlg.setWindowModality(Qt.WindowModality.WindowModal)
+    dlg.setInputMode(QInputDialog.InputMode.IntInput)
+    dlg.setWindowTitle(title)
+    dlg.setIntRange(minimum, maximum)
+    dlg.setIntStep(step)
+    dlg.setIntValue(value)
+    dlg.setLabelText(label)
+    _translate_input_buttons(dlg)
+    ok = dlg.exec() == QDialog.DialogCode.Accepted
+    return dlg.intValue(), ok

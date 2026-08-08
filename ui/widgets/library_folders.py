@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QMenu, QWidget, QGraphicsOpacityEffect, QScrollArea, QSizePolicy,
-    QSplitter, QMessageBox, QApplication,
+    QSplitter, QStackedWidget, QMessageBox, QApplication,
 )
 
 from i18n import t
@@ -24,7 +24,6 @@ from ui.widgets.library_drag import _active_drag, DragProxy
 from ui.widgets.search_inputs import GhostClearableLineEdit, _SuggestPopup
 
 logger = logging.getLogger(__name__)
-
 
 FOLDER_COLOR_KEYS = [
     "folder_red", "folder_orange", "folder_yellow", "folder_green",
@@ -163,18 +162,35 @@ def _swatch_style(hex_c: str, selected: bool) -> str:
     )
 
 class TagFilterPanel(QFrame, ThemedMixin):
-    """Panel with 3-state tag buttons for filtering the library.
-    Click 1: include (green) — game must have this tag.
-    Click 2: exclude (red)  — game must NOT have this tag.
-    Click 3: deselect       — tag not used for filtering.
+    """Panel with 3-state chip buttons for filtering the library.
+    Click 1: include (green) — game must have this value.
+    Click 2: exclude (red)  — game must NOT have this value.
+    Click 3: deselect       — value not used for filtering.
+
+    Built for tags and reused verbatim for engines: the interaction is the
+    same, only the words around it differ, so the labels come in as i18n
+    keys rather than being hard-coded here.
     """
     tags_changed = Signal()
+    cleared = Signal()      # "clear all" pressed, before tags_changed
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *,
+                 header_key: str = "library.filter_tags",
+                 search_key: str = "library.search_tags",
+                 clear_key: str = "library.clear_tags",
+                 active_key: str = "library.active_tag_filters",
+                 merge_variants: bool = True):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._states: dict[str, int] = {}   # tag → 0=off 1=include 2=exclude
         self._all_tags: list[str] = []
+        self._header_key = header_key
+        self._search_key = search_key
+        self._clear_key = clear_key
+        self._active_key = active_key
+        # Tags arrive in every spelling a web source felt like; engine names
+        # come from one table and must not be collapsed into each other.
+        self._merge_variants = merge_variants
         self._build()
 
     def _build(self):
@@ -182,7 +198,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         layout.setContentsMargins(0, 4, 0, 4)
         layout.setSpacing(4)
 
-        header = QLabel(t("library.filter_tags"))
+        header = QLabel(t(self._header_key))
         self._sty(header, lambda: (
             f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
             f"letter-spacing:0.5px;background:transparent;"
@@ -191,7 +207,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         self._header = header
 
         self._search = GhostClearableLineEdit()
-        self._search.setPlaceholderText(t("library.search_tags"))
+        self._search.setPlaceholderText(t(self._search_key))
         self._search.setFixedHeight(24)
         self._sty(self._search, lambda: (
             f"QLineEdit{{background:{palette('bg_input')};border:1px solid {palette('border')};"
@@ -241,7 +257,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         # up to five rows, then scrolls inside its own fixed-height area,
         # so a large selection can never push the tag list out of view.
         # Hidden entirely at zero selections. Clicking an entry removes it.
-        self._selected_lbl = QLabel(t("library.active_tag_filters"))
+        self._selected_lbl = QLabel(t(self._active_key))
         self._sty(self._selected_lbl, lambda: (
             f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
             f"letter-spacing:0.5px;background:transparent;margin-top:2px;"
@@ -265,7 +281,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         layout.addWidget(self._selected_scroll, 1)
         self._selected_buttons: dict[str, QPushButton] = {}
 
-        self._clear_btn = QPushButton(t("library.clear_tags"))
+        self._clear_btn = QPushButton(t(self._clear_key))
         self._sty(self._clear_btn, lambda: (
             f"QPushButton{{color:{palette('text_muted')};font-size:10px;background:transparent;"
             f"border:none;padding:2px;}}"
@@ -300,6 +316,19 @@ class TagFilterPanel(QFrame, ThemedMixin):
         # spelling. Ordering is casefold too — one interleaved alphabet.
         from collections import Counter
         from core.library import tag_merge_key
+        if not self._merge_variants:
+            seen: dict[str, str] = {}
+            for x in tags:
+                value = (x or "").strip()
+                if value:
+                    seen.setdefault(value.casefold(), value)
+            self._all_tags = sorted(seen.values(),
+                                    key=lambda s: (s.casefold(), s))
+            live = {v.casefold() for v in self._all_tags}
+            self._states = {k: s for k, s in self._states.items()
+                            if s and k.casefold() in live}
+            self._rebuild_checks(self._search.text())
+            return
         variants: dict[str, Counter] = {}
         first_idx: dict[tuple, int] = {}
         for i, x in enumerate(tags):
@@ -499,16 +528,26 @@ class TagFilterPanel(QFrame, ThemedMixin):
                 self._hide_suggest()
         return super().eventFilter(obj, event)
 
-    def _clear_all(self):
+    def clear_selection(self, *, emit: bool = True):
+        """Drop every include/exclude in this panel."""
         self._states.clear()
         self._rebuild_checks(self._search.text())
-        self.tags_changed.emit()
+        if emit:
+            self.tags_changed.emit()
+
+    def _clear_all(self):
+        # Announced BEFORE this panel emits, so an owner clearing a sibling
+        # panel too has already done it by the time the list re-filters —
+        # one rebuild, with every selection gone, instead of two.
+        self.cleared.emit()
+        self.clear_selection()
 
     def update_locale(self):
-        self._header.setText(t("library.filter_tags"))
-        self._search.setPlaceholderText(t("library.search_tags"))
-        self._clear_btn.setText(t("library.clear_tags"))
-        self._selected_lbl.setText(t("library.active_tag_filters"))
+        self._header.setText(t(self._header_key))
+        self._search.setPlaceholderText(t(self._search_key))
+        self._clear_btn.setText(t(self._clear_key))
+        self._selected_lbl.setText(t(self._active_key))
+        self._rebuild_checks(self._search.text())
 
     def refresh_styles(self):
         # Re-apply the registered one-shot styles (header/search/clear). The
@@ -761,9 +800,10 @@ class FolderRow(QFrame, ThemedMixin):
 
 
 class FolderTree(QFrame, ThemedMixin):
-    """Sidebar showing the folder tree, plus tag filter."""
+    """Sidebar showing the folder tree, plus the tag/engine filter tabs."""
     folder_selected = Signal(str)  # folder_path or "__all__"
     tags_changed = Signal()        # tag selection changed
+    engines_changed = Signal()     # engine selection changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -799,16 +839,65 @@ class FolderTree(QFrame, ThemedMixin):
         self._folders_pane.setMinimumHeight(90)
         self._splitter.addWidget(self._folders_pane)
 
-        # ── Bottom pane: tag filter panel ────────────────────────────────
+        # ── Bottom pane: "filter by" tabs — tags | engine ─────────────────
+        # Two filters of the same shape share the pane. Both stay ACTIVE
+        # while hidden: switching tab changes what is being edited, not what
+        # is being filtered. "Clear all" empties both tabs.
+        self._filters_pane = QWidget()
+        filters_col = QVBoxLayout(self._filters_pane)
+        filters_col.setContentsMargins(0, 0, 0, 0)
+        filters_col.setSpacing(2)
+
+        self._filter_by_lbl = QLabel(t("library.filter_by"))
+        self._sty(self._filter_by_lbl, lambda: (
+            f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
+            f"letter-spacing:0.5px;background:transparent;"))
+        filters_col.addWidget(self._filter_by_lbl)
+
+        tabs_row = QHBoxLayout()
+        tabs_row.setContentsMargins(0, 0, 0, 0)
+        tabs_row.setSpacing(4)
+        self._tab_tags_btn = QPushButton(t("library.tab_tags"))
+        self._tab_engines_btn = QPushButton(t("library.tab_engines"))
+        self._filter_tab_btns = (self._tab_tags_btn, self._tab_engines_btn)
+        self._tab_tags_btn.setToolTip(t("library.filter_tags"))
+        self._tab_engines_btn.setToolTip(t("library.filter_engines"))
+        for i, btn in enumerate(self._filter_tab_btns):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setFixedHeight(24)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                              QSizePolicy.Policy.Fixed)
+            btn.setMinimumWidth(0)
+            btn.clicked.connect(lambda _=False, idx=i: self._show_filter_tab(idx))
+            tabs_row.addWidget(btn, 1)
+        filters_col.addLayout(tabs_row)
+
+        self._filter_stack = QStackedWidget()
         self._tag_panel = TagFilterPanel()
         self._tag_panel.tags_changed.connect(self.tags_changed)
+        self._engine_panel = TagFilterPanel(
+            header_key="library.filter_engines",
+            search_key="library.search_engines",
+            clear_key="library.clear_engines",
+            active_key="library.active_engine_filters",
+            merge_variants=False)
+        self._engine_panel.tags_changed.connect(self.engines_changed)
+        self._tag_panel.cleared.connect(self._clear_sibling_filters)
+        self._engine_panel.cleared.connect(self._clear_sibling_filters)
+        self._filter_stack.addWidget(self._tag_panel)
+        self._filter_stack.addWidget(self._engine_panel)
+        filters_col.addWidget(self._filter_stack, 1)
+        self._has_unknown_engines = False
+
         # Was a hard setMaximumHeight(215) (no resize possible at all); now
         # just a floor so the header/search/clear row always stays usable
         # however far the user drags the handle up. TagFilterPanel's own
         # tag-list scroll area grows to fill whatever extra height the
         # splitter gives this pane (see TagFilterPanel._build).
-        self._tag_panel.setMinimumHeight(130)
-        self._splitter.addWidget(self._tag_panel)
+        self._filters_pane.setMinimumHeight(160)
+        self._splitter.addWidget(self._filters_pane)
+        self._show_filter_tab(0)
 
         self._splitter.setStretchFactor(0, 1)
         self._splitter.setStretchFactor(1, 0)
@@ -881,13 +970,27 @@ class FolderTree(QFrame, ThemedMixin):
             except RuntimeError:
                 pass
         self._tag_panel.refresh_styles()
+        self._engine_panel.refresh_styles()
 
     def update_locale(self):
         """Retranslate the sidebar: rebuild covers the folder rows ("All
-        games", "+ new folder"); the tag panel is a permanent pane rebuild
-        never touches, so it retranslates its own header/search/clear."""
+        games", "+ new folder"); the filter panes are permanent panes rebuild
+        never touches, so they retranslate their own header/search/clear."""
         self.rebuild()
+        self._filter_by_lbl.setText(t("library.filter_by"))
+        self._tab_tags_btn.setText(t("library.tab_tags"))
+        self._tab_engines_btn.setText(t("library.tab_engines"))
+        self._tab_tags_btn.setToolTip(t("library.filter_tags"))
+        self._tab_engines_btn.setToolTip(t("library.filter_engines"))
         self._tag_panel.update_locale()
+        self._engine_panel.update_locale()
+        # Others chip label is translated — rebuild engine chips so the
+        # wording tracks the locale while keeping include/exclude state.
+        if self._has_unknown_engines:
+            old = getattr(self, "_others_label", None)
+            engines = [x for x in self._engine_panel._all_tags if x != old]
+            self.update_engines(engines, has_unknown=True)
+        self._show_filter_tab(self._filter_stack.currentIndex())
 
     def update_drag_hover(self, global_pos: QPoint):
         """Highlight the folder row under the cursor during drag."""
@@ -903,15 +1006,90 @@ class FolderTree(QFrame, ThemedMixin):
         for row in self._rows:
             row.set_drag_hover(False)
 
+    def _clear_sibling_filters(self):
+        """Clear the filter tabs that did not raise the clear signal."""
+        sender = self.sender()
+        for panel in (self._tag_panel, self._engine_panel):
+            if panel is not sender:
+                panel.clear_selection(emit=False)
+
+    def _show_filter_tab(self, index: int):
+        """Switch which filter is on show; both keep filtering either way."""
+        self._filter_stack.setCurrentIndex(index)
+        for i, btn in enumerate(self._filter_tab_btns):
+            active = i == index
+            btn.setObjectName("filter_tab")
+            btn.setProperty("active", "1" if active else "0")
+            # Belt-and-suspenders: Fusion sometimes ignores QSS text colour
+            # on property-keyed buttons, leaving green-on-green (invisible).
+            if active:
+                btn.setStyleSheet(
+                    f"QPushButton#filter_tab{{background:{palette('accent')};"
+                    f"color:{palette('accent_text')};"
+                    f"border:1px solid {palette('accent')};"
+                    f"border-radius:3px;font-size:10px;font-weight:700;"
+                    f"padding:2px 6px;}}")
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton#filter_tab{{background:{palette('bg_elevated')};"
+                    f"color:{palette('text_secondary')};"
+                    f"border:1px solid {palette('border_hover')};"
+                    f"border-radius:3px;font-size:10px;font-weight:600;"
+                    f"padding:2px 6px;}}"
+                    f"QPushButton#filter_tab:hover{{color:{palette('text')};"
+                    f"border-color:{palette('accent')};}}")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            btn.update()
+
     def update_tags(self, all_tags: list[str]):
         """Refresh available tags from game library."""
         self._tag_panel.set_tags(all_tags)
+
+    def update_engines(self, all_engines: list[str], *, has_unknown: bool = False):
+        """Refresh available engines from the game library.
+
+        Populated from the games themselves rather than from the full table
+        of known engines: a filter offering twelve engines for a library with
+        two is a longer list that says less. *has_unknown* adds an Others
+        chip for titles whose engine was not identified.
+        """
+        self._has_unknown_engines = bool(has_unknown)
+        old_others = getattr(self, "_others_label", None)
+        self._others_label = t("library.engine_others")
+        # Keep include/exclude across a locale switch when only the Others
+        # wording changed.
+        if old_others and old_others != self._others_label:
+            st = self._engine_panel._states.pop(old_others, None)
+            if st:
+                self._engine_panel._states[self._others_label] = st
+        chips = [x for x in all_engines
+                 if x and x != old_others and x != self._others_label]
+        if has_unknown:
+            chips.append(self._others_label)
+        self._engine_panel.set_tags(chips)
+
+    def engine_others_label(self) -> str:
+        """Current translated label of the Others engine chip."""
+        return getattr(self, "_others_label", None) or t("library.engine_others")
 
     def get_selected_tags(self) -> set[str]:
         return self._tag_panel.get_selected()
 
     def get_excluded_tags(self) -> set[str]:
         return self._tag_panel.get_excluded()
+
+    def get_selected_engines(self) -> set[str]:
+        return self._engine_panel.get_selected()
+
+    def get_excluded_engines(self) -> set[str]:
+        return self._engine_panel.get_excluded()
+
+    def has_active_filters(self) -> bool:
+        """Whether any chip filter is narrowing the library right now."""
+        return bool(self.get_selected_tags() or self.get_excluded_tags()
+                    or self.get_selected_engines()
+                    or self.get_excluded_engines())
 
     def _on_row_clicked(self, path: str):
         self._selected_path = path

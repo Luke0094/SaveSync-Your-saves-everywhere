@@ -735,33 +735,50 @@ class BackupManager(QObject):
         return True
 
     def _save_game_index(self, game_id: str, _folder_hint: str = ""):
-        """Save index.json for a single game into its backup subfolder.
+        """Save index.json for the backup folder that *game_id* uses.
 
-        If no entries remain, removes the index.json and the empty folder.
-        *_folder_hint* is used when no entries remain (can't derive from zip_path).
+        The file is per folder name, not per UUID: a game re-added from the
+        overlay gets a new id but the same install-folder name, and writing
+        only that id's rows used to wipe every earlier id out of the index
+        while leaving the zip files on disk — invisible to restore. So every
+        entry whose zip lives in the folder is persisted, whatever its
+        game_id.
+
+        If nothing at all remains in the folder, removes the index.json and
+        the empty folder. *_folder_hint* is used when *game_id* itself has no
+        rows left (can't derive the folder from a zip_path).
         """
         with _index_lock:
-            game_entries = [b for b in self._index if b.game_id == game_id]
+            own = [b for b in self._index if b.game_id == game_id]
+            folder = ""
+            if own:
+                folder = self._game_folder_for_entry(own[0])
+            elif _folder_hint:
+                folder = _folder_hint
+            if not folder:
+                return
+            # Everything that belongs in this folder's index — any game_id.
+            folder_entries = [
+                b for b in self._index
+                if self._game_folder_for_entry(b) == folder
+            ]
 
-        if not game_entries:
-            # No entries left — clean up the index file and empty folder
-            if _folder_hint:
-                idx_path = self._game_index_path(_folder_hint)
-                try:
-                    idx_path.unlink(missing_ok=True)
-                    if idx_path.parent != BACKUP_DIR and idx_path.parent.exists():
-                        if not any(idx_path.parent.iterdir()):
-                            idx_path.parent.rmdir()
-                except Exception:
-                    pass
+        if not folder_entries:
+            idx_path = self._game_index_path(folder)
+            try:
+                idx_path.unlink(missing_ok=True)
+                if idx_path.parent != BACKUP_DIR and idx_path.parent.exists():
+                    if not any(idx_path.parent.iterdir()):
+                        idx_path.parent.rmdir()
+            except Exception:
+                pass
             return
 
-        folder = self._game_folder_for_entry(game_entries[0])
         idx_path = self._game_index_path(folder)
         idx_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            data = [b.to_dict() for b in game_entries]
+            data = [b.to_dict() for b in folder_entries]
             tmp_path = idx_path.with_suffix(".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)

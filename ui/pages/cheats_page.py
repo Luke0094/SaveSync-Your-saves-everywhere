@@ -44,6 +44,12 @@ _SCAN_DEPTH = 3
 # single allowance let the first of them use the lot.
 _MAX_PER_PATH = 400
 _MAX_FILES = 600
+# Subfolders under a save root that are never saves (logs, caches, crash
+# dumps). Backup's own skip list is narrower — a confirmed archive may still
+# want odd paths — but the editor list must not offer engine noise.
+_EDITOR_SKIP_DIRS = frozenset({
+    "cache", "caches", "log", "logs", "temp", "tmp", "crash", "crashes",
+})
 # Values shown on one page of the editor. The filter and the pager together
 # are how the rest is reached, so nothing is ever hidden — only paged.
 _PAGE_SIZE = 40
@@ -149,7 +155,10 @@ def _save_files(entry) -> list:
     they were. Whatever a path does not use goes back to the others, so a
     game with one folder is capped exactly as before.
     """
+    from core.backup import _BACKUP_SKIP_DIRS, _is_skip_file
     from core.registry_saves import is_registry_path, registry_has_values
+
+    skip_dirs = _BACKUP_SKIP_DIRS | _EDITOR_SKIP_DIRS
 
     def when(f: Path) -> float:
         try:
@@ -165,8 +174,13 @@ def _save_files(entry) -> list:
                 if budget[0] <= 0:
                     return
                 if child.is_dir():
+                    if child.name.lower() in skip_dirs:
+                        continue
                     walk(child, depth + 1, budget, found)
                 elif child.is_file():
+                    # Same noise rules as backup: .log / .cache / stem "log", …
+                    if _is_skip_file(child):
+                        continue
                     found.append(child)
                     budget[0] -= 1
         except OSError:
@@ -186,6 +200,8 @@ def _save_files(entry) -> list:
         else:
             p = Path(raw)
             if p.is_file():
+                if _is_skip_file(p):
+                    continue
                 found = [p]
             elif p.is_dir():
                 found = []
@@ -230,7 +246,7 @@ class _Row(QFrame, ThemedMixin):
     clicked = Signal()
 
     def __init__(self, title: str, detail: str = "", where: str = "",
-                 parent=None):
+                 engine: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("cheats_row")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -239,9 +255,24 @@ class _Row(QFrame, ThemedMixin):
         row.setSpacing(10)
         titles = QVBoxLayout()
         titles.setSpacing(0)
-        self._title = ElidedLabel(title)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+        self._title = ElidedLabel(title, own_tooltip=False)
         self._title.setObjectName("cheats_row_title")
-        titles.addWidget(self._title)
+        # Maximum: sit at the name's natural width so the engine label
+        # follows the text, not the far edge next to the paths column.
+        # (Ignored + stretch 1 shoved "· Engine" against the detail.)
+        self._title.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        title_row.addWidget(self._title, 0)
+        if engine:
+            eng = QLabel(f"· {engine}")
+            eng.setObjectName("cheats_row_engine")
+            eng.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            title_row.addWidget(eng, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_row.addStretch(1)
+        titles.addLayout(title_row)
         # Where the file is, under the name. Only when it is needed to tell
         # two rows apart: a game with several save paths has the same save
         # names in each of them, and without this the list reads as the same
@@ -254,6 +285,9 @@ class _Row(QFrame, ThemedMixin):
         self._detail = QLabel(detail)
         self._detail.setObjectName("cheats_row_detail")
         row.addWidget(self._detail)
+        # Tip on the whole row: the title label is only as wide as its text
+        # (Maximum), so hovering the stretch / engine / detail would miss it.
+        self.setToolTip(title)
 
     def add_button(self, text: str, handler) -> QPushButton:
         btn = QPushButton(text)
@@ -359,8 +393,9 @@ class CheatsPage(QWidget, ThemedMixin):
         self._doc = None
         self._editors = {}          # field path -> widget, for the page shown
         self._pending = {}          # every edit made, whatever page it was on
-        self._held = {}             # values being kept fixed in the file
+        self._held = {}             # locked values (✓ stays until cleared)
         self._hold = None
+        self._hold_armed = False    # True after Apply — loop may run when playing
         self._page = 0
         self._prefix = ""           # the part every row of a group repeats
         self._loose = None          # a save opened without a game behind it
@@ -368,6 +403,9 @@ class CheatsPage(QWidget, ThemedMixin):
         self._files = []            # the save list, newest first
         self._file_page = 0
         self._games_page = 0        # the library list has its own page number
+        self._hold_watch = QTimer(self)
+        self._hold_watch.setInterval(1000)
+        self._hold_watch.timeout.connect(self._watch_hold_game)
         self._build()
         self.show_step(self.STEP_PICK)
 
@@ -438,8 +476,10 @@ class CheatsPage(QWidget, ThemedMixin):
         self._games_area, self._games_col = self._scroller()
         col.addWidget(self._games_area, 1)
         # Own page size on the pager row (with ← n/m →), not beside search.
+        self._games_size_combo = PageSizeCombo(
+            SCOPE_CHEATS_GAMES, self._on_games_page_size_changed)
         bar, self._games_prev, self._games_page_lbl, self._games_next = self._pager(
-            PageSizeCombo(SCOPE_CHEATS_GAMES, self._on_games_page_size_changed))
+            self._games_size_combo)
         self._games_prev.clicked.connect(lambda: self._step_games(-1))
         self._games_next.clicked.connect(lambda: self._step_games(1))
         col.addLayout(bar)
@@ -482,8 +522,10 @@ class CheatsPage(QWidget, ThemedMixin):
         # A game with several save paths has every save listed once per path,
         # so even a modest folder runs to a hundred rows. Same pager as the
         # editor's, so the two read the same way. Page size sits on this row.
+        self._saves_size_combo = PageSizeCombo(
+            SCOPE_CHEATS_SAVES, self._on_saves_page_size_changed)
         bar, self._file_prev, self._file_page_lbl, self._file_next = self._pager(
-            PageSizeCombo(SCOPE_CHEATS_SAVES, self._on_saves_page_size_changed))
+            self._saves_size_combo)
         self._file_prev.clicked.connect(lambda: self._step_saves(-1))
         self._file_next.clicked.connect(lambda: self._step_saves(1))
         col.addLayout(bar)
@@ -605,7 +647,11 @@ class CheatsPage(QWidget, ThemedMixin):
             # Walking away from the editor stops holding: a loop rewriting a
             # file for a screen nobody is looking at is not something to
             # leave running.
+            self._held = {}
+            self._hold_armed = False
             self._stop_hold()
+            self._hold_watch.stop()
+            self._sync_hold_label()
             if self._entry is None:
                 # Picked on its own, so back means that file and the copies
                 # kept of it, not a game list it never came from.
@@ -676,10 +722,12 @@ class CheatsPage(QWidget, ThemedMixin):
         if not found:
             self._add_note(self._games_col, t("cheats.no_games"))
             return
+        from core.engines.game_engine import engine_display, engine_for_game
         for g in found[start:start + per_page]:
             n = len(g.save_paths or [])
+            eng = engine_display(engine_for_game(g))
             row = _Row(g.name, t("cheats.n_paths", count=n) if n else
-                       t("cheats.no_paths"))
+                       t("cheats.no_paths"), engine=eng)
             row.clicked.connect(lambda e=g: self._open_game(e))
             self._insert(self._games_col, row)
 
@@ -830,7 +878,9 @@ class CheatsPage(QWidget, ThemedMixin):
             known = describe(f)
             detail = known or f.suffix.lower().lstrip(".") or ""
             row = _Row(f.name, detail, str(f.parent) if show_where else "")
-            row.setToolTip(str(f))
+            # Name first (elided in the row), then full path — the default
+            # row tip is only the title, which is not enough for saves.
+            row.setToolTip(f"{f.name}\n{f}")
             row.clicked.connect(lambda p=f: self._open_editor(p))
             self._insert(self._files_col, row)
         self._file_page_lbl.setText(t("cheats.page_of_saves",
@@ -934,8 +984,10 @@ class CheatsPage(QWidget, ThemedMixin):
             warning_window_modal(self, t("cheats.title"), explain(e))
             return
         self._stop_hold()
+        self._hold_watch.stop()
         self._pending = {}
         self._held = {}
+        self._hold_armed = False
         self._page = 0
         self.show_step(self.STEP_EDIT)
         self._subtitle.setText(t("cheats.editing",
@@ -1051,14 +1103,17 @@ class CheatsPage(QWidget, ThemedMixin):
         line.addWidget(name, 1)
         line.addWidget(self._editor_for(f))
 
-        hold = QPushButton("🔒")
+        # Check only — no padlock. Marks stay selected; the re-apply loop
+        # runs only while THIS game is running (see _watch_hold_game).
+        marked = f.label in self._held
+        hold = QPushButton("✓" if marked else "")
         hold.setObjectName("cheats_hold_btn")
         hold.setCheckable(True)
         hold.setFixedSize(24, 24)
         hold.setCursor(Qt.CursorShape.PointingHandCursor)
         hold.setToolTip(t("cheats.hold_tip"))
-        hold.setChecked(f.label in self._held)
-        hold.toggled.connect(lambda on, fld=f: self._toggle_hold(fld, on))
+        hold.setChecked(marked)
+        hold.toggled.connect(lambda on, fld=f, btn=hold: self._toggle_hold(fld, on, btn))
         line.addWidget(hold)
         return row
 
@@ -1111,10 +1166,9 @@ class CheatsPage(QWidget, ThemedMixin):
     def _apply_edits(self):
         if self._doc is None:
             return
-        # Pause the hold across the write: both write this same file, and
-        # the copy save() keeps should be of the state it actually replaced.
-        holding = self._hold is not None and self._hold.is_running()
-        if holding:
+        # Pause an active hold across the write: both write this same file.
+        was_holding = self._hold is not None and self._hold.is_running()
+        if was_holding:
             self._hold.stop()
         from ui.widgets.busy_overlay import busy_over
         for path, value in self._pending.items():
@@ -1128,43 +1182,60 @@ class CheatsPage(QWidget, ThemedMixin):
             logger.error(f"Saving edits failed: {e}")
             warning_window_modal(self, t("cheats.title"),
                                  t("cheats.write_failed", error=str(e)))
-            return
-        finally:
-            if holding and self._hold is not None:
+            if was_holding and self._hold is not None:
                 self._hold.start()
+            return
         self._subtitle.setText(t("cheats.applied", name=kept.name))
-        # Holding is the one case where a running game is the point of the
-        # exercise — it exists to keep writing the value back — so it says
-        # nothing there.
-        running = "" if holding else self._playing()
-        if running:
+        running = self._playing()
+        # Marks persist across game stop/start; the loop needs Apply first,
+        # then runs only while THIS game is up.
+        if self._held:
+            for f in self._doc.fields:
+                if f.label in self._held:
+                    self._held[f.label] = self._pending.get(f.path, f.value)
+            self._hold_armed = True
+            if running:
+                self._start_hold()
+            else:
+                self._stop_hold()
+            self._hold_watch.start()
+            self._sync_hold_label()
+        elif was_holding and self._hold is not None:
+            self._hold.start()
+        if running and not (self._hold is not None and self._hold.is_running()):
             warning_window_modal(self, t("cheats.title"),
                                  t("cheats.reload_warning", name=running))
 
     # ── holding values ───────────────────────────────────────────────────────
 
-    def _toggle_hold(self, field, on: bool):
-        """Hold a value at what the editor shows, or let it go.
-
-        Holding writes the value back every time the game overwrites it, so
-        it is the difference between "I set my health to 9999 once" and "my
-        health stays at 9999".
-        """
+    def _toggle_hold(self, field, on: bool, btn=None):
+        """Toggle a lock mark. Marks stay; the file loop needs Apply + game running."""
         if on:
             self._held[field.label] = self._pending.get(field.path, field.value)
+            if btn is not None:
+                btn.setText("✓")
         else:
             self._held.pop(field.label, None)
-        if self._held:
-            self._start_hold()
-        else:
-            self._stop_hold()
+            if btn is not None:
+                btn.setText("")
+            if not self._held:
+                self._hold_armed = False
+                self._stop_hold()
+                self._hold_watch.stop()
+            elif self._hold is not None and self._hold.is_running():
+                self._hold.set_values(self._held)
         self._sync_hold_label()
 
     def _start_hold(self):
         from core.save_editor import SaveHold
 
+        if (not self._hold_armed or not self._held
+                or not self._playing() or self._doc is None):
+            return
         if self._hold is not None:
             self._hold.set_values(self._held)
+            if not self._hold.is_running():
+                self._hold.start()
             return
         self._hold = SaveHold(self._doc.path, self._held, self)
         self._hold.reapplied.connect(lambda _n: self._sync_hold_label())
@@ -1177,22 +1248,44 @@ class CheatsPage(QWidget, ThemedMixin):
             self._hold.deleteLater()
             self._hold = None
 
+    def _watch_hold_game(self):
+        """Pause/resume the re-apply loop with the game; keep the ✓ marks."""
+        if not self._held or not self._hold_armed:
+            self._stop_hold()
+            if not self._held:
+                self._hold_watch.stop()
+            self._sync_hold_label()
+            return
+        if self._stack.currentIndex() != self.STEP_EDIT or self._doc is None:
+            return
+        if self._playing():
+            if self._hold is None or not self._hold.is_running():
+                self._start_hold()
+            self._sync_hold_label()
+            return
+        # Game closed: stop checking the file, leave locks selected.
+        if self._hold is not None:
+            self._stop_hold()
+            self._sync_hold_label()
+
     def _on_hold_failed(self, message: str):
-        self._held = {}
-        self._hold = None
+        self._stop_hold()
         self._sync_hold_label()
-        self._render_page()
         warning_window_modal(self, t("cheats.title"),
                              t("cheats.hold_failed", error=message))
 
     def _sync_hold_label(self):
+        active = self._hold is not None and self._hold.is_running()
         if not self._held:
             self._hold_lbl.setText("")
             self._hold_lbl.setVisible(False)
             return
-        rounds = self._hold.rounds if self._hold is not None else 0
-        self._hold_lbl.setText(t("cheats.holding", count=len(self._held),
-                                 rounds=rounds))
+        if active:
+            rounds = self._hold.rounds
+            self._hold_lbl.setText(t("cheats.holding", count=len(self._held),
+                                     rounds=rounds))
+        else:
+            self._hold_lbl.setText(t("cheats.hold_pending", count=len(self._held)))
         self._hold_lbl.setVisible(True)
 
     # ── Small helpers ────────────────────────────────────────────────────────
@@ -1232,6 +1325,8 @@ class CheatsPage(QWidget, ThemedMixin):
         self._save_btn.setText(t("cheats.apply"))
         self._kept_lbl.setText(t("cheats.kept_copies"))
         self._files_lbl.setText(t("cheats.pick_save"))
+        self._games_size_combo.update_locale()
+        self._saves_size_combo.update_locale()
         self._drop.retranslate()
         if self._stack.currentIndex() == self.STEP_SAVES:
             self._render_saves_page()

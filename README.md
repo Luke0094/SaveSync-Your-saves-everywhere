@@ -169,13 +169,15 @@ savesync/
 │   ├── monitor.py                 # Process monitor (cached snapshots, adaptive polling)
 │   ├── watcher.py                 # Real-time filesystem watcher, debounced events
 │   ├── save_detector.py           # Heuristic save folder detection and scoring
-│   ├── engines/                   # Engine recognition + save format readers
+│   ├── engines/                   # Engine recognition + binary/format readers
 │   │   ├── game_engine.py         # Which engine a game was built with
 │   │   ├── gvas.py                # Unreal Engine .sav (GVAS)
-│   │   ├── renpy_save.py          # Ren'Py .save (pickle, read never run)
+│   │   ├── renpy.py               # Ren'Py .save (pickle, read never run)
 │   │   ├── lcf.py                 # RPG Maker 2000/2003 .lsd (LCF chunks)
-│   │   ├── lzstring.py            # LZString codec (RPG Maker MV/MZ)
+│   │   ├── rpgmaker.py            # RPG Maker MV/MZ save packing
+│   │   ├── lzstring.py            # LZString codec (used by MV / HTML games)
 │   │   ├── rubymarshal.py         # Ruby Marshal 4.8 (XP/VX/VX Ace)
+│   │   ├── naninovel.py           # Naninovel .nson (raw deflate)
 │   │   ├── sol.py                 # Flash shared objects (.sol, AMF0/AMF3)
 │   │   ├── qsp.py                 # QSP saves (line-based, obfuscated)
 │   │   ├── kirikiri.py            # KiriKiri .ksd (TJS dictionary in UTF-16)
@@ -183,15 +185,46 @@ savesync/
 │   │   ├── alicesoft.py           # AliceSoft System 4 globals and slots
 │   │   ├── artemis.py             # Artemis Engine settings (BOWX container)
 │   │   ├── rags.py                # RAGS .rsv (.NET objects behind fixed AES)
-│   │   └── wolf.py                # Wolf RPG obfuscation and checksum
-│   ├── save_editor/               # Save-file editor + editor-only crypto tools
-│   │   ├── save_editor.py         # Reads/writes saves, keeps the original
+│   │   ├── wolf.py                # Wolf RPG obfuscation and checksum
+│   │   ├── sqlite_db.py           # SQLite save databases (Room / Java)
+│   │   ├── playerprefs.py         # Unity PlayerPrefs registry export
+│   │   ├── tads.py                # TADS system.rec slots
+│   │   ├── keyvalue.py            # key = value text configs
+│   │   └── xml_save.py            # Plain XML saves
+│   ├── save_editor/               # Save-file editor: orchestration + adapters
+│   │   ├── save_editor.py         # open_save, detection, backups of edits
 │   │   ├── save_hold.py           # Holds chosen values against the game
-│   │   ├── unreal_crypt.py        # Unreal saves locked with the game's own key
-│   │   ├── es3.py                 # Unity Easy Save 3, including encrypted
-│   │   ├── game_keys.py           # Remembered decrypt keys, per game
-│   │   ├── unityfs.py             # Unity asset bundles, unpacked to find keys
-│   │   └── wolf_save.py           # Wolf RPG values, named from the game DB
+│   │   ├── base.py                # SaveField, errors, shared walk helpers
+│   │   ├── json_format.py         # Plain JSON
+│   │   ├── xml_format.py          # Plain XML
+│   │   ├── playerprefs_format.py  # Unity PlayerPrefs (registry export)
+│   │   ├── naninovel_format.py    # Naninovel .nson
+│   │   ├── lzstring_json_format.py # LZString base64 JSON (shared base)
+│   │   ├── rpgmaker_mv_format.py  # RPG Maker MV (.rpgsave)
+│   │   ├── rpgmaker_mz_format.py  # RPG Maker MZ (.rmmzsave, zlib wrap)
+│   │   ├── sugarcube_format.py    # Twine / SugarCube
+│   │   ├── lcf_format.py          # RPG Maker 2000/2003 .lsd
+│   │   ├── rubymarshal_format.py  # RPG Maker XP/VX/VX Ace
+│   │   ├── keyvalue_format.py     # key = value text (.ini, .properties, …)
+│   │   ├── gvas_format.py         # Unreal GVAS (+ encrypted wrapper)
+│   │   ├── renpy_format.py        # Ren'Py .save
+│   │   ├── sol_format.py          # Flash .sol
+│   │   ├── qsp_format.py          # QSP
+│   │   ├── es3_format.py          # Easy Save 3
+│   │   ├── rags_format.py         # RAGS .rsv
+│   │   ├── kirikiri_format.py     # KiriKiri .ksd
+│   │   ├── wolf_format.py         # Wolf RPG Editor
+│   │   ├── alicesoft_format.py    # AliceSoft System 4
+│   │   ├── artemis_format.py      # Artemis
+│   │   ├── tyrano_format.py       # TyranoScript
+│   │   ├── tads_rec_format.py     # TADS TAD-kit system.rec
+│   │   ├── sqlite_format.py       # SQLite (Room / Java desktop)
+│   │   └── crypt/                 # Decryptors used only by the editor
+│   │       ├── unreal_crypt.py    # Unreal saves locked with the game's own key
+│   │       ├── es3.py             # Unity Easy Save 3, including encrypted
+│   │       ├── wolf.py            # Wolf unlock + variable database
+│   │       ├── game_keys.py       # Remembered decrypt keys, per game
+│   │       └── unityfs.py         # Unity asset bundles, unpacked to find keys
 │   ├── manual_paths.py            # Hand-registered save folders, single or in bulk
 │   ├── registry_saves.py          # Windows-registry save locations
 │   ├── skip_dirs.py               # Shared skip-list of noise directories
@@ -328,19 +361,20 @@ engine is read from the game's executable before they are judged:
 
 | Engine | Also treated as saves |
 |---|---|
-| Unity, Godot | `.dat`, `.bin` |
+| Unity, Godot, Java, WebGL | `.dat`, `.bin` |
 | GameMaker | `.dat` |
+| TADS | `.t3v` (classic MJR state files) |
 | RPG Maker, Unreal, Ren'Py, unknown | none — `.dat`/`.bin` stay engine data |
-| TyranoScript, Bakin, SRPG Studio, AliceSoft, Artemis | none — they save into extensions nothing skips |
+| TyranoScript, Bakin, SRPG Studio, AliceSoft, Artemis, Wolf RPG | none — they save into extensions nothing skips |
 | NW.js, Electron | none — a wrapper says nothing about what the game inside saves into |
 
 The engines it knows are Ren'Py, RPG Maker (2000 through MZ), Unity, Unreal,
 Godot, GameMaker, TyranoScript, RPG Developer Bakin, SRPG Studio, AliceSoft
-System and Artemis. NW.js and Electron are recognised too, but only after
-every one of those has been ruled out: they are a Chromium runtime with
-somebody's game inside, and RPG Maker MV and TyranoScript both ship as one —
-answering "NW.js" for an MV game would be naming the box instead of what is
-in it.
+System, Artemis, Wolf RPG Editor, TADS, Java and WebGL. NW.js and Electron
+are recognised too, but only after every one of those has been ruled out:
+they are a Chromium runtime with somebody's game inside, and RPG Maker MV,
+TyranoScript and HTML5/WebGL shells all ship as one — answering "NW.js" for
+those would be naming the box instead of what is in it.
 
 A game added with only a save folder has no executable to read, so it is
 treated as unknown: the conservative side, where a save that is merely not
@@ -371,7 +405,7 @@ Two rules it is built around:
 
 | Editable now | Recognised, not editable yet |
 |---|---|
-| JSON — Unity, Naninovel, Godot, HTML games, whatever the extension | Saves a game encrypts with a key of its own |
+| JSON — Unity, Naninovel, Godot, HTML / WebGL games, whatever the extension | Saves a game encrypts with a key of its own |
 | Naninovel (`.nson`), deflated or plain, down to the game's own variables | |
 | XML — .NET's serializer, so Unity and Godot games saving through it | |
 | Unity PlayerPrefs — a registry key rather than a file | |
@@ -391,7 +425,9 @@ Two rules it is built around:
 | Twine / SugarCube and other LZString HTML games (`.save`) | |
 | RAGS (`.rsv`) — variables, objects, rooms, the player | |
 | Any Ruby Marshal file, including engine `.dat` saves | |
-| `key = value` text (`.ini`, `.cfg`, `.conf`) | |
+| `key = value` text (`.ini`, `.cfg`, `.conf`, `.properties`) | |
+| TADS record (`system.rec`) — whitespace tokens, NUL-padded | Classic MJR TADS 3 VM state (`.t3v`) — a snapshot, not a named value list |
+| SQLite (`.db`, `.sqlite`) — Room / Compose Desktop Java progress | |
 
 Two notes on Ren'Py, because they are unusual. Its saves are Python pickles,
 and unpickling one runs code from the file — so SaveSync reads the pickle
@@ -585,6 +621,33 @@ sits beside the save — level, HP, attack, in the game's own words. A game that
 packs that database away still gets every value, numbered instead of named. A
 Wolf file with no values in it, such as some games' `System.sav`, is reported
 as unreadable rather than opened and guessed at.
+
+**TADS** covers two layouts. The TAD-kit style (picture packs as `.tad` under
+`pic/`, plus `system/system.rec`) is recognised from the install folder; the
+record file is a line of whitespace-separated tokens padded with NULs to a
+fixed size, and SaveSync edits those tokens and writes the same byte length
+back — open with no changes is byte-identical. Classic MJR TADS 2/3 image
+files (`.gam` / `.t3`) are recognised the same way; their `.t3v` VM state
+snapshots are named but not edited, because they are a machine dump rather
+than a list of named values.
+
+**Java** desktop titles are recognised from a bundled JVM (`java.dll` with
+`jvm.dll` / `awt.dll` next to the launcher), from jars beside a private JRE,
+or from the Compose Desktop / Conveyor layout (`bin/` launcher + sibling
+`app/*.jar`), including MSIX installs under WindowsApps. Progress is often a
+SQLite database (Android Room on the desktop): tables the game owns are
+offered cell by cell, Room's own schema tables are skipped, and a no-edit
+open that does not touch a page stays bit-identical — after a real edit the
+gate checks that every value still round-trips, because SQLite rewrites
+pages when it writes.
+
+**WebGL** is the answer for HTML5 / WebGL shells: Unity WebGL exports
+(`Build/*.wasm` and friends), plain `index.html` + wasm/data, and NW.js or
+Electron packages whose main page is HTML — those are named WebGL rather than
+"NW.js", for the same reason Tyrano is named before the wrapper. Saves are
+normally JSON beside the game (and LZString / SugarCube when that is what the
+page wrote); indent and line endings are kept when they are unambiguous, so an
+untouched open/close is byte-for-byte.
 
 It edits files at rest. Nothing is injected into a running game and nothing
 attaches to one.

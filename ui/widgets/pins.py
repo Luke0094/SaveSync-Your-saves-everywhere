@@ -783,6 +783,16 @@ class PinManager(QObject):
             return {_GENERAL: [str(p) for p in raw]}
         return {str(k): list(v) for k, v in raw.items() if isinstance(v, list)}
 
+    def assert_topmost_all(self, why: str = "asked"):
+        """Put every pin back on top, on request from elsewhere.
+
+        The overlay calls this right after raising itself: both windows sit in
+        the always-on-top group and both re-assert on their own timer, so the
+        last one to ask wins, and left to chance the overlay's second beat the
+        pins' 1.2 — a pin made from the overlay's own menu vanished behind it.
+        """
+        self._assert_topmost(why)
+
     def _assert_topmost(self, why: str = "timer"):
         if popup_is_open():
             return

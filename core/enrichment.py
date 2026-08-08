@@ -100,6 +100,42 @@ def apply_game_info(entry, info, fetch_cover: bool = True) -> list:
             entry.tags = genres[:6]
             changed.append("tags")
 
+    # What the source thought of the game — one verdict (Steam/VNDB) or many
+    # user reviews (DLsite). Keyed by review_identity so re-running updates
+    # each entry instead of stacking duplicates, and the user's own reviews
+    # (source "user") are never touched.
+    from core.library import review_identity
+    if hasattr(info, "as_reviews"):
+        web_reviews = info.as_reviews()
+    elif hasattr(info, "as_review"):
+        one = info.as_review()
+        web_reviews = [one] if one else []
+    else:
+        web_reviews = []
+    if web_reviews:
+        reviews = list(getattr(entry, "reviews", None) or [])
+        by_key = {review_identity(r): i
+                  for i, r in enumerate(reviews) if isinstance(r, dict)}
+        touched = False
+        for web_review in web_reviews:
+            if (web_review.get("source") or "") == "user":
+                continue
+            key = review_identity(web_review)
+            if not key:
+                continue
+            idx = by_key.get(key)
+            if idx is not None:
+                if reviews[idx] != web_review:
+                    reviews[idx] = web_review
+                    touched = True
+            else:
+                by_key[key] = len(reviews)
+                reviews.append(web_review)
+                touched = True
+        if touched:
+            entry.reviews = reviews
+            changed.append("reviews")
+
     if fetch_cover and not getattr(entry, "icon_path", ""):
         local = download_cover(
             getattr(info, "image_url", ""), entry.name, entry.id,

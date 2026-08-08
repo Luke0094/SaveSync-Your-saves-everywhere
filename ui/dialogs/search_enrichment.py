@@ -87,24 +87,28 @@ class CandidatePreviewDialog(QDialog):
         )
         outer.addWidget(self._counter_lbl)
 
+        # Filled triangles (◀ ▶) — thin ‹ › glyphs disappear on some fonts /
+        # Windows DPI scales; these stay readable at the sidebar width.
         _arrow_css = (
             f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
-            f"border:1px solid {palette('border')};border-radius:4px;"
-            f"font-weight:bold;font-size:18px;}}"
-            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
-            f"QPushButton:disabled{{color:{palette('text_muted')};border-color:{palette('border')};}}"
+            f"border:1px solid {palette('border_hover')};border-radius:4px;"
+            f"font-weight:700;font-size:16px;padding:0;}}"
+            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};"
+            f"border-color:{palette('accent')};}}"
+            f"QPushButton:disabled{{color:{palette('text_muted')};"
+            f"border-color:{palette('border')};background:{palette('bg')};}}"
         )
 
-        self._prev_btn = QPushButton("‹")
-        self._prev_btn.setFixedWidth(30)
+        self._prev_btn = QPushButton("◀")
+        self._prev_btn.setFixedWidth(32)
         self._prev_btn.setMinimumHeight(90)
         self._prev_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self._prev_btn.setToolTip(t('add_game.candidate_prev'))
         self._prev_btn.setStyleSheet(_arrow_css)
         self._prev_btn.clicked.connect(self._go_prev)
 
-        self._next_btn = QPushButton("›")
-        self._next_btn.setFixedWidth(30)
+        self._next_btn = QPushButton("▶")
+        self._next_btn.setFixedWidth(32)
         self._next_btn.setMinimumHeight(90)
         self._next_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self._next_btn.setToolTip(t('add_game.candidate_next'))
@@ -148,6 +152,13 @@ class CandidatePreviewDialog(QDialog):
         self._meta_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._meta_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
         content.addWidget(self._meta_lbl)
+
+        # The source's own verdict, when it has one and the form doesn't yet.
+        self._review_lbl = QLabel()
+        self._review_lbl.setWordWrap(True)
+        self._review_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._review_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        content.addWidget(self._review_lbl)
 
         self._tags_lbl = QLabel()
         self._tags_lbl.setWordWrap(True)
@@ -287,6 +298,29 @@ class CandidatePreviewDialog(QDialog):
         _meta_bits = [p for p in (_dev_piece, _yr_piece) if p]
         self._meta_lbl.setText('&nbsp;&nbsp;&nbsp;'.join(_meta_bits))
         self._meta_lbl.setVisible(bool(_meta_bits))
+
+        # ── Reviews — count + up to 3 samples on ONE line ──────────────
+        # Vertical stacking ate the room the description and tags need;
+        # the reviews panel is where they are read in full.
+        _new_reviews = diff.get('new_reviews') or []
+        if _new_reviews:
+            _bits = [
+                f"<b>{_h.escape(t('reviews.preview'))}:</b> "
+                f"{_h.escape(t('reviews.preview_count', count=len(_new_reviews)))}"
+            ]
+            for _r in _new_reviews[:3]:
+                _score = float(_r.get('rating') or 0)
+                _who = (_r.get('reviewer') or '').strip()
+                _head = ' '.join(x for x in (
+                    f"★ {_score:g}" if _score else '',
+                    _h.escape(_who),
+                ) if x)
+                if _head:
+                    _bits.append(_head)
+            self._review_lbl.setText('&nbsp;&nbsp;·&nbsp;&nbsp;'.join(_bits))
+            self._review_lbl.setVisible(True)
+        else:
+            self._review_lbl.setVisible(False)
 
         # ── Tags — always additive (union, never struck through) ─────────
         _all_genre_tags = list(c.genres or [])
@@ -502,6 +536,7 @@ class EnrichmentMergeDialog(QDialog):
         self._field_groups: dict[str, _ChipGroup] = {}
         self._tag_boxes: list[tuple[QPushButton, str]] = []
         self._url_boxes: list[tuple[QPushButton, str]] = []
+        self._review_boxes: list[tuple[QPushButton, list]] = []
         self._img_chips: dict[str, QPushButton] = {}   # image url → its chip
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t('add_game.merge_title'))
@@ -531,6 +566,27 @@ class EnrichmentMergeDialog(QDialog):
             f"letter-spacing:0.5px;margin-top:6px;"
         )
         return lbl
+
+    @staticmethod
+    def _reviews_chip_text(reviews: list) -> str:
+        """"Reviews (n)", carrying the score when a single one gives it."""
+        label = t('reviews.merge_chip', count=len(reviews))
+        rated = [float(r.get('rating') or 0) for r in reviews
+                 if float(r.get('rating') or 0) > 0]
+        if len(rated) == 1:
+            return f"★ {rated[0]:g} · {label}"
+        return label
+
+    @staticmethod
+    def _reviews_tooltip(reviews: list) -> str:
+        lines = []
+        for r in reviews:
+            who = (r.get('reviewer') or '').strip()
+            score = float(r.get('rating') or 0)
+            head = " ".join(x for x in (who, f"★ {score:g}" if score else "") if x)
+            body = (r.get('text') or '').strip()
+            lines.append(f"{head}\n{body}".strip() if body else head)
+        return "\n\n".join(x for x in lines if x)
 
     def _field_chip(self, field: str, text: str, value, tooltip: str = "",
                     checked: bool = False) -> QPushButton:
@@ -570,7 +626,7 @@ class EnrichmentMergeDialog(QDialog):
         for field in self._FIELDS:
             for opt in self._model.get(field, []):
                 by_source.setdefault(opt['source'], {}).setdefault(field, []).append(opt['value'])
-        for kind in ('tags', 'urls'):
+        for kind in ('tags', 'urls', 'reviews'):
             for opt in self._model.get(kind, []):
                 by_source.setdefault(opt['source'], {}).setdefault(kind, []).append(opt['value'])
 
@@ -605,6 +661,15 @@ class EnrichmentMergeDialog(QDialog):
                 chip.setChecked(True)
                 flow.addWidget(chip)
                 self._url_boxes.append((chip, url))
+            # One chip for ALL of a source's reviews: a score, who gave it and
+            # what they wrote are one verdict, so they are taken or left as
+            # one. Independent of the other sources' chips, the way tags are.
+            for reviews in offers.get('reviews', []):
+                chip = _merge_chip(self._reviews_chip_text(reviews),
+                                   tooltip=self._reviews_tooltip(reviews))
+                chip.setChecked(True)
+                flow.addWidget(chip)
+                self._review_boxes.append((chip, reviews))
             col.addWidget(host)
 
         col.addStretch()
@@ -660,10 +725,13 @@ class EnrichmentMergeDialog(QDialog):
 
     def selection(self) -> dict:
         """Chosen pieces: description/developer/year/image mapped to the
-        picked value or None (keep current / skip), plus tag and url lists."""
+        picked value or None (keep current / skip), plus tag, url and review
+        lists — reviews arrive already flattened, a whole source at a time."""
         sel = {
             'tags': [v for cb, v in self._tag_boxes if cb.isChecked()],
             'urls': [v for cb, v in self._url_boxes if cb.isChecked()],
+            'reviews': [r for cb, group in self._review_boxes
+                        if cb.isChecked() for r in group],
         }
         for field, group in self._field_groups.items():
             btn = group.checkedButton()

@@ -695,9 +695,12 @@ class ElidedLabel(QLabel):
     (the drive and the leaf) while the whole thing stays available on hover.
     """
 
-    def __init__(self, text: str = "", parent=None):
+    def __init__(self, text: str = "", parent=None, *, own_tooltip: bool = True):
         super().__init__(parent)
         self._full = ""
+        # False when a parent row owns the tip (hover on stretch/engine still
+        # shows the full title; this label alone is only as wide as its text).
+        self._own_tooltip = own_tooltip
         self.setTextFormat(Qt.TextFormat.PlainText)
         self.setMinimumWidth(40)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -705,16 +708,59 @@ class ElidedLabel(QLabel):
 
     def setFullText(self, text: str):
         self._full = text or ""
-        self.setToolTip(self._full)
         self._apply_elide()
+        self.updateGeometry()
 
     def fullText(self) -> str:
         return self._full
 
+    def sizeHint(self):
+        from PySide6.QtCore import QSize
+        metrics = QFontMetrics(self.font())
+        # Slack: elidedText() is stricter than horizontalAdvance, and QSS
+        # fonts may polish after the first hint.
+        return QSize(metrics.horizontalAdvance(self._full) + 8, metrics.height())
+
+    def minimumSizeHint(self):
+        from PySide6.QtCore import QSize
+        metrics = QFontMetrics(self.font())
+        return QSize(40, metrics.height())
+
     def _apply_elide(self):
         metrics = QFontMetrics(self.font())
-        width = max(40, self.width() - 2)
-        super().setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideMiddle, width))
+        # Before the first layout pass width is 0. Using a fake 40px budget
+        # here made short names elide (file2→file2....mzsave) while a longer
+        # neighbour that later got a real geometry stayed whole — looking
+        # like a character-limit bug when there was ample row space.
+        if self.width() <= 0:
+            super().setText(self._full)
+            self._sync_tooltip(elided=False)
+            return
+        width = max(1, self.width() - 2)
+        full_w = metrics.horizontalAdvance(self._full)
+        if full_w <= width:
+            super().setText(self._full)
+            self._sync_tooltip(elided=False)
+            return
+        elided = metrics.elidedText(
+            self._full, Qt.TextElideMode.ElideMiddle, width)
+        # ElideMiddle can replace a couple of letters with "…" and end up
+        # wider than the original ("Love" → "…ve"). Keep the full text then.
+        if (elided == self._full
+                or metrics.horizontalAdvance(elided) >= full_w):
+            super().setText(self._full)
+            self._sync_tooltip(elided=False)
+            return
+        super().setText(elided)
+        self._sync_tooltip(elided=True)
+
+    def _sync_tooltip(self, elided: bool):
+        if not self._own_tooltip:
+            self.setToolTip("")
+            return
+        # Full value only when shortened — otherwise the tip repeats what
+        # is already on screen.
+        self.setToolTip(self._full if elided else "")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -763,8 +809,21 @@ class ElidedCheckBox(QCheckBox):
 
     def _apply_elide(self):
         metrics = QFontMetrics(self.font())
-        width = max(40, self.width() - self._label_offset())
-        super().setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideMiddle, width))
+        if self.width() <= 0:
+            super().setText(self._full)
+            return
+        width = max(1, self.width() - self._label_offset())
+        full_w = metrics.horizontalAdvance(self._full)
+        if full_w <= width:
+            super().setText(self._full)
+            return
+        elided = metrics.elidedText(
+            self._full, Qt.TextElideMode.ElideMiddle, width)
+        if (elided == self._full
+                or metrics.horizontalAdvance(elided) >= full_w):
+            super().setText(self._full)
+            return
+        super().setText(elided)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

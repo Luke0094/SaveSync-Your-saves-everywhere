@@ -605,3 +605,142 @@ def load_all(data: bytes) -> list:
 
 def dump_all(values: list) -> bytes:
     return b"".join(dumps(v) for v in values)
+
+
+# How deep to walk a Ruby object graph looking for values. RPG Maker nests a
+# few levels; past this it is the engine's own bookkeeping.
+_MARSHAL_DEPTH = 12
+
+
+def _key_label(key, index: int) -> str:
+    if isinstance(key, RString):
+        return key.text()
+    if isinstance(key, (str, int)):
+        return str(key).lstrip("@")
+    return str(index)
+
+
+class MarshalSave:
+    """Several Marshal streams opened for editing (RPG Maker XP/VX/Ace)."""
+
+    def __init__(self, streams: list):
+        self.streams = streams
+
+    def dump(self) -> bytes:
+        return dump_all(self.streams)
+
+    def _children(self, node):
+        """(step, label, child) for everything inside *node*."""
+        if isinstance(node, list):
+            for i, v in enumerate(node):
+                yield ("i", i), str(i), v
+        elif isinstance(node, RHash):
+            for i, (k, v) in enumerate(node.pairs):
+                yield ("h", i), _key_label(k, i), v
+        elif isinstance(node, (RObject, RStructVal)):
+            pairs = node.ivars if isinstance(node, RObject) else node.pairs
+            for i, (k, v) in enumerate(pairs):
+                yield ("o", i), str(k).lstrip("@"), v
+        elif isinstance(node, RUserMarshal):
+            yield ("u", 0), "value", node.value
+
+    def _child_at(self, node, step):
+        kind, idx = step
+        if kind == "i":
+            return node[idx]
+        if kind == "h":
+            return node.pairs[idx][1]
+        if kind == "o":
+            pairs = node.ivars if isinstance(node, RObject) else node.pairs
+            return pairs[idx][1]
+        return node.value
+
+    def _set_child(self, node, step, value):
+        kind, idx = step
+        if kind == "i":
+            node[idx] = value
+        elif kind == "h":
+            k, _ = node.pairs[idx]
+            node.pairs[idx] = (k, value)
+        elif kind == "o":
+            pairs = node.ivars if isinstance(node, RObject) else node.pairs
+            k, _ = pairs[idx]
+            pairs[idx] = (k, value)
+        else:
+            node.value = value
+
+    def _get_parent(self, path):
+        node = self.streams[path[0]]
+        for step in path[1:-1]:
+            node = self._child_at(node, step)
+        return node
+
+    @staticmethod
+    def _stream_name(stream, index: int) -> str:
+        """What the save itself calls this stream.
+
+        Ruby writes an object's class name into the file, and an RPG Maker
+        save is a run of them: Game_Switches, Game_Variables, Game_Party and
+        the rest. Naming them is not decoration — Game_Switches and
+        Game_Variables both keep their contents in an ivar called ``data``, so
+        without the class name switch 12 and variable 12 are the same label.
+        """
+        return stream.cls if isinstance(stream, RObject) else str(index)
+
+    def values(self) -> list:
+        """(path, label, kind, value, group) for every editable leaf."""
+        out, seen = [], set()
+
+        def walk(node, path, labels, depth):
+            # Ruby graphs contain back-references; without an identity guard
+            # a save that points at itself would walk forever.
+            if depth > _MARSHAL_DEPTH or id(node) in seen:
+                return
+            seen.add(id(node))
+            for step, label, child in self._children(node):
+                here = path + (step,)
+                names = labels + (label,)
+                if isinstance(child, bool):
+                    kind = "bool"
+                elif isinstance(child, int):
+                    kind = "int"
+                elif isinstance(child, RFloat):
+                    kind = "float"
+                elif isinstance(child, RString):
+                    kind = "str"
+                else:
+                    walk(child, here, names, depth + 1)
+                    continue
+                value = (child.value if isinstance(child, RFloat)
+                         else child.text() if isinstance(child, RString)
+                         else child)
+                out.append((here, ".".join(names), kind, value,
+                            names[0] if names else ""))
+
+        for i, stream in enumerate(self.streams):
+            walk(stream, (i,), (self._stream_name(stream, i),), 0)
+        return out
+
+    def set_value(self, path: tuple, value) -> None:
+        parent = self._get_parent(path)
+        current = self._child_at(parent, path[-1])
+        if isinstance(current, RFloat):
+            value = current.with_value(value)
+        elif isinstance(current, RString):
+            # Keep the string OBJECT: it may be shared, and replacing it
+            # would turn a back-reference into a second copy.
+            current.data = str(value).encode("utf-8")
+            return
+        elif isinstance(current, bool):
+            value = bool(value)
+        elif isinstance(current, int):
+            value = int(value)
+        self._set_child(parent, path[-1], value)
+
+
+def open_save(data: bytes) -> MarshalSave:
+    """Every stream in a RPG Maker-style save, ready to edit."""
+    streams = load_all(data)
+    if not streams:
+        raise MarshalError("no Marshal stream in the file")
+    return MarshalSave(streams)

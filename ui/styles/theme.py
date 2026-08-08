@@ -245,10 +245,11 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #6b6b7a;
+    /* Placeholder filled at apply-time with a real SVG (CSS triangles
+       often fail to paint on Windows Fusion). */
+    image: __ICON_DOWN__;
+    width: 10px;
+    height: 10px;
     margin-right: 8px;
 }
 
@@ -265,7 +266,7 @@ QComboBox QAbstractItemView {
 QComboBox#page_size_combo {
     padding: 2px 18px 2px 6px;
     min-width: 0px;
-    max-width: 52px;
+    max-width: 58px;
     border-radius: 4px;
 }
 QComboBox#page_size_combo::drop-down {
@@ -276,7 +277,8 @@ QComboBox#page_size_combo::down-arrow {
 }
 
 /* ── Sliders & Spinboxes ──────────────────────────────────────────── */
-QSpinBox {
+/* QDoubleSpinBox too: float fields (e.g. Ren'Py BINFLOAT) must match ints. */
+QSpinBox, QDoubleSpinBox {
     background-color: #111114;
     color: #e8e8ea;
     border: 1px solid #2a2a38;
@@ -306,29 +308,70 @@ QCheckBox::indicator:checked {
 /* ── ScrollBar ────────────────────────────────────────────────────── */
 QScrollBar:vertical {
     background: transparent;
-    width: 6px;
+    width: 12px;
     margin: 0;
 }
 
 QScrollBar::handle:vertical {
     background: #2a2a3a;
     border-radius: 3px;
-    min-height: 30px;
+    min-height: 24px;
 }
 
 QScrollBar::handle:vertical:hover { background: #3a3a50; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar::sub-line:vertical {
+    height: 12px;
+    background: transparent;
+    subcontrol-position: top;
+    subcontrol-origin: margin;
+}
+QScrollBar::add-line:vertical {
+    height: 12px;
+    background: transparent;
+    subcontrol-position: bottom;
+    subcontrol-origin: margin;
+}
+QScrollBar::up-arrow:vertical {
+    width: 8px; height: 8px;
+    image: __ICON_UP__;
+}
+QScrollBar::down-arrow:vertical {
+    width: 8px; height: 8px;
+    image: __ICON_DOWN__;
+}
 
 QScrollBar:horizontal {
     background: transparent;
-    height: 6px;
+    height: 12px;
 }
 
 QScrollBar::handle:horizontal {
     background: #2a2a3a;
     border-radius: 3px;
-    min-width: 30px;
+    min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover { background: #3a3a50; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+QScrollBar::sub-line:horizontal {
+    width: 12px;
+    background: transparent;
+    subcontrol-position: left;
+    subcontrol-origin: margin;
+}
+QScrollBar::add-line:horizontal {
+    width: 12px;
+    background: transparent;
+    subcontrol-position: right;
+    subcontrol-origin: margin;
+}
+QScrollBar::left-arrow:horizontal {
+    width: 8px; height: 8px;
+    image: __ICON_LEFT__;
+}
+QScrollBar::right-arrow:horizontal {
+    width: 8px; height: 8px;
+    image: __ICON_RIGHT__;
 }
 
 /* ── Tab widget ───────────────────────────────────────────────────── */
@@ -492,23 +535,23 @@ QGroupBox::title {
 }
 
 /* ── Spinbox up/down arrows ──────────────────────────────────────── */
-QSpinBox::up-button, QSpinBox::down-button {
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 18px;
     background: #1e1e28;
     border: none;
 }
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
     background: #2a2a38;
 }
-QSpinBox::up-arrow {
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-bottom: 4px solid #6b6b7a;
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    width: 8px; height: 8px;
+    image: __ICON_UP__;
 }
-QSpinBox::down-arrow {
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-top: 4px solid #6b6b7a;
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    width: 8px; height: 8px;
+    image: __ICON_DOWN__;
 }
 
 /* ── Views & scroll areas (prevent Qt default gray) ──────────────── */
@@ -581,14 +624,14 @@ QFrame#game_card_grid:hover {
     background: #161619;
 }
 
-/* Card playtime: total normally, last session while hovered. Only the TEXT
-   swap needs Python; the two colours are constant per theme. The hover
-   colour is gated on hasHover, because a game with no recorded session
-   keeps its text on hover and so must keep its colour too. */
+/* Card playtime: total normally, last session while hovered. Transparent —
+   overlap with stars is masked in _PlayRatingStrip (no backdrop). Hover
+   colour matches the sync-status accent. */
 #playtime_lbl {
     color: #6b6b7a;
     font-size: 9px;
     background: transparent;
+    padding: 0px;
 }
 
 #playtime_lbl[hasHover="1"]:hover {
@@ -986,6 +1029,41 @@ QPushButton#tag_chip[tagState="2"]:hover {
     background: #7d2e2e;
 }
 
+/* ── Sidebar "filter by" tabs (tags | engine) ─────────────────────── */
+/* Named and keyed on an "active" property for the same reason as the chips
+   above: the two buttons are re-polished on every switch, and a per-button
+   stylesheet would have to be rewritten on a theme change. */
+QPushButton#filter_tab {
+    background: #161619;
+    color: #c8c8d0;
+    border: 1px solid #2a2a38;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    min-width: 0;
+}
+
+QPushButton#filter_tab:hover {
+    color: #e8e8ea;
+    border-color: #3a3a50;
+    background: #1a1a22;
+}
+
+/* Active tab: white on accent. Also pinned for :hover/:focus — the global
+   QPushButton:hover colour was winning and painting light-on-light / green-
+   on-green so the selected label looked blank. */
+QPushButton#filter_tab[active="1"],
+QPushButton#filter_tab[active="1"]:hover,
+QPushButton#filter_tab[active="1"]:pressed,
+QPushButton#filter_tab[active="1"]:focus {
+    background: #76b900;
+    color: #ffffff;
+    border: 1px solid #76b900;
+    padding: 2px 6px;
+    font-weight: 700;
+}
+
 /* The chips' two scroll bodies. These MUST be NAMED rather than carrying
    "background: transparent" as their own stylesheet: a widget's stylesheet
    outranks the application one across its whole subtree, so a transparent
@@ -1014,6 +1092,7 @@ QPushButton#tag_chip[tagState="2"]:hover {
 }
 #cheats_row:hover { background: #24243a; border-color: #6c5ce7; }
 #cheats_row_title { color: #e8e8ea; font-size: 12px; }
+#cheats_row_engine { color: #8a8a9a; font-size: 11px; font-weight: 500; }
 #cheats_row_where { color: #8a8a9a; font-size: 10px; }
 #cheats_row_detail { color: #8a8a9a; font-size: 11px; }
 #cheats_row_btn {
@@ -1173,13 +1252,14 @@ QCheckBox::indicator:disabled {
     background: #16161c;
 }
 
-QSpinBox:disabled {
+QSpinBox:disabled, QDoubleSpinBox:disabled {
     color: #55555f;
     background-color: #16161c;
     border-color: #1e1e24;
 }
 
-QSpinBox::up-button:disabled, QSpinBox::down-button:disabled {
+QSpinBox::up-button:disabled, QSpinBox::down-button:disabled,
+QDoubleSpinBox::up-button:disabled, QDoubleSpinBox::down-button:disabled {
     background: #16161c;
 }
 """
@@ -1419,10 +1499,9 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #1a1a2e;
+    image: __ICON_DOWN__;
+    width: 10px;
+    height: 10px;
     margin-right: 8px;
 }
 
@@ -1439,7 +1518,7 @@ QComboBox QAbstractItemView {
 QComboBox#page_size_combo {
     padding: 2px 18px 2px 6px;
     min-width: 0px;
-    max-width: 52px;
+    max-width: 58px;
     border-radius: 4px;
 }
 QComboBox#page_size_combo::drop-down {
@@ -1450,7 +1529,7 @@ QComboBox#page_size_combo::down-arrow {
 }
 
 /* ── Sliders & Spinboxes ──────────────────────────────────────────── */
-QSpinBox {
+QSpinBox, QDoubleSpinBox {
     background-color: #ffffff;
     color: #1a1a2e;
     border: 1px solid #e0e0ea;
@@ -1458,23 +1537,23 @@ QSpinBox {
     padding: 6px 10px;
 }
 
-QSpinBox::up-button, QSpinBox::down-button {
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 18px;
     background: #f0f0f5;
     border: none;
 }
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
     background: #d8d8e8;
 }
-QSpinBox::up-arrow {
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-bottom: 4px solid #6a6a7a;
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    width: 8px; height: 8px;
+    image: __ICON_UP__;
 }
-QSpinBox::down-arrow {
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-top: 4px solid #6a6a7a;
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    width: 8px; height: 8px;
+    image: __ICON_DOWN__;
 }
 
 /* ── CheckBox ─────────────────────────────────────────────────────── */
@@ -1499,29 +1578,70 @@ QCheckBox::indicator:checked {
 /* ── ScrollBar ────────────────────────────────────────────────────── */
 QScrollBar:vertical {
     background: transparent;
-    width: 6px;
+    width: 12px;
     margin: 0;
 }
 
 QScrollBar::handle:vertical {
     background: #c0c0d0;
     border-radius: 3px;
-    min-height: 30px;
+    min-height: 24px;
 }
 
 QScrollBar::handle:vertical:hover { background: #a8a8b8; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar::sub-line:vertical {
+    height: 12px;
+    background: transparent;
+    subcontrol-position: top;
+    subcontrol-origin: margin;
+}
+QScrollBar::add-line:vertical {
+    height: 12px;
+    background: transparent;
+    subcontrol-position: bottom;
+    subcontrol-origin: margin;
+}
+QScrollBar::up-arrow:vertical {
+    width: 8px; height: 8px;
+    image: __ICON_UP__;
+}
+QScrollBar::down-arrow:vertical {
+    width: 8px; height: 8px;
+    image: __ICON_DOWN__;
+}
 
 QScrollBar:horizontal {
     background: transparent;
-    height: 6px;
+    height: 12px;
 }
 
 QScrollBar::handle:horizontal {
     background: #c0c0d0;
     border-radius: 3px;
-    min-width: 30px;
+    min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover { background: #a8a8b8; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+QScrollBar::sub-line:horizontal {
+    width: 12px;
+    background: transparent;
+    subcontrol-position: left;
+    subcontrol-origin: margin;
+}
+QScrollBar::add-line:horizontal {
+    width: 12px;
+    background: transparent;
+    subcontrol-position: right;
+    subcontrol-origin: margin;
+}
+QScrollBar::left-arrow:horizontal {
+    width: 8px; height: 8px;
+    image: __ICON_LEFT__;
+}
+QScrollBar::right-arrow:horizontal {
+    width: 8px; height: 8px;
+    image: __ICON_RIGHT__;
 }
 
 /* ── Tab widget ───────────────────────────────────────────────────── */
@@ -1835,6 +1955,7 @@ QFrame#game_card_grid:hover {
     color: #2a2a3a;
     font-size: 9px;
     background: transparent;
+    padding: 0px;
 }
 
 #playtime_lbl[hasHover="1"]:hover {
@@ -2106,6 +2227,35 @@ QPushButton#tag_chip[tagState="2"]:hover {
     background: #7d2e2e;
 }
 
+/* ── Sidebar "filter by" tabs — mirror of the DARK_THEME block ────── */
+QPushButton#filter_tab {
+    background: #f2f2f7;
+    color: #1a1a2e;
+    border: 1px solid #c8c8d4;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    min-width: 0;
+}
+
+QPushButton#filter_tab:hover {
+    color: #1a1a2e;
+    border-color: #5a9400;
+    background: #e8e8f0;
+}
+
+QPushButton#filter_tab[active="1"],
+QPushButton#filter_tab[active="1"]:hover,
+QPushButton#filter_tab[active="1"]:pressed,
+QPushButton#filter_tab[active="1"]:focus {
+    background: #5a9400;
+    color: #ffffff;
+    border: 1px solid #5a9400;
+    padding: 2px 6px;
+    font-weight: 700;
+}
+
 /* The chips' two scroll bodies. These MUST be NAMED rather than carrying
    "background: transparent" as their own stylesheet: a widget's stylesheet
    outranks the application one across its whole subtree, so a transparent
@@ -2133,6 +2283,7 @@ QPushButton#tag_chip[tagState="2"]:hover {
 }
 #cheats_row:hover { background: #f4f2ff; border-color: #6c5ce7; }
 #cheats_row_title { color: #1a1a2e; font-size: 12px; }
+#cheats_row_engine { color: #6a6a7e; font-size: 11px; font-weight: 500; }
 #cheats_row_where { color: #6a6a7e; font-size: 10px; }
 #cheats_row_detail { color: #6a6a7e; font-size: 11px; }
 #cheats_row_btn {
@@ -2280,13 +2431,14 @@ QCheckBox::indicator:disabled {
     background: #f4f4f8;
 }
 
-QSpinBox:disabled {
+QSpinBox:disabled, QDoubleSpinBox:disabled {
     color: #a8a8b4;
     background-color: #f4f4f8;
     border-color: #e8e8f0;
 }
 
-QSpinBox::up-button:disabled, QSpinBox::down-button:disabled {
+QSpinBox::up-button:disabled, QSpinBox::down-button:disabled,
+QDoubleSpinBox::up-button:disabled, QDoubleSpinBox::down-button:disabled {
     background: #f4f4f8;
 }
 """
@@ -2461,6 +2613,10 @@ class ThemeManager(QObject):
     def _apply_inner(self, theme: str, app: QApplication):
         self._current = theme
         qss = DARK_THEME if theme == "dark" else LIGHT_THEME
+        # SVG chevrons — CSS border triangles do not paint reliably on Windows.
+        from ui.styles.arrow_icons import ensure_arrow_icons
+        for key, url in ensure_arrow_icons(theme).items():
+            qss = qss.replace(f"__ICON_{key.upper()}__", url)
 
         # Override Qt's built-in QPalette so Fusion doesn't paint
         # its default gray on view viewports and scroll areas.

@@ -33,6 +33,9 @@ _MACHINE_SPECIFIC_KEYS = frozenset({
     "last_cloud_config_hash",
     "last_cloud_config_import",
     "suppress_cloud_config_prompt",
+    # Per-machine schedule stamps — each install tracks its own last run.
+    "auto_export_config_last",
+    "backup_verify_last",
     # Note: suppressed_overlay_apps and ignored_processes ARE exported so the
     # blocklist roams with the user.  On a machine where a path doesn't exist
     # it simply never matches — no harm done.
@@ -317,15 +320,18 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
     """Merge imported game data into an existing entry.
 
     User-valuable title info must never be silently dropped by an import:
-    playtime keeps the higher total, last_played keeps the most recent
-    timestamp (and carries its session length along), tags/name_history
-    are unioned, and descriptive metadata fills fields that are empty
-    locally.
+    playtime fills only when local is zero (never inflate an existing total
+    on re-import), last_played keeps the most recent timestamp (and carries
+    its session length along), tags/name_history are unioned, and
+    descriptive metadata fills fields that are empty locally.
     """
-    # Always merge playtime (keep higher)
-    imported_playtime = imported_dict.get("playtime_seconds", 0)
-    if imported_playtime > existing.playtime_seconds:
-        existing.playtime_seconds = imported_playtime
+    # Playtime: transfer into an empty slot only. Taking max() on every
+    # import could leave "ghost hours" when the same export is re-applied
+    # or when both sides already reflect the same sessions.
+    if existing.playtime_seconds <= 0:
+        imported_playtime = int(imported_dict.get("playtime_seconds", 0) or 0)
+        if imported_playtime > 0:
+            existing.playtime_seconds = imported_playtime
 
     # last_played: keep the most recent; the matching session length
     # travels with whichever side wins.
@@ -350,9 +356,29 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
 
     # Descriptive metadata: fill only fields that are empty locally
     for fill_key in ("description", "developer", "release_year",
-                     "store_url", "category", "info_source"):
+                     "store_url", "category", "info_source", "engine"):
         if not getattr(existing, fill_key, "") and imported_dict.get(fill_key):
             setattr(existing, fill_key, imported_dict[fill_key])
+
+    # Reviews: union keyed by source, local side winning. A review is written
+    # once and is worth keeping — the same reasoning as playtime — but two
+    # machines that both searched Steam hold the same verdict twice, so the
+    # source is what decides identity. The user's own review ("user") stays
+    # whatever this machine has: an import must not rewrite what they wrote.
+    imported_reviews = imported_dict.get("reviews") or []
+    if imported_reviews:
+        from core.library import review_identity
+        merged_reviews = list(existing.reviews or [])
+        have = {review_identity(r) for r in merged_reviews if isinstance(r, dict)}
+        for review in imported_reviews:
+            if not isinstance(review, dict):
+                continue
+            key = review_identity(review)
+            if not key or key in have:
+                continue
+            have.add(key)
+            merged_reviews.append(review)
+        existing.reviews = merged_reviews
 
     # Merge cloud metadata (copy to avoid in-place mutation before update_game)
     imported_cloud = imported_dict.get("cloud_metadata", {})

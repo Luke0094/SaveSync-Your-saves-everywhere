@@ -33,6 +33,60 @@ VALID_SYNC_STATUSES = frozenset(
     {"synced", "pending", "conflict", "local_only", "cloud_only", "no_saves"}
 )
 
+# ── Ratings ─────────────────────────────────────────────────────────────────
+# Quarter-star granularity: fine enough that "not quite four stars" can be
+# said, coarse enough that a star can still be drawn for it.
+RATING_STEP = 0.25
+RATING_MAX = 5.0
+RATING_MIN = RATING_STEP      # zero means "no rating", not "worthless"
+
+
+def quantize_rating(value) -> float:
+    """A rating snapped to the quarter-star grid, or 0.0 when there is none.
+
+    Out-of-range and unparseable values collapse to 0.0 rather than being
+    clamped to a star count nobody chose — a review carrying junk should
+    read as unrated, not as one star.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if v <= 0:
+        return 0.0
+    v = min(v, RATING_MAX)
+    return round(round(v / RATING_STEP) * RATING_STEP, 2)
+
+
+def review_rating(review) -> float:
+    """The quantized rating of one review dict."""
+    if not isinstance(review, dict):
+        return 0.0
+    return quantize_rating(review.get("rating"))
+
+
+def review_identity(review) -> str:
+    """Stable key for one review, so a site's many user reviews do not
+    collapse into a single slot.
+
+    Preference order:
+      1. source + site id (DLsite's member_review_id, …)
+      2. source alone for single-verdict sites (Steam/VNDB — one score each)
+      3. source + reviewer + text head, for everything else (including the
+         user's own reviews, which all carry source "user")
+    """
+    if not isinstance(review, dict):
+        return ""
+    src = str(review.get("source") or "").strip()
+    rid = str(review.get("id") or "").strip()
+    if src and rid:
+        return f"{src}:{rid}"
+    if src in ("steam", "vndb"):
+        return src
+    who = str(review.get("reviewer") or "").strip()
+    text = str(review.get("text") or "").strip()[:80]
+    return f"{src}|{who}|{text}"
+
 
 @dataclass
 class GameEntry:
@@ -131,6 +185,23 @@ class GameEntry:
     # and the game's install folder agree on it exactly, while the two tidied
     # titles may not. Kept as a hint, never shown.
     name_hints: list[str] = field(default_factory=list)
+    # Which engine built this game — "unity", "rpgmaker", … as named in
+    # core.engines.game_engine, or "" when nothing said. Persisted rather
+    # than detected on demand for two reasons: detection reads the install
+    # folder, which is gone once a game is uninstalled while the library
+    # entry (and its backups) are not; and the user can correct it by hand,
+    # which a value recomputed from disk would overwrite on the next look.
+    engine: str = ""
+    # User/web reviews, newest first. Each is a dict:
+    #   rating   float, quarter-star steps, 0.25..5 (see quantize_rating)
+    #   reviewer str,   who wrote it ("" = this user)
+    #   text     str,   the review itself
+    #   notes    str,   private remarks, not part of the review
+    #   source   str,   where it came from ("user", or a web source id)
+    #   at       str,   ISO datetime it was recorded
+    # Dicts rather than a dataclass: entries written by an older version
+    # simply lack keys, and every reader here treats a missing key as empty.
+    reviews: list[dict] = field(default_factory=list)
 
     def record_path_chain(self, path: str, chain: str):
         """Remember where the saves in *path* belong."""
@@ -193,6 +264,22 @@ class GameEntry:
             return
         if raw.casefold() not in {h.casefold() for h in self.name_hints}:
             self.name_hints.append(raw)
+
+    def rated_reviews(self) -> list:
+        """Reviews that actually carry a rating, in stored order."""
+        return [r for r in (self.reviews or []) if review_rating(r) > 0]
+
+    def average_rating(self) -> float:
+        """Mean rating across reviews, on the quarter-star grid; 0 if none.
+
+        Unrated reviews (text only) are left out of the mean instead of
+        counting as zero, which would drag the score down for saying nothing.
+        """
+        rated = self.rated_reviews()
+        if not rated:
+            return 0.0
+        return quantize_rating(
+            sum(review_rating(r) for r in rated) / len(rated))
 
     def __post_init__(self):
         if self.sync_status not in VALID_SYNC_STATUSES:

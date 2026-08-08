@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize, QRectF
-from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QImageReader
+from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QImageReader, QRegion
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QMenu, QApplication, QGraphicsOpacityEffect,
+    QFrame, QMenu, QApplication, QGraphicsOpacityEffect, QSizePolicy,
 )
 
 from core.library import GameEntry, get_library
@@ -32,6 +32,7 @@ from ui.widgets.library_folders import (FolderRow, _clean_tag_display,
                                         _flatten_folders,
                                         _get_folder_color_by_path,
                                         _hex_to_rgb)
+from ui.widgets.rating import StarRating
 
 logger = logging.getLogger(__name__)
 
@@ -513,10 +514,10 @@ class _PlaytimeLabel(QLabel, ThemedMixin):
     """Card playtime label with a hover effect: shows total playtime
     normally and the most recent session's duration while hovered.
 
-    Only the TEXT swap happens here — both colours are constant per theme
-    and live in the QSS under ``#playtime_lbl``, so the label carries no
-    stylesheet of its own (a library page holds one per card, and each one
-    would cost triple to re-polish on a theme switch)."""
+    Geometry is owned by ``_PlayRatingStrip`` so hover can widen over the
+    stars without a layout jump. Only the TEXT swap happens here — colours
+    live in the QSS under ``#playtime_lbl``.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -524,6 +525,7 @@ class _PlaytimeLabel(QLabel, ThemedMixin):
         self._normal_text = ""
         self._hover_text = ""
         self._hovering = False
+        self._on_hover = None   # callback(bool) → strip relayout
 
     def set_entry(self, entry: GameEntry):
         total = entry.get_playtime_formatted()
@@ -547,24 +549,109 @@ class _PlaytimeLabel(QLabel, ThemedMixin):
             self.style().polish(self)
         self._apply(self._hovering)
 
+    def hover_text(self) -> str:
+        return self._hover_text if (self._hover_text and self._normal_text) else ""
+
     def _apply(self, hovering: bool):
         self._hovering = hovering
         if hovering and self._hover_text and self._normal_text:
-            self.setText(self._hover_text)
+            text = self._hover_text
         else:
-            self.setText(self._normal_text)
+            text = self._normal_text
+        if text:
+            fm = self.fontMetrics()
+            text = fm.elidedText(
+                text, Qt.TextElideMode.ElideRight, max(self.width(), 40))
+        self.setText(text)
 
     def refresh_styles(self):
         super().refresh_styles()
-        self._apply(self._hovering)   # keep the right text for the hover state
+        self._apply(self._hovering)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply(self._hovering)
 
     def enterEvent(self, event):
         super().enterEvent(event)
         self._apply(True)
+        if self._on_hover:
+            self._on_hover(True)
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
         self._apply(False)
+        if self._on_hover:
+            self._on_hover(False)
+
+
+class _PlayRatingStrip(QWidget):
+    """Playtime left, rating flush to the right — no layout jump on hover.
+
+    On hover the playtime label widens only as far as its text needs. The
+    rating stays pinned to the right edge; a mask hides only the overlap so
+    yellow stars do not show through under the text. No opaque fill.
+    """
+
+    def __init__(self, entry: GameEntry, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(16)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._playtime = _PlaytimeLabel(self)
+        self._playtime.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._playtime.set_entry(entry)
+        self._playtime._on_hover = self._on_play_hover
+        self._rating = StarRating(entry.average_rating(),
+                                  star_size=10, font_size=10, parent=self)
+        self._gap = 6
+        # Fixed natural width — never reuse a clipped geometry width.
+        self._rating_w = max(self._rating.sizeHint().width(), 1)
+
+    @property
+    def playtime_lbl(self) -> _PlaytimeLabel:
+        return self._playtime
+
+    @property
+    def rating(self) -> StarRating:
+        return self._rating
+
+    def _on_play_hover(self, _hovering: bool):
+        self._place()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place()
+
+    def _place(self):
+        rw = max(self._rating_w, self._rating.sizeHint().width(), 1)
+        self._rating_w = rw
+        rh = self.height()
+        w = self.width()
+        # Rating pinned to the right edge — geometry never shifts on hover.
+        rx = max(0, w - rw)
+        self._rating.setGeometry(rx, 0, min(rw, w), rh)
+        hover = self._playtime._hovering and self._playtime.hover_text()
+        if hover:
+            fm = self._playtime.fontMetrics()
+            need = fm.horizontalAdvance(self._playtime.hover_text()) + 4
+            pw = min(max(need, 1), w)
+            self._playtime.setGeometry(0, 0, pw, rh)
+            # Hide only the part of the rating under the text.
+            under = max(0, min(rw, pw - rx))
+            if under >= rw:
+                self._rating.setMask(QRegion())          # fully covered
+            elif under > 0:
+                self._rating.setMask(QRegion(under, 0, rw - under, rh))
+            else:
+                self._rating.clearMask()
+            self._playtime.raise_()
+        else:
+            self._rating.clearMask()
+            pw = max(0, w - rw - self._gap)
+            self._playtime.setGeometry(0, 0, pw, rh)
+            self._rating.raise_()
+        self._playtime._apply(self._playtime._hovering)
 
 
 class _HoverSwapLabel(QLabel, ThemedMixin):
@@ -1030,10 +1117,11 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._slideshow_timer = QTimer(self)
         self._slideshow_timer.setInterval(1800)
         self._slideshow_timer.timeout.connect(self._slideshow_tick)
-        # Cover crossfade state (~150 ms QPainter blend between slides —
-        # a single-label blend avoids z-order issues with the badge/dots)
+        # Cover crossfade state — single-label QPainter blend (avoids z-order
+        # fights with the badge/dots). Longer + eased so multi-image cards
+        # don't feel like a hard cut between slides.
         self._fade_timer = QTimer(self)
-        self._fade_timer.setInterval(16)
+        self._fade_timer.setInterval(8)
         self._fade_timer.timeout.connect(self._fade_step)
         self._fade_from: Optional[QPixmap] = None
         self._fade_to: Optional[QPixmap] = None
@@ -1159,12 +1247,21 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         if not self._all_images:
             self._slideshow_timer.stop()
             return
+        # Never start a new slide while the previous crossfade is still
+        # painting — interrupting mid-blend was the main source of stutter.
+        if self._fade_timer.isActive():
+            return
+        from_idx = self._slideshow_idx
         self._slideshow_idx = (self._slideshow_idx + 1) % len(self._all_images)
         path = self._all_images[self._slideshow_idx]
         focus = getattr(self._entry, 'cover_focus', 'center')
         px = _make_pixmap(path, 186, 240, focus)
         if px and not px.isNull():
-            self._start_cover_fade(px)
+            # Blend two freshly rendered cache frames (same path as the
+            # clean loop-back to image 0). Using cover.pixmap() as the
+            # outgoing frame reused a recomposited blend buffer and made
+            # mid-cycle transitions look dirtier than the wrap-around.
+            self._start_cover_fade(px, from_path=self._all_images[from_idx])
             self._cover.setText("")
         else:
             # Image was deleted from the cache mid-slideshow — prune every now-
@@ -1182,20 +1279,55 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
                 self._rebuild_dots(n)
         self._update_dot_highlight()
 
-    # ── Cover crossfade (light ~150 ms blend between slideshow frames) ───────
+    # ── Cover crossfade (eased blend between slideshow frames) ───────────────
 
-    _FADE_MS = 150
+    _FADE_MS = 320
 
-    def _start_cover_fade(self, new_px: QPixmap):
-        cur = self._cover.pixmap()
-        if cur is None or cur.isNull():
-            # Nothing to fade from (placeholder icon) — swap instantly
-            self._cover.setPixmap(new_px)
-            return
-        self._fade_from = QPixmap(cur)
+    def _norm_fade_frame(self, px: QPixmap) -> QPixmap:
+        """Force a slide onto the cover's logical 186×240 at the screen DPR.
+
+        Mismatched sizes / ratios between consecutive cache hits make the
+        blend jump even when the opacity ramp itself is smooth.
+        Source rect uses px.rect() (device pixels) — the pairing that keeps
+        cover framing identical to the static _make_pixmap path.
+        """
+        dpr = max(1.0, float(display_scale() or 1.0))
+        tw = int(round(186 * dpr))
+        th = int(round(240 * dpr))
+        if (px.width() == tw and px.height() == th
+                and abs(float(px.devicePixelRatio() or 1.0) - dpr) < 0.01):
+            return px
+        out = QPixmap(tw, th)
+        out.setDevicePixelRatio(dpr)
+        out.fill(Qt.GlobalColor.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawPixmap(QRectF(0.0, 0.0, 186.0, 240.0), px, QRectF(px.rect()))
+        p.end()
+        return out
+
+    def _start_cover_fade(self, new_px: QPixmap, from_path: Optional[str] = None):
+        new_px = self._norm_fade_frame(new_px)
+        if self._fade_timer.isActive() and self._fade_to is not None \
+                and not self._fade_to.isNull():
+            # Chain from the intended destination, not a mid-blend frame.
+            self._fade_from = QPixmap(self._fade_to)
+        else:
+            from_px = None
+            if from_path:
+                focus = getattr(self._entry, 'cover_focus', 'center')
+                from_px = _make_pixmap(from_path, 186, 240, focus)
+            if from_px is None or from_px.isNull():
+                cur = self._cover.pixmap()
+                if cur is None or cur.isNull():
+                    self._cover.setPixmap(new_px)
+                    return
+                from_px = cur
+            self._fade_from = self._norm_fade_frame(QPixmap(from_px))
         self._fade_to = new_px
         self._fade_t = 0.0
-        self._fade_timer.start()
+        if not self._fade_timer.isActive():
+            self._fade_timer.start()
 
     def _fade_step(self):
         self._fade_t += self._fade_timer.interval() / float(self._FADE_MS)
@@ -1203,31 +1335,33 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             final = self._fade_to
             self._stop_cover_fade()
             if final is not None and not final.isNull():
-                self._cover.setPixmap(final)
+                # Settle on the same cache frame the static cover uses, so
+                # proportions match image 0 and the next fade starts clean.
+                path = (self._all_images[self._slideshow_idx]
+                        if self._all_images else None)
+                focus = getattr(self._entry, 'cover_focus', 'center')
+                settled = _make_pixmap(path, 186, 240, focus) if path else None
+                self._cover.setPixmap(
+                    settled if settled and not settled.isNull() else final)
             return
+        # Smoothstep easing — linear opacity looked snappy at the ends.
         t = self._fade_t
-        # The blend canvas must carry the SAME scale as the frames going into
-        # it. QPixmap.size() is in real pixels while QPainter.drawPixmap and
-        # QLabel both work in Qt's coordinates, so a canvas left at scale 1
-        # was 2x too big on a scaled display: each frame landed in its
-        # top-left quarter and the label, which does not resize a pixmap,
-        # showed that quarter — the whole cover, shrunk, instead of the
-        # framing render_cover had just produced. Only the fade frames were
-        # affected, which is why the cover looked right until it changed.
+        t = t * t * (3.0 - 2.0 * t)
         dpr = max(1.0, float(self._fade_to.devicePixelRatio() or 1.0))
         blended = QPixmap(self._fade_to.size())
         blended.setDevicePixelRatio(dpr)
-        blended.fill(Qt.GlobalColor.transparent)
-        # Explicit source/target rects rather than a point: the two frames can
-        # differ in scale (one straight from the cache, one re-rendered), and
-        # both have to fill the same frame.
+        # Opaque cover chrome under both frames. Keeping the outgoing slide
+        # fully opaque under the incoming one made letterboxed / custom-focus
+        # slides (fit bars, transparent margins) show a ghost of image 1
+        # after image 2 was already up — then the settle step cleared it.
+        # The wrap-around to image 0 hid the bug when that frame was full-bleed.
+        # True crossfade on a solid backdrop: no ghost, no chrome flash.
+        blended.fill(QColor(palette("bg_elevated")))
         target = QRectF(0.0, 0.0,
                         blended.width() / dpr, blended.height() / dpr)
         p = QPainter(blended)
-        # Outgoing frame opaque, incoming one faded over it. Fading BOTH (the
-        # obvious 1-t / t pair) blends them onto transparency instead of onto
-        # each other, so the canvas peaked at 75% alpha mid-fade and the card
-        # behind it showed through.
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.setOpacity(1.0 - t)
         p.drawPixmap(target, self._fade_from, QRectF(self._fade_from.rect()))
         p.setOpacity(t)
         p.drawPixmap(target, self._fade_to, QRectF(self._fade_to.rect()))
@@ -1308,10 +1442,6 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._status_lbl = _HoverSwapLabel()
         self._apply_status()
 
-        # Playtime with hover effect: total normally, last session on hover
-        self._playtime_lbl = _PlaytimeLabel()
-        self._playtime_lbl.set_entry(self._entry)
-
         bl.addWidget(self._name_lbl)
 
         # Status row: status label + compact sync button side-by-side
@@ -1330,7 +1460,11 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         _status_row.addWidget(self._sync_card_btn)
         bl.addLayout(_status_row)
 
-        bl.addWidget(self._playtime_lbl)
+        # Playtime left, rating on the right edge (see _PlayRatingStrip).
+        self._play_strip = _PlayRatingStrip(self._entry)
+        self._playtime_lbl = self._play_strip.playtime_lbl
+        self._rating = self._play_strip.rating
+        bl.addWidget(self._play_strip)
 
         # Action bar
         bar = QHBoxLayout()
@@ -1421,6 +1555,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._apply_card_style()
         self._apply_status()
         self._playtime_lbl.refresh_styles()
+        self._rating.refresh_styles()
 
     def _get_folder_color(self) -> str:
         cat = self._entry.category
@@ -1457,6 +1592,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._name_lbl.setToolTip(_disp_name)
         self._apply_status()   # self._entry already == entry (set above)
         self._playtime_lbl.set_entry(entry)
+        self._rating.set_value(entry.average_rating())
         self._apply_card_style()
 
     def update_locale(self):
@@ -1520,8 +1656,18 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         # Info
         info = QVBoxLayout()
         info.setSpacing(3)
+        # Name + rating on one line: the score belongs to the title, not to
+        # the playtime/meta row underneath.
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        name_row.setContentsMargins(0, 0, 0, 0)
         self._name_lbl = QLabel(_clean_tag_display(self._entry.name))
         self._name_lbl.setObjectName("game_name")
+        name_row.addWidget(self._name_lbl, 0)
+        self._rating = StarRating(self._entry.average_rating(),
+                                  star_size=10, font_size=11)
+        name_row.addWidget(self._rating, 0)
+        name_row.addStretch(1)
 
         meta = QHBoxLayout()
         meta.setSpacing(12)
@@ -1540,7 +1686,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         meta.addWidget(self._playtime_lbl)
         meta.addStretch()
 
-        info.addWidget(self._name_lbl)
+        info.addLayout(name_row)
         info.addLayout(meta)
         row.addLayout(info, 1)
 
@@ -1635,6 +1781,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         self._played_lbl.setText(f"{t('library.last_played')}: {_fmt_dt(entry.last_played)}")
         self._synced_lbl.setText(f"{t('library.last_synced')}: {_fmt_dt(entry.last_synced)}")
         self._apply_playtime()   # self._entry already == entry (set above)
+        self._rating.set_value(entry.average_rating())
         self._apply_status()
         self._update_folder_dot()
 
@@ -1646,6 +1793,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         super().refresh_styles()
         self._apply_status()
         self._apply_playtime()
+        self._rating.refresh_styles()
         self._update_folder_dot()
 
     def update_locale(self):

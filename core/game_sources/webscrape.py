@@ -18,11 +18,11 @@ from typing import Optional
 from core.constants import CAMEL_SPLIT_RE
 from core.game_sources.common import (GameInfo, _clean_game_name,
                                       _decode_entities, _dedupe_candidates,
-                                      _fuzzy_score, _fuzzy_slug,
+                                      _fetch_json, _fuzzy_score, _fuzzy_slug,
                                       _is_favicon_like,
                                       _is_non_game_media_title,
                                       _parse_forum_description,
-                                      _strip_release_noise,
+                                      _strip_release_noise, source_label,
                                       _GENERIC_EXE_STEMS, _VER_NUM_RE)
 from core.net import open_url as _open_url
 
@@ -174,8 +174,212 @@ def _scrape_dlsite_en(product_url: str) -> Optional[GameInfo]:
             canon_html = _fetch_html(canon_url)
             if canon_html:
                 logger.debug(f"DLSite: followed canonical to {canon_url}")
+                # Reviews are attached inside _scrape_opengraph for every
+                # dlsite.com URL, so the locale redirect does not have to.
                 return _scrape_opengraph(canon_url, html=canon_html)
     return _scrape_opengraph(url, html=html)
+
+
+# How many DLsite user reviews to pull in one go. Matches the reviews panel's
+# page size: more than that and the import would bury the pager under a
+# scroll of unread text.
+_DLSITE_REVIEW_LIMIT = 10
+
+_DLSITE_SECTION_RE = re.compile(
+    r'dlsite\.com/(maniax|soft|pro|books|girls|bl|home|comic|appx)/',
+    re.IGNORECASE,
+)
+_DLSITE_CODE_RE = re.compile(r'product_id/([A-Z]{2}\d+)', re.IGNORECASE)
+
+
+def _attach_dlsite_reviews(info: GameInfo, product_url: str,
+                           html: str = "") -> None:
+    """Fill *info.reviews* from DLsite's user-review list.
+
+    The work page only mounts a Vue ``product-review-list`` stub inside
+    ``#work_review`` — the ``.review_contents`` blocks the browser shows are
+    rendered client-side. The JSON the component fetches
+    (``/{section}/api/review``) is what we ask for. HTML parsing of
+    ``.review_contents`` is kept as a fallback for pages that already have
+    them embedded (the dedicated review-list view).
+    """
+    reviews = _fetch_dlsite_reviews_api(product_url)
+    if not reviews and html:
+        reviews = _parse_dlsite_review_contents(html)
+    if not reviews:
+        return
+    info.reviews = reviews
+    # A single score for the candidate chip / average display: the mean of
+    # what users actually rated, not a zero that would look like a damning
+    # empty verdict.
+    from core.library import quantize_rating
+    rated = [float(r.get("rating") or 0) for r in reviews
+             if float(r.get("rating") or 0) > 0]
+    if rated and not info.rating:
+        info.rating = quantize_rating(sum(rated) / len(rated))
+    if not info.reviewer:
+        info.reviewer = "DLsite"
+
+
+def _fetch_dlsite_reviews_api(product_url: str) -> list[dict]:
+    """``/{section}/api/review`` → list of GameEntry-shaped review dicts."""
+    sm = _DLSITE_SECTION_RE.search(product_url or "")
+    cm = _DLSITE_CODE_RE.search(product_url or "")
+    if not cm:
+        return []
+    section = (sm.group(1) if sm else "maniax").lower()
+    code = cm.group(1).upper()
+    api = (
+        f"https://www.dlsite.com/{section}/api/review"
+        f"?product_id={code}&limit={_DLSITE_REVIEW_LIMIT}"
+        f"&mix_pickup=true&page=1&order=top&locale=en_US"
+    )
+    data = _fetch_json(api, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": (product_url or "").split("?")[0] or (
+            f"https://www.dlsite.com/{section}/work/=/product_id/{code}.html"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    if not isinstance(data, dict) or not data.get("is_success"):
+        return []
+    out: list[dict] = []
+    for raw in data.get("review_list") or []:
+        if not isinstance(raw, dict):
+            continue
+        mapped = _dlsite_api_review_to_dict(raw)
+        if mapped:
+            out.append(mapped)
+    return out
+
+
+def _dlsite_api_review_to_dict(raw: dict) -> Optional[dict]:
+    """One DLsite API review → GameEntry.reviews entry."""
+    from core.library import quantize_rating
+    try:
+        rate = float(raw.get("rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    # Prefer a translation when the API actually shipped one; most reviews
+    # stay in Japanese either way (title/text null under en_US).
+    title = (raw.get("review_title") or "").strip()
+    text = (raw.get("review_text") or "").strip()
+    for tr in raw.get("translations") or []:
+        if not isinstance(tr, dict):
+            continue
+        if tr.get("locale") != "en_US":
+            continue
+        if tr.get("title"):
+            title = str(tr["title"]).strip()
+        if tr.get("text"):
+            text = str(tr["text"]).strip()
+        break
+    body = text
+    if title and text:
+        body = f"{title}\n\n{text}"
+    elif title:
+        body = title
+    if rate <= 0 and not body:
+        return None
+    when = (raw.get("regist_date") or raw.get("entry_date") or "").strip()
+    if when and "T" not in when:
+        when = when.replace(" ", "T", 1)
+    return {
+        "id": str(raw.get("member_review_id") or "").strip(),
+        "rating": quantize_rating(rate),
+        "reviewer": (raw.get("nick_name") or "").strip() or "DLsite",
+        "text": body,
+        "notes": "",
+        "source": "dlsite",
+        "at": when,
+    }
+
+
+def _parse_dlsite_review_contents(html: str) -> list[dict]:
+    """Fallback: scrape schema.org Review blocks already in the HTML.
+
+    Used when ``#work_review`` was server-rendered with ``.review_contents``
+    (the dedicated review-list page). The work page itself does not embed
+    them — that path goes through ``_fetch_dlsite_reviews_api``.
+    """
+    from core.library import quantize_rating
+    # Bound the search to #work_review when present, so a stray schema.org
+    # Review elsewhere on the page cannot be mistaken for a user review.
+    scope = html
+    wm = re.search(
+        r'<div[^>]*id=["\']work_review["\'][^>]*>([\s\S]*?)</div>\s*<div',
+        html, re.I,
+    )
+    if wm:
+        scope = wm.group(1)
+    out: list[dict] = []
+    for block in re.finditer(
+            r'<div[^>]*class=["\'][^"\']*\breview_contents\b[^"\']*["\'][^>]*'
+            r'itemprop=["\']review["\'][^>]*>([\s\S]*?)'
+            r'(?=<div[^>]*class=["\'][^"\']*\breview_contents\b|$)',
+            scope, re.I):
+        chunk = block.group(1)
+        who = ""
+        am = re.search(
+            r'itemprop=["\']author["\'][\s\S]*?itemprop=["\']name["\'][^>]*>\s*([^<]+)',
+            chunk, re.I,
+        )
+        if not am:
+            am = re.search(
+                r'class=["\'][^"\']*reveiw_author[^"\']*["\'][^>]*>\s*<a[^>]*>\s*([^<]+)',
+                chunk, re.I,
+            )
+        if am:
+            who = am.group(1).strip()
+        rate = 0.0
+        rm = re.search(
+            r'itemprop=["\']ratingValue["\'][^>]*content=["\']([^"\']+)',
+            chunk, re.I,
+        )
+        if not rm:
+            rm = re.search(
+                r'itemprop=["\']ratingValue["\'][^>]*>\s*([^<]+)',
+                chunk, re.I,
+            )
+        if rm:
+            try:
+                rate = float(rm.group(1).strip())
+            except ValueError:
+                rate = 0.0
+        body = ""
+        bm = re.search(
+            r'itemprop=["\']reviewBody["\'][^>]*>([\s\S]*?)</(?:div|p|span)>',
+            chunk, re.I,
+        )
+        if bm:
+            body = re.sub(r'<[^>]+>', ' ', bm.group(1))
+            body = re.sub(r'\s+', ' ', body).strip()
+        when = ""
+        dm = re.search(
+            r'itemprop=["\']datePublished["\'][^>]*(?:content=["\']([^"\']+)'
+            r'|>\s*([^<]+))',
+            chunk, re.I,
+        )
+        if dm:
+            when = (dm.group(1) or dm.group(2) or "").strip()
+        if rate <= 0 and not body:
+            continue
+        out.append({
+            "id": "",
+            "rating": quantize_rating(rate),
+            "reviewer": who or "DLsite",
+            "text": body,
+            "notes": "",
+            "source": "dlsite",
+            "at": when,
+        })
+        if len(out) >= _DLSITE_REVIEW_LIMIT:
+            break
+    return out
 
 
 def _find_dlsite_url_via_search(keyword: str) -> Optional[str]:
@@ -314,6 +518,255 @@ _STORE_LINK_HOST_RE = re.compile(
     r'|gamejolt\.com|nutaku\.net)', re.IGNORECASE)
 
 
+def _ld_aggregate_rating(ld: dict) -> tuple[float, str, str]:
+    """Pull a 5-star score out of a JSON-LD node's aggregateRating.
+
+    Returns (stars, reviewer_label, summary_text), or (0, "", "") when the
+    node has no usable score. Scales whatever bestRating the site declared
+    (itch uses 5, some Product pages use 100) onto SaveSync's five stars.
+    """
+    agg = ld.get("aggregateRating")
+    if not isinstance(agg, dict):
+        return 0.0, "", ""
+    try:
+        value = float(agg.get("ratingValue") or 0)
+    except (TypeError, ValueError):
+        return 0.0, "", ""
+    if value <= 0:
+        return 0.0, "", ""
+    try:
+        best = float(agg.get("bestRating") or 5)
+    except (TypeError, ValueError):
+        best = 5.0
+    if best <= 0:
+        best = 5.0
+    stars = value * (5.0 / best)
+    # Cap before quantize: a site that put bestRating below the value would
+    # otherwise produce a 6-star score that collapses to "unrated".
+    stars = min(stars, 5.0)
+    count = agg.get("ratingCount") or agg.get("reviewCount") or ""
+    try:
+        count_n = int(float(count)) if count != "" else 0
+    except (TypeError, ValueError):
+        count_n = 0
+    # Reviewer label is filled by the caller from the page's source id
+    # (itch / mobygames / …); leave it blank here so the source wins.
+    summary = f"{value:g}/{best:g}"
+    if count_n:
+        summary = f"{summary} ({count_n})"
+    return stars, "", summary
+
+
+# How many forum user reviews to pull from the Reviews tab's first page.
+# These boards list twenty per page; taking fewer would throw away reviews
+# already sitting in the HTML we fetched. The reviews panel still pages
+# them ten at a time for display — that is independent of how many we keep.
+_FORUM_REVIEW_LIMIT = 20
+
+# XenForo threads that split the product post from the user-review list put
+# the latter on a sibling path (…/br-reviews/, optionally …/br-reviews/page-N).
+# Matched generically — the addon name is not a source label we ever store.
+_FORUM_REVIEWS_PATH_RE = re.compile(
+    r'/br-reviews(?:/page-\d+)?/?$', re.IGNORECASE,
+)
+_FORUM_REVIEWS_HREF_RE = re.compile(
+    r'/br-reviews(?:/|$|\?)', re.IGNORECASE,
+)
+_FORUM_REVIEWS_TAB_TEXT_RE = re.compile(
+    r'^\s*reviews?\s*(?:\(\d+\))?\s*$', re.IGNORECASE,
+)
+
+
+def _is_forum_reviews_url(url: str) -> bool:
+    path = urllib.parse.urlsplit(url or "").path or ""
+    return bool(_FORUM_REVIEWS_PATH_RE.search(path))
+
+
+def _forum_thread_base_url(url: str) -> str:
+    """Product-thread URL for a reviews-tab URL, otherwise the URL itself."""
+    base = (url or "").split("?")[0]
+    trimmed = _FORUM_REVIEWS_PATH_RE.sub("/", base)
+    if not trimmed.endswith("/"):
+        # XenForo thread canonicals keep the trailing slash; without it the
+        # reviews-tab join below would produce …/287854br-reviews.
+        trimmed += "/"
+    return trimmed
+
+
+def _looks_like_forum_reviews_html(html: str) -> bool:
+    """Whether *html* is a reviews-tab listing rather than the product post."""
+    return bool(html and re.search(
+        r'class=["\'][^"\']*\bmessage--review\b', html, re.IGNORECASE))
+
+
+def _find_forum_reviews_tab(html: str, page_url: str) -> str:
+    """Absolute URL of the Reviews tab linked from a product thread, or ""."""
+    if not html:
+        return ""
+    for m in re.finditer(
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+            html, re.IGNORECASE):
+        href = m.group(1).strip()
+        text = re.sub(r'<[^>]+>', '', m.group(2))
+        text = re.sub(r'\s+', ' ', text).strip()
+        if _FORUM_REVIEWS_HREF_RE.search(href) or (
+                _FORUM_REVIEWS_TAB_TEXT_RE.match(text)
+                and re.search(r'review', href, re.IGNORECASE)):
+            return urllib.parse.urljoin(page_url, href)
+    return ""
+
+
+def _web_reviewer_label() -> str:
+    """Fallback reviewer label for an anonymous web review."""
+    try:
+        from i18n import t
+        return t("add_game.web_source_generic")
+    except Exception:
+        return "web"
+
+
+def _parse_forum_message_reviews(html: str) -> list[dict]:
+    """User reviews from a XenForo-style reviews tab.
+
+    Shape observed on threads that park reviews on a sibling tab:
+      ``.message.message--review.js-review`` with ``data-author``,
+      ``data-content="review-…"``, a ``.ratingStars`` title of
+      ``"N.NN star(s)"``, body in ``.bbWrapper``, date in ``<time datetime>``.
+    Source is left as generic ``web`` — the forum is not a named catalogue.
+    """
+    from core.library import quantize_rating
+    if not html:
+        return []
+    out: list[dict] = []
+    # Match ONLY the opening tag so finditer advances past each card's
+    # start, not past an 8 KB window that would swallow the next opens.
+    for m in re.finditer(
+            r'<div([^>]*class=["\'][^"\']*\bmessage--review\b[^"\']*["\'][^>]*)>',
+            html, re.IGNORECASE):
+        attrs = m.group(1)
+        chunk = html[m.end():m.end() + 8000]
+        nxt = re.search(
+            r'<div[^>]*class=["\'][^"\']*\bmessage--review\b',
+            chunk, re.IGNORECASE,
+        )
+        if nxt:
+            chunk = chunk[:nxt.start()]
+        who = ""
+        am = re.search(r'data-author=["\']([^"\']+)["\']', attrs, re.I)
+        if am:
+            who = _decode_entities(am.group(1)).strip()
+        if not who:
+            um = re.search(
+                r'class=["\'][^"\']*\busername\b[^"\']*["\'][^>]*>\s*'
+                r'(?:<span[^>]*>)?\s*([^<]+)',
+                chunk, re.I,
+            )
+            if um:
+                who = _decode_entities(um.group(1)).strip()
+        rid = ""
+        im = re.search(r'data-content=["\']([^"\']+)["\']', attrs, re.I)
+        if im:
+            rid = im.group(1).strip()
+        rate = 0.0
+        rm = re.search(
+            r'class=["\'][^"\']*\bratingStars\b[^"\']*["\'][^>]*'
+            r'title=["\']\s*([\d.]+)\s*star',
+            chunk, re.I,
+        ) or re.search(
+            r'class=["\'][^"\']*\bu-srOnly\b[^"\']*["\'][^>]*>\s*'
+            r'([\d.]+)\s*star',
+            chunk, re.I,
+        )
+        if rm:
+            try:
+                rate = float(rm.group(1))
+            except ValueError:
+                rate = 0.0
+        body = ""
+        bm = re.search(
+            r'class=["\'][^"\']*\bbbWrapper\b[^"\']*["\'][^>]*>([\s\S]*?)</div>',
+            chunk, re.I,
+        ) or re.search(
+            r'<article[^>]*class=["\'][^"\']*\bmessage-body\b[^"\']*["\'][^>]*>'
+            r'([\s\S]*?)</article>',
+            chunk, re.I,
+        )
+        if bm:
+            raw = bm.group(1)
+            raw = re.sub(r'<br\s*/?>', '\n', raw, flags=re.I)
+            raw = re.sub(r'</p\s*>', '\n', raw, flags=re.I)
+            raw = re.sub(r'<script[\s\S]*?</script>|<style[\s\S]*?</style>',
+                         ' ', raw, flags=re.I)
+            raw = re.sub(r'<[^>]+>', ' ', raw)
+            body = re.sub(r'[ \t]+\n', '\n', _decode_entities(raw))
+            body = re.sub(r'\n{3,}', '\n\n', body).strip()
+            body = re.sub(r'[^\S\n]{2,}', ' ', body)
+        when = ""
+        dm = re.search(
+            r'<time[^>]+datetime=["\']([^"\']+)["\']',
+            chunk, re.I,
+        )
+        if dm:
+            when = dm.group(1).strip()
+        if rate <= 0 and not body:
+            continue
+        out.append({
+            "id": rid,
+            "rating": quantize_rating(rate),
+            "reviewer": who or _web_reviewer_label(),
+            "text": body,
+            "notes": "",
+            "source": "web",
+            "at": when,
+        })
+        if len(out) >= _FORUM_REVIEW_LIMIT:
+            break
+    return out
+
+
+def _attach_forum_reviews(info: GameInfo, page_url: str, html: str,
+                          reviews_html: Optional[str] = None) -> None:
+    """Pull the Reviews-tab listing into *info.reviews* when the thread has one.
+
+    *reviews_html* is the already-fetched tab body (caller pasted the tab
+    URL). Otherwise the product page's Reviews link is followed. No-op when
+    the page is not a forum thread with that split.
+    """
+    reviews: list[dict] = []
+    if reviews_html and _looks_like_forum_reviews_html(reviews_html):
+        reviews = _parse_forum_message_reviews(reviews_html)
+    elif _looks_like_forum_reviews_html(html):
+        reviews = _parse_forum_message_reviews(html)
+    else:
+        tab = _find_forum_reviews_tab(html, page_url)
+        if tab:
+            tab_html = _fetch_html(tab)
+            if tab_html:
+                reviews = _parse_forum_message_reviews(tab_html)
+    if not reviews:
+        return
+    # Forum reviews are additive to whatever a store link on the same page
+    # already contributed; identity is per review id, so duplicates collapse
+    # later in the merge path.
+    existing = list(info.reviews or [])
+    have = {str(r.get("id") or "") for r in existing if r.get("id")}
+    for r in reviews:
+        rid = str(r.get("id") or "")
+        if rid and rid in have:
+            continue
+        existing.append(r)
+        if rid:
+            have.add(rid)
+    info.reviews = existing
+    from core.library import quantize_rating
+    rated = [float(r.get("rating") or 0) for r in existing
+             if float(r.get("rating") or 0) > 0]
+    if rated and not info.rating:
+        info.rating = quantize_rating(sum(rated) / len(rated))
+    if not info.reviewer:
+        info.reviewer = _web_reviewer_label()
+
+
 def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo]:
     """Fetch *url* and extract Open Graph / JSON-LD / meta tag info.
 
@@ -329,10 +782,28 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     if not url or "youtube.com" in url or "youtu.be" in url:
         return None
 
+    # XenForo-style product threads sometimes park user reviews on a sibling
+    # tab (…/br-reviews/). Pasting that tab should still fill the product
+    # fields from the main thread, and keep this page's body for the list.
+    _forum_reviews_html: Optional[str] = None
+    _forum_reviews_url = ""
+    if _is_forum_reviews_url(url) or (html and _looks_like_forum_reviews_html(html)):
+        _forum_reviews_url = url
+        _forum_reviews_html = html
+        parent = _forum_thread_base_url(url)
+        parent_norm = parent.rstrip("/")
+        here_norm = (url or "").split("?")[0].rstrip("/")
+        if parent_norm and parent_norm != here_norm:
+            url = parent
+            html = None
+
     if html is None:
         html = _fetch_html(url)
     if not html:
         return None
+
+    if _forum_reviews_url and _forum_reviews_html is None:
+        _forum_reviews_html = _fetch_html(_forum_reviews_url)
 
     def _meta(*names: str) -> str:
         for name in names:
@@ -499,6 +970,13 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     ld_dates: list[str] = []
     ld_publishers: list[str] = []
     ld_developers: list[str] = []
+    # Aggregate score from JSON-LD (itch.io, MobyGames, Product pages…).
+    # Kept as (stars_0_to_5, reviewer_label, summary_text) and applied to
+    # GameInfo at the end so Steam/VNDB/DLsite-specific paths can still
+    # overwrite with a richer verdict.
+    ld_rating: float = 0.0
+    ld_reviewer: str = ""
+    ld_review_text: str = ""
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL | re.IGNORECASE
@@ -557,6 +1035,10 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                             for g in ([val] if isinstance(val, str) else val):
                                 if str(g) not in genres:
                                     genres.append(str(g))
+                    if not ld_rating:
+                        stars, who, summary = _ld_aggregate_rating(ld)
+                        if stars:
+                            ld_rating, ld_reviewer, ld_review_text = stars, who, summary
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -881,7 +1363,20 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     elif "vndb.org" in _url_lower:
         _source = "vndb"
 
-    return GameInfo(
+    # JSON-LD aggregate → a single-verdict review for sites that publish one
+    # (itch ratings, MobyScore, …). DLsite's user-review list is richer and
+    # is attached just below; the aggregate is only the fallback there.
+    _rating = 0.0
+    _reviewer = ""
+    _review_text = ""
+    if ld_rating and _source != "dlsite":
+        from core.library import quantize_rating
+        _rating = quantize_rating(ld_rating)
+        _reviewer = ld_reviewer or source_label(_source) or _source
+        _review_text = (f"{_reviewer}: {ld_review_text}"
+                        if ld_review_text else f"{_reviewer}: {_rating:g}/5")
+
+    info = GameInfo(
         name=title,
         description=description,
         image_url=image_url,
@@ -892,7 +1387,23 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         store_url=_store_link or url,
         source=_source,
         extra_urls=([url] + _store_extra) if _store_link else [],
+        rating=_rating,
+        reviewer=_reviewer,
+        review_text=_review_text,
     )
+    # DLsite user reviews live behind a Vue stub on the work page; every
+    # dlsite.com scrape (locale redirect, direct opengraph, pasted link)
+    # has to ask the review API, or the score never reaches the form.
+    if _source == "dlsite":
+        _attach_dlsite_reviews(info, url, html=html)
+    elif (_forum_reviews_html or _forum
+          or _FORUM_REVIEWS_HREF_RE.search(html or "")):
+        # XenForo product threads that split Reviews onto a sibling tab:
+        # follow that tab (or use the pasted tab body) and import the
+        # user reviews as generic "web" entries — never as a named source.
+        _attach_forum_reviews(info, url, html,
+                              reviews_html=_forum_reviews_html)
+    return info
 
 
 # ── Search-engine access layer ────────────────────────────────────────────────

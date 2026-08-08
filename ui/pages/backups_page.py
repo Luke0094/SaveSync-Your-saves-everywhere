@@ -405,8 +405,8 @@ class BackupsPage(QWidget, ThemedMixin):
         self._verify_btn = QPushButton("⚕️")
         self._verify_btn.setObjectName("toolbar_icon_btn")
         self._verify_btn.setFixedSize(30, 30)
-        self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
         self._verify_btn.clicked.connect(self._on_verify_all)
+        self._refresh_verify_tooltip()
         header_row.addWidget(self._verify_btn)
         self._verify_status_tone = "text_hint"
         self._verify_status = QLabel("")
@@ -438,6 +438,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
         self._backup_now_btn = QPushButton(t("buttons.backup_now"))
         self._backup_now_btn.setObjectName("primary_btn")
+        self._backup_now_btn.setToolTip(t("backups.backup_now_tooltip"))
         self._backup_now_btn.clicked.connect(self._on_backup_now)
         self._backup_now_btn.setEnabled(True)    # always active — falls back to backup-all
         header_row.addWidget(self._backup_now_btn)
@@ -1074,6 +1075,7 @@ class BackupsPage(QWidget, ThemedMixin):
             le.setPlaceholderText(clean_name)
         finally:
             self._game_combo_updating = False
+        self._refresh_verify_tooltip()
         self._refresh_list()
 
     def _on_game_text_changed(self, text: str):
@@ -1086,6 +1088,7 @@ class BackupsPage(QWidget, ThemedMixin):
         self._game_filter_text = text.strip()
         self._selected_game_id = None
         self._backups_page_num = 1
+        self._refresh_verify_tooltip()
         self._update_suggest_popup()
         self._search_timer.start()   # (re)starts; fires 120 ms after last key
 
@@ -1120,6 +1123,7 @@ class BackupsPage(QWidget, ThemedMixin):
             self._selected_game_id = None
             self._game_filter_text = ""
             self._backups_page_num = 1
+            self._refresh_verify_tooltip()
             self._game_combo_updating = True
             try:
                 self._game_combo.lineEdit().clear()
@@ -1242,6 +1246,7 @@ class BackupsPage(QWidget, ThemedMixin):
         self._provider_only_extra_game_ids = None  # invalidate; recomputed on demand
         self._provider_only_phantom_folders = None
         self._backups_page_num = 1
+        self._refresh_verify_tooltip()
         self._hide_suggest_popup()
         self._game_combo_updating = True
         try:
@@ -1266,6 +1271,20 @@ class BackupsPage(QWidget, ThemedMixin):
         self._verify_status.setVisible(True)
         self._verify_status.setStyleSheet(
             f"color:{palette(self._verify_status_tone)};font-size:12px;")
+
+    def _refresh_verify_tooltip(self):
+        """Idle checkup tip: all backups, or only the selected game's."""
+        if not _safe(self._verify_btn) or not self._verify_btn.isEnabled():
+            return
+        if self._selected_game_id:
+            self._verify_btn.setToolTip(t("backups.verify_game_tooltip"))
+        else:
+            self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
+
+    def _verify_idle_tooltip(self) -> str:
+        if self._selected_game_id:
+            return t("backups.verify_game_tooltip")
+        return t("backups.verify_all_tooltip")
 
     def _on_verify_all(self):
         """Check every backup currently listed, on a worker thread.
@@ -1355,7 +1374,7 @@ class BackupsPage(QWidget, ThemedMixin):
             self._set_verify_status(
                 msg, tone="success" if not bad else "error")
             self._verify_btn.setToolTip(
-                msg + "\n" + t("backups.verify_all_tooltip"))
+                msg + "\n" + self._verify_idle_tooltip())
             logger.info(f"Backup verification: {msg}")
 
         self._verify_worker.progress.connect(_on_progress)
@@ -1868,15 +1887,19 @@ class BackupsPage(QWidget, ThemedMixin):
         if _safe(self._verify_btn):
             # Icon-only: the label is the emoji. While a check is running the
             # status text next to it is live; otherwise reset the tooltip.
-            if self._verify_btn.isEnabled():
-                self._verify_btn.setToolTip(t("backups.verify_all_tooltip"))
+            self._refresh_verify_tooltip()
         if _safe(self._verify_status) and self._verify_btn.isEnabled():
             # A finished result was in the old language — clear rather than
             # guess which key it came from.
             if self._verify_status.isVisible():
                 self._set_verify_status("")
+        if _safe(self._add_paths_btn):
+            self._add_paths_btn.setToolTip(t("manual_path.button_tooltip"))
         if _safe(self._backup_now_btn):
             self._backup_now_btn.setText(t("buttons.backup_now"))
+            self._backup_now_btn.setToolTip(t("backups.backup_now_tooltip"))
+        if _safe(self._page_size_combo):
+            self._page_size_combo.update_locale()
         if _safe(self._empty_lbl):
             self._empty_lbl.setText(t("backup.no_backups"))
         # Rebuild origin filter with translated items

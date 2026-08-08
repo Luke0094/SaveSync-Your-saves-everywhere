@@ -6,6 +6,7 @@ Frameless always-on-top overlay.
 - Thread-safe: all public methods must be called from GUI thread
 - hide_animated uses flag to avoid RuntimeWarning
 """
+import html
 import logging
 import platform
 import re
@@ -31,6 +32,33 @@ _FADE_OUT_MS   = 280
 
 from ui.helpers import (force_topmost as _force_topmost, popup_is_open,
                         ScreenSignalMixin, SystemCursor, TRACE_Z, z_report)
+
+
+def _engine_badge_html(engine: str) -> str:
+    """Muted label for an engine name, or '' when there is nothing to show."""
+    engine = (engine or "").strip()
+    if not engine:
+        return ""
+    return (
+        f" <span style='color:{palette('text_muted')};font-size:11px;"
+        f"font-weight:500;'>· {html.escape(engine)}</span>"
+    )
+
+
+def _engine_label_for_exe(exe_path: str = "") -> str:
+    """Display label for the engine of the running / named game, or ''."""
+    from core.engines.game_engine import engine_display, engine_for_game
+    from core.library import get_library
+    from core.monitor import get_monitor
+
+    entry = None
+    if exe_path:
+        entry = get_library().get_by_exe(exe_path)
+    if entry is None:
+        playing = get_monitor().currently_playing()
+        if playing:
+            entry = playing[0]
+    return engine_display(engine_for_game(entry)) if entry else ""
 
 
 def _remote_game_folder(orch, provider, entry, game_id: str) -> str:
@@ -1137,19 +1165,22 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._carousel_next.setEnabled(idx < n - 1)
 
     def show_game_added(self, game_name: str, exe_path: str = "",
-                        then_track: bool = False):
+                        then_track: bool = False, engine: str = ""):
         """Confirmation that a game was added to library.
         If then_track=True, automatically transitions to tracking overlay after delay."""
-        if self._defer_if_priority(lambda: self.show_game_added(game_name, exe_path, then_track)):
+        if self._defer_if_priority(
+                lambda: self.show_game_added(
+                    game_name, exe_path, then_track, engine)):
             return
         self._set_mode("added")
         self._context_exe = exe_path
         self._icon_label.setText("✓")
         self._title.setText(t("app.name"))
+        eng = engine or _engine_label_for_exe(exe_path)
         self._message.setText(
             f"<span style='color:{palette('accent')};font-weight:700;'>"
             f"{t('overlay.add_to_library')}</span><br>"
-            f"<b>{game_name}</b>"
+            f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng)}"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -1159,9 +1190,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         if then_track:
             # Wait for auto_hide + fade_out + buffer before showing next overlay
-            QTimer.singleShot(2500 + _FADE_OUT_MS + 50, lambda n=game_name, e=exe_path: self.show_game_launched(n, e))
+            QTimer.singleShot(
+                2500 + _FADE_OUT_MS + 50,
+                lambda n=game_name, e=exe_path, eng=eng:
+                    self.show_game_launched(n, e, eng))
 
-    def show_game_launched(self, game_name: str, exe_path: str = ""):
+    def show_game_launched(self, game_name: str, exe_path: str = "",
+                           engine: str = ""):
         """Notification that a known game is being monitored.
 
         Shows the overlay hotkey hint so the user knows how to open the app
@@ -1169,22 +1204,30 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         has not asked to restore anything; it would appear as a false alarm.
         Clears stale backup/sync notifications from previous sessions.
         """
-        if self._defer_if_priority(lambda: self.show_game_launched(game_name, exe_path)):
+        if self._defer_if_priority(
+                lambda: self.show_game_launched(game_name, exe_path, engine)):
             return
         self._clear_notification_queue()
         self._set_mode("tracking")
         self._context_exe = exe_path
         self._icon_label.setText("🎮")
         self._title.setText(t("app.name"))
+        eng = (engine or "").strip() or _engine_label_for_exe(exe_path)
+        # Two lines so the engine label stays visible beside the title even
+        # with the message's fixed height and word-wrap.
         self._message.setText(
-            f"<span style='color:{palette('accent')};font-weight:700;'>{t('overlay.tracking_msg')}</span> <b>{game_name}</b>"
+            f"<span style='color:{palette('accent')};font-weight:700;'>"
+            f"{t('overlay.tracking_msg')}</span><br>"
+            f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng)}"
         )
         self._hide_dashboard()
         self._clear_buttons()
 
         # Show the overlay hotkey so the user knows how to open SaveSync mid-game
         from core.config_manager import get_config
-        hotkey = get_config().get("overlay_hotkey", "Ctrl+Shift+S").upper()
+        # Same fallback as the registration in MainWindow._setup_hotkeys —
+        # a different one here told the user a shortcut that never worked.
+        hotkey = get_config().get("overlay_hotkey", "alt+ctrl+s").upper()
         hotkey_lbl = QLabel(
             f"<span style='color:{palette('text_muted')};font-size:10px;'>"
             f"{t('overlay.open_with_hotkey', hotkey=hotkey)}</span>"
@@ -1764,12 +1807,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         if stats:
             active = stats.get("active_game")
-            self._message.setText(
-                t('overlay.game_launched', game=active) if active
-                else f"<span style='color:{palette('text_hint')};'>{t('app.tagline')}</span>"
-            )
             if active:
+                eng = stats.get("active_engine") or _engine_label_for_exe()
+                game_html = (
+                    f"<b>{html.escape(str(active))}</b>"
+                    f"{_engine_badge_html(eng)}"
+                )
+                self._message.setText(t("overlay.game_launched", game=game_html))
                 self._icon_label.setText("🎮")
+            else:
+                self._message.setText(
+                    f"<span style='color:{palette('text_hint')};'>"
+                    f"{t('app.tagline')}</span>"
+                )
             self._dashboard.setVisible(True); self._dashboard.setMaximumHeight(16777215)
             self._set_dash(0, t('overlay.library'), t('overview.stat_games_count', count=stats.get('library_count', 0)))
             self._set_dash(1, t('overlay.last_backup'),  stats.get("last_backup", t("library.never")))
@@ -1891,7 +1941,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         # ── Show + topmost ──────────────────────────────────────────────────
         self.show()
-        _force_topmost(self)
+        self._take_the_front()
         self._ensure_visible_on_screen()
 
         # Periodic re-assert for z-order recovery.
@@ -2076,7 +2126,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if self._is_exclusive_fullscreen_hwnd(fg_hwnd):
             self._hide_for_exclusive()
         elif not popup_is_open():
-            _force_topmost(self)
+            self._take_the_front()
             self._trace_z("the window in front changed")
 
     # ── Topmost helpers ──────────────────────────────────────────────────────
@@ -2124,18 +2174,34 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if platform.system() != "Windows":
             # On Linux/macOS: unconditional raise_() via _force_topmost.
             # This is the only mechanism we have to recover z-order.
-            _force_topmost(self)
+            self._take_the_front()
             return
 
         if self._is_fullscreen_active():
             if self._is_exclusive_fullscreen():
                 self._hide_for_exclusive()
             else:
-                _force_topmost(self)
+                self._take_the_front()
                 self._trace_z("borderless fullscreen")
         elif self._is_overlay_obscured():
-            _force_topmost(self)
+            self._take_the_front()
             self._trace_z("obscured by a window")
+
+    def _take_the_front(self):
+        """Raise the overlay — then hand the front straight back to the pins.
+
+        A pin is something the user put on screen to keep reading; the overlay
+        announces things and goes away. So the pins go above it, always, and
+        the only place that can be guaranteed is here: every raise the overlay
+        does passes through this.
+        """
+        _force_topmost(self)
+        try:
+            from ui.widgets.pins import get_pin_manager
+            get_pin_manager().assert_topmost_all("the overlay came forward")
+        except Exception:
+            logger.debug("overlay: could not put the pins back on top",
+                         exc_info=True)
 
     def _trace_z(self, why: str):
         """Say where the overlay ended up, on the same switch as the pins.

@@ -567,7 +567,10 @@ class OverviewPage(QWidget, ThemedMixin):
         active_entries = get_monitor().currently_playing()
         if active_entries:
             e = active_entries[0]
-            self._active_name.setText(e.name)
+            from core.engines.game_engine import engine_display, engine_for_game
+            eng = engine_display(engine_for_game(e))
+            self._active_name.setText(
+                f"{e.name}  ·  {eng}" if eng else e.name)
             self._active_sub.setText(t("overview.running_saves", count=len(e.save_paths)))
             self._active_backup_btn.setVisible(True)
             self._active_backup_btn.setProperty("_game_id", e.id)
@@ -796,12 +799,34 @@ class OverviewPage(QWidget, ThemedMixin):
             QTimer.singleShot(i * 100, lambda gid=g.id: self.backup_requested.emit(gid))
 
     def _sync_all(self):
+        """Sync games that may have changes — same skip rules as Sync page.
+
+        Unchanged games are left alone so library cards / recent activity are
+        not stamped for empty up/down runs. The Sync page history still logs
+        any run that does go out.
+        """
         orch = get_orchestrator()
         if not orch.is_online():
             return
+        from core.backup import get_backup_manager
+        bm = get_backup_manager()
         for g in get_library().all_games():
-            if g.save_paths:
-                orch.sync_game(g.id, g.name, g.save_paths, exe_path=g.exe_path, computed_folder_name=g.computed_folder_name)
+            if not g.save_paths:
+                continue
+            if g.sync_status == "synced":
+                recents = bm.get_backups_for_game(g.id)
+                if recents:
+                    current_hash = (recents[0].cloud_metadata or {}).get("save_hash", "")
+                    synced_hash = (g.cloud_metadata or {}).get("last_synced_hash", "")
+                    if current_hash and current_hash == synced_hash:
+                        continue
+                elif not g._saves_changed_since_sync():
+                    continue
+            orch.sync_game(
+                g.id, g.name, g.save_paths,
+                exe_path=g.exe_path,
+                computed_folder_name=g.computed_folder_name,
+            )
 
     # ── Visibility management ────────────────────────────────────────────────
 
@@ -907,8 +932,13 @@ class OverviewPage(QWidget, ThemedMixin):
             except ValueError:
                 pass
 
+        active_engine = ""
+        if active:
+            from core.engines.game_engine import engine_display, engine_for_game
+            active_engine = engine_display(engine_for_game(active[0]))
         return {
             "active_game":   active[0].name if active else None,
+            "active_engine": active_engine,
             "library_count": len(games),
             "last_backup":   last_bk_str,
             "sync_status":   t("common.online") if orch.is_online() else t("common.offline"),

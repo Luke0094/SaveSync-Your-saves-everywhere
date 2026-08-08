@@ -8,7 +8,7 @@ import platform
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.2.0"
 APP_ID = "com.savesync.app"
 
 # Paths — platform-aware data directory
@@ -119,6 +119,7 @@ def _with_simple_plural(words) -> frozenset:
 # _with_simple_plural() above for the "log"/"logs" combinator.
 SKIP_FILENAME_STEMS = _with_simple_plural({
     "log",
+    "cache",
 })
 
 # Extensions excluded from save DETECTION only (scan scoring, live tracking,

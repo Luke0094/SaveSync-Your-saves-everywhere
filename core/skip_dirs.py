@@ -31,6 +31,14 @@ _COMMON_SKIP_DIRS = frozenset({
     # game database/UI asset folders, never saves.
     "data", "rmmz-game", "css", "js", "img",
     "dictionaries", "dictionary", "effects",
+    # Player/runtime profile roots these engines create under LOCALAPPDATA,
+    # named after the NW.js package rather than the game. What is inside is
+    # the Chromium profile of the player — cache, cookies, a "userdata"
+    # folder holding the PLAYER's own settings — not the saves of any one
+    # game. "userdata" is a save-folder hint on its own (see
+    # SAVE_FOLDER_HINTS), which is why these roots have to be named here or
+    # the profile gets offered as a save path.
+    "mmz-game", "mv-game", "rmmv-game",
 })
 
 # ── Backup content-walk exclusions ──────────────────────────────────────────

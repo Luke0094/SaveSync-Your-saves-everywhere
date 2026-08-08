@@ -23,7 +23,7 @@ _VNDB_FIELDS = (
     "description, "
     "tags{id,name,rating,spoiler}, "
     "developers{name}, "
-    "released, platforms, languages, "
+    "released, platforms, languages, rating, votecount, "
     "extlinks{url,label}"
 )
 
@@ -178,6 +178,13 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
     # query never mentioned. See GameInfo.alt_names.
     alt_names = [n for n in _title_variants(entry) if n != display_title]
 
+    # VNDB scores out of 100; SaveSync's stars go to 5. A score with no votes
+    # behind it is not one — VNDB reports those as null, and 0 would read as
+    # a damning review rather than as "nobody has said".
+    vndb_rating = entry.get("rating")
+    stars = (float(vndb_rating) / 20.0) if vndb_rating else 0.0
+    votes = entry.get("votecount") or 0
+
     return GameInfo(
         name=display_title,
         description=clean_desc,
@@ -189,6 +196,10 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
         source="vndb",
         extra_urls=extra_urls,
         alt_names=alt_names,
+        rating=stars,
+        reviewer="VNDB" if stars else "",
+        review_text=(f"VNDB: {float(vndb_rating):.0f}/100 ({votes} votes)"
+                     if stars else ""),
     )
 
 

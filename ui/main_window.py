@@ -199,6 +199,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # acknowledge button and an actual restore take it out.
         self._pending_regression: dict[str, tuple[str, bool]] = {}
         self._setup_backup_verify()
+        self._setup_auto_export_config()
         # A previous run may have died between suspending a game for a forced
         # restore and resuming it. The game would still be frozen, with
         # nothing on screen to explain why.
@@ -345,6 +346,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Settings
         self._settings_page.hotkey_changed.connect(self._update_hotkey)
+        self._settings_page.hotkeys_reload.connect(self._setup_hotkeys)
         self._settings_page.theme_changed.connect(self._on_theme_changed)
 
         # Status bar
@@ -624,9 +626,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         playing_ids = {g.id for g in get_monitor().currently_playing()}
         if entry.id not in playing_ids:
             return
+        from core.engines.game_engine import engine_display, engine_for_game
+        eng = engine_display(engine_for_game(entry))
         QTimer.singleShot(
-            delay_ms, lambda n=entry.name, e=entry.exe_path:
-                self._overlay.show_game_launched(n, e))
+            delay_ms, lambda n=entry.name, e=entry.exe_path, eng=eng:
+                self._overlay.show_game_launched(n, e, eng))
 
 
     def _on_overlay_action(self, action: str, context: str):
@@ -1278,7 +1282,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # saves check FIRST and only then shows the single tracking toast —
         # chaining a second one from here is what produced the duplicate.
         if self._overlay:
-            self._overlay.show_game_added(name, exe_path, then_track=False)
+            from core.engines.game_engine import engine_display, engine_for_game
+            self._overlay.show_game_added(
+                name, exe_path, then_track=False,
+                engine=engine_display(engine_for_game(entry)))
 
     def _on_suppress_overlay(self, exe_path: str):
         config = get_config()
@@ -1301,8 +1308,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     # ── Hotkeys ───────────────────────────────────────────────────────────────
 
     def _setup_hotkeys(self):
+        """Bind the one hotkey this app has, replacing whatever was bound.
+
+        unregister_all first: the manager keys bindings by hotkey string, so
+        a config replaced wholesale (reset, import, snapshot restore) would
+        otherwise leave the PREVIOUS combination listening alongside the new
+        one — a shortcut the user had changed away from kept working.
+        """
+        mgr = get_hotkey_manager()
+        mgr.unregister_all()
         hotkey = get_config().get("overlay_hotkey", "alt+ctrl+s")
-        get_hotkey_manager().register(hotkey, self._toggle_overlay)
+        mgr.register(hotkey, self._toggle_overlay)
 
     def _toggle_overlay(self):
         """Toggle overlay. If a currently-playing game has an unresolved
@@ -1639,6 +1655,72 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # somebody goes back to.
         QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._prune_save_edit_copies)
 
+    def _setup_auto_export_config(self):
+        """Schedule encrypted config uploads to the sync provider."""
+        self._auto_export_timer = QTimer(self)
+        self._auto_export_timer.setInterval(self._VERIFY_RECHECK_MS)
+        self._auto_export_timer.timeout.connect(self._maybe_run_auto_export_config)
+        self._auto_export_timer.start()
+        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS,
+                          self._maybe_run_auto_export_config)
+        self._auto_export_thread = None
+
+    def _maybe_run_auto_export_config(self):
+        """Upload config to the sync provider if enabled and due."""
+        from core.config_manager import get_config
+        cfg = get_config()
+        if not cfg.get("auto_export_config_enabled", False):
+            return
+        if self._auto_export_thread is not None and self._auto_export_thread.is_alive():
+            return
+        if get_monitor().currently_playing():
+            logger.debug("Auto config export postponed — a game is running")
+            return
+
+        days = max(1, int(cfg.get("auto_export_config_interval_days", 7)))
+        last = cfg.get("auto_export_config_last", "") or ""
+        if last:
+            try:
+                from datetime import datetime, timedelta
+                if datetime.utcnow() - datetime.fromisoformat(last) < timedelta(days=days):
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        import threading
+        from datetime import datetime
+
+        def _run():
+            try:
+                from sync import get_orchestrator
+                orch = get_orchestrator()
+                if not orch.is_online() or not orch.provider:
+                    logger.debug("Auto config export postponed — provider offline")
+                    return
+                from core.config_transfer import (
+                    upload_config_to_cloud, save_config_snapshot,
+                )
+                result = upload_config_to_cloud(
+                    orch.provider, skip_if_unchanged=True)
+                if result is True:
+                    save_config_snapshot("auto_upload")
+                    get_config().set(
+                        "auto_export_config_last",
+                        datetime.utcnow().isoformat())
+                    logger.info("Scheduled config export uploaded to cloud")
+                elif result is None:
+                    get_config().set(
+                        "auto_export_config_last",
+                        datetime.utcnow().isoformat())
+                    logger.info("Scheduled config export skipped — unchanged")
+                else:
+                    logger.warning("Scheduled config export failed")
+            except Exception as e:
+                logger.debug(f"Scheduled config export error: {e}")
+
+        self._auto_export_thread = threading.Thread(target=_run, daemon=True)
+        self._auto_export_thread.start()
+
     @staticmethod
     def _prune_save_edit_copies():
         try:
@@ -1948,7 +2030,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._start_live_tracking_loop(entry)
 
         if show_toast and self._overlay and get_config().get("show_overlay_on_launch", True):
-            self._overlay.show_game_launched(entry.name, exe_path)
+            from core.engines.game_engine import engine_display, engine_for_game
+            self._overlay.show_game_launched(
+                entry.name, exe_path,
+                engine=engine_display(engine_for_game(entry)))
 
     def _start_live_tracking_loop(self, entry: GameEntry):
         """Poll open files every 60 s while game is running.
@@ -2834,10 +2919,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 )
 
         if result.success:
+            no_changes = (result.files_uploaded == 0 and result.files_downloaded == 0
+                         and not result.conflicts)
             if entry:
                 from datetime import timezone as _tz
                 if result.conflicts:
                     get_library().update_game_fields(game_id, sync_status="conflict")
+                elif no_changes:
+                    # Up 0 / down 0: do NOT stamp last_synced — the library
+                    # card and overview "recent activity" would claim a sync
+                    # that moved nothing. The sync history log still records
+                    # the run. Only clear a stuck pending badge.
+                    if entry.sync_status == "pending":
+                        get_library().update_game_fields(
+                            game_id, sync_status="synced")
                 else:
                     from core.backup import get_backup_manager as _gbm
                     recents = _gbm().get_backups_for_game(game_id)
@@ -2848,8 +2943,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         sync_status="synced",
                         cloud_metadata={**((entry.cloud_metadata or {})), "last_synced_hash": synced_hash},
                     )
-            no_changes = (result.files_uploaded == 0 and result.files_downloaded == 0
-                         and not result.conflicts)
             if result.conflicts:
                 self._status_bar.showMessage(
                     t("sync.sync_conflicts", game=name, count=len(result.conflicts)), 8000)
@@ -3485,7 +3578,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         )
         # Also flash overlay if visible
         if self._overlay:
-            self._overlay.show_game_launched(entry.name, "")
+            from core.engines.game_engine import engine_display, engine_for_game
+            self._overlay.show_game_launched(
+                entry.name, entry.exe_path or "",
+                engine=engine_display(engine_for_game(entry)))
 
     def _remove_game(self, game_id: str):
         entry = get_library().get_by_id(game_id)
@@ -3553,6 +3649,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         get_engine().language_changed.connect(self._on_language_changed)
 
     def _on_language_changed(self, locale: str):
+        # Relabeling every page (and rebuilding library chrome) blocks the
+        # GUI thread long enough to look hung — same "please wait" sheet as
+        # a theme swap.
+        from ui.widgets.busy_overlay import busy_over
+        with busy_over(self):
+            self._on_language_changed_inner(locale)
+
+    def _on_language_changed_inner(self, locale: str):
         self.setWindowTitle(t("app.name"))
         # Pins are top-level windows of their own: nothing else in the tree
         # walk below reaches them.

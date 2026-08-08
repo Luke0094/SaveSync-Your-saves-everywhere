@@ -1,4 +1,7 @@
-"""LZString — the compression RPG Maker MV wraps its saves in.
+"""LZString — the compression RPG Maker MV (and many HTML games) wrap saves in.
+
+Save packing helpers for MV/MZ live in ``rpgmaker``; this module is only the
+codec itself.
 
 An MV save file is ``LZString.compressToBase64(JSON.stringify(save))``, so
 reading one means implementing the same algorithm the engine's JavaScript

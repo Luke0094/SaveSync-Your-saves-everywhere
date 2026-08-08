@@ -59,6 +59,11 @@ _DEFAULTS: dict[str, Any] = {
     "backup_verify_enabled": True,
     "backup_verify_interval_days": 7,
     "backup_verify_last": "",      # ISO datetime of the last completed run
+    # Periodic cloud config export — same encrypted payload as a manual
+    # "export to provider", so library/settings are not lost between machines.
+    "auto_export_config_enabled": False,
+    "auto_export_config_interval_days": 7,
+    "auto_export_config_last": "",  # ISO datetime of last successful/skipped run
     # Pinned notes/images: only paths and window geometry. The files stay
     # where the player put them and are never copied into SaveSync.
     "pins_recent": {},             # game_id -> recently pinned files, newest first
@@ -125,6 +130,8 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "save_correlation_window_ms": lambda x: isinstance(x, int) and 100 <= x <= 10000,
     "backup_verify_enabled": lambda x: isinstance(x, bool),
     "backup_verify_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    "auto_export_config_enabled": lambda x: isinstance(x, bool),
+    "auto_export_config_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
     # A plain list is the pre-per-game shape; still accepted so an existing
     # config loads and is migrated on first read instead of being reset.
     "pins_recent": lambda x: (

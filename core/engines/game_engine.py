@@ -34,6 +34,10 @@ BAKIN = "bakin"
 SRPGSTUDIO = "srpgstudio"
 ALICESOFT = "alicesoft"
 ARTEMIS = "artemis"
+WOLFRPG = "wolfrpg"
+TADS = "tads"
+JAVA = "java"
+WEBGL = "webgl"
 # Not engines but packaging: a Chromium runtime with a game's HTML and
 # JavaScript inside it. They are the answer only when nothing more particular
 # is — see _engine_of_folder.
@@ -70,6 +74,18 @@ _ENGINE_SAVE_EXTENSIONS = {
     # This is the same case as Unity's .dat above, and the reason the table
     # exists at all.
     ARTEMIS:    {".dat"},
+    # Wolf RPG Editor writes SaveData*.sav under Save/ — .sav is not skipped,
+    # so no exception is needed. Listed so the engine is present in the table.
+    WOLFRPG:    set(),
+    # Classic TADS 3 state files use .t3v; TADS 2 uses .sav. Neither extension
+    # is on the skip list. JSON beside a TAD-kit install is also common.
+    TADS:       {".t3v"},
+    # Desktop Java titles often land progress in .dat / .bin under the user
+    # profile; .json is already kept.
+    JAVA:       {".dat", ".bin"},
+    # Browser / NW-packaged WebGL games typically write .json (and sometimes
+    # .dat via idbfs exports). Unity WebGL is the same family for detection.
+    WEBGL:      {".dat", ".bin"},
     # The rest save into extensions nothing skips: TyranoScript, AliceSoft
     # and SRPG Studio write .sav, Bakin .sgs. Listed to say so, as Ren'Py and
     # Unreal are above.
@@ -110,6 +126,10 @@ _LABELS = {
     SRPGSTUDIO: "SRPG Studio",
     ALICESOFT: "AliceSoft System",
     ARTEMIS: "Artemis",
+    WOLFRPG: "Wolf RPG Editor",
+    TADS: "TADS",
+    JAVA: "Java",
+    WEBGL: "WebGL",
     NWJS: "NW.js",
     ELECTRON: "Electron",
 }
@@ -214,6 +234,65 @@ def _engine_of_folder(folder: Path) -> str:
     # loose claims somebody else's.
     if "root.pfs" in names or ".pfs" in suffixes:
         return ARTEMIS
+    # Wolf RPG Editor: encrypted .wolfx assets, a packed Data.wolf, or the
+    # classic unpacked layout (Game.ini + Data/BasicData or SystemFile)
+    # next to Game.exe.
+    if any(n.endswith(".wolfx") for n in names) or ".wolf" in suffixes:
+        return WOLFRPG
+    if "game.ini" in names and (
+            (folder / "Data" / "BasicData").is_dir()
+            or (folder / "Data" / "SystemFile").is_dir()):
+        return WOLFRPG
+    # TADS: MJR TADS 2/3 image files (.gam / .t3), or the TAD-kit layout
+    # (system/system.rec + pic/*.tad asset packs — the .tad files live in a
+    # subfolder, so the top-level listing alone will not see them).
+    if ".t3" in suffixes or ".gam" in suffixes:
+        return TADS
+    if any(n.startswith("htmltads") or n.startswith("t3run")
+           or n in ("tads.exe", "frob.exe") for n in names):
+        return TADS
+    if (folder / "system" / "system.rec").is_file() or "system" in names:
+        pic = folder / "pic"
+        try:
+            if pic.is_dir() and any(
+                    c.suffix.lower() == ".tad" for c in pic.iterdir()):
+                return TADS
+        except OSError:
+            pass
+    if ".tad" in suffixes:
+        return TADS
+    # Desktop Java — three common layouts:
+    #  1. jars beside a private JRE / java.exe
+    #  2. bundled JVM in the exe folder (java.dll + jvm.dll / awt.dll) —
+    #     jpackage and MSIX/Conveyor apps put the launcher here
+    #  3. sibling app/*.jar next to bin/ (Compose Desktop / Conveyor)
+    # HTML shells with jars inside node tooling are left alone.
+    if "nw.dll" not in names and "node_modules" not in names:
+        if "java.dll" in names and (
+                "jvm.dll" in names or "awt.dll" in names):
+            return JAVA
+        jars = [n for n in names if n.endswith(".jar")]
+        if jars and (
+                "jre" in names or "jdk" in names or "java.exe" in names):
+            return JAVA
+        if jars and any(n.endswith(".exe") for n in names) and not (
+                {"index.html", "index.htm"} & names):
+            return JAVA
+        app = folder / "app"
+        try:
+            if app.is_dir() and any(
+                    c.suffix.lower() == ".jar" for c in app.iterdir()):
+                # bin/java.dll one level down, or already standing in bin/
+                if (folder / "bin" / "java.dll").is_file() \
+                        or "java.dll" in names:
+                    return JAVA
+        except OSError:
+            pass
+    # WebGL / HTML5 shell — including Unity WebGL exports (Build/*.wasm) and
+    # NW.js/Electron packages whose main is index.html. Must run BEFORE the
+    # wrapper answers below, or the box is named instead of the contents.
+    if _looks_like_webgl(folder, names, suffixes):
+        return WEBGL
     # SRPG Studio: its packed data, and only alongside the folders a published
     # game carries — .dts on its own is too plain a name to claim a game with.
     if ".dts" in suffixes and ("material" in names or "resource" in names
@@ -229,6 +308,44 @@ def _engine_of_folder(folder: Path) -> str:
             or (folder / "resources" / "app").is_dir():
         return ELECTRON
     return ""
+
+
+def _looks_like_webgl(folder: Path, names: set, suffixes: set) -> bool:
+    """HTML5 / WebGL content, including Unity WebGL and packaged web shells.
+
+    Unity *desktop* still answers UNITY via UnityPlayer.dll earlier. A Unity
+    WebGL export has no player DLL — only the Build/ wasm payload — so it
+    lands here. Plain HTML games and NW-packaged index.html shells do too,
+    unless Tyrano already claimed the folder above.
+    """
+    build = folder / "Build"
+    try:
+        if build.is_dir():
+            bnames = {c.name.lower() for c in build.iterdir()}
+            if any(n.endswith(".wasm") for n in bnames) or any(
+                    n.endswith(".framework.js") or "unityloader" in n
+                    or n.endswith(".data") for n in bnames):
+                return True
+    except OSError:
+        pass
+    if ".wasm" in suffixes:
+        return True
+    if "index.html" in names or "index.htm" in names:
+        # Packaged Chromium + index.html is a web game, not "NW.js" as the
+        # engine answer — same rationale as Tyrano before the wrappers.
+        if "nw.dll" in names or "package.nw" in names \
+                or (folder / "resources" / "app.asar").exists() \
+                or (folder / "resources" / "app").is_dir():
+            return True
+        # Unpackaged HTML5 folder: webgl/three/babylon hints in sibling JS,
+        # or a Build-less Unity-style data file at the root.
+        if any(n.endswith((".data", ".unityweb")) for n in names):
+            return True
+        for n in names:
+            if n.endswith(".js") and any(
+                    k in n for k in ("webgl", "three", "babylon", "unity")):
+                return True
+    return False
 
 
 def detect_engine(exe_path: str = "", game_dir: str = "") -> str:
@@ -312,8 +429,33 @@ def saves_in_skipped_dir(engine: str, path) -> bool:
 
 
 def engine_for_game(entry) -> str:
-    """The engine of a library entry, from whatever it can be read off."""
+    """The engine of a library entry, from whatever it can be read off.
+
+    What the entry already records wins over reading the disk again: it may
+    have been corrected by hand, and the install folder detection needs is
+    gone once the game is uninstalled.
+    """
     if entry is None:
         return ""
+    stored = (getattr(entry, "engine", "") or "").strip()
+    if stored:
+        return stored
     exe = getattr(entry, "exe_path", "") or ""
     return detect_engine(exe_path=exe) if exe else ""
+
+
+def known_engines() -> list:
+    """Every engine that can be named, ordered by label — for pickers."""
+    return sorted(_LABELS, key=lambda e: _LABELS[e].casefold())
+
+
+def engine_display(engine: str) -> str:
+    """A label for *engine*, falling back to the raw value.
+
+    A hand-typed engine SaveSync does not know about is still the user's
+    answer, so it is shown as given rather than reduced to "unknown".
+    """
+    engine = (engine or "").strip()
+    if not engine:
+        return ""
+    return _LABELS.get(engine) or engine

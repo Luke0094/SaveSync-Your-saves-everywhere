@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint
-from PySide6.QtGui import QPixmap, QColor, QIcon
+from PySide6.QtGui import QPixmap, QColor, QIcon, QFont
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QFileDialog, QProgressBar, QFrame,
@@ -224,6 +224,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._original_desc: str = ""
         self._original_image_path: Optional[str] = None
         self._original_image_url: Optional[str] = None
+        # Reviews are edited in their own window and only written back on
+        # Save, so a cancelled dialog leaves the stored ones untouched.
+        self._reviews: list[dict] = [dict(r) for r in
+                                     (getattr(entry, "reviews", None) or [])]
 
         self.setWindowTitle(t("add_game.title") if not entry else t("library.edit"))
         self.setMinimumWidth(540)
@@ -236,6 +240,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self.setAcceptDrops(True)
         
         self._build()
+        self._update_reviews_btn()
+        # Live locale: placeholder "Unknown"/"Sconosciuto" changes width.
+        from i18n import get_engine as _get_i18n
+        _get_i18n().language_changed.connect(self._on_language_changed)
 
         if entry:
             # Block signals during init population to prevent auto-detect firing
@@ -316,6 +324,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 # chip strip while add mode rendered fine, which read as the
                 # add/edit tag-area inconsistency.
                 self._rebuild_tag_chips()
+            # A stored engine is the answer even when it came from detection:
+            # re-detecting here would need the install folder, which may be
+            # gone, and would overwrite a hand-typed value.
+            _stored_engine = (getattr(entry, "engine", "") or "").strip()
+            if _stored_engine:
+                self._set_engine(_stored_engine, from_user=True)
+            elif entry.exe_path:
+                self._detect_engine_from_exe(entry.exe_path)
             # New metadata fields
             if hasattr(entry, 'developer') and entry.developer:
                 self._developer_edit.setText(self._clean_tag(entry.developer))
@@ -402,14 +418,17 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         img_nav_row = QHBoxLayout()
         img_nav_row.setSpacing(2)
 
-        self._img_prev_btn = QPushButton("<")
-        self._img_prev_btn.setFixedSize(20, 56)
-        self._img_prev_btn.setToolTip(t('add_game.previous_image'))
-        self._img_prev_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:{palette('accent')};}}"
+        _img_arrow_css = (
+            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:4px;"
+            f"font-weight:700;font-size:12px;padding:0;}}"
+            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
             f"QPushButton:disabled{{color:{palette('text_muted')};border-color:{palette('border')};}}"
         )
+        self._img_prev_btn = QPushButton("◀")
+        self._img_prev_btn.setFixedSize(22, 56)
+        self._img_prev_btn.setToolTip(t('add_game.previous_image'))
+        self._img_prev_btn.setStyleSheet(_img_arrow_css)
         self._img_prev_btn.setEnabled(False)
         self._img_prev_btn.clicked.connect(self._prev_image)
 
@@ -451,14 +470,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # Keep the preview on top of the stacked widget
         img_preview_layout.setCurrentIndex(1)
 
-        self._img_next_btn = QPushButton(">")
-        self._img_next_btn.setFixedSize(20, 56)
+        self._img_next_btn = QPushButton("▶")
+        self._img_next_btn.setFixedSize(22, 56)
         self._img_next_btn.setToolTip(t('add_game.next_image') if t('add_game.next_image') != 'add_game.next_image' else "Next image")
-        self._img_next_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:{palette('accent')};}}"
-            f"QPushButton:disabled{{color:{palette('text_muted')};border-color:{palette('border')};}}"
-        )
+        self._img_next_btn.setStyleSheet(_img_arrow_css)
         self._img_next_btn.setEnabled(False)
         self._img_next_btn.clicked.connect(self._next_image)
 
@@ -526,20 +541,58 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # _show_search_candidates() — see that method. No inline bar to
         # build here any more.
 
-        exe_lbl = QLabel(t("add_game.exe_path"))
-        exe_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        # Engine sits beside the "Game Executable" label (not on the path
+        # row): the path line stays path + Browse, full width.
+        exe_col = QVBoxLayout()
+        exe_col.setSpacing(3)
+        self._exe_lbl = QLabel(t("add_game.exe_path"))
+        self._exe_lbl.setStyleSheet(
+            f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        self._engine_user_edited = False
+        self._engine_fit_deferred = False
+        self._engine_edit = QLineEdit()
+        self._engine_edit.setPlaceholderText(t("common.unknown"))
+        self._engine_edit.setToolTip(t("add_game.engine_tooltip"))
+        self._engine_edit.setFixedHeight(22)
+        self._engine_edit.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        # Pixel size (not point size) so metrics match the QSS font-size:11px.
+        _eng_font = self._engine_edit.font()
+        _eng_font.setPixelSize(11)
+        _eng_font.setWeight(QFont.Weight.DemiBold)
+        self._engine_edit.setFont(_eng_font)
+        self._engine_edit.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._engine_edit.setStyleSheet(
+            f"QLineEdit{{background:{palette('bg_elevated')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:4px;"
+            f"padding:1px 8px;font-size:11px;font-weight:600;}}"
+            f"QLineEdit:focus{{border-color:{palette('accent')};}}"
+        )
+        self._engine_edit.textChanged.connect(self._fit_engine_width)
+        self._engine_edit.textEdited.connect(self._on_engine_edited)
+        self._fit_engine_width()
+        exe_lbl_row = QHBoxLayout()
+        exe_lbl_row.setContentsMargins(0, 0, 0, 0)
+        exe_lbl_row.setSpacing(8)
+        # Engine immediately to the RIGHT of the label — no stretch between.
+        exe_lbl_row.addWidget(self._exe_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        exe_lbl_row.addWidget(self._engine_edit, 0, Qt.AlignmentFlag.AlignVCenter)
+        exe_lbl_row.addStretch(1)
+        exe_col.addLayout(exe_lbl_row)
         exe_row = QHBoxLayout()
+        exe_row.setSpacing(6)
         self._exe_edit = QLineEdit()
         self._exe_edit.setPlaceholderText(
             "C:\\Games\\game.exe" if os.name == 'nt' else "/opt/games/game")
         self._exe_edit.textChanged.connect(self._on_exe_changed)
+        exe_row.addWidget(self._exe_edit, 1)
         browse_exe = QPushButton(t("add_game.browse"))
         browse_exe.setFixedWidth(80)
         browse_exe.clicked.connect(lambda: self._browse_exe())
-        exe_row.addWidget(self._exe_edit, 1)
         exe_row.addWidget(browse_exe)
-        right_col.addWidget(exe_lbl)
-        right_col.addLayout(exe_row)
+        exe_col.addLayout(exe_row)
+        right_col.addLayout(exe_col)
         
         # Game ID (appid from launcher URL)
         appid_lbl = QLabel(t("add_game.game_id"))
@@ -651,9 +704,30 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         desc_col.addWidget(self._desc_edit)
         desc_cat_row.addLayout(desc_col, 2)
 
-        # Category / Folder
+        # Reviews and folder, in that order: the button sits level with the
+        # description beside it, and the folder picker — which carries its own
+        # label — reads better underneath than squeezed between the two.
         cat_col = QVBoxLayout()
         cat_col.setSpacing(4)
+
+        # Reviews live in their own window: a rating, who wrote it and the
+        # text of it need far more room than this form has, and there can be
+        # any number of them. The button carries the count so the panel does
+        # not have to be opened to find out there is nothing in it.
+        self._reviews_btn = QPushButton()
+        self._reviews_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._reviews_btn.setToolTip(t("reviews.button_tooltip"))
+        self._reviews_btn.setFixedHeight(28)
+        self._reviews_btn.setStyleSheet(
+            f"QPushButton{{font-size:11px;font-weight:600;padding:3px 10px;"
+            f"background:{palette('bg_elevated')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:4px;}}"
+            f"QPushButton:hover{{background:{palette('bg_button')};"
+            f"border-color:{palette('accent')};color:{palette('accent')};}}"
+        )
+        self._reviews_btn.clicked.connect(self._open_reviews)
+        cat_col.addWidget(self._reviews_btn)
+
         cat_lbl = QLabel(t("library.category"))
         cat_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
         self._category_combo = QComboBox()
@@ -1191,11 +1265,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             f"QPushButton:hover{{background:{palette('accent_hover')};}}"
             "QPushButton:disabled{background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.25);}"
         )
-        prev_btn = QPushButton(f"‹  {t('add_game.previous_image')}")
+        prev_btn = QPushButton(f"◀  {t('add_game.previous_image')}")
         prev_btn.setFixedHeight(36)
         prev_btn.setStyleSheet(_btn_style)
         prev_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        next_btn = QPushButton(f"{t('add_game.next_image')}  ›")
+        next_btn = QPushButton(f"{t('add_game.next_image')}  ▶")
         next_btn.setFixedHeight(36)
         next_btn.setStyleSheet(_btn_style)
         next_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1975,8 +2049,114 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if exe_path and Path(exe_path).exists():
             self._detect_btn.setEnabled(True)
             self._auto_detect_image(exe_path)
+            self._detect_engine_from_exe(exe_path)
         else:
             self._detect_btn.setEnabled(False)
+
+    # ── Engine ───────────────────────────────────────────────────────────────
+
+    def _on_engine_edited(self, _text: str):
+        """Anything the user types here wins over later auto-detection."""
+        self._engine_user_edited = True
+
+    def _on_language_changed(self, _locale: str = ""):
+        """Placeholder / labels follow the new locale; width follows them."""
+        self._refresh_engine_locale()
+
+    def _refresh_engine_locale(self):
+        if not hasattr(self, "_engine_edit"):
+            return
+        self._exe_lbl.setText(t("add_game.exe_path"))
+        self._engine_edit.setPlaceholderText(t("common.unknown"))
+        self._engine_edit.setToolTip(t("add_game.engine_tooltip"))
+        # Empty field → width tracks Unknown/Sconosciuto; filled → engine name.
+        self._fit_engine_width()
+
+    def _fit_engine_width(self, _text: str = ""):
+        """Width follows the visible string: engine text, or placeholder if empty.
+
+        Runs once immediately and once deferred so a post-layout / post-locale
+        font polish cannot leave the field sized for the previous string.
+        """
+        self._apply_engine_width()
+        if not self._engine_fit_deferred:
+            self._engine_fit_deferred = True
+            QTimer.singleShot(0, self._fit_engine_width_deferred)
+
+    def _fit_engine_width_deferred(self):
+        self._engine_fit_deferred = False
+        self._apply_engine_width()
+
+    def _apply_engine_width(self):
+        if not hasattr(self, "_engine_edit"):
+            return
+        fm = self._engine_edit.fontMetrics()
+        raw = self._engine_edit.text().strip()
+        placeholder = self._engine_edit.placeholderText() or "?"
+        sample = raw or placeholder
+        text_w = max(fm.horizontalAdvance(sample), fm.boundingRect(sample).width())
+        # padding 8×2 + border 1×2 + slack for bold glyphs / focus frame.
+        chrome = 8 + 8 + 1 + 1 + 14
+        self._engine_edit.setFixedWidth(min(max(text_w + chrome, 48), 280))
+        # setText leaves the cursor at the end; keep the start of the name
+        # visible if the field was briefly too narrow.
+        if not self._engine_edit.hasFocus():
+            self._engine_edit.setCursorPosition(0)
+
+    def _set_engine(self, engine: str, from_user: bool = False):
+        """Show *engine* in the compact field, by label when it is a known one."""
+        from core.engines.game_engine import engine_display
+        text = engine_display(engine) if engine else ""
+        self._engine_edit.blockSignals(True)
+        self._engine_edit.setText(text)
+        self._engine_edit.setCursorPosition(0)
+        self._engine_edit.blockSignals(False)
+        self._fit_engine_width()
+        if from_user:
+            self._engine_user_edited = True
+
+    def _detect_engine_from_exe(self, exe_path: str):
+        """Fill the engine field from the executable, unless it was typed in."""
+        if self._engine_user_edited:
+            return
+        try:
+            from core.engines.game_engine import detect_engine
+            self._set_engine(detect_engine(exe_path=exe_path) or "")
+        except Exception as e:
+            logger.debug(f"Engine detection failed for {exe_path!r}: {e}")
+
+    def _engine_value(self) -> str:
+        """What to store: the engine id for a known one, else the typed text.
+
+        Empty / "Unknown" is stored as empty, so a later detection run (a game
+        moved, an executable finally pointed at) can still fill it in.
+        """
+        typed = self._engine_edit.text().strip()
+        if not typed or typed == t("common.unknown"):
+            return ""
+        # Typed text that happens to name a known engine is stored as its id,
+        # so the sidebar filter groups it with the detected ones.
+        from core.engines.game_engine import known_engines, label as engine_label
+        for eng in known_engines():
+            if typed.casefold() in (eng.casefold(), engine_label(eng).casefold()):
+                return eng
+        return typed
+
+    # ── Reviews ──────────────────────────────────────────────────────────────
+
+    def _update_reviews_btn(self):
+        count = len(self._reviews)
+        self._reviews_btn.setText(
+            t("reviews.button_n", count=count) if count
+            else t("reviews.button"))
+
+    def _open_reviews(self):
+        from ui.dialogs.reviews_dialog import ReviewsDialog
+        dlg = ReviewsDialog(self._name_edit.text().strip(),
+                            self._reviews, self)
+        if dlg.exec():
+            self._reviews = dlg.reviews()
+            self._update_reviews_btn()
 
     def _get_missing_fields(self) -> list[str]:
         """Return list of human-readable field names that are still empty."""
@@ -2627,6 +2807,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Override reject to cancel in-flight detection and clean up icon cache before closing."""
         self._cancel_detection()
         self._cleanup_session_icon_dirs()
+        try:
+            from i18n import get_engine as _get_i18n
+            _get_i18n().language_changed.disconnect(self._on_language_changed)
+        except (RuntimeError, TypeError):
+            pass
         super().reject()
 
     def _cancel_detection(self):
@@ -2647,6 +2832,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def closeEvent(self, event):
         self._cancel_detection()
         self._cleanup_session_icon_dirs()
+        try:
+            from i18n import get_engine as _get_i18n
+            _get_i18n().language_changed.disconnect(self._on_language_changed)
+        except (RuntimeError, TypeError):
+            pass
         super().closeEvent(event)
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -3214,6 +3404,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             entry.developer  = self._developer_edit.text().strip()
             entry.release_year = self._year_edit.text().strip()
             entry.store_url  = ', '.join(self._store_urls)
+            entry.engine     = self._engine_value()
+            entry.reviews    = [dict(r) for r in self._reviews]
             # Persist which API source the metadata came from so replacement-tier
             # logic is correct the next time this dialog is opened.
             _fp = getattr(self, '_enrichment_source_fingerprint', {}) or {}
@@ -3343,6 +3535,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 store_url=', '.join(self._store_urls),
                 info_source=(getattr(self, '_enrichment_source_fingerprint', {}) or {}).get('source', ''),
                 computed_folder_name=get_folder_name_for_save(name, exe or "", ""),
+                engine=self._engine_value(),
+                reviews=[dict(r) for r in self._reviews],
             )
             # Initialise name_history for new entries so rename tracking works
             # from day one (record_name also sets computed_folder_name)

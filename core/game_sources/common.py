@@ -23,6 +23,36 @@ from core.save_detector import GENERIC_EXE_STEMS as _GENERIC_EXE_STEMS_LIST
 logger = logging.getLogger(__name__)
 
 
+_SOURCE_LABELS = {
+    "steam": "Steam",
+    "pcgamingwiki": "PCGamingWiki",
+    "itch": "itch.io",
+    "vndb": "VNDB",
+    "dlsite": "DLsite",
+    "mobygames": "MobyGames",
+    "wikipedia": "Wikipedia",
+}
+
+
+def source_label(raw_source: str) -> str:
+    """An internal source id ('steam', 'web', 'itch+web'…) as a human label.
+
+    Lives here rather than in the dialog that first needed it: a review keeps
+    the source that produced it, and it is shown wherever that review is —
+    the search preview, the merge chips, the reviews panel.
+    """
+    from i18n import t
+    raw_source = (raw_source or "").strip()
+    if not raw_source:
+        return ""
+    if "+web" in raw_source:
+        base = raw_source.replace("+web", "")
+        return f"{_SOURCE_LABELS.get(base, base)} + web"
+    if raw_source == "web":
+        return t("add_game.web_source_generic")
+    return _SOURCE_LABELS.get(raw_source, raw_source)
+
+
 def _fuzzy_slug(s: str) -> str:
     """Normalize string for fuzzy matching.
 
@@ -301,6 +331,22 @@ class GameInfo:
     # the source had already identified was rejected. Carrying the titles it
     # matched on is what lets the answer be recognised as the right one.
     alt_names: Optional[list[str]] = None
+    # What the source thought of the game, on SaveSync's own five-star scale
+    # (see core.library.quantize_rating) rather than each source's — Steam
+    # counts to 100, VNDB to 10, and a library card cannot show both.
+    # 0 means the source said nothing about quality.
+    rating: float = 0.0
+    # Who is being quoted: "Metacritic", "VNDB", the site's own name. Shown
+    # as the reviewer, so an imported opinion is never mistaken for the
+    # user's own.
+    reviewer: str = ""
+    review_text: str = ""
+    # When a source has many user reviews (DLsite), they live here as a
+    # list of ready-to-store review dicts. The scalar rating/reviewer/
+    # review_text fields above stay for single-verdict sources (Steam's
+    # Metacritic score, VNDB's average). Prefer as_reviews() over reading
+    # either shape by hand.
+    reviews: Optional[list] = None
 
     def __post_init__(self):
         if self.genres is None:
@@ -309,6 +355,8 @@ class GameInfo:
             self.extra_urls = []
         if self.alt_names is None:
             self.alt_names = []
+        if self.reviews is None:
+            self.reviews = []
         # Deduplicated, and never repeating the display name: several steps
         # can arrive at the same alternative — the store search matched on it
         # and the store details returned it — and one name listed twice is
@@ -328,6 +376,55 @@ class GameInfo:
         self.developer = _decode_entities(self.developer)
         self.publisher = _decode_entities(self.publisher)
         self.description = _clean_description(self.description)
+        self.reviewer = _decode_entities(self.reviewer)
+        self.review_text = _clean_description(self.review_text)
+        from core.library import quantize_rating
+        self.rating = quantize_rating(self.rating)
+        cleaned = []
+        for r in self.reviews:
+            if not isinstance(r, dict):
+                continue
+            item = dict(r)
+            item["reviewer"] = _decode_entities(str(item.get("reviewer") or ""))
+            item["text"] = _clean_description(str(item.get("text") or ""))
+            item["rating"] = quantize_rating(item.get("rating"))
+            if item["rating"] or item["text"]:
+                cleaned.append(item)
+        self.reviews = cleaned
+
+    def as_reviews(self) -> list:
+        """Every review this source carried, ready for GameEntry.reviews.
+
+        Prefers the multi-review list when present (DLsite user reviews);
+        otherwise wraps the single-verdict fields (Steam/VNDB) into one
+        entry. Empty when the source said nothing about quality.
+        """
+        if self.reviews:
+            return [dict(r) for r in self.reviews]
+        one = self.as_review()
+        return [one] if one else []
+
+    def as_review(self) -> Optional[dict]:
+        """This source's opinion as a review dict, or None when it had none.
+
+        The shape is the one core.library.GameEntry.reviews stores, so the
+        callers that import metadata do not each have to know it. For a
+        multi-review source this is the first entry of as_reviews() — prefer
+        that method when every review matters.
+        """
+        if self.reviews:
+            return dict(self.reviews[0])
+        if not self.rating and not (self.review_text or "").strip():
+            return None
+        from datetime import datetime, timezone
+        return {
+            "rating": self.rating,
+            "reviewer": self.reviewer or self.source,
+            "text": (self.review_text or "").strip(),
+            "notes": "",
+            "source": self.source or "web",
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 def _fetch_json(url: str, timeout: int = 10, headers: Optional[dict] = None) -> Optional[dict]:

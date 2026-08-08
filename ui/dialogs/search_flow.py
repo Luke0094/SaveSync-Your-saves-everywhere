@@ -287,20 +287,8 @@ class SearchFlowMixin:
     def _source_label(self, raw_source: str) -> str:
         """Map an internal source id ('steam', 'web', 'itch+web'…) to its
         human label, preserving the '+ web' enrichment suffix."""
-        _source_labels = {
-            "steam": "Steam",
-            "pcgamingwiki": "PCGamingWiki",
-            "itch": "itch.io",
-            "vndb": "VNDB",
-            "dlsite": "DLsite",
-            "mobygames": "MobyGames",
-            "wikipedia": "Wikipedia",
-            "web": t('add_game.web_source_generic'),
-        }
-        if "+web" in raw_source:
-            base = raw_source.replace("+web", "")
-            return f"{_source_labels.get(base, base)} + web"
-        return _source_labels.get(raw_source, raw_source)
+        from core.game_sources.common import source_label
+        return source_label(raw_source)
 
     # ── Web-search candidate preview (single title or several) ───────────────
 
@@ -472,8 +460,10 @@ class SearchFlowMixin:
                                    when it's being REPLACED with materially
                                    different content
           new_tags / new_urls   — additive (tags/URLs are always a union,
-                                   never cleared)
+                                  never cleared)
           new_image             — whether a new/updated cover would be set
+          new_reviews           — the source's own verdict, when it isn't
+                                  already on the form (one per source)
         """
         current_name = self._name_edit.text().strip()
         current_desc = self._desc_edit.toPlainText().strip()
@@ -531,6 +521,7 @@ class SearchFlowMixin:
         new_tags = [g for g in (result.genres or []) if g not in current_tags]
         new_urls = self._new_result_site_urls(result)
         new_image = bool(result.image_url and (is_overwrite or not has_image))
+        new_reviews = self._new_result_reviews(result)
 
         # ── Per-field diff (for display — strikethrough old, show new) ──
         fields: dict = {}
@@ -563,8 +554,13 @@ class SearchFlowMixin:
             or (getattr(result, 'developer', '') and not current_dev)
             or (result_year and not current_year)
             or new_tags
+            or new_reviews
         )
-        has_changes = bool(fields or new_tags or new_urls or new_image)
+        # A source whose only news is its score still has news: without
+        # reviews counted here a rating-only candidate is dropped as "nothing
+        # to apply" and the score never reaches the form.
+        has_changes = bool(fields or new_tags or new_urls or new_image
+                           or new_reviews)
 
         return {
             'has_existing': has_existing,
@@ -577,6 +573,7 @@ class SearchFlowMixin:
             'new_tags': new_tags,
             'new_urls': new_urls,
             'new_image': new_image,
+            'new_reviews': new_reviews,
         }
 
     def _apply_result_init(self, result):
@@ -602,6 +599,7 @@ class SearchFlowMixin:
         if _ry and not current_year:
             self._year_edit.setText(_ry)
         self._merge_result_urls(result)
+        self._merge_result_review(result)
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
 
@@ -623,15 +621,106 @@ class SearchFlowMixin:
         if _ry:
             self._year_edit.setText(_ry)
         self._merge_result_urls(result)
+        self._merge_result_review(result)
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
 
+    def _merge_result_review(self, result):
+        """Keep the source's verdict(s) as reviews of their own.
+
+        Every tier does this — a rating is not something one tier owns and
+        another ignores — and the source travels with each review, so where a
+        score came from is answerable long after the search. A site that
+        ships many user reviews (DLsite) contributes the whole list.
+        """
+        if hasattr(result, "as_reviews"):
+            reviews = result.as_reviews()
+        elif hasattr(result, "as_review"):
+            one = result.as_review()
+            reviews = [one] if one else []
+        else:
+            reviews = []
+        if reviews:
+            self._merge_reviews(reviews)
+
+    def _merge_reviews(self, reviews: list):
+        """Fold *reviews* into the form, keyed by review_identity.
+
+        A single-verdict site (Steam/VNDB) still occupies one slot keyed by
+        source; a multi-review site keeps every user review distinct. The
+        user's own reviews (source "user") are never overwritten by a web
+        import — different identity — and are never touched here either.
+        """
+        from core.library import review_identity
+        merged = list(getattr(self, "_reviews", None) or [])
+        by_key = {review_identity(r): i
+                  for i, r in enumerate(merged) if isinstance(r, dict)}
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            if (review.get("source") or "") == "user":
+                continue
+            key = review_identity(review)
+            if not key:
+                continue
+            idx = by_key.get(key)
+            if idx is not None:
+                merged[idx] = review
+            else:
+                by_key[key] = len(merged)
+                merged.append(review)
+        self._reviews = merged
+        if hasattr(self, "_update_reviews_btn"):
+            self._update_reviews_btn()
+
+    def _new_result_reviews(self, result) -> list:
+        """Reviews the source would add that the form does not already have.
+
+        Identity is per review (see review_identity), so a DLsite page with
+        ten user reviews can contribute the ones that are new without the
+        whole set being dropped because one of them was already imported.
+        """
+        from core.library import review_identity
+        if hasattr(result, "as_reviews"):
+            incoming = result.as_reviews()
+        elif hasattr(result, "as_review"):
+            one = result.as_review()
+            incoming = [one] if one else []
+        else:
+            incoming = []
+        if not incoming:
+            return []
+        have = {review_identity(r): r
+                for r in (getattr(self, "_reviews", None) or [])
+                if isinstance(r, dict)}
+        fresh = []
+        for review in incoming:
+            key = review_identity(review)
+            if not key:
+                continue
+            existing = have.get(key)
+            if existing and all(
+                    str(existing.get(k, "")) == str(review.get(k, ""))
+                    for k in ("rating", "reviewer", "text")):
+                continue
+            fresh.append(review)
+        return fresh
+
     def _apply_result_enrich(self, result, new_tags: list):
         """Case E — same/lower tier: only fill EMPTY fields; tags always
-        union (additive, never replaces or clears existing tags)."""
+        union (additive, never replaces or clears existing tags).
+
+        The title is the exception: the candidate preview already showed the
+        rename with a strikethrough, and accepting that candidate means the
+        rename — leaving the old name in place after the user confirmed the
+        new one is what made "already saved" games keep the wrong title.
+        """
+        current_name = self._name_edit.text().strip()
         current_desc = self._desc_edit.toPlainText().strip()
         current_dev  = self._developer_edit.text().strip()
         current_year = self._year_edit.text().strip()
+        if result.name and result.name != current_name:
+            self._name_edit.setText(result.name)
         if result.description and not current_desc:
             self._desc_edit.setPlainText(result.description)
         if result.image_url and not self._original_image_path:
@@ -644,6 +733,7 @@ class SearchFlowMixin:
         if new_tags:
             self._apply_web_tags(new_tags)
         self._merge_result_urls(result)
+        self._merge_result_review(result)
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
 
@@ -759,9 +849,11 @@ class SearchFlowMixin:
             'image':       [] if has_img  else _opts(lambda i: i.image_url),
             'tags': [],
             'urls': [],
+            'reviews': [],
         }
         seen_tags = set(cur_tags)
         seen_urls: set[str] = set()
+        seen_review_sources: set[str] = set()
         for info in collected:
             src = (info.source or 'web').split('+')[0]
             for g in (info.genres or []):
@@ -774,9 +866,19 @@ class SearchFlowMixin:
                     continue
                 seen_urls.add(u)
                 model['urls'].append({'source': src, 'value': u})
+            # Reviews are offered per SOURCE, all of that source's together:
+            # a score, who gave it and what they said are one verdict, and
+            # picking them apart would leave a rating nobody stands behind.
+            # Additive like tags — two sites rating a game is two reviews,
+            # not a contest between them.
+            _revs = [r for r in self._new_result_reviews(info)
+                     if str(r.get('source') or src) not in seen_review_sources]
+            if _revs:
+                seen_review_sources.add(str(_revs[0].get('source') or src))
+                model['reviews'].append({'source': src, 'value': _revs})
         model['has_options'] = any([
             model['description'], model['developer'], model['year'],
-            model['image'], model['tags'], model['urls'],
+            model['image'], model['tags'], model['urls'], model['reviews'],
         ])
         return model
 
@@ -792,6 +894,8 @@ class SearchFlowMixin:
             self._download_and_set_image(sel['image'])
         if sel.get('tags'):
             self._apply_web_tags(sel['tags'])
+        if sel.get('reviews'):
+            self._merge_reviews(sel['reviews'])
         _new_urls = [u for u in sel.get('urls', []) if u not in self._store_urls]
         if _new_urls:
             self._store_urls.extend(_new_urls)

@@ -34,6 +34,36 @@ _PYNPUT_KEY_ALIASES = {
     "minus": "-",
 }
 
+# Canonical modifier names, in the order a normalized hotkey string lists
+# them. "ctrl+alt+s" and "alt+ctrl+s" are the same shortcut, so they have to
+# reduce to the same key: bindings are stored per string, and two spellings
+# of one shortcut used to live side by side, each with its own callback.
+_MOD_ORDER = ("ctrl", "alt", "shift", "win")
+
+# Virtual-key codes for the physical check in _modifiers_held (Windows only).
+_VK = {"ctrl": 0x11, "alt": 0x12, "shift": 0x10}
+_VK_LWIN, _VK_RWIN = 0x5B, 0x5C
+
+
+def _split_hotkey(hotkey: str) -> tuple[list[str], list[str]]:
+    """(canonical modifiers, remaining keys) for a hotkey string."""
+    mods, keys = set(), []
+    for part in (p.strip().lower() for p in hotkey.split("+")):
+        if not part:
+            continue
+        if part in _PYNPUT_MODS:
+            mods.add({"control": "ctrl", "windows": "win", "super": "win",
+                      "cmd": "win", "meta": "win"}.get(part, part))
+        else:
+            keys.append(_PYNPUT_KEY_ALIASES.get(part, part))
+    return [m for m in _MOD_ORDER if m in mods], keys
+
+
+def normalize_hotkey(hotkey: str) -> str:
+    """A hotkey string in canonical form: fixed modifier order, lowercase."""
+    mods, keys = _split_hotkey(hotkey)
+    return "+".join(mods + keys)
+
 
 def _to_pynput_combo(hotkey: str) -> str:
     parts = [p.strip().lower() for p in hotkey.split("+") if p.strip()]
@@ -47,6 +77,33 @@ def _to_pynput_combo(hotkey: str) -> str:
         p = _PYNPUT_KEY_ALIASES.get(p, p)
         out.append(p if len(p) == 1 else f"<{p}>")
     return "+".join(out)
+
+
+def _modifiers_held(required: list[str]) -> bool:
+    """True when exactly *required* modifiers are physically down right now.
+
+    pynput decides a hotkey fired by comparing the set of keys it believes
+    are held. That belief is wrong whenever a key-up is missed — which
+    happens on Windows when a modifier is released while another window has
+    the keyboard, or after a UAC prompt — and a stuck Alt makes plain Ctrl+S
+    look like Alt+Ctrl+S. Asking the OS what is actually down closes that
+    gap. Only meaningful on Windows; elsewhere the check passes.
+    """
+    try:
+        import ctypes
+        get_state = ctypes.windll.user32.GetAsyncKeyState
+    except (ImportError, AttributeError, OSError):
+        return True
+
+    def _down(vk: int) -> bool:
+        return bool(get_state(vk) & 0x8000)
+
+    for name, vk in _VK.items():
+        if _down(vk) != (name in required):
+            return False
+    if (_down(_VK_LWIN) or _down(_VK_RWIN)) != ("win" in required):
+        return False
+    return True
 
 
 class HotkeyManager(QObject):
@@ -67,6 +124,7 @@ class HotkeyManager(QObject):
         super().__init__()
         self._bindings: Dict[str, Callable] = {}   # hotkey_str → callback
         self._combos: Dict[str, str] = {}          # hotkey_str → pynput combo
+        self._mods: Dict[str, list] = {}           # hotkey_str → modifiers
         self._bindings_lock = threading.Lock()
         self._listener = None
         self._available = False
@@ -108,7 +166,17 @@ class HotkeyManager(QObject):
             return
 
         def _fire_for(hk: str):
+            mods = self._mods.get(hk, [])
+
             def _fire():
+                # Checked here, on the listener thread, while the keys are
+                # still down — not in the queued slot, where the user may
+                # already have let go.
+                if not _modifiers_held(mods):
+                    logger.debug(
+                        f"Hotkey {hk} ignored: modifiers not actually held")
+                    self._clear_listener_state()
+                    return
                 self._trigger.emit(hk)
             return _fire
 
@@ -118,11 +186,26 @@ class HotkeyManager(QObject):
         listener.start()
         self._listener = listener
 
+    def _clear_listener_state(self):
+        """Drop pynput's idea of which keys are down.
+
+        Without this a modifier whose key-up was missed stays "held" for the
+        rest of the session, so every later press of the remaining keys looks
+        like the full combination.
+        """
+        listener = self._listener
+        for hk in getattr(listener, "_hotkeys", ()) or ():
+            try:
+                hk._state.clear()
+            except Exception:
+                pass
+
     # ── Registration ──────────────────────────────────────────────────────────
 
     def register(self, hotkey: str, callback: Callable) -> bool:
         if not self._available:
             return False
+        hotkey = normalize_hotkey(hotkey)
         try:
             self.unregister(hotkey)
             combo = _to_pynput_combo(hotkey)
@@ -132,6 +215,7 @@ class HotkeyManager(QObject):
             with self._bindings_lock:
                 self._bindings[hotkey] = callback
                 self._combos[hotkey] = combo
+                self._mods[hotkey] = _split_hotkey(hotkey)[0]
                 self._rebuild_listener_locked()
             logger.info(f"Hotkey registered: {hotkey} (pynput: {combo})")
             return True
@@ -141,6 +225,7 @@ class HotkeyManager(QObject):
             with self._bindings_lock:
                 self._bindings.pop(hotkey, None)
                 self._combos.pop(hotkey, None)
+                self._mods.pop(hotkey, None)
                 try:
                     self._rebuild_listener_locked()
                 except Exception:
@@ -148,11 +233,13 @@ class HotkeyManager(QObject):
             return False
 
     def unregister(self, hotkey: str):
+        hotkey = normalize_hotkey(hotkey)
         with self._bindings_lock:
             if not self._available or hotkey not in self._bindings:
                 return
             self._bindings.pop(hotkey, None)
             self._combos.pop(hotkey, None)
+            self._mods.pop(hotkey, None)
             try:
                 self._rebuild_listener_locked()
             except Exception as e:

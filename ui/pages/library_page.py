@@ -29,6 +29,7 @@ _SORT_NATURAL_DIRECTION = {
     "last_played": "desc",
     "name_asc":    "asc",
     "playtime":    "desc",
+    "rating":      "desc",
     "status":      "asc",
     "last_backup": "desc",
 }
@@ -43,6 +44,7 @@ _SORT_DIR_LABELS = {
     "last_backup": ("sort_dir_newest", "sort_dir_oldest"),
     "name_asc":    ("sort_dir_za",     "sort_dir_az"),
     "playtime":    ("sort_dir_most",   "sort_dir_least"),
+    "rating":      ("sort_dir_most",   "sort_dir_least"),
     "status":      ("sort_descending", "sort_ascending"),
 }
 
@@ -338,6 +340,7 @@ class LibraryPage(QWidget, ThemedMixin):
         self._folder_tree = FolderTree()
         self._folder_tree.folder_selected.connect(self._on_folder_selected)
         self._folder_tree.tags_changed.connect(self._on_tags_changed)
+        self._folder_tree.engines_changed.connect(self._on_tags_changed)
         body.addWidget(self._folder_tree)
 
         # Scroll area for game cards/rows
@@ -427,6 +430,21 @@ class LibraryPage(QWidget, ThemedMixin):
             all_tags.extend(_clean_tag_display(x) for x in g.tags)
         self._folder_tree.update_tags(all_tags)
 
+        # …and the engines behind them, by label: the sidebar shows "RPG
+        # Maker", not "rpgmaker", and an engine typed in by hand shows as
+        # typed (see engine_display).
+        from core.engines.game_engine import engine_display, engine_for_game
+        engine_labels = {}
+        unknown_ids = set()
+        for g in all_games:
+            shown = engine_display(engine_for_game(g))
+            if shown:
+                engine_labels[g.id] = shown
+            else:
+                unknown_ids.add(g.id)
+        self._folder_tree.update_engines(
+            list(engine_labels.values()), has_unknown=bool(unknown_ids))
+
         games = self._sort_games(all_games)
 
         # Apply folder filter from sidebar
@@ -451,6 +469,25 @@ class LibraryPage(QWidget, ThemedMixin):
             _exc_cf = {tag_merge_key(x) for x in excluded_tags}
             games = [g for g in games if not _exc_cf.intersection(
                 {tag_merge_key(_clean_tag_display(x)) for x in g.tags})]
+
+        # Engine filter, same three states. A game has exactly one engine, so
+        # "include" is a membership test rather than the subset test tags need.
+        # The Others chip matches titles whose engine was not identified.
+        others_cf = self._folder_tree.engine_others_label().casefold()
+        selected_engines = {x.casefold()
+                            for x in self._folder_tree.get_selected_engines()}
+        excluded_engines = {x.casefold()
+                            for x in self._folder_tree.get_excluded_engines()}
+
+        def _engine_chip_for(g) -> str:
+            label = engine_labels.get(g.id, "")
+            return label.casefold() if label else others_cf
+
+        if selected_engines:
+            games = [g for g in games if _engine_chip_for(g) in selected_engines]
+        if excluded_engines:
+            games = [g for g in games
+                     if _engine_chip_for(g) not in excluded_engines]
 
         # Apply text search filter inline so the grid reflows without gaps.
         # Filters/search run on the FULL library — pagination is applied
@@ -613,6 +650,7 @@ class LibraryPage(QWidget, ThemedMixin):
                 or entry.last_backed_up != card._entry.last_backed_up
                 or entry.sync_status != card._entry.sync_status
                 or entry.name != card._entry.name
+                or entry.average_rating() != card._entry.average_rating()
             )
         else:
             tags_changed = True
@@ -654,7 +692,7 @@ class LibraryPage(QWidget, ThemedMixin):
         self._rebuild_view()
 
     def _on_tags_changed(self):
-        """Tag filter changed — re-paginate from page 1 and rebuild."""
+        """A chip filter changed — re-paginate from page 1 and rebuild."""
         self._current_page = 1
         self._rebuild_view()
 
@@ -664,10 +702,9 @@ class LibraryPage(QWidget, ThemedMixin):
         sm = getattr(self, '_search_mode', None)
         query = q.text().strip() if q else ""
         mode = sm.currentData() if sm else "title"
-        # Check active tag filters
+        # Any chip filter (tags or engine) narrowing the list right now
         folder_tree = getattr(self, '_folder_tree', None)
-        tags_active = bool(folder_tree and (folder_tree.get_selected_tags()
-                                            or folder_tree.get_excluded_tags()))
+        tags_active = bool(folder_tree and folder_tree.has_active_filters())
 
         is_empty = (len(self._cards) == 0)
         if is_empty:
@@ -698,6 +735,7 @@ class LibraryPage(QWidget, ThemedMixin):
             ("last_played",  "library.sort_last_played"),
             ("name_asc",     "library.sort_name"),
             ("playtime",     "library.sort_playtime"),
+            ("rating",       "library.sort_rating"),
             ("status",       "library.sort_status"),
             ("last_backup",  "library.sort_last_backup"),
             # "tags" sort removed — tag filtering is handled by the tag panel
@@ -759,6 +797,10 @@ class LibraryPage(QWidget, ThemedMixin):
             result = sorted(games, key=lambda g: g.last_backed_up or "", reverse=True)
         elif criterion == "last_played":
             result = sorted(games, key=lambda g: g.last_played or "", reverse=True)
+        elif criterion == "rating":
+            # Highest average first; unrated (0) sink to the bottom in the
+            # natural direction, and the ↓/↑ toggle reverses that.
+            result = sorted(games, key=lambda g: g.average_rating(), reverse=True)
         else:  # date_added (default) — newest added first. Legacy entries
                # have no timestamp (date_added is None); without a fallback
                # every untimestamped game collapses to the key "" and Python's
@@ -805,6 +847,7 @@ class LibraryPage(QWidget, ThemedMixin):
         self._list_btn.setToolTip(t("tooltips.list_view"))
         self._populate_sort_combo()
         self._update_sort_dir_btn()
+        self._page_size_combo.update_locale()
         self._folder_tree.update_locale()
         for card in self._cards.values():
             if hasattr(card, "update_locale"):

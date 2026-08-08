@@ -90,6 +90,26 @@ def _storesearch_urls(term: str) -> list[tuple[str, str]]:
     return urls
 
 
+def _metacritic(app_data: dict) -> dict:
+    """Steam's Metacritic score as GameInfo's review fields.
+
+    Metacritic counts to 100 and SaveSync's stars to 5. Games without a score
+    (most of them) get nothing rather than a zero, which would read as a
+    damning review instead of as an absent one.
+    """
+    try:
+        score = int((app_data.get("metacritic") or {}).get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if score <= 0:
+        return {}
+    return {
+        "rating": score / 20.0,
+        "reviewer": "Metacritic",
+        "review_text": f"Metacritic: {score}/100",
+    }
+
+
 def search_steam(game_name: str, appid: Optional[str] = None,
                  region: str = "us") -> Optional[GameInfo]:
     """Search Steam Store API.
@@ -120,6 +140,7 @@ def search_steam(game_name: str, appid: Optional[str] = None,
                 # is shown: it holds the game's other name, and that is what
                 # a search written in that name has to match against.
                 alt_names=[full_name] if full_name != shown else [],
+                **_metacritic(app_data),
             )
 
     # Search by name — build meaningful queries, collect candidates then pick best

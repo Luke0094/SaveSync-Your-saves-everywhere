@@ -32,6 +32,10 @@ def _group(title: str) -> QGroupBox:
 
 class SettingsPage(QWidget):
     hotkey_changed = Signal(str, str)   # old, new
+    # Config replaced wholesale (reset / import / snapshot restore): the
+    # hotkey in the file may differ from the one actually listening, and
+    # hotkey_changed cannot say what the old one was.
+    hotkeys_reload = Signal()
     theme_changed  = Signal(str)
 
     def __init__(self, parent=None):
@@ -400,6 +404,23 @@ class SettingsPage(QWidget):
         self._history_btn.clicked.connect(self._on_config_history)
         transfer_form.addRow("", self._history_btn)
 
+        # Scheduled cloud export — keeps a fresh encrypted config on the
+        # sync provider so a wipe or new machine still has library/settings.
+        self._auto_export_cb = QCheckBox(t("settings.auto_export_config"))
+        self._auto_export_cb.setToolTip(t("settings.auto_export_config_tooltip"))
+        transfer_form.addRow("", self._auto_export_cb)
+        self._auto_export_days_spin = QSpinBox()
+        self._auto_export_days_spin.setRange(1, 365)
+        self._auto_export_days_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._auto_export_days_spin.setToolTip(
+            t("settings.auto_export_config_interval_tooltip"))
+        self._auto_export_days_lbl = QLabel(
+            t("settings.auto_export_config_interval"))
+        transfer_form.addRow(self._auto_export_days_lbl,
+                             self._auto_export_days_spin)
+        self._auto_export_cb.toggled.connect(self._auto_export_days_spin.setEnabled)
+        self._auto_export_cb.toggled.connect(self._auto_export_days_lbl.setEnabled)
+
         self._scroll_layout.addWidget(transfer_grp)
 
         # ── Inline buttons (bottom of scroll) ────────────────────────────────
@@ -582,6 +603,8 @@ class SettingsPage(QWidget):
         self._poll_spin.valueChanged.connect(self._mark_dirty)
         self._verify_cb.stateChanged.connect(self._mark_dirty)
         self._verify_days_spin.valueChanged.connect(self._mark_dirty)
+        self._auto_export_cb.stateChanged.connect(self._mark_dirty)
+        self._auto_export_days_spin.valueChanged.connect(self._mark_dirty)
         self._correlation_cb.stateChanged.connect(self._mark_dirty)
         self._correlation_spin.valueChanged.connect(self._mark_dirty)
         self._hints_edit.textChanged.connect(self._mark_dirty)
@@ -855,6 +878,8 @@ class SettingsPage(QWidget):
             "poll": self._poll_spin.value(),
             "verify": self._verify_cb.isChecked(),
             "verify_days": self._verify_days_spin.value(),
+            "auto_export": self._auto_export_cb.isChecked(),
+            "auto_export_days": self._auto_export_days_spin.value(),
             "correlation": self._correlation_cb.isChecked(),
             "correlation_window": self._correlation_spin.value(),
             "ignored": "",  # managed via unified process list, not a textarea
@@ -914,6 +939,12 @@ class SettingsPage(QWidget):
         self._verify_days_spin.setValue(config.get("backup_verify_interval_days", 7))
         self._verify_days_spin.setEnabled(_ver_on)
         self._verify_days_lbl.setEnabled(_ver_on)
+        _auto_exp = config.get("auto_export_config_enabled", False)
+        self._auto_export_cb.setChecked(_auto_exp)
+        self._auto_export_days_spin.setValue(
+            config.get("auto_export_config_interval_days", 7))
+        self._auto_export_days_spin.setEnabled(_auto_exp)
+        self._auto_export_days_lbl.setEnabled(_auto_exp)
         _corr_on = config.get("save_correlation_enabled", False)
         self._correlation_cb.setChecked(_corr_on)
         self._correlation_spin.setValue(config.get("save_correlation_window_ms", 1000))
@@ -966,6 +997,9 @@ class SettingsPage(QWidget):
         config.set("process_poll_interval",  self._poll_spin.value())
         config.set("backup_verify_enabled",      self._verify_cb.isChecked())
         config.set("backup_verify_interval_days", self._verify_days_spin.value())
+        config.set("auto_export_config_enabled", self._auto_export_cb.isChecked())
+        config.set("auto_export_config_interval_days",
+                   self._auto_export_days_spin.value())
         config.set("save_correlation_enabled",   self._correlation_cb.isChecked())
         config.set("save_correlation_window_ms", self._correlation_spin.value())
 
@@ -1237,6 +1271,7 @@ class SettingsPage(QWidget):
             try:
                 result = apply_import(parsed, settings, library, creds, strategy)
                 self._load()
+                self.hotkeys_reload.emit()
                 msg = t("settings.import_success",
                          settings=result["settings_applied"],
                          games_added=result["games_added"],
@@ -1304,6 +1339,7 @@ class SettingsPage(QWidget):
             try:
                 result = apply_import(parsed, settings, library, creds, strategy)
                 self._load()
+                self.hotkeys_reload.emit()
                 msg = t("settings.import_success",
                          settings=result["settings_applied"],
                          games_added=result["games_added"],
@@ -1358,6 +1394,7 @@ class SettingsPage(QWidget):
         def _do_restore(snap_path):
             if restore_config_snapshot(snap_path):
                 self._load()
+                self.hotkeys_reload.emit()
                 self._saved_lbl.setText(t("config_transfer.restore_success"))
                 self._saved_lbl.setVisible(True)
 
@@ -1396,6 +1433,8 @@ class SettingsPage(QWidget):
             "process_poll_interval":  1,
             "backup_verify_enabled":      True,
             "backup_verify_interval_days": 7,
+            "auto_export_config_enabled": False,
+            "auto_export_config_interval_days": 7,
             "save_correlation_enabled":   False,
             "save_correlation_window_ms": 1000,
             "ignored_processes":      [],
@@ -1406,6 +1445,7 @@ class SettingsPage(QWidget):
         for k, v in DEFAULTS.items():
             config.set(k, v)
         self._load()
+        self.hotkeys_reload.emit()
         self._snapshot = self._take_snapshot()
         self._dirty = False
         self._inline_save.setEnabled(False)
@@ -1526,6 +1566,12 @@ class SettingsPage(QWidget):
         self._verify_days_lbl.setText(t("settings.backup_verify_interval"))
         self._verify_days_spin.setSuffix(" " + t("settings.days_suffix"))
         self._verify_days_spin.setToolTip(t("settings.backup_verify_interval_tooltip"))
+        self._auto_export_cb.setText(t("settings.auto_export_config"))
+        self._auto_export_cb.setToolTip(t("settings.auto_export_config_tooltip"))
+        self._auto_export_days_lbl.setText(t("settings.auto_export_config_interval"))
+        self._auto_export_days_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._auto_export_days_spin.setToolTip(
+            t("settings.auto_export_config_interval_tooltip"))
         self._correlation_cb.setText(t("settings.save_correlation"))
         self._correlation_cb.setToolTip(t("settings.save_correlation_tooltip"))
         self._correlation_lbl.setText(t("settings.save_correlation_window"))

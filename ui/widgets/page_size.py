@@ -18,15 +18,15 @@ import logging
 from contextlib import contextmanager
 
 from PySide6.QtGui import QFontMetrics
-from PySide6.QtWidgets import QComboBox, QInputDialog
+from PySide6.QtWidgets import QComboBox
 
 from core.config_manager import get_config
 from i18n import t
 
-# Closed width: enough for a 3-digit size + arrow. The popup is sized
+# Closed width: enough for a 2-digit size + arrow. The popup is sized
 # separately so "Personalizzato…" / "Custom…" is never clipped there.
 # Global QComboBox QSS uses min-width:120px — overridden via #page_size_combo.
-_COMBO_WIDTH = 52
+_COMBO_WIDTH = 58
 
 logger = logging.getLogger(__name__)
 
@@ -44,23 +44,52 @@ SCOPE_LIBRARY = "library"
 SCOPE_BACKUPS = "backups"
 SCOPE_CHEATS_GAMES = "cheats_games"
 SCOPE_CHEATS_SAVES = "cheats_saves"
+SCOPE_REVIEWS = "reviews"
+
+# Per-scope ceilings and preset lists. The generic maximum is NOT offered as
+# a preset — that is what put "500" in every dropdown. Reviews are denser
+# than a row of cards, so they get their own smaller ladder.
+SCOPE_MAXIMUM = {
+    SCOPE_REVIEWS: 50,
+}
+SCOPE_PRESETS = {
+    SCOPE_REVIEWS: (5, 10, 20),
+}
+SCOPE_DEFAULT = {
+    SCOPE_REVIEWS: 10,
+}
+
+
+def scope_maximum(scope: str) -> int:
+    """The largest page size *scope* allows."""
+    return SCOPE_MAXIMUM.get(scope, PAGE_SIZE_MAX)
+
+
+def scope_presets(scope: str) -> tuple:
+    """The presets offered for *scope*, never above its ceiling."""
+    ceiling = scope_maximum(scope)
+    raw = SCOPE_PRESETS.get(scope, PAGE_SIZE_PRESETS)
+    presets = tuple(p for p in raw if p <= ceiling)
+    return presets or (min(raw[0], ceiling),)
 
 
 def page_size(scope: str) -> int:
     """The page size for *scope*, always a usable number."""
+    ceiling = scope_maximum(scope)
+    default = min(SCOPE_DEFAULT.get(scope, PAGE_SIZE_DEFAULT), ceiling)
     raw = (get_config().get(_SIZES_KEY, {}) or {}).get(scope)
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return PAGE_SIZE_DEFAULT
+        return default
     if value < 1:
-        return PAGE_SIZE_DEFAULT
-    return min(value, PAGE_SIZE_MAX)
+        return default
+    return min(value, ceiling)
 
 
 def set_page_size(scope: str, value: int) -> int:
     """Store the page size for *scope*; returns what was actually stored."""
-    value = max(1, min(int(value), PAGE_SIZE_MAX))
+    value = max(1, min(int(value), scope_maximum(scope)))
     sizes = dict(get_config().get(_SIZES_KEY, {}) or {})
     sizes[scope] = value
     get_config().set(_SIZES_KEY, sizes)
@@ -143,29 +172,52 @@ class PageSizeCombo(QComboBox):
 
     def _reload_items(self):
         current = page_size(self._scope)
+        presets = scope_presets(self._scope)
         self.blockSignals(True)
         self.clear()
-        for preset in PAGE_SIZE_PRESETS:
+        for preset in presets:
             self.addItem(str(preset), preset)
-        if current not in PAGE_SIZE_PRESETS:
+        if current not in presets:
             # The active custom value needs a slot of its own, or reopening
             # the page would show a preset that isn't what is being used.
             self.addItem(str(current), current)
         self.addItem(t("common.per_page_custom"), "custom")
         idx = self.findData(current)
-        self.setCurrentIndex(idx if idx >= 0 else PAGE_SIZE_PRESETS.index(
-            PAGE_SIZE_DEFAULT))
+        self.setCurrentIndex(idx if idx >= 0 else 0)
         self.blockSignals(False)
         self._fit_popup()
 
     def _fit_popup(self):
-        """Popup wider than the compact closed box so custom labels fit."""
+        """Popup wide enough for labels and tall enough for every item.
+
+        Reviews offer four rows (5 / 10 / 20 / Custom…): without an explicit
+        visible-item count the view clipped to ~3 and hid the rest behind a
+        scrollbar.
+        """
         fm = QFontMetrics(self.font())
         widest = max(
             (fm.horizontalAdvance(self.itemText(i))
              for i in range(self.count())),
             default=0)
-        self.view().setMinimumWidth(max(_COMBO_WIDTH, widest + 28))
+        view = self.view()
+        view.setMinimumWidth(max(_COMBO_WIDTH, widest + 28))
+        n = max(1, self.count())
+        self.setMaxVisibleItems(n)
+        row_h = view.sizeHintForRow(0)
+        if row_h <= 0:
+            row_h = fm.height() + 10
+        # Frame + a little air so the last row is not clipped by the border.
+        view.setMinimumHeight(row_h * n + 6)
+
+    def update_locale(self):
+        """Re-translate the "custom…" entry and the tooltip.
+
+        The presets are bare numbers, but the last item and the tooltip are
+        words: without this they keep the language they were built in, which
+        is what the dropdown showed after a live language switch.
+        """
+        self.setToolTip(t("common.per_page_tooltip"))
+        self._reload_items()
 
     def _on_activated(self, index: int):
         data = self.itemData(index)
@@ -183,8 +235,17 @@ class PageSizeCombo(QComboBox):
             self._on_change(stored)
 
     def _ask_custom(self):
-        value, ok = QInputDialog.getInt(
+        # Not QInputDialog.getInt: the static helper leaves Qt's own English
+        # OK/Cancel in place and lays the explanation out on a single line.
+        from ui.modal_helpers import input_int_window_modal
+        ceiling = scope_maximum(self._scope)
+        # The warning about slow renders only makes sense where a size big
+        # enough to cause one can be asked for; a capped list cannot.
+        prompt = ("common.per_page_custom_prompt"
+                  if ceiling > max(PAGE_SIZE_PRESETS)
+                  else "common.per_page_custom_prompt_capped")
+        value, ok = input_int_window_modal(
             self, t("common.per_page_custom_title"),
-            t("common.per_page_custom_prompt", max=PAGE_SIZE_MAX),
-            page_size(self._scope), 1, PAGE_SIZE_MAX, 5)
+            t(prompt, max=ceiling),
+            page_size(self._scope), 1, ceiling, 5)
         return value if ok else None

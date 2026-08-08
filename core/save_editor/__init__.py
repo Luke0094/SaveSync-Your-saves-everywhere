@@ -2,10 +2,10 @@
 
 Public API stays importable as ``from core.save_editor import …``.
 
-Beside the editor itself this package holds tools used *only* for editing
-— decryptors (Unreal, Easy Save 3), remembered keys, UnityFS unpack for
-key search, and Wolf value extraction. Engine recognition, format readers
-and Wolf's obfuscation layer stay in ``core.engines``.
+Beside the editor itself this package holds per-format adapters
+(``*_format``) and — under ``crypt/`` — the decryptors (Unreal, Easy Save 3,
+Wolf unlock, UnityFS, remembered keys). Engine recognition and binary/format
+readers stay in ``core.engines``.
 """
 from .save_editor import (  # noqa: F401
     SaveEditorError,
