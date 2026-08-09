@@ -122,9 +122,16 @@ class _SoftwareCursor(QWidget):
     ``ShowCursor`` / ``SetCursor`` are per-thread: Unity hiding the pointer in
     its own process cannot be undone from SaveSync. A tiny topmost, input-
     transparent window that follows ``QCursor.pos()`` is the reliable fallback.
+
+    Size follows the screen's logical DPI (Windows display scaling) from a
+    compact 96‑DPI baseline — slightly smaller than a classic system arrow.
     """
 
-    _HOTSPOT = QPoint(1, 1)
+    # Design units at 96 DPI (compact); painted / sized with ``_scale``.
+    _BASE_W, _BASE_H = 14, 20
+    _BASE_BODY = (
+        (1, 1), (1, 14), (4, 11), (7, 18), (9, 17), (6, 10), (11, 10),
+    )
 
     def __init__(self):
         super().__init__(None)
@@ -140,24 +147,47 @@ class _SoftwareCursor(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus)
-        self.setFixedSize(24, 32)
         self.setCursor(Qt.CursorShape.BlankCursor)
+        self._scale = 1.0
+        self._hotspot = QPoint(1, 1)
+        self._apply_scale(self._dpi_scale())
+
+    @staticmethod
+    def _dpi_scale() -> float:
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return 1.0
+        # logicalDotsPerInch tracks Windows per-monitor scaling; clamp so
+        # 100% stays compact and 200%+ does not become a slab.
+        return max(0.85, min(2.25, float(screen.logicalDotsPerInch()) / 96.0))
+
+    def _apply_scale(self, scale: float) -> None:
+        self._scale = scale
+        self._hotspot = QPoint(max(1, round(scale)), max(1, round(scale)))
+        self.setFixedSize(
+            max(10, round(self._BASE_W * scale)),
+            max(14, round(self._BASE_H * scale)),
+        )
+        self.update()
 
     def paintEvent(self, _event):
+        s = self._scale
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        # Classic Windows-style arrow (white fill, dark outline).
-        body = QPolygon([
-            QPoint(1, 1), QPoint(1, 22), QPoint(6, 17), QPoint(10, 28),
-            QPoint(14, 26), QPoint(9, 16), QPoint(16, 16),
-        ])
-        p.setPen(QPen(QColor(20, 20, 24), 1))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, s >= 1.25)
+        body = QPolygon([QPoint(round(x * s), round(y * s))
+                         for x, y in self._BASE_BODY])
+        p.setPen(QPen(QColor(20, 20, 24), max(1, round(s))))
         p.setBrush(QBrush(QColor(245, 245, 248)))
         p.drawPolygon(body)
         p.end()
 
     def follow(self) -> None:
-        tip = QCursor.pos() - self._HOTSPOT
+        scale = self._dpi_scale()
+        if abs(scale - self._scale) > 0.04:
+            self._apply_scale(scale)
+        tip = QCursor.pos() - self._hotspot
         self.move(tip)
         if not self.isVisible():
             self.show()
@@ -165,20 +195,17 @@ class _SoftwareCursor(QWidget):
 
 
 class SystemCursor:
-    """Make the mouse pointer usable while a game is hiding it.
+    """Free the mouse while a game is locking/hiding it — without drawing a
+    second arrow when one is already there.
 
-    Immersive titles (Unity ``Cursor.visible = false``, locked cursor, …)
-    hide and confine the pointer from their own process every frame.
-    ``ShowCursor`` is per-thread, so calling it here never undoes the game's
-    hide. While a holder is active we:
+    Used from the hotkey overlay (``show_manual``) and pins, and only while a
+    game is running. Most titles already show their own cursor; for those we
+    only undo ``ClipCursor`` / capture so the pointer can reach our panel.
+    The software arrow (and a blank Qt override) appear only when the OS
+    cursor is actually hidden or null — immersive Unity-style hides.
 
-    - ``ClipCursor(NULL)`` / ``ReleaseCapture`` so the pointer can leave;
-    - keep fighting ``SetCursor`` / the show-counter when possible;
-    - draw a software arrow that follows the real pointer (always visible);
-    - blank Qt's own cursor so we do not stack two arrows on our widgets.
-
-    Holders are counted, not calls — the pointer comes up for the first
-    hold and goes down only when the last one lets go.
+    Holders are counted, not calls — the first hold starts the fight loop and
+    the last release tears it down.
     """
 
     _raised = 0
@@ -190,7 +217,7 @@ class SystemCursor:
 
     @classmethod
     def hold(cls, key: str) -> None:
-        """Keep the pointer up until *key* lets go. Re-holding is harmless."""
+        """Keep the pointer usable until *key* lets go. Re-holding is harmless."""
         cls._holders.add(key)
         cls._raise()
         cls._ensure_timer()
@@ -213,59 +240,78 @@ class SystemCursor:
         return set(cls._holders)
 
     @classmethod
-    def warp_to(cls, x: int, y: int) -> None:
-        """Move the OS pointer (and software arrow) to a screen point."""
-        try:
-            if platform.system() == "Windows":
-                import ctypes
-                ctypes.windll.user32.SetCursorPos(int(x), int(y))
-            else:
-                QCursor.setPos(int(x), int(y))
-        except Exception as e:
-            logger.debug(f"Could not warp cursor: {e}")
-        cls._follow_soft()
-
-    @classmethod
     def reassert(cls) -> None:
-        """Fight a game that re-hides / re-clips the pointer every frame.
+        """Undo clip/capture; draw a software arrow only if the OS one is gone.
 
         Safe to call from a short timer while any holder is active.
         """
         if not cls._holders:
             return
+        need_soft = False
         if platform.system() == "Windows":
             try:
                 import ctypes
-                from ctypes import wintypes
                 user32 = ctypes.windll.user32
                 # ReleaseCapture: some Unity builds keep WM capture on their HWND
                 # so the pointer never generates move events outside the game.
                 if user32.GetCapture():
                     user32.ReleaseCapture()
                 user32.ClipCursor(None)
-                user32.SetCursor(user32.LoadCursorW(None, cls._IDC_ARROW))
-
-                class CURSORINFO(ctypes.Structure):
-                    _fields_ = [
-                        ("cbSize", wintypes.DWORD),
-                        ("flags", wintypes.DWORD),
-                        ("hCursor", wintypes.HANDLE),
-                        ("ptScreenPos", wintypes.POINT),
-                    ]
-
-                ci = CURSORINFO()
-                ci.cbSize = ctypes.sizeof(ci)
-                # CURSOR_SHOWING = 0x1. Extra ShowCursor bumps are best-effort;
-                # the software arrow is what the user actually sees.
-                if user32.GetCursorInfo(ctypes.byref(ci)) and not (ci.flags & 0x1):
-                    for _ in range(16):
-                        counter = user32.ShowCursor(True)
-                        cls._raised += 1
-                        if counter >= 0:
-                            break
+                need_soft = cls._os_cursor_hidden()
+                if need_soft:
+                    user32.SetCursor(user32.LoadCursorW(None, cls._IDC_ARROW))
+                    # Extra ShowCursor bumps are best-effort; soft arrow covers
+                    # the case where the game re-hides from its own thread.
+                    if not cls._cursor_showing():
+                        for _ in range(16):
+                            counter = user32.ShowCursor(True)
+                            cls._raised += 1
+                            if counter >= 0:
+                                break
             except Exception as e:
                 logger.debug(f"Could not reassert cursor freedom: {e}")
-        cls._follow_soft()
+                need_soft = False
+        cls._sync_soft(need_soft)
+
+    @classmethod
+    def _cursor_info(cls):
+        """``(showing, hCursor)`` from GetCursorInfo, or ``None`` on failure."""
+        if platform.system() != "Windows":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class CURSORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("hCursor", wintypes.HANDLE),
+                    ("ptScreenPos", wintypes.POINT),
+                ]
+
+            ci = CURSORINFO()
+            ci.cbSize = ctypes.sizeof(ci)
+            if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)):
+                return None
+            return (bool(ci.flags & 0x1), ci.hCursor)
+        except Exception:
+            return None
+
+    @classmethod
+    def _cursor_showing(cls) -> bool:
+        info = cls._cursor_info()
+        return bool(info and info[0])
+
+    @classmethod
+    def _os_cursor_hidden(cls) -> bool:
+        """True when we should draw our own arrow (no usable OS cursor)."""
+        info = cls._cursor_info()
+        if info is None:
+            return False
+        showing, handle = info
+        # Hidden entirely, or "showing" a NULL/blank hotspot.
+        return (not showing) or (not handle)
 
     @classmethod
     def _ensure_timer(cls) -> None:
@@ -302,13 +348,21 @@ class SystemCursor:
         return cls._soft
 
     @classmethod
-    def _follow_soft(cls) -> None:
-        if not cls._holders:
-            return
-        w = cls._soft_cursor()
-        if w is None:
+    def _sync_soft(cls, need_soft: bool) -> None:
+        """Show the drawn arrow only when the OS pointer is unusable."""
+        if not need_soft:
+            cls._hide_soft()
+            cls._clear_qt_override()
             return
         try:
+            app = QApplication.instance()
+            if app is not None and not cls._qt_override:
+                # Blank our widgets so we do not stack Qt arrow + soft arrow.
+                app.setOverrideCursor(Qt.CursorShape.BlankCursor)
+                cls._qt_override = True
+            w = cls._soft_cursor()
+            if w is None:
+                return
             w.follow()
         except RuntimeError:
             cls._soft = None
@@ -325,44 +379,34 @@ class SystemCursor:
             cls._soft = None
 
     @classmethod
-    def _raise(cls) -> None:
+    def _clear_qt_override(cls) -> None:
+        if not cls._qt_override:
+            return
         try:
             app = QApplication.instance()
-            # Blank on our widgets: the software arrow is the one pointer.
-            if app is not None and not cls._qt_override:
-                app.setOverrideCursor(Qt.CursorShape.BlankCursor)
-                cls._qt_override = True
+            if app is not None:
+                app.restoreOverrideCursor()
+        except Exception as e:
+            logger.debug(f"Could not restore Qt override cursor: {e}")
+        cls._qt_override = False
+
+    @classmethod
+    def _raise(cls) -> None:
+        try:
             if platform.system() == "Windows":
                 import ctypes
                 user32 = ctypes.windll.user32
                 if user32.GetCapture():
                     user32.ReleaseCapture()
                 user32.ClipCursor(None)
-                user32.SetCursor(user32.LoadCursorW(None, cls._IDC_ARROW))
-                if not cls._raised:
-                    raised = 0
-                    while raised < 16:
-                        counter = user32.ShowCursor(True)
-                        raised += 1
-                        if counter >= 0:
-                            break
-                    cls._raised = raised
-            cls._follow_soft()
+            cls.reassert()
         except Exception as e:
             logger.debug(f"Could not raise the system cursor: {e}")
 
     @classmethod
     def _lower(cls) -> None:
         cls._hide_soft()
-        try:
-            if cls._qt_override:
-                app = QApplication.instance()
-                if app is not None:
-                    app.restoreOverrideCursor()
-                cls._qt_override = False
-        except Exception as e:
-            logger.debug(f"Could not restore Qt override cursor: {e}")
-            cls._qt_override = False
+        cls._clear_qt_override()
         if not cls._raised:
             return
         try:

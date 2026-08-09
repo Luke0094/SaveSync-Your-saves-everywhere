@@ -670,10 +670,13 @@ class SyncOrchestrator(QObject):
             if len(self._sync_history) > self._max_history:
                 self._sync_history = self._sync_history[:self._max_history]
         self._save_history()
-        # Retire the one-shot "keep local wins" flag once a sync SUCCEEDS (any
-        # direction — an explicit later download should also clear it). A failed
-        # sync leaves it set, so the next attempt is still forced to upload.
-        if result.success:
+        # Retire the one-shot "keep local wins" flag only after a sync that
+        # actually moved bytes. An empty success (0↑ 0↓ — e.g. keep-local
+        # right after re-adding a game, before any save path exists) used to
+        # clear the flag too early; the next auto-sync then downloaded the
+        # old cloud history the user had just declined.
+        if result.success and (
+                result.files_uploaded > 0 or result.files_downloaded > 0):
             try:
                 from core.library import get_library as _gl
                 _e3 = _gl().get_by_id(game_id)

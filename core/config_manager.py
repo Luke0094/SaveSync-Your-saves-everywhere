@@ -104,6 +104,8 @@ _DEFAULTS: dict[str, Any] = {
     "library_sort": "date_added",           # sort criterion for library page
     "library_sort_direction": "",           # "asc"/"desc" — empty = use criterion's natural default
     "library_folders": [],                  # [{name: str, color: str}, ...] user-defined folders
+    # Folder tree vs tag/engine filter panes in the library sidebar (QSplitter sizes).
+    "library_filter_splitter": [260, 215],
     # Unknown-game detections history — its OWN list, deliberately separate
     # from the backup/sync notification flow. Written only while
     # show_overlay_on_unknown is on; the hotkey opens this queue first when
@@ -154,6 +156,9 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "page_sizes": lambda x: isinstance(x, dict) and all(
         isinstance(v, int) and 1 <= v <= 500 for v in x.values()),
     "page_size_render_guard": lambda x: isinstance(x, dict),
+    "library_filter_splitter": lambda x: (
+        isinstance(x, (list, tuple)) and len(x) == 2
+        and all(isinstance(n, int) and n >= 0 for n in x)),
     "language": lambda x: isinstance(x, str) and x in ["en", "it"],
     "theme": lambda x: isinstance(x, str) and x in ["dark", "light"],
     "launch_on_startup": lambda x: isinstance(x, bool),

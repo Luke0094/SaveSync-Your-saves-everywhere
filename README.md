@@ -24,7 +24,9 @@ choice — with an always-on-top overlay so you never have to leave the game.
   polling while a game session is active — near-zero background cost during
   CPU-bound gameplay
 - **Heuristic save-folder detection** — scored candidates from folder keywords,
-  game-name similarity, file analysis, engine-specific paths, and registry saves
+  game-name similarity (`match_slug` keeps letters and digits in any script —
+  Japanese, Chinese, Korean, Cyrillic, Greek — not only ASCII), file analysis,
+  engine-specific paths, and registry saves
 - **Real-time filesystem watcher** — reacts to save changes instantly, even for
   paths that don't exist yet
 - **Unknown-game queue** — every unrecognized game is remembered; the overlay
@@ -59,19 +61,20 @@ choice — with an always-on-top overlay so you never have to leave the game.
 
 ### Library
 - **Card and list views** with search (by title or developer), folder tree with
-  colors, and a three-state tag filter (include / exclude)
+  colors, star ratings from reviews, and three-state filters for tags and
+  engines (include / exclude)
 - **Smart tag merging** — case- and separator-insensitive ("2D Game", "2d-game"
   and "2DCG"/"2dcg" converge to one canonical tag, self-healing on startup)
-- **Web metadata search** — name, description, cover, developer, release date
-  and tags scraped from store pages, wikis and forum threads (spoiler-wrapped
-  tag lists included), with a merge dialog to pick what to keep
+- **Web metadata search** — name, description, cover, developer, release date,
+  tags and reviews/ratings scraped from store pages, wikis and forum threads
+  (spoiler-wrapped tag lists included), with a merge dialog to pick what to keep
 - **Per-game context menu** — backup, restore, sync, open save folder, edit,
   web search, remove
 
 ### Experience
 - **In-game overlay** — frameless always-on-top card with fade animations,
-  notification carousel, cloud-save prompts, and exclusive-fullscreen
-  protection (never breaks a game's display mode)
+  notification carousel, cloud-save prompts, running game with engine label,
+  and exclusive-fullscreen protection (never breaks a game's display mode)
 - **Save editor** — open a game's save and change the values in it, with the
   original kept aside first; reachable from the sidebar, the library's context
   menu, straight to the running game, or by dropping a save file on it
@@ -338,7 +341,9 @@ offers to restore the newest backup, with acknowledgement in the dropdown.
 Candidate folders are scored from multiple signals:
 
 - Keyword match in the folder name (`save`, `savegame`, `checkpoint`, `userdata`, …)
-- Game-name similarity in path components
+- Game-name similarity in path components — `match_slug()` compares letters and
+  digits in **any** Unicode script (not ASCII-only), so titles in Japanese,
+  Chinese, Korean, Cyrillic or Greek still match their save folders
 - File analysis (non-binary, non-empty, known save extensions)
 - Common save naming patterns (slot numbering, autosave, player profiles)
 - Engine-specific locations (RenPy, RPG Maker, Unity, Unreal, Godot, …)

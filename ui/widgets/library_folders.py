@@ -901,9 +901,26 @@ class FolderTree(QFrame, ThemedMixin):
 
         self._splitter.setStretchFactor(0, 1)
         self._splitter.setStretchFactor(1, 0)
-        self._splitter.setSizes([260, 215])   # sensible default split
+        self._restore_splitter_sizes()
+        self._splitter.splitterMoved.connect(self._save_splitter_sizes)
 
         self.rebuild()
+
+    def _restore_splitter_sizes(self) -> None:
+        """Re-apply the user's folder/filter split (or the default)."""
+        raw = get_config().get("library_filter_splitter", [260, 215]) or [260, 215]
+        try:
+            sizes = [max(1, int(raw[0])), max(1, int(raw[1]))]
+        except (TypeError, ValueError, IndexError):
+            sizes = [260, 215]
+        self._splitter.setSizes(sizes)
+
+    def _save_splitter_sizes(self, *_args) -> None:
+        sizes = self._splitter.sizes()
+        if len(sizes) < 2 or sizes[0] <= 0 or sizes[1] <= 0:
+            return
+        get_config().set("library_filter_splitter",
+                         [int(sizes[0]), int(sizes[1])])
 
     def rebuild(self):
         # Clear the folder-list pane (top splitter pane only — the tag

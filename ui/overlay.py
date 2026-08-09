@@ -1895,11 +1895,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         self._hide_suppress_btn()
         self._position_top_right()
-        self.show_animated(auto_hide=_AUTO_HIDE_MS)
+        # Hotkey dashboard only: notifications must not steal / redraw the pointer.
+        self.show_animated(auto_hide=_AUTO_HIDE_MS, pointer=True)
 
     # ── Animation ─────────────────────────────────────────────────────────────
 
-    def show_animated(self, auto_hide: int = _AUTO_HIDE_MS):
+    def show_animated(self, auto_hide: int = _AUTO_HIDE_MS, *,
+                      pointer: bool = False):
         """Show the overlay above any window — safely handles fullscreen games.
 
         Fullscreen handling:
@@ -1910,6 +1912,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
           and emit ``exclusive_blocked(title, message)`` so the caller can
           give audio feedback (a notification sound).  No defer — by the time
           exclusive mode ends the notification is stale.
+
+        *pointer*: when True (hotkey / ``show_manual`` only) **and** a game is
+        running, free clip/capture so the overlay is reachable. The software
+        arrow appears only if the game has hidden the OS cursor — titles that
+        already draw their own pointer are left alone. Outside a session, and
+        for toasts/notifications, the player's cursor is untouched.
         """
         # ── Exclusive fullscreen guard ──────────────────────────────────────
         if platform.system() == "Windows" and self._is_exclusive_fullscreen():
@@ -1922,14 +1930,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             logger.info("Overlay skipped — exclusive fullscreen active")
             return
 
-        # A game may be hiding the mouse pointer and confining it to its own
-        # window; a panel that cannot be pointed at cannot be used. Undone in
-        # _do_hide, so the pointer goes away when this does.
-        if self._game_is_running():
+        # In-game hotkey dashboard only. Desktop / toasts: no second cursor.
+        if pointer and self._game_is_running():
             SystemCursor.hold("overlay")
             self._cursor_timer.start()
         else:
             self._cursor_timer.stop()
+            SystemCursor.release("overlay")
 
         # Cancel any pending hide first
         self._auto_hide_timer.stop()
@@ -1959,12 +1966,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._take_the_front()
         self._ensure_visible_on_screen()
 
-        # Immersive games leave the pointer trapped/invisible in their HWND.
-        # Drop the OS pointer onto this panel so the software arrow (and clicks)
-        # land where the user can actually use the overlay.
-        if self._game_is_running():
-            c = self.frameGeometry().center()
-            SystemCursor.warp_to(c.x(), c.y())
+        if pointer and self._game_is_running():
             SystemCursor.reassert()
 
         # Periodic re-assert for z-order recovery.

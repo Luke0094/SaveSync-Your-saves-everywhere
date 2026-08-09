@@ -21,12 +21,13 @@ from ui.helpers import force_topmost, ScreenSignalMixin
 
 class BlurModalWidget(QWidget, ScreenSignalMixin):
     """Fullscreen blur modal background widget."""
-    
+
     # Signal emitted when the modal is clicked (optional - can be used to close)
     background_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._fade_out_cb = None
         self._setup_window()
         self._setup_animation()
         self._connect_screen_changes()
@@ -42,14 +43,14 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
             Qt.WindowType.WindowDoesNotAcceptFocus |
             Qt.WindowType.BypassWindowManagerHint  # Helps with fullscreen behavior
         )
-        
+
         # Transparent background with blur effect
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus)  # Linux support
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        
+
         # Set to cover entire virtual desktop (all screens)
         self._update_geometry()
 
@@ -57,6 +58,22 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         """Setup fade animations."""
         self._fade_anim = QPropertyAnimation(self, b"windowOpacity")
         self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def _disconnect_fade_finished(self):
+        """Drop only the fade-out slot we connected — never a blind disconnect.
+
+        Blind ``finished.disconnect()`` / ``disconnect(self.hide)`` when nothing
+        is attached is what produced the RuntimeWarning noise (and left the
+        vignette feeling "stuck" when a later hide raced the wrong slot).
+        """
+        cb = self._fade_out_cb
+        if cb is None:
+            return
+        try:
+            self._fade_anim.finished.disconnect(cb)
+        except (RuntimeError, TypeError):
+            pass
+        self._fade_out_cb = None
 
     def _update_geometry(self):
         """Update widget geometry to cover all screens (re-computed on every call)."""
@@ -88,12 +105,8 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
 
     def show_animated(self):
         """Show the blur modal with fade-in animation — never steals game focus."""
-        # Cancel any ongoing animation and disconnect stale hide connection
         self._fade_anim.stop()
-        try:
-            self._fade_anim.finished.disconnect(self.hide)
-        except RuntimeError:
-            pass
+        self._disconnect_fade_finished()
 
         # Set initial state
         self.setWindowOpacity(0.0)
@@ -120,10 +133,7 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         """
         try:
             self._fade_anim.stop()
-            try:
-                self._fade_anim.finished.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+            self._disconnect_fade_finished()
         except Exception:
             pass
         try:
@@ -134,12 +144,7 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
     def hide_animated(self):
         """Hide the blur modal with fade-out animation."""
         self._fade_anim.stop()
-
-        # Disconnect any existing connections to avoid duplicates
-        try:
-            self._fade_anim.finished.disconnect(self.hide)
-        except RuntimeError:
-            pass
+        self._disconnect_fade_finished()
 
         self._fade_anim.setDuration(_FADE_OUT_MS)
         self._fade_anim.setStartValue(self.windowOpacity())
@@ -156,9 +161,11 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
             _has_sip = False
 
         def _on_fade_out_done():
+            if self._fade_out_cb is _on_fade_out_done:
+                self._fade_out_cb = None
             try:
                 self._fade_anim.finished.disconnect(_on_fade_out_done)
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 return  # animation or widget already destroyed
             # Guard against calling hide() on a deleted C++ object
             try:
@@ -167,6 +174,7 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
                 self.hide()
             except RuntimeError:
                 pass
+        self._fade_out_cb = _on_fade_out_done
         self._fade_anim.finished.connect(_on_fade_out_done)
         self._fade_anim.start()
 
@@ -178,19 +186,19 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         """Paint the dark blur effect."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Vignette effect (single pass — no double paint)
         center_x = self.rect().center().x()
         center_y = self.rect().center().y()
         max_radius = max(self.width(), self.height())
-        
+
         # Create radial gradient for vignette
         from PySide6.QtGui import QRadialGradient
         gradient = QRadialGradient(center_x, center_y, max_radius)
         gradient.setColorAt(0.0, QColor(0, 0, 0, 120))   # Lighter at center
         gradient.setColorAt(0.7, QColor(0, 0, 0, 160))   # Medium
         gradient.setColorAt(1.0, QColor(0, 0, 0, 200))   # Darker at edges
-        
+
         painter.fillRect(self.rect(), QBrush(gradient))
         painter.end()
 

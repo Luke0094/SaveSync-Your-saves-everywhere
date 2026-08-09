@@ -235,9 +235,77 @@ class CloudFlowsMixin:
             self._overlay.show_cloud_saves(entry.name, entry.exe_path)
         elif notification_kind in ("conflict_diverged", "conflict_unreconciled"):
             self._pending_cloud_notification[game_id] = notification_kind
+            # Cheap local date only here (GUI thread). Remote is filled when
+            # the user opens the comparison dialog — see _ensure_conflict_times.
+            self._stash_local_conflict_time(entry)
             self._overlay.show_cloud_conflict_resolve(
                 entry.name, entry.exe_path,
                 diverged=(notification_kind == "conflict_diverged"))
+
+
+    def _stash_local_conflict_time(self, entry) -> None:
+        """Record the newest local backup date for a launch-time reconcile."""
+        info = dict(self._pending_conflict_info.get(entry.id) or {})
+        if info.get("local"):
+            return
+        try:
+            from core.backup import get_backup_manager
+            from core.constants import get_install_folder_name
+            bm = get_backup_manager()
+            backs = list(bm.get_backups_for_game(entry.id) or [])
+            if not backs:
+                folder = get_install_folder_name(
+                    entry.exe_path or "", entry.name, entry.id,
+                    entry.computed_folder_name,
+                )
+                if folder:
+                    backs = list(bm.get_backups_for_folder(folder) or [])
+            if backs:
+                info["local"] = max(
+                    (b.created_at or "" for b in backs), default="")
+                self._pending_conflict_info[entry.id] = info
+        except Exception:
+            logger.debug("Could not resolve local conflict time", exc_info=True)
+
+
+    def _ensure_conflict_times(self, entry) -> None:
+        """Make sure ``_pending_conflict_info`` has local/remote dates to show.
+
+        Live auto-sync conflicts already stash ISO timestamps. Launch-time
+        ``conflict_unreconciled`` does not — without this the dialog shows
+        two "unknown" cards even when both sides have dated backups.
+        Remote listing may hit the network; call only when opening the dialog.
+        """
+        self._stash_local_conflict_time(entry)
+        info = dict(self._pending_conflict_info.get(entry.id) or {})
+        if not info.get("remote"):
+            try:
+                from core.constants import get_install_folder_name, get_folder_name_for_save
+                folder = get_install_folder_name(
+                    entry.exe_path or "", entry.name, entry.id,
+                    entry.computed_folder_name,
+                )
+                orch = get_orchestrator()
+                candidates = [folder] if folder else []
+                for hn in (entry.name_history or []):
+                    fn = get_folder_name_for_save(hn, entry.exe_path or "", entry.id)
+                    if fn and fn not in candidates:
+                        candidates.append(fn)
+                for p in orch.get_connected_providers():
+                    resolved = orch.resolve_remote_game_folder(p, candidates)
+                    if not resolved:
+                        continue
+                    remote = p.list_cloud_backups(resolved) or []
+                    if remote:
+                        info["remote"] = max(
+                            (e.get("created_at") or "" for e in remote),
+                            default="")
+                        break
+            except Exception:
+                logger.debug("Could not resolve remote conflict time",
+                             exc_info=True)
+        if info:
+            self._pending_conflict_info[entry.id] = info
 
 
     def _mark_cloud_machine_confirmed(self, game_id: str):
@@ -441,11 +509,11 @@ class CloudFlowsMixin:
         """The local-vs-cloud comparison window, with both versions dated.
 
         Reached from the conflict notification's primary action; also the
-        direct path when no overlay is available. Timestamps come from
-        whatever the detection stashed — a conflict surfaced at launch (from
-        a status recorded in an earlier session) has none, and the dialog
-        renders those as unknown rather than refusing to open.
+        direct path when no overlay is available. Timestamps come from the
+        live sync detection when present, otherwise from backup indexes
+        (see ``_ensure_conflict_times``).
         """
+        self._ensure_conflict_times(entry)
         conflict_info = self._pending_conflict_info.get(entry.id) or {}
         from ui.dialogs.conflict_dialog import ConflictDialog
         from datetime import datetime
@@ -498,8 +566,30 @@ class CloudFlowsMixin:
             # machine for this game (mirrors the cloud-prompt flow).
             self._mark_cloud_machine_confirmed(entry.id)
         elif choice == "local":
-            # Up-only for the rest of the session, without re-asking.
+            # Up-only for the rest of the session AND for later auto-syncs
+            # (exit backup, sync page, …). Without pending_local_wins, a
+            # plain "auto" sync after "keep local" still pulled remote-only
+            # backups (e.g. from a previous library entry of the same game).
+            # Leave local_only so the next successful upload can stamp
+            # synced; mark reconciled enough that launch won't re-ask with
+            # sync_status still stuck on local_only after an empty up.
             self._cross_machine_local_only.add(entry.id)
+            try:
+                from core.machine import get_machine_id
+                mid = get_machine_id()
+                cloud_meta = dict(entry.cloud_metadata or {})
+                confirmed = list(cloud_meta.get("download_confirmed_machines", []))
+                if mid not in confirmed:
+                    confirmed.append(mid)
+                cloud_meta["download_confirmed_machines"] = confirmed
+                get_library().update_game_fields(
+                    entry.id,
+                    pending_local_wins=True,
+                    sync_status="synced",
+                    cloud_metadata=cloud_meta,
+                )
+            except Exception:
+                logger.debug("Could not persist keep-local wins", exc_info=True)
         if choice == "both":
             # Keep both: backup local first, download cloud version,
             # then upload local saves once the download finishes.
