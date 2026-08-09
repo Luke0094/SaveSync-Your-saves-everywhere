@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit,
 from i18n import t
 from ui.styles.theme import palette
 from ui.dialogs.search_enrichment import (CandidatePreviewDialog,
-                                          EnrichmentMergeDialog)
+                                          EnrichmentMergeDialog,
+                                          _inspect_url)
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +300,12 @@ class SearchFlowMixin:
         same concrete detail (image, description, developer, year, tags,
         source) whether there's one candidate or many, with ‹ › to browse
         when there's more than one. The form is only touched once the user
-        confirms — browsing and rejecting are both preview-only."""
+        confirms — browsing and rejecting are both preview-only.
+
+        After confirm, same-tier peers open the chip merge dialog. Back there
+        restores the form snapshot and reopens this carousel so the user can
+        pick another candidate without being stuck.
+        """
         self._add_btn.setEnabled(True)
         self._web_search_btn.setEnabled(True)
         n = len(results)
@@ -309,17 +315,23 @@ class SearchFlowMixin:
         )
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
         # Remember this result set: confirming one candidate offers the OTHER
-        # candidates of the SAME set as enrichment pieces (same-tier merge
-        # preview in _offer_same_tier_enrichment).
+        # candidates of the SAME set as enrichment pieces (same-tier merge).
         self._last_search_candidates = list(results)
-        dlg = CandidatePreviewDialog(
-            results, self._compute_candidate_diff, self,
-            extra_note=t('add_game.enrich_note') if n > 1 else '',
-        )
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected is not None:
-            self._process_search_result(dlg.selected)
-        else:
-            self._candidates_rejected()
+        while True:
+            dlg = CandidatePreviewDialog(
+                results, self._compute_candidate_diff, self,
+                extra_note=t('add_game.enrich_note') if n > 1 else '',
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected is None:
+                self._candidates_rejected()
+                return
+            snap = self._capture_search_form()
+            if not self._process_search_result(dlg.selected, offer_enrichment=False):
+                return
+            if self._run_same_tier_merge(dlg.selected):
+                self._restore_search_form(snap)
+                continue
+            return
 
     def _candidates_rejected(self):
         """No candidate confirmed (Reject / closed the popup): proceed
@@ -349,25 +361,17 @@ class SearchFlowMixin:
         else:
             self._status_lbl.setText(t('add_game.search_not_found'))
 
-    def _process_search_result(self, result):
+    def _process_search_result(self, result, offer_enrichment: bool = True) -> bool:
         """Apply ONE confirmed search result — either the only candidate
         found, or the one the user confirmed in the candidate-preview
         popup (CandidatePreviewDialog).
 
-        The user has ALREADY reviewed this exact candidate's concrete
-        preview (image, description, developer, year, tags, source —
-        with strikethrough on anything it would replace) and clicked
-        Confirm, so — unlike the old flow — this does not show a second
-        confirmation with a freshly recomputed diff. It applies directly,
-        using the same tier / overwrite-vs-enrich rules as before. The
-        only cases that still don't apply anything are the ones where
-        applying this candidate would change nothing at all — those still
-        silently advance to the next tier instead of pretending something
-        happened.
+        Returns True when the form was updated. When *offer_enrichment* is
+        True (default), same-tier peers open the chip merge dialog; the
+        candidate carousel drives that itself with offer_enrichment=False
+        so Back can restore a snapshot first.
         """
-        _current_phase = getattr(self, '_current_search_phase', 'api')
         _raw_source = getattr(result, 'source', '') or ''
-        _hint_fwd = getattr(self, '_last_search_folder_hint', '')
 
         diff = self._compute_candidate_diff(result)
 
@@ -388,7 +392,7 @@ class SearchFlowMixin:
             self._add_btn.setEnabled(True)
             self._web_search_btn.setEnabled(True)
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
-            return
+            return False
 
         # ── Apply — the user already confirmed this exact candidate ───────
         if not diff['has_existing']:
@@ -404,22 +408,18 @@ class SearchFlowMixin:
         self._add_btn.setEnabled(True)
         self._web_search_btn.setEnabled(True)
 
-        # Same-tier enrichment: the OTHER candidates of the result set the
-        # user just confirmed from can complete the entry — offered in ONE
-        # merge preview where the user picks the pieces. Never triggers new
-        # searches: each search (including a later tier-2/tier-3 pass of the
-        # cascade) brings its own candidate set, and confirming from THAT set
-        # offers THAT set's remaining results.
-        _peers = [r for r in (getattr(self, '_last_search_candidates', None) or [])
-                  if r is not result]
-        if _peers:
-            self._offer_same_tier_enrichment(result, _peers)
+        if offer_enrichment:
+            _peers = [r for r in (getattr(self, '_last_search_candidates', None) or [])
+                      if r is not result]
+            if _peers:
+                self._offer_same_tier_enrichment(result, _peers)
 
         missing = self._get_missing_fields()
         if missing:
             self._status_lbl.setText(
                 t('add_game.fields_still_missing', fields=", ".join(missing)))
             self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+        return True
 
     # ── Shared result diff/apply helpers ──────────────────────────────────
     # Used by _process_search_result (acceptance), the same-tier merge
@@ -794,50 +794,170 @@ class SearchFlowMixin:
         if not w1 or not w2:  return 0.0
         return len(w1 & w2) / len(w1 | w2)
 
-    def _offer_same_tier_enrichment(self, base_result, others: list):
-        """After the user confirms one of the search candidates, offer the
-        OTHER candidates from the SAME result set as enrichment pieces in one
-        merge preview — same tier only, never a new search on lower tiers.
-        Only what the user picks gets written (see EnrichmentMergeDialog)."""
+    def _same_tier_peers(self, base_result, others: list) -> list:
+        """Peers for chip enrichment after a candidate is confirmed.
+
+        Same *tier* only (no lower-tier search). The confirmed *source* is
+        excluded entirely — picking Steam title 1 must not re-offer Steam
+        title 2. Other sources keep every distinct title (VNDB 1 + VNDB 2).
+        """
         _base_src = (getattr(base_result, 'source', '') or '').split('+')[0]
         _base_tier = self._get_source_tier(_base_src)
-        peers = [
-            r for r in others
-            if r is not base_result
-            and self._get_source_tier(
-                (getattr(r, 'source', '') or '').split('+')[0]) == _base_tier
-        ]
+        peers = []
+        for r in others:
+            if r is base_result:
+                continue
+            src = (getattr(r, 'source', '') or '').split('+')[0]
+            if src and _base_src and src == _base_src:
+                continue               # same source already declared
+            if self._get_source_tier(src) != _base_tier:
+                continue
+            peers.append(r)
+        return peers
+
+    @staticmethod
+    def _peer_section_key(info, index: int) -> str:
+        """Composite key: ``source · title · url`` so same-source peers stay distinct."""
+        src = (getattr(info, 'source', '') or 'web').split('+')[0] or 'web'
+        name = (getattr(info, 'name', '') or '').strip() or f'#{index}'
+        url = _inspect_url(info) or (getattr(info, 'image_url', '') or '').strip()
+        return f"{src} · {name} · {url or index}"
+
+    @staticmethod
+    def _peer_section_label(src_label: str, title: str, url: str) -> str:
+        """Human header matching the composite key, URL shortened for space."""
+        bits = [src_label]
+        if title:
+            bits.append(title)
+        if url:
+            # Host + short path — enough to tell two VNDB/Steam pages apart.
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(url)
+                host = (p.netloc or "").removeprefix("www.")
+                path = (p.path or "").rstrip("/")
+                tail = path.rsplit("/", 1)[-1] if path else ""
+                short = f"{host}/{tail}" if host and tail else (host or url)
+            except Exception:
+                short = url
+            if len(short) > 42:
+                short = short[:41] + "…"
+            bits.append(short)
+        return " · ".join(bits)
+
+    def _run_same_tier_merge(self, base_result) -> bool:
+        """Offer peer enrichment chips. Returns True when the user asked to
+        go back to the candidate carousel (form snapshot must be restored)."""
+        peers = self._same_tier_peers(
+            base_result,
+            getattr(self, '_last_search_candidates', None) or [],
+        )
+        if not peers:
+            return False
+        model = self._build_merge_model(peers)
+        if not model.get('has_options'):
+            return False
+        dlg = EnrichmentMergeDialog(model, self._source_label, self)
+        code = dlg.exec()
+        if code == EnrichmentMergeDialog.RESULT_BACK:
+            return True
+        if code == QDialog.DialogCode.Accepted:
+            self._apply_merge_selection(dlg.selection())
+            missing = self._get_missing_fields()
+            if missing:
+                self._status_lbl.setText(
+                    t('add_game.fields_still_missing', fields=", ".join(missing)))
+                self._status_lbl.setStyleSheet(
+                    f"color:{palette('warning')};font-size:12px;")
+        return False
+
+    def _offer_same_tier_enrichment(self, base_result, others: list):
+        """Legacy entry: merge without a Back path (no form snapshot)."""
+        peers = self._same_tier_peers(base_result, others)
         if not peers:
             return
         model = self._build_merge_model(peers)
-        if not model['has_options']:
+        if not model.get('has_options'):
             return
         dlg = EnrichmentMergeDialog(model, self._source_label, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_merge_selection(dlg.selection())
 
+    def _capture_search_form(self) -> dict:
+        """Snapshot fields a search apply may change, for merge-dialog Back."""
+        return {
+            'name': self._name_edit.text(),
+            'desc': self._desc_edit.toPlainText(),
+            'dev': self._developer_edit.text(),
+            'year': self._year_edit.text(),
+            'tags': list(getattr(self, '_tags', []) or []),
+            'urls': list(getattr(self, '_store_urls', []) or []),
+            'reviews': [dict(r) for r in (getattr(self, '_reviews', None) or [])],
+            'image_path': getattr(self, '_image_path', None),
+            'original_image_path': getattr(self, '_original_image_path', None),
+            'detected_images': list(getattr(self, '_detected_images', []) or []),
+            'current_image_idx': getattr(self, '_current_image_idx', 0),
+            'fingerprint': dict(
+                getattr(self, '_enrichment_source_fingerprint', None) or {}),
+        }
+
+    def _restore_search_form(self, snap: dict):
+        """Undo a provisional candidate apply so the carousel can reopen."""
+        self._name_edit.setText(snap.get('name', ''))
+        self._desc_edit.setPlainText(snap.get('desc', ''))
+        self._developer_edit.setText(snap.get('dev', ''))
+        self._year_edit.setText(snap.get('year', ''))
+        self._tags = list(snap.get('tags') or [])
+        self._store_urls = list(snap.get('urls') or [])
+        self._reviews = [dict(r) for r in (snap.get('reviews') or [])]
+        self._image_path = snap.get('image_path')
+        self._original_image_path = snap.get('original_image_path')
+        self._detected_images = list(snap.get('detected_images') or [])
+        self._current_image_idx = snap.get('current_image_idx') or 0
+        self._enrichment_source_fingerprint = dict(snap.get('fingerprint') or {})
+        if hasattr(self, '_rebuild_tag_chips'):
+            self._rebuild_tag_chips()
+        if hasattr(self, '_rebuild_url_chips'):
+            self._rebuild_url_chips()
+        if hasattr(self, '_update_reviews_btn'):
+            self._update_reviews_btn()
+        if hasattr(self, '_update_image_preview'):
+            self._update_image_preview(self._image_path or '')
+        self._status_lbl.setText(
+            t('add_game.candidates_found',
+              n=len(getattr(self, '_last_search_candidates', []) or []))
+            if len(getattr(self, '_last_search_candidates', []) or []) > 1
+            else t('add_game.candidate_found_single')
+        )
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+
     def _build_merge_model(self, collected: list) -> dict:
         """Per-field option lists for the merge preview.
 
         The CONFIRMED candidate is authoritative: fields it filled are never
-        offered for replacement — the other sources only compete for the
-        fields still EMPTY (exact duplicates across sources keep the first
-        source's label). Tags and site links instead always expand
-        additively, each piece individually excludable."""
+        offered for replacement — peers only compete for fields still EMPTY.
+        Each peer title is its own section (``vndb::Title::0``), so two VNDB
+        hits stay distinguishable. Tags/URLs expand additively; reviews are
+        one chip per peer (same API source identity still collapses on apply).
+        """
         cur_desc = self._desc_edit.toPlainText().strip()
         cur_dev  = self._developer_edit.text().strip()
         cur_year = self._year_edit.text().strip()
         cur_tags = {x.lower() for x in (getattr(self, '_tags', []) or [])}
         has_img  = bool(self._original_image_path or getattr(self, '_image_path', ''))
 
+        peer_keys: list[str] = []
+        for i, info in enumerate(collected):
+            peer_keys.append(self._peer_section_key(info, i))
+
         def _opts(getter):
             opts, seen = [], set()
-            for info in collected:
+            for info, pkey in zip(collected, peer_keys):
                 v = (getter(info) or '').strip()
                 if not v or v.lower() in seen:
                     continue
                 seen.add(v.lower())
-                opts.append({'source': (info.source or 'web').split('+')[0], 'value': v})
+                opts.append({'source': pkey, 'value': v})
             return opts
 
         model = {
@@ -850,32 +970,42 @@ class SearchFlowMixin:
             'tags': [],
             'urls': [],
             'reviews': [],
+            'source_meta': {},
         }
         seen_tags = set(cur_tags)
         seen_urls: set[str] = set()
-        seen_review_sources: set[str] = set()
-        for info in collected:
-            src = (info.source or 'web').split('+')[0]
+        # Review slot is per API source id (steam/vndb…): two VNDB titles
+        # share one stored identity, so only the first peer offers reviews.
+        seen_review_api: set[str] = set()
+        for info, pkey in zip(collected, peer_keys):
+            src_id = (info.source or 'web').split('+')[0] or 'web'
+            title = (getattr(info, 'name', '') or '').strip()
+            inspect = _inspect_url(info)
+            cover = (getattr(info, 'image_url', '') or '').strip()
+            model['source_meta'][pkey] = {
+                'inspect_url': inspect,
+                'image_url': cover,
+                'name': title,
+                'source_id': src_id,
+                'label': self._peer_section_label(
+                    self._source_label(src_id), title, inspect),
+            }
             for g in (info.genres or []):
                 if g.lower() in seen_tags:
                     continue
                 seen_tags.add(g.lower())
-                model['tags'].append({'source': src, 'value': g})
+                model['tags'].append({'source': pkey, 'value': g})
             for u in self._new_result_site_urls(info):
                 if u in seen_urls:
                     continue
                 seen_urls.add(u)
-                model['urls'].append({'source': src, 'value': u})
-            # Reviews are offered per SOURCE, all of that source's together:
-            # a score, who gave it and what they said are one verdict, and
-            # picking them apart would leave a rating nobody stands behind.
-            # Additive like tags — two sites rating a game is two reviews,
-            # not a contest between them.
-            _revs = [r for r in self._new_result_reviews(info)
-                     if str(r.get('source') or src) not in seen_review_sources]
+                model['urls'].append({'source': pkey, 'value': u})
+            if src_id in seen_review_api:
+                continue
+            _revs = self._new_result_reviews(info)
             if _revs:
-                seen_review_sources.add(str(_revs[0].get('source') or src))
-                model['reviews'].append({'source': src, 'value': _revs})
+                seen_review_api.add(src_id)
+                model['reviews'].append({'source': pkey, 'value': _revs})
         model['has_options'] = any([
             model['description'], model['developer'], model['year'],
             model['image'], model['tags'], model['urls'], model['reviews'],

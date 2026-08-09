@@ -203,10 +203,15 @@ class CloudFlowsMixin:
                     # local_only and stops the asking.
                     notification_kind = "conflict_unreconciled"
                 elif entry.sync_status in ("cloud_only", "pending"):
-                    # Local backups already exist — only prompt a download
-                    # when reconciliation is actually needed (cloud-only copy,
-                    # or local saves changed since the last sync).
-                    notification_kind = "sync_prompt"
+                    # Keep-local already chosen: pending_local_wins forces the
+                    # next auto-sync to upload — do not re-ask "download?".
+                    if getattr(entry, "pending_local_wins", False):
+                        pass
+                    else:
+                        # Local backups already exist — only prompt a download
+                        # when reconciliation is actually needed (cloud-only
+                        # copy, or local saves changed since the last sync).
+                        notification_kind = "sync_prompt"
 
             logger.info(
                 f"Cloud launch check for {entry.name!r}: "
@@ -291,16 +296,20 @@ class CloudFlowsMixin:
                     fn = get_folder_name_for_save(hn, entry.exe_path or "", entry.id)
                     if fn and fn not in candidates:
                         candidates.append(fn)
+                newest = ""
                 for p in orch.get_connected_providers():
                     resolved = orch.resolve_remote_game_folder(p, candidates)
                     if not resolved:
                         continue
                     remote = p.list_cloud_backups(resolved) or []
-                    if remote:
-                        info["remote"] = max(
-                            (e.get("created_at") or "" for e in remote),
-                            default="")
-                        break
+                    if not remote:
+                        continue
+                    candidate = max(
+                        (e.get("created_at") or "" for e in remote), default="")
+                    if candidate > newest:
+                        newest = candidate
+                if newest:
+                    info["remote"] = newest
             except Exception:
                 logger.debug("Could not resolve remote conflict time",
                              exc_info=True)
@@ -570,9 +579,10 @@ class CloudFlowsMixin:
             # (exit backup, sync page, …). Without pending_local_wins, a
             # plain "auto" sync after "keep local" still pulled remote-only
             # backups (e.g. from a previous library entry of the same game).
-            # Leave local_only so the next successful upload can stamp
-            # synced; mark reconciled enough that launch won't re-ask with
-            # sync_status still stuck on local_only after an empty up.
+            # Stay on "pending" (not "synced"): the post-exit path that
+            # reconciles when the backup is unchanged only runs for pending,
+            # and that is the usual case — close the game with nothing new.
+            # Launch skips the download prompt while pending_local_wins is set.
             self._cross_machine_local_only.add(entry.id)
             try:
                 from core.machine import get_machine_id
@@ -585,7 +595,7 @@ class CloudFlowsMixin:
                 get_library().update_game_fields(
                     entry.id,
                     pending_local_wins=True,
-                    sync_status="synced",
+                    sync_status="pending",
                     cloud_metadata=cloud_meta,
                 )
             except Exception:

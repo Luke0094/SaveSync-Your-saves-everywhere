@@ -23,7 +23,7 @@ _VNDB_FIELDS = (
     "description, "
     "tags{id,name,rating,spoiler}, "
     "developers{name}, "
-    "released, platforms, languages, rating, votecount, "
+    "released, platforms, languages, rating, average, votecount, "
     "extlinks{url,label}"
 )
 
@@ -181,9 +181,30 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
     # VNDB scores out of 100; SaveSync's stars go to 5. A score with no votes
     # behind it is not one — VNDB reports those as null, and 0 would read as
     # a damning review rather than as "nobody has said".
+    #
+    # Only the aggregate is imported. Kana has no written-review endpoint;
+    # site reviews are votes that already sit inside votecount, so fetching
+    # prose on top would double-count the same opinions.
     vndb_rating = entry.get("rating")
     stars = (float(vndb_rating) / 20.0) if vndb_rating else 0.0
-    votes = entry.get("votecount") or 0
+    try:
+        votes = int(entry.get("votecount") or 0)
+    except (TypeError, ValueError):
+        votes = 0
+    review_text = ""
+    if stars and vndb_rating is not None:
+        bayes = float(vndb_rating)
+        bits = [f"VNDB Bayesian {bayes:.0f}/100"]
+        raw = entry.get("average")
+        if raw is not None:
+            try:
+                avg = float(raw)
+                bits.append(f"raw average {avg:.1f}/100")
+            except (TypeError, ValueError):
+                pass
+        if votes > 0:
+            bits.append(f"{votes:,} votes")
+        review_text = " · ".join(bits)
 
     return GameInfo(
         name=display_title,
@@ -198,8 +219,8 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
         alt_names=alt_names,
         rating=stars,
         reviewer="VNDB" if stars else "",
-        review_text=(f"VNDB: {float(vndb_rating):.0f}/100 ({votes} votes)"
-                     if stars else ""),
+        review_text=review_text,
+        vote_count=votes if stars else 0,
     )
 
 

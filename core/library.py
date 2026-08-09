@@ -65,6 +65,31 @@ def review_rating(review) -> float:
     return quantize_rating(review.get("rating"))
 
 
+def review_vote_count(review) -> int:
+    """How many underlying votes one stored review represents.
+
+    Aggregate store scores (Steam percent-positive, VNDB Bayesian average)
+    carry ``vote_count`` so a single row is not counted as one opinion.
+    Individual reviews (user, DLsite, …) count as 1 when they say anything.
+    """
+    if not isinstance(review, dict):
+        return 0
+    try:
+        n = int(review.get("vote_count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return n
+    if review_rating(review) > 0 or (review.get("text") or "").strip():
+        return 1
+    return 0
+
+
+def reviews_display_count(reviews) -> int:
+    """Total extracted opinions for UI counters (preview, merge chip, button)."""
+    return sum(review_vote_count(r) for r in (reviews or []))
+
+
 def review_identity(review) -> str:
     """Stable key for one review, so a site's many user reviews do not
     collapse into a single slot.

@@ -247,7 +247,11 @@ class SystemCursor:
         """
         if not cls._holders:
             return
-        need_soft = False
+        # Windows: only draw when GetCursorInfo says the OS pointer is gone
+        # (games that already show their own cursor keep it). Elsewhere there
+        # is no equivalent probe — Proton/Wine can hide the pointer with no
+        # Win32 API to ask — so while a holder is active we always draw.
+        need_soft = platform.system() != "Windows"
         if platform.system() == "Windows":
             try:
                 import ctypes

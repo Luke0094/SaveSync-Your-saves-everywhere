@@ -110,6 +110,52 @@ def _metacritic(app_data: dict) -> dict:
     }
 
 
+def _steam_user_reviews(appid: str) -> dict:
+    """Steam store user-review summary for *appid* as GameInfo review fields.
+
+    Most titles have no Metacritic block in appdetails; the appreviews
+    endpoint still returns percent-positive / totals for nearly every
+    shipped game. Empty when Steam has no reviews yet.
+    """
+    if not appid:
+        return {}
+    url = (
+        f"https://store.steampowered.com/appreviews/{appid}"
+        "?json=1&language=all&purchase_type=all&num_per_page=0"
+    )
+    data = _fetch_json(url)
+    if not data or data.get("success") != 1:
+        return {}
+    qs = data.get("query_summary") or {}
+    try:
+        total = int(qs.get("total_reviews") or 0)
+        positive = int(qs.get("total_positive") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if total <= 0:
+        return {}
+    pct = round(100.0 * positive / total)
+    desc = (qs.get("review_score_desc") or "").strip()
+    # Declare composition: percent-positive built from total_positive/total.
+    text = f"Steam {pct}% positive ({positive:,}/{total:,})"
+    if desc:
+        text = f"{desc} — {text}"
+    return {
+        "rating": pct / 20.0,
+        "reviewer": "Steam",
+        "review_text": text,
+        "vote_count": total,
+    }
+
+
+def _review_fields(app_data: dict, appid: str) -> dict:
+    """Prefer Steam user reviews; fall back to Metacritic when present."""
+    steam = _steam_user_reviews(str(appid))
+    if steam:
+        return steam
+    return _metacritic(app_data)
+
+
 def search_steam(game_name: str, appid: Optional[str] = None,
                  region: str = "us") -> Optional[GameInfo]:
     """Search Steam Store API.
@@ -140,7 +186,7 @@ def search_steam(game_name: str, appid: Optional[str] = None,
                 # is shown: it holds the game's other name, and that is what
                 # a search written in that name has to match against.
                 alt_names=[full_name] if full_name != shown else [],
-                **_metacritic(app_data),
+                **_review_fields(app_data, str(appid)),
             )
 
     # Search by name — build meaningful queries, collect candidates then pick best

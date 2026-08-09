@@ -22,7 +22,8 @@ from core.game_sources.common import (GameInfo, _clean_game_name,
                                       _is_favicon_like,
                                       _is_non_game_media_title,
                                       _parse_forum_description,
-                                      _strip_release_noise, source_label,
+                                      _strip_release_noise, _title_keep_version,
+                                      source_label,
                                       _GENERIC_EXE_STEMS, _VER_NUM_RE)
 from core.net import open_url as _open_url
 
@@ -2169,21 +2170,23 @@ def _search_targeted_sites(primary: str,
         for _v in ([_sp, _h] if _sp != _h else [_h]):
             if _v not in _q_hints:
                 _q_hints.append(_v)
-    # Self-published stores (itch.io, DLSite) are frequently titled straight
-    # after the dev's raw release folder/zip name ("My Game v0.4.8"), so
-    # cleaning can strip the very token that would have found the page.
-    # Append any raw (pre-clean) hint whose fuzzy-slug isn't already covered
-    # by a cleaned _q_hints entry — one extra query only when the version
-    # actually adds new information, never a duplicate of a cleaned query.
+    # Self-published stores often keep the version in the page title
+    # ("My Game v0.4.8"). From the raw folder keep only title + version
+    # via _title_keep_version — not pc/publisher/RJ. Tier 3 stays verbatim.
     _q_slugs = {_fuzzy_slug(h) for h in _q_hints}
     for _rh in _raw_all_hints:
         _rh = (_rh or '').strip()
         if not _rh or _rh.lower() in _GENERIC_EXE_STEMS:
             continue
-        _rslug = _fuzzy_slug(_rh)
+        _with_ver = _title_keep_version(_rh)
+        _bare = _strip_release_noise(_with_ver, drop_version=True) or _with_ver
+        if (not _with_ver or not _bare
+                or _with_ver.casefold() == _bare.casefold()):
+            continue                   # no version token to preserve
+        _rslug = _fuzzy_slug(_with_ver)
         if _rslug and _rslug not in _q_slugs:
             _q_slugs.add(_rslug)
-            _q_hints.append(_rh)
+            _q_hints.append(_with_ver)
     MIN_SCORE = 40.0
     results: list[tuple[GameInfo, float]] = []
 
@@ -2228,28 +2231,26 @@ def _search_targeted_sites(primary: str,
         _itch_hints = [primary]  # always have at least the primary name
     if 'itch' not in _skip:
         try:
-            # The version/platform/language tokens a dev bakes into a release
-            # name ("MyGame v0.4.8 - Win [ENG]") are hints, not part of the
-            # itch page title — quoting the whole thing as an exact phrase
-            # finds nothing. Query the bare title (version dropped too); the
-            # version stays available to tier 3, here it must not be mandatory.
-            # Skip a hint whose stripped title was already queried so two
-            # spellings of one name don't fire the same itch.io fetch twice.
+            # site: itch: bare title + title-with-version only
+            # ("My Game" / "My Game v0.3.6.2"). Not the full folder.
             _itch_seen: set[str] = set()
             for hint in _itch_hints:
-                _q = _strip_release_noise(hint, drop_version=True) or hint
-                _qslug = _fuzzy_slug(_q)
-                if not _qslug or _qslug in _itch_seen:
-                    continue
-                _itch_seen.add(_qslug)
-                url = _find_itch_url_via_search(
-                    f'"{_q}" site:itch.io',
-                    game_name=_q,
-                )
-                if url:
-                    _collect("itch.io", _scrape_opengraph(url))
-                else:
-                    logger.info(f"Targeted itch.io: no page for {_q!r}")
+                _ver = _title_keep_version(hint)
+                _bare = _strip_release_noise(_ver, drop_version=True) or _ver
+                for _q in (_bare, _ver):
+                    _q = (_q or "").strip()
+                    _key = _q.casefold()
+                    if not _q or _key in _itch_seen:
+                        continue
+                    _itch_seen.add(_key)
+                    url = _find_itch_url_via_search(
+                        f'"{_q}" site:itch.io',
+                        game_name=_q,
+                    )
+                    if url:
+                        _collect("itch.io", _scrape_opengraph(url))
+                    else:
+                        logger.info(f"Targeted itch.io: no page for {_q!r}")
         except Exception as e:
             logger.debug(f"itch.io targeted search failed: {e}")
 
@@ -2459,6 +2460,9 @@ def _web_search_urls_single(query: str,
     hints = [h for h in raw_hints if h != query] + [query]
     # Build a separate list for scoring that excludes generic stems, so that
     # a Wikipedia hit for "Game" doesn't get a high score via the generic query.
+    # Score against the same specific strings we query — no stripped/clean
+    # variants. Generic-web indexing rewards the full folder/title; cleaning
+    # is a tier-2 site: exception only (itch/DLsite/…).
     _scoring_hints = [h for h in hints if h.lower() not in _GENERIC_EXE_STEMS] or hints[:1]
     # Early-exit: if every hint is a generic stem, nothing useful to search for.
     if not any(h.lower() not in _GENERIC_EXE_STEMS for h in hints):
@@ -2506,11 +2510,13 @@ def _web_search_urls_single(query: str,
     for hint in query_hints:
         if stop or len(candidates) >= MAX_GENERIC_RESULTS:
             break
-        # A version-bearing hint is queried verbatim (the '"…" game' form
-        # returns nothing for a version string) and fetched deeper, since the
-        # right game is often ranked below generic same-named pages.
+        # Verbatim only — engines index the specific string (version, "pc",
+        # …). Do NOT strip/clean here; tier-2 site: queries are the place
+        # that tries bare + versioned forms. Early-stop only on a strong
+        # TITLE score — a version match in a random URL must not freeze the
+        # search on a weak page.
         _hv = _hint_version(hint)
-        _forms = [hint] if _hv else [f'"{hint}" game', hint]
+        _forms = [hint, f'"{hint}"']
         # _target counts VALID candidates per query — results dropped AFTER
         # their fetch (failed scrape, film/TV page) don't consume it. The URL
         # pool is fetched 2× deeper so each dropped result is replaced by the
@@ -2543,7 +2549,8 @@ def _web_search_urls_single(query: str,
                 # rejected targeted results from these sources already.
                 info.source = "web"
                 info.store_url = info.store_url or url
-                score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
+                base_score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
+                score = base_score
                 # The folder's version appearing in the candidate's title or
                 # URL is a high-precision same-game signal — lift it over a
                 # clean-titled namesake (whose padded title would otherwise
@@ -2556,9 +2563,9 @@ def _web_search_urls_single(query: str,
                 logger.debug(f"Generic web: {url[:55]} → {info.name!r} (score={score:.0f})")
                 candidates.append((info, score))
                 _query_valid += 1
-                if score >= 60:
-                    # Strong hit: stop burning engine quota on more queries,
-                    # keep what was already collected for the picker.
+                if base_score >= 60:
+                    # Strong title hit: stop burning engine quota on more
+                    # queries. Version-only boosts do not early-stop.
                     logger.info(f"Generic web early hit: {info.name!r} (score={score:.0f})")
                     stop = True
                     break

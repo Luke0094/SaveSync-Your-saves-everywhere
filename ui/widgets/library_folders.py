@@ -911,7 +911,7 @@ class FolderTree(QFrame, ThemedMixin):
         raw = get_config().get("library_filter_splitter", [260, 215]) or [260, 215]
         try:
             sizes = [max(1, int(raw[0])), max(1, int(raw[1]))]
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, IndexError, KeyError):
             sizes = [260, 215]
         self._splitter.setSizes(sizes)
 

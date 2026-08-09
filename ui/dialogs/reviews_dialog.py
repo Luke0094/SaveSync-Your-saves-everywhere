@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QHBoxLayout,
                                QTextEdit, QVBoxLayout, QWidget)
 
 from core.game_sources.common import source_label
-from core.library import quantize_rating, review_rating
+from core.library import quantize_rating, review_rating, review_vote_count
 from i18n import t
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
@@ -132,6 +132,13 @@ class _ReviewCard(QFrame):
                 f"border:1px solid {palette('border')};border-radius:6px;"
                 f"padding:0px 5px;")
             head.addWidget(src_lbl)
+        votes = review_vote_count(review)
+        # Aggregates only — an ordinary user/DLsite review is one opinion.
+        if votes > 1:
+            votes_lbl = QLabel(t("reviews.votes_n", count=votes))
+            votes_lbl.setStyleSheet(
+                f"color:{palette('text_hint')};font-size:10px;")
+            head.addWidget(votes_lbl)
         head.addStretch()
 
         edit_btn = QPushButton("✏")
@@ -410,6 +417,10 @@ class ReviewsDialog(QDialog):
             # a web review's wording does not make it this user's own.
             review["source"] = kept.get("source", "user")
             review["at"] = kept.get("at") or review["at"]
+            if kept.get("id"):
+                review["id"] = kept["id"]
+            if kept.get("vote_count"):
+                review["vote_count"] = kept["vote_count"]
             self._reviews[self._editing_index] = review
         else:
             review["source"] = "user"

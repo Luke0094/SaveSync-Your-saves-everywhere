@@ -3277,11 +3277,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             else:
                 # Dedup skip — content unchanged since the previous backup.
                 # If the game is still flagged "pending" (e.g. from an old
-                # failed sync or a restore), reconcile it now instead of
-                # leaving it stuck: the sync itself will report "unchanged"
-                # and flip the status back to synced.
+                # failed sync, a restore, or keep-local waiting to upload),
+                # reconcile it now instead of leaving it stuck: the sync
+                # itself will report "unchanged" / upload and flip status.
+                # pending_local_wins alone is enough: keep-local sets pending
+                # but an empty prior sync must not leave the upload stranded.
                 config = get_config()
-                if (entry.sync_status == "pending"
+                _needs_reconcile = (
+                    entry.sync_status == "pending"
+                    or getattr(entry, "pending_local_wins", False)
+                )
+                if (_needs_reconcile
                         and config.get("auto_sync_after_backup", False)
                         and entry.save_paths):
                     orch = get_orchestrator()

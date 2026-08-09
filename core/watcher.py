@@ -785,6 +785,11 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
         self._on_change = on_change
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
+        # cancel() cannot stop a Timer that has already begun _fire_all_pending;
+        # these flags serialize in-flight fires and re-arm debounce if events
+        # arrived during one (avoids two _on_change calls for the same batch).
+        self._firing = False
+        self._rearm_after_fire = False
         # Pre-initialize hints cache on first handler creation (avoids
         # doing config I/O on every file-system event).
         with _CACHE_LOCK:
@@ -966,6 +971,12 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
     def schedule_fire(self):
         """(Re)arm the debounced backup trigger for all pending files."""
         with self._lock:
+            if self._firing:
+                # A previous debounce is already inside _fire_all_pending;
+                # cancel() cannot stop it. Ask it to re-arm when it finishes
+                # instead of stacking a second Timer that would race it.
+                self._rearm_after_fire = True
+                return
             if self._timer:
                 self._timer.cancel()
             self._timer = threading.Timer(_DEBOUNCE_SEC, self._fire_all_pending)
@@ -974,42 +985,60 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
 
     def _fire_all_pending(self):
         """Backup ALL pending files for this game and clear pending cache."""
-        with _CACHE_LOCK:
-            my_pending = _PENDING_FILES.get(self._game_id, set())
-            if not my_pending:
+        with self._lock:
+            self._timer = None
+            if self._firing:
+                # Overlapping Timer that cancel() could not stop — fold into
+                # a single trailing re-arm rather than a second _on_change.
+                self._rearm_after_fire = True
                 return
-            # Snapshot the pending files but keep them in _PENDING_FILES.
-            # They will only be removed after backup succeeds (via
-            # mark_game_files_backed_up) or on next successful fire.
-            pending_snapshot = set(my_pending)
+            self._firing = True
+            self._rearm_after_fire = False
+        try:
+            with _CACHE_LOCK:
+                my_pending = _PENDING_FILES.get(self._game_id, set())
+                if not my_pending:
+                    return
+                # Snapshot the pending files but keep them in _PENDING_FILES.
+                # They will only be removed after backup succeeds (via
+                # mark_game_files_backed_up) or on next successful fire.
+                pending_snapshot = set(my_pending)
 
-        # File I/O outside the lock to avoid blocking other threads
-        pending_files = []
-        for file_key in pending_snapshot:
-            try:
-                file_path = Path(file_key)
-                if file_path.exists():
-                    pending_files.append(str(file_path))
-            except (OSError, ValueError):
-                pass
+            # File I/O outside the lock to avoid blocking other threads
+            pending_files = []
+            for file_key in pending_snapshot:
+                try:
+                    file_path = Path(file_key)
+                    if file_path.exists():
+                        pending_files.append(str(file_path))
+                except (OSError, ValueError):
+                    pass
 
-        if pending_files:
-            logger.info(f"Backing up {len(pending_files)} save files: {[Path(f).name for f in pending_files]}")
-            try:
-                self._on_change(self._game_id)
-                # The callback is asynchronous (queued to the Qt event loop).
-                # Files remain in _PENDING_FILES until the backup completes
-                # and mark_game_files_backed_up() moves them to _BACKED_UP_FILES.
-                # On failure, they stay pending and will be retried on next event.
-            except Exception as e:
-                logger.warning(f"Backup callback failed for {self._game_id}, "
-                               f"files will be retried: {e}")
+            if pending_files:
+                logger.info(f"Backing up {len(pending_files)} save files: {[Path(f).name for f in pending_files]}")
+                try:
+                    self._on_change(self._game_id)
+                    # The callback is asynchronous (queued to the Qt event loop).
+                    # Files remain in _PENDING_FILES until the backup completes
+                    # and mark_game_files_backed_up() moves them to _BACKED_UP_FILES.
+                    # On failure, they stay pending and will be retried on next event.
+                except Exception as e:
+                    logger.warning(f"Backup callback failed for {self._game_id}, "
+                                   f"files will be retried: {e}")
+        finally:
+            with self._lock:
+                self._firing = False
+                rearm = self._rearm_after_fire
+                self._rearm_after_fire = False
+            if rearm:
+                self.schedule_fire()
 
     def cancel(self):
         with self._lock:
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
+            self._rearm_after_fire = False
 
 
 class _PendingPathHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):

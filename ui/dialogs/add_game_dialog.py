@@ -749,11 +749,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         tag_layout.setContentsMargins(0, 0, 0, 0)
         tag_layout.setSpacing(4)
 
-        self._tag_left_btn = QPushButton("<")
+        # Filled triangles — ASCII "<"/">" (and thin ‹ ›) vanish on some fonts /
+        # Windows DPI scales; same fix as the image nav arrows above.
+        self._tag_left_btn = QPushButton("◀")
         self._tag_left_btn.setFixedWidth(24)
         self._tag_left_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:{palette('accent')};}}"
+            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;font-size:11px;}}"
+            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
         self._tag_left_btn.setVisible(False)
         self._tag_left_btn.clicked.connect(self._scroll_tags_left)
@@ -819,11 +821,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         self._tag_scroll.setWidget(self._tag_container)
 
-        self._tag_right_btn = QPushButton(">")
+        self._tag_right_btn = QPushButton("▶")
         self._tag_right_btn.setFixedWidth(24)
         self._tag_right_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:{palette('accent')};}}"
+            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;font-size:11px;}}"
+            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
         self._tag_right_btn.setVisible(False)
         self._tag_right_btn.clicked.connect(self._scroll_tags_right)
@@ -2145,7 +2147,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     # ── Reviews ──────────────────────────────────────────────────────────────
 
     def _update_reviews_btn(self):
-        count = len(self._reviews)
+        from core.library import reviews_display_count
+        count = reviews_display_count(self._reviews)
         self._reviews_btn.setText(
             t("reviews.button_n", count=count) if count
             else t("reviews.button"))

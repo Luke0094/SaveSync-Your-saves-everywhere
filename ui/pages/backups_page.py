@@ -345,8 +345,8 @@ class BackupRow(QFrame, ThemedMixin):
         open_in_file_manager(target)
 
 
-from ui.widgets.search_inputs import (_GhostLineEdit, _SearchCombo,
-                                      _SuggestPopup)
+from ui.widgets.search_inputs import (GhostClearableLineEdit, _SearchCombo,
+                                      _SuggestPopup)  # clearable ghost for title search
 
 
 class BackupsPage(QWidget, ThemedMixin):
@@ -453,7 +453,7 @@ class BackupsPage(QWidget, ThemedMixin):
         # native dropdown (arrow click) is the only place the "Tutti i
         # titoli" reset entry exists. The currently highlighted suggestion
         # is mirrored in the line edit as a painted, NON-physical
-        # completion hint (see _GhostLineEdit) — Enter or ↑/↓ + Enter (or
+        # completion hint (see GhostClearableLineEdit) — Enter or ↑/↓ + Enter (or
         # a click on the popup row) confirms it; clicking away keeps the
         # typed text as a placeholder and the filter active.
         self._game_combo = _SearchCombo()
@@ -461,7 +461,7 @@ class BackupsPage(QWidget, ThemedMixin):
         self._game_combo.setMinimumHeight(34)
         self._game_combo.setEditable(True)
         self._game_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self._game_combo.setLineEdit(_GhostLineEdit())
+        self._game_combo.setLineEdit(GhostClearableLineEdit())
         # Kill the built-in completer Qt installs on every editable combo:
         # its INLINE completion physically writes the first alphabetical
         # match into the buffer while typing — exactly the "physical text"
@@ -471,6 +471,7 @@ class BackupsPage(QWidget, ThemedMixin):
         # The global QSS styles QLineEdit with its own border+padding; inside
         # the (already padded/bordered) combo frame that squashed the field
         # and clipped the typed text — make the embedded editor bare.
+        # Keep the clear button's own stylesheet (do not wipe QToolButton).
         self._game_combo.lineEdit().setStyleSheet(
             "QLineEdit{background:transparent;border:none;padding:0;margin:0;}"
         )
@@ -1013,7 +1014,7 @@ class BackupsPage(QWidget, ThemedMixin):
         if self._suggest_popup.isVisible():
             self._suggest_popup.hide()
         le = self._game_combo.lineEdit()
-        if isinstance(le, _GhostLineEdit):
+        if hasattr(le, "set_ghost"):
             le.set_ghost("")
 
     def _install_click_filter(self):
@@ -1039,7 +1040,7 @@ class BackupsPage(QWidget, ThemedMixin):
         painted (non-physical) completion hint: typed 'exam' + highlighted
         'Example Game 1' paints 'ple Game 1' after the caret."""
         le = self._game_combo.lineEdit()
-        if not isinstance(le, _GhostLineEdit):
+        if not hasattr(le, "set_ghost"):
             return
         matches = self._current_suggestions()
         row = self._suggest_popup.current_row()

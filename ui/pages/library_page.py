@@ -6,7 +6,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QFrame, QComboBox, QToolButton,
@@ -23,6 +23,7 @@ from ui.widgets.library_folders import FolderTree, _clean_tag_display
 from ui.widgets.game_items import GameCard, GameRow, _display_sync_status
 from ui.widgets.page_size import (
     PageSizeCombo, SCOPE_LIBRARY, guarded_render, page_size)
+from ui.widgets.search_inputs import ClearableLineEdit
 
 _SORT_NATURAL_DIRECTION = {
     "date_added":  "desc",
@@ -285,10 +286,18 @@ class LibraryPage(QWidget, ThemedMixin):
         ))
         filter_row.addWidget(self._search_mode)
 
-        self._search = QLineEdit()
+        self._search = ClearableLineEdit()
         self._search.setPlaceholderText(t("library.search_placeholder"))
-        self._search.textChanged.connect(self._filter_cards)
-        self._search_mode.currentIndexChanged.connect(lambda _: self._filter_cards(self._search.text()))
+        # Debounce: rebuilds show a "please wait" sheet; without a pause the
+        # grid rebuilds on every keystroke while typing.
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(320)
+        self._search_timer.timeout.connect(self._apply_search_filter)
+        self._search.textChanged.connect(self._on_search_text_changed)
+        # Mode change is a deliberate click — apply at once, no debounce.
+        self._search_mode.currentIndexChanged.connect(
+            lambda _: self._apply_search_filter())
         filter_row.addWidget(self._search, 1)
 
         # Sort combo (criterion) + direction dropdown (asc/desc, resets to
@@ -680,7 +689,15 @@ class LibraryPage(QWidget, ThemedMixin):
         if entry is not None:
             card.refresh(entry)
 
-    def _filter_cards(self, query: str):
+    def _on_search_text_changed(self, _text: str = ""):
+        """Arm (or re-arm) the search debounce; empty text applies immediately."""
+        if not (self._search.text() or "").strip():
+            self._search_timer.stop()
+            self._apply_search_filter()
+            return
+        self._search_timer.start()
+
+    def _apply_search_filter(self):
         """Filter the card grid by rebuilding it with only matching games.
 
         We always do a full rebuild (never show/hide individual cards) so the
@@ -690,6 +707,10 @@ class LibraryPage(QWidget, ThemedMixin):
         """
         self._current_page = 1
         self._rebuild_view()
+
+    def _filter_cards(self, query: str):
+        """Compat entry used by sort/mode callers — same as a debounced apply."""
+        self._on_search_text_changed(query)
 
     def _on_tags_changed(self):
         """A chip filter changed — re-paginate from page 1 and rebuild."""

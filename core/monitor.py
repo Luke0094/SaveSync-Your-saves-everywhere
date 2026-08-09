@@ -71,6 +71,8 @@ _SYSTEM_STEMS: frozenset[str] = frozenset({
     "adobecollabsync", "adobearm", "armsvc", "adobeipcbroker",  # Adobe services
     "epicwebhelper", "epiconlineserviceshost", "crashreport",  # Epic launcher helpers
     "epiconlineservicesuihelper", "epiconlineservicesinstallhelper",
+    "unitycrashhandler", "unitycrashhandler64",  # Unity crash reporters (not the game)
+
     "discord", "discordptb", "discordcanary",  # Chat apps
     "spotify", "slack", "teams", "telegram",
     "winrar", "7z", "7za", "7zfm", "7zg", "7zip",  # Archives

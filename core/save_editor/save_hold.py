@@ -119,10 +119,11 @@ class SaveHold(QObject):
         logger.info(f"Holding {len(self._values)} value(s) in {self._path.name}")
 
     def stop(self):
-        if self._timer.isActive():
-            self._timer.stop()
-            logger.info(f"Stopped holding values in {self._path.name} "
-                        f"after {self._rounds} round(s)")
+        if not self._timer.isActive():
+            return
+        self._timer.stop()
+        logger.info(f"Stopped holding values in {self._path.name} "
+                    f"after {self._rounds} round(s)")
         self.stopped.emit()
 
     def set_values(self, values: dict):

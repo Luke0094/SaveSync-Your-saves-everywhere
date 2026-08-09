@@ -29,7 +29,7 @@ from i18n import t
 from ui.helpers import ElidedLabel
 from ui.modal_helpers import warning_window_modal
 from ui.styles.theme import palette, ThemedMixin
-from ui.widgets.search_inputs import GhostClearableLineEdit
+from ui.widgets.search_inputs import ClearableLineEdit, GhostClearableLineEdit
 from ui.widgets.page_size import (PageSizeCombo, SCOPE_CHEATS_GAMES,
                                   SCOPE_CHEATS_SAVES, guarded_render,
                                   page_size)
@@ -393,7 +393,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._doc = None
         self._editors = {}          # field path -> widget, for the page shown
         self._pending = {}          # every edit made, whatever page it was on
-        self._held = {}             # locked values (✓ stays until cleared)
+        self._held = {}             # locked values (🔒 stays until cleared)
         self._hold = None
         self._hold_armed = False    # True after Apply — loop may run when playing
         self._page = 0
@@ -581,7 +581,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._group_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._group_combo.currentIndexChanged.connect(self._apply_group)
         bar.addWidget(self._group_combo)
-        self._field_filter = QLineEdit()
+        self._field_filter = ClearableLineEdit()
         self._field_filter.setObjectName("list_search")
         self._field_filter.setPlaceholderText(t("cheats.filter_values"))
         self._field_filter.setFixedHeight(30)
@@ -1103,10 +1103,10 @@ class CheatsPage(QWidget, ThemedMixin):
         line.addWidget(name, 1)
         line.addWidget(self._editor_for(f))
 
-        # Check only — no padlock. Marks stay selected; the re-apply loop
-        # runs only while THIS game is running (see _watch_hold_game).
+        # Open/closed padlock. Marks stay selected; the re-apply loop runs
+        # only while THIS game is running (see _watch_hold_game).
         marked = f.label in self._held
-        hold = QPushButton("✓" if marked else "")
+        hold = QPushButton("🔒" if marked else "🔓")
         hold.setObjectName("cheats_hold_btn")
         hold.setCheckable(True)
         hold.setFixedSize(24, 24)
@@ -1213,11 +1213,11 @@ class CheatsPage(QWidget, ThemedMixin):
         if on:
             self._held[field.label] = self._pending.get(field.path, field.value)
             if btn is not None:
-                btn.setText("✓")
+                btn.setText("🔒")
         else:
             self._held.pop(field.label, None)
             if btn is not None:
-                btn.setText("")
+                btn.setText("🔓")
             if not self._held:
                 self._hold_armed = False
                 self._stop_hold()
@@ -1249,7 +1249,7 @@ class CheatsPage(QWidget, ThemedMixin):
             self._hold = None
 
     def _watch_hold_game(self):
-        """Pause/resume the re-apply loop with the game; keep the ✓ marks."""
+        """Pause/resume the re-apply loop with the game; keep the lock marks."""
         if not self._held or not self._hold_armed:
             self._stop_hold()
             if not self._held:

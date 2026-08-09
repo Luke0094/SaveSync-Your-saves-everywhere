@@ -347,6 +347,11 @@ class GameInfo:
     # Metacritic score, VNDB's average). Prefer as_reviews() over reading
     # either shape by hand.
     reviews: Optional[list] = None
+    # Underlying vote / review count for a single-verdict aggregate (Steam
+    # total_reviews, VNDB votecount). 0 means "one opinion" or unknown.
+    # Written VNDB reviews are NOT fetched separately: the Kana API has no
+    # review endpoint, and any written vote is already inside votecount.
+    vote_count: int = 0
 
     def __post_init__(self):
         if self.genres is None:
@@ -417,7 +422,7 @@ class GameInfo:
         if not self.rating and not (self.review_text or "").strip():
             return None
         from datetime import datetime, timezone
-        return {
+        out = {
             "rating": self.rating,
             "reviewer": self.reviewer or self.source,
             "text": (self.review_text or "").strip(),
@@ -425,6 +430,13 @@ class GameInfo:
             "source": self.source or "web",
             "at": datetime.now(timezone.utc).isoformat(),
         }
+        try:
+            votes = int(self.vote_count or 0)
+        except (TypeError, ValueError):
+            votes = 0
+        if votes > 0:
+            out["vote_count"] = votes
+        return out
 
 
 def _fetch_json(url: str, timeout: int = 10, headers: Optional[dict] = None) -> Optional[dict]:
@@ -961,60 +973,140 @@ def _strip_release_noise(name: str, drop_version: bool = False) -> str:
     return ' '.join(tokens).strip() or name
 
 
+def _title_keep_version(name: str) -> str:
+    """Title + version only for site-targeted queries.
+
+    Like ``_strip_release_noise(..., drop_version=False)`` then also peels
+    trailing store/publisher labels and product codes. ``My Game v0.3.6.2 - pc``
+    → ``My Game v0.3.6.2``; full folder strings with RJ/publisher noise do not
+    become extra useless site: queries.
+    """
+    if not name:
+        return name
+    s = _strip_release_noise(name, drop_version=False)
+    tokens = s.split()
+    while len(tokens) > 1:
+        last = tokens[-1]
+        bare = last.strip("-_.").lower()
+        if _is_version_token(last):
+            break
+        if (bare in _TRAILING_MARKERS or bare in _RELEASE_NOISE
+                or _is_product_code(last) or _is_punctuation(last)):
+            tokens.pop()
+            continue
+        break
+    out = " ".join(tokens).strip(" ._-")
+    out = _TWO_WORD_TRAILING.sub("", out).strip(" ._-")
+    # Drop leftover product codes sitting mid/end (not version tokens).
+    kept = [w for w in out.split() if not _is_product_code(w)]
+    out = " ".join(kept).strip() if kept else out
+    return out or s
+
+
 def _dedupe_slug(name: str) -> str:
     """Identity slug for de-dup: title with release noise stripped."""
     return _fuzzy_slug(_strip_release_noise(name))
 
 
+def _norm_field(text: str) -> str:
+    """Casefold + collapse whitespace for 1:1 field comparison."""
+    return re.sub(r'\s+', ' ', (text or '').strip()).casefold()
+
+
+def _info_tag_set(info: "GameInfo") -> set[str]:
+    return {_norm_field(g) for g in (info.genres or []) if (g or '').strip()}
+
+
+def _info_url_set(info: "GameInfo") -> set[str]:
+    out: set[str] = set()
+    for u in ((info.store_url or ''), *(info.extra_urls or [])):
+        u = (u or '').strip().rstrip('/').casefold()
+        if u:
+            out.add(u)
+    return out
+
+
+def _has_review_payload(info: "GameInfo") -> bool:
+    if info.reviews:
+        return True
+    return bool(info.rating or (info.review_text or '').strip())
+
+
+def _is_enrichment_subset(new: "GameInfo", kept: "GameInfo") -> bool:
+    """True when *new* would add nothing the merge UI cannot already take from *kept*.
+
+    Same title from two APIs is kept when description, tags, links, image or
+    a score differ. Dropped only when every non-empty field on *new* is an
+    exact match (or a subset, for tags/URLs) of *kept* — a 1:1 duplicate.
+    """
+    nd, kd = _norm_field(new.description), _norm_field(kept.description)
+    if nd and nd != kd:
+        return False
+    ndev, kdev = _norm_field(new.developer), _norm_field(kept.developer)
+    if ndev and ndev != kdev:
+        return False
+    ny, ky = _release_year(new), _release_year(kept)
+    if ny and ny != ky:
+        return False
+    ni = (new.image_url or '').strip()
+    ki = (kept.image_url or '').strip()
+    if ni and ni != ki:
+        return False
+    if not _info_tag_set(new).issubset(_info_tag_set(kept)):
+        return False
+    if not _info_url_set(new).issubset(_info_url_set(kept)):
+        return False
+    # A score from another source is never redundant with the first's.
+    if _has_review_payload(new):
+        return False
+    return True
+
+
 def _dedupe_candidates(cands: list[tuple["GameInfo", float]],
-                       limit: int = 3) -> list[tuple["GameInfo", float]]:
+                       per_source: int = 3) -> list[tuple["GameInfo", float]]:
     """Drop duplicate hits from a best-first candidate list.
 
-    A shared NAME alone is never enough to hide a candidate. Two rules:
+    Within one source, an identical store URL collapses duplicates.
+    Across sources, the same title is kept when it still has something to
+    offer for enrichment (different description/tags/links/image/score);
+    it is dropped only when its payload is a 1:1 subset of an already-kept
+    peer — sharing a Steam URL alone is not enough to discard PCGamingWiki.
 
-    * Exact same store URL → the same entry, collapsed regardless of source.
-    * Otherwise de-dup only ACROSS DIFFERENT sources, and only with positive
-      corroboration: the titles must normalize to the same identity slug
-      (release noise — language / platform / edition tags — stripped) AND at
-      least one of developer / release-year must be present on both sides and
-      agree. One field may be absent (identity degrades gracefully), but
-      name-alone never merges, and a present field that disagrees keeps both.
-      Two same-named results from the SAME source are always both kept — a
-      store legitimately lists different games under one name.
-
-    Capped at *limit* — the result feeds a user-facing picker, not another
-    ranking pass: the input is already sorted best-first, so the cap keeps
-    the top-scored titles and discards the lower-ranked tail.
+    Cap is *per source* (not a single tier-wide budget): each source may keep
+    up to *per_source* titles. A global pool of 5 used to let Steam fill the
+    picker and push PCGamingWiki / VNDB out entirely when several hints hit.
+    Input stays sorted best-first, so each source keeps its own top hits.
     """
     kept: list[tuple[GameInfo, float]] = []
-    # (name_slug, dev_slug, year, source, url) per kept entry
-    kept_meta: list[tuple[str, str, str, str, str]] = []
+    # (source, url, name_slug, info) per kept entry
+    kept_meta: list[tuple[str, str, str, GameInfo]] = []
+    per_src_counts: dict[str, int] = {}
     for info, score in cands:
-        slug = _dedupe_slug(info.name)
-        dev_slug = _fuzzy_slug(info.developer or '')
-        year = _release_year(info)
-        src = (info.source or '').strip().lower()
+        raw_src = (info.source or '').strip().lower()
+        src = raw_src.split('+')[0] or 'web'
         url = (info.store_url or '').strip().rstrip('/').lower()
+        slug = _dedupe_slug(info.name)
         is_dup = False
-        for k_slug, k_dev, k_year, k_src, k_url in kept_meta:
-            if url and k_url and url == k_url:
-                is_dup = True          # identical link — same entry
-                break
-            if src and k_src and src == k_src:
-                continue               # same source: always keep both
-            if not slug or slug != k_slug:
-                continue               # different title: not a duplicate
-            dev_match = bool(dev_slug and k_dev and dev_slug == k_dev)
-            year_match = bool(year and k_year and year == k_year)
-            if dev_match or year_match:
-                is_dup = True          # cross-source, positively identified
+        for k_src, k_url, k_slug, k_info in kept_meta:
+            k_base = (k_src or '').split('+')[0] or 'web'
+            if src and k_base and src == k_base:
+                if url and k_url and url == k_url:
+                    is_dup = True      # same source + identical link
+                    break
+                continue               # same source, different link: keep both
+            # Different sources: only collapse same-title 1:1 content clones.
+            if not slug or not k_slug or slug != k_slug:
+                continue
+            if _is_enrichment_subset(info, k_info):
+                is_dup = True
                 break
         if is_dup:
             continue
+        if per_src_counts.get(src, 0) >= per_source:
+            continue                   # this source already filled its quota
         kept.append((info, score))
-        kept_meta.append((slug, dev_slug, year, src, url))
-        if len(kept) >= limit:
-            break
+        kept_meta.append((raw_src, url, slug, info))
+        per_src_counts[src] = per_src_counts.get(src, 0) + 1
     return kept
 
 

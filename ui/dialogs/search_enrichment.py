@@ -1,19 +1,16 @@
 """
 SaveSync - Web-search candidate preview + same-tier enrichment merge UI.
 
-Extracted verbatim from ui/dialogs/add_game_dialog.py:
-
 - CandidatePreviewDialog — arrow-carousel preview of search candidates; the
   candidate the user confirms is authoritative for every field it fills.
 - EnrichmentMergeDialog — chip-based "fill the EMPTY fields" panel offered
   from the OTHER candidates of the same result set (same tier, never new
   searches), grouped by source; tags/links always extend additively.
 - _FlowLayout / _ChipGroup / _merge_chip — the wrapping chip machinery.
-
-Pure move — no behavior change.
 """
 import logging
 import threading
+import webbrowser
 
 from PySide6.QtCore import Qt, QSize, QRect, QPoint, Signal
 from PySide6.QtGui import QPixmap, QIcon
@@ -26,6 +23,24 @@ from i18n import t
 from ui.styles.theme import palette
 
 logger = logging.getLogger(__name__)
+
+
+def _inspect_url(info) -> str:
+    """Best page URL for opening a candidate/source in the browser."""
+    u = (getattr(info, "store_url", "") or "").strip()
+    if u:
+        return u
+    for extra in getattr(info, "extra_urls", None) or []:
+        extra = (extra or "").strip()
+        if extra:
+            return extra
+    return ""
+
+
+def _open_inspect_url(url: str):
+    url = (url or "").strip()
+    if url:
+        webbrowser.open(url)
 
 
 class CandidatePreviewDialog(QDialog):
@@ -140,6 +155,20 @@ class CandidatePreviewDialog(QDialog):
         self._source_lbl.setWordWrap(True)
         self._source_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
         content.addWidget(self._source_lbl)
+
+        self._inspect_btn = QPushButton()
+        self._inspect_btn.setFlat(True)
+        self._inspect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._inspect_btn.setToolTip(t("add_game.candidate_inspect_tooltip"))
+        self._inspect_btn.setStyleSheet(
+            f"QPushButton{{color:{palette('accent')};font-size:11px;text-align:left;"
+            f"padding:0;background:transparent;border:none;}}"
+            f"QPushButton:hover{{text-decoration:underline;}}"
+            f"QPushButton:disabled{{color:{palette('text_disabled')};}}"
+        )
+        self._inspect_btn.clicked.connect(self._on_inspect)
+        self._inspect_url = ""
+        content.addWidget(self._inspect_btn)
 
         self._desc_lbl = QLabel()
         self._desc_lbl.setWordWrap(True)
@@ -259,6 +288,19 @@ class CandidatePreviewDialog(QDialog):
 
         self._source_lbl.setText(_h.escape(src_label))
 
+        self._inspect_url = _inspect_url(c)
+        if self._inspect_url:
+            self._inspect_btn.setText(t("add_game.candidate_inspect"))
+            self._inspect_btn.setToolTip(
+                t("add_game.candidate_inspect_tooltip") + "\n" + self._inspect_url)
+            self._inspect_btn.setEnabled(True)
+            self._inspect_btn.setVisible(True)
+        else:
+            self._inspect_btn.clear()
+            self._inspect_btn.setToolTip(t("add_game.candidate_inspect_tooltip"))
+            self._inspect_btn.setEnabled(False)
+            self._inspect_btn.setVisible(False)
+
         # ── Description ──────────────────────────────────────────────────
         _desc_field = fields.get('description')
         _new_desc = (_desc_field['new'] if _desc_field else (c.description or '')) or ''
@@ -304,9 +346,10 @@ class CandidatePreviewDialog(QDialog):
         # the reviews panel is where they are read in full.
         _new_reviews = diff.get('new_reviews') or []
         if _new_reviews:
+            from core.library import reviews_display_count
             _bits = [
                 f"<b>{_h.escape(t('reviews.preview'))}:</b> "
-                f"{_h.escape(t('reviews.preview_count', count=len(_new_reviews)))}"
+                f"{_h.escape(t('reviews.preview_count', count=reviews_display_count(_new_reviews)))}"
             ]
             for _r in _new_reviews[:3]:
                 _score = float(_r.get('rating') or 0)
@@ -362,6 +405,9 @@ class CandidatePreviewDialog(QDialog):
     def _on_reject(self):
         self.selected = None
         self.reject()
+
+    def _on_inspect(self):
+        _open_inspect_url(self._inspect_url)
 
     # ── Cover thumbnail (lazy, cached, stale-load safe) ──────────────────
 
@@ -518,12 +564,15 @@ class EnrichmentMergeDialog(QDialog):
     Pieces are shown as toggle chips DIVIDED BY SOURCE — the same visual
     language as the dialog tag/URL chips. Single-value fields (description,
     developer, year, image) are exclusive across sources: selecting one chip
-    deselects the same field chips elsewhere, and the leading "current /
-    do not import" chip makes keeping the existing value (or skipping) an
-    explicit choice. Tag and link chips toggle independently. Nothing touches
-    the form until Apply."""
+    deselects the same field chips elsewhere. Tag and link chips toggle
+    independently. Image offers render a real thumbnail. Nothing touches the
+    form until Apply. Back restores the candidate carousel (RESULT_BACK).
+    """
+
+    RESULT_BACK = 2
 
     _ELIDE = 60   # preview length inside a chip
+    _IMG_W, _IMG_H = 96, 60
 
     _FIELDS = ('description', 'developer', 'year', 'image')
 
@@ -537,11 +586,17 @@ class EnrichmentMergeDialog(QDialog):
         self._tag_boxes: list[tuple[QPushButton, str]] = []
         self._url_boxes: list[tuple[QPushButton, str]] = []
         self._review_boxes: list[tuple[QPushButton, list]] = []
-        self._img_chips: dict[str, QPushButton] = {}   # image url → its chip
+        self._img_chips: dict[str, QPushButton] = {}   # image url → select chip
+        self._header_thumbs: dict[str, QLabel] = {}    # cover url → header preview
+        # source key → every chip offered under that source (for header toggle)
+        self._source_chips: dict[str, list[QPushButton]] = {}
+        self._source_headers: dict[str, QPushButton] = {}
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t('add_game.merge_title'))
-        self.setMinimumWidth(520)
-        self.setMaximumHeight(640)
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(360)
+        self.setMaximumHeight(680)
+        self.resize(560, 520)
         self._thumb_ready.connect(self._on_thumb_ready)
         self._build()
         self._start_thumb_downloads()
@@ -559,18 +614,115 @@ class EnrichmentMergeDialog(QDialog):
             'image':       t('add_game.image'),
         }[field]
 
-    def _section_lbl(self, text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
-            f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
-            f"letter-spacing:0.5px;margin-top:6px;"
+    @staticmethod
+    def _short_inspect_host(url: str) -> str:
+        """Compact host/path for the clickable inspect segment."""
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(url)
+            host = (p.netloc or "").removeprefix("www.")
+            path = (p.path or "").rstrip("/")
+            tail = path.rsplit("/", 1)[-1] if path else ""
+            short = f"{host}/{tail}" if host and tail else (host or url)
+        except Exception:
+            short = url
+        return short if len(short) <= 42 else short[:41] + "…"
+
+    def _source_header_row(self, source: str) -> QWidget:
+        """Cover + ``source · title ·`` + clickable URL (inspect) + chip toggle."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 8, 0, 2)
+        lay.setSpacing(4)
+
+        meta = (self._model.get("source_meta") or {}).get(source) or {}
+        cover = (meta.get("image_url") or "").strip()
+        # Identity thumb — always shown when the peer has a cover, so two
+        # VNDB titles are recognizable before reading the composite label.
+        thumb = QLabel("🖼")
+        thumb.setFixedSize(56, 36)
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.setStyleSheet(
+            f"background:{palette('bg_elevated')};border:1px solid {palette('border')};"
+            f"border-radius:4px;font-size:14px;color:{palette('text_muted')};"
         )
-        return lbl
+        if cover:
+            thumb.setToolTip((meta.get("name") or "") or cover)
+            self._header_thumbs[cover] = thumb
+        else:
+            thumb.setVisible(False)
+        lay.addWidget(thumb, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        src_id = meta.get("source_id") or source.split(" · ")[0] or source
+        title = (meta.get("name") or "").strip()
+        # Toggle target is source · title; the URL is a separate inspect control.
+        head = self._src_label(src_id)
+        if title:
+            head = f"{head} · {title}"
+        btn = QPushButton(head)
+        btn.setFlat(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(t("add_game.merge_toggle_source"))
+        btn.setStyleSheet(
+            f"QPushButton{{color:{palette('text_muted')};font-size:10px;font-weight:700;"
+            f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
+            f"background:transparent;border:none;}}"
+            f"QPushButton:hover{{color:{palette('accent')};}}"
+        )
+        btn.clicked.connect(lambda _=False, s=source: self._toggle_source(s))
+        self._source_headers[source] = btn
+        lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        inspect = (meta.get("inspect_url") or "").strip()
+        if inspect:
+            sep = QLabel("·")
+            sep.setStyleSheet(
+                f"color:{palette('text_muted')};font-size:10px;font-weight:700;padding:0 2px;")
+            lay.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
+            # The URL itself is the inspect control (opens the source page).
+            link = QPushButton(self._short_inspect_host(inspect))
+            link.setFlat(True)
+            link.setCursor(Qt.CursorShape.PointingHandCursor)
+            link.setToolTip(t("add_game.merge_inspect_tooltip") + "\n" + inspect)
+            link.setStyleSheet(
+                f"QPushButton{{color:{palette('accent')};font-size:10px;font-weight:600;"
+                f"text-align:left;padding:2px 0;background:transparent;border:none;}}"
+                f"QPushButton:hover{{text-decoration:underline;}}"
+            )
+            link.clicked.connect(lambda _=False, u=inspect: _open_inspect_url(u))
+            lay.addWidget(link, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addStretch(1)
+        return row
+
+    def _toggle_source(self, source: str):
+        chips = self._source_chips.get(source) or []
+        if not chips:
+            return
+        # Any checked → turn all off (exclude source). All off → turn all on.
+        any_on = any(c.isChecked() for c in chips)
+        for c in chips:
+            c.setChecked(not any_on)
+        self._refresh_source_header(source)
+
+    def _refresh_source_header(self, source: str):
+        btn = self._source_headers.get(source)
+        chips = self._source_chips.get(source) or []
+        if btn is None or not chips:
+            return
+        any_on = any(c.isChecked() for c in chips)
+        color = palette('accent') if any_on else palette('text_disabled')
+        btn.setStyleSheet(
+            f"QPushButton{{color:{color};font-size:10px;font-weight:700;"
+            f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
+            f"background:transparent;border:none;}}"
+            f"QPushButton:hover{{color:{palette('accent')};}}"
+        )
 
     @staticmethod
     def _reviews_chip_text(reviews: list) -> str:
-        """"Reviews (n)", carrying the score when a single one gives it."""
-        label = t('reviews.merge_chip', count=len(reviews))
+        """"Reviews (n)", carrying the score when a single aggregate gives it."""
+        from core.library import reviews_display_count
+        label = t('reviews.merge_chip', count=reviews_display_count(reviews))
         rated = [float(r.get('rating') or 0) for r in reviews
                  if float(r.get('rating') or 0) > 0]
         if len(rated) == 1:
@@ -597,6 +749,29 @@ class EnrichmentMergeDialog(QDialog):
         chip.setChecked(checked)
         return chip
 
+    def _image_chip(self, url: str, checked: bool = False,
+                    title: str = "") -> QPushButton:
+        """Checkable cover thumbnail — readable without relying on memory."""
+        chip = QPushButton("🖼")
+        chip.setCheckable(True)
+        chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        chip.setFixedSize(self._IMG_W + 8, self._IMG_H + 8)
+        chip.setIconSize(QSize(self._IMG_W, self._IMG_H))
+        chip.setToolTip("\n".join(x for x in (title, url) if x))
+        chip.setProperty("opt_value", url)
+        chip.setStyleSheet(
+            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text_muted')};"
+            f"border:1px solid {palette('border')};border-radius:6px;font-size:22px;padding:2px;}}"
+            f"QPushButton:hover{{border-color:{palette('accent')};}}"
+            f"QPushButton:checked{{border:2px solid {palette('accent')};"
+            f"background:{palette('bg_card')};}}"
+        )
+        group = self._field_groups.setdefault("image", _ChipGroup())
+        group.add(chip)
+        chip.setChecked(checked)
+        self._img_chips[url] = chip
+        return chip
+
     def _build(self):
         outer = QVBoxLayout(self)
         outer.setSpacing(8)
@@ -610,11 +785,13 @@ class EnrichmentMergeDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content = QWidget()
         content.setObjectName("transparent_bg")
         col = QVBoxLayout(content)
         col.setSpacing(4)
-        col.setContentsMargins(0, 0, 6, 0)
+        col.setContentsMargins(0, 0, 8, 0)
 
         # ── One section per source, chips inside ──────────────────────────
         # Only fields the confirmed candidate left EMPTY reach this dialog
@@ -633,34 +810,44 @@ class EnrichmentMergeDialog(QDialog):
         _field_first_taken = {f: False for f in self._FIELDS}
 
         for source, offers in by_source.items():
-            col.addWidget(self._section_lbl(self._src_label(source)))
+            col.addWidget(self._source_header_row(source))
             flow = _FlowLayout(spacing=6)
             host = QWidget()
             host.setLayout(flow)
+            src_chips: list[QPushButton] = []
+            peer_title = ((self._model.get("source_meta") or {}).get(source) or {}).get("name") or ""
+            # Cover select chip first — identity at a glance before text fields.
+            for value in offers.get('image', []):
+                checked = not _field_first_taken['image']
+                _field_first_taken['image'] = True
+                chip = self._image_chip(value, checked=checked, title=peer_title)
+                flow.addWidget(chip)
+                src_chips.append(chip)
             for field in self._FIELDS:
+                if field == 'image':
+                    continue
                 for value in offers.get(field, []):
-                    if field == 'image':
-                        text = t('add_game.image')
-                    else:
-                        text = self._field_title(field) + ": " + self._short(value)
                     checked = not _field_first_taken[field]
                     _field_first_taken[field] = True
-                    chip = self._field_chip(field, text, value,
-                                            tooltip=value, checked=checked)
-                    if field == 'image':
-                        # Async thumbnail preview lands on the chip icon
-                        self._img_chips[value] = chip
+                    chip = self._field_chip(
+                        field,
+                        self._field_title(field) + ": " + self._short(value),
+                        value, tooltip=value, checked=checked,
+                    )
                     flow.addWidget(chip)
+                    src_chips.append(chip)
             for tag in offers.get('tags', []):
                 chip = _merge_chip(tag)
                 chip.setChecked(True)
                 flow.addWidget(chip)
                 self._tag_boxes.append((chip, tag))
+                src_chips.append(chip)
             for url in offers.get('urls', []):
                 chip = _merge_chip(self._short(url, 44), tooltip=url)
                 chip.setChecked(True)
                 flow.addWidget(chip)
                 self._url_boxes.append((chip, url))
+                src_chips.append(chip)
             # One chip for ALL of a source's reviews: a score, who gave it and
             # what they wrote are one verdict, so they are taken or left as
             # one. Independent of the other sources' chips, the way tags are.
@@ -670,6 +857,12 @@ class EnrichmentMergeDialog(QDialog):
                 chip.setChecked(True)
                 flow.addWidget(chip)
                 self._review_boxes.append((chip, reviews))
+                src_chips.append(chip)
+            self._source_chips[source] = src_chips
+            for chip in src_chips:
+                chip.toggled.connect(
+                    lambda _on, s=source: self._refresh_source_header(s))
+            self._refresh_source_header(source)
             col.addWidget(host)
 
         col.addStretch()
@@ -677,9 +870,15 @@ class EnrichmentMergeDialog(QDialog):
         outer.addWidget(scroll, 1)
 
         btn_row = QHBoxLayout()
+        back_btn = QPushButton(t('add_game.merge_back'))
+        back_btn.setMinimumWidth(120)
+        back_btn.setToolTip(t('add_game.merge_back_tooltip'))
+        back_btn.clicked.connect(lambda: self.done(self.RESULT_BACK))
+        btn_row.addWidget(back_btn)
         btn_row.addStretch()
         cancel_btn = QPushButton(t('common.cancel'))
         cancel_btn.setMinimumWidth(90)
+        cancel_btn.setToolTip(t('add_game.merge_cancel_tooltip'))
         cancel_btn.clicked.connect(self.reject)
         apply_btn = QPushButton(t('common.apply'))
         apply_btn.setObjectName("primary_btn")
@@ -690,36 +889,39 @@ class EnrichmentMergeDialog(QDialog):
         outer.addLayout(btn_row)
 
     def _start_thumb_downloads(self):
-        """Fetch a small preview for every offered image, off the GUI thread;
-        _on_thumb_ready puts it on the chip as its icon."""
+        """Fetch cover previews off the GUI thread (same opener as candidate)."""
         import urllib.request as _url_req
-        _UA = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        for url in list(self._img_chips):
+        from core.net import open_url as _open_url
+        _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        urls = set(self._img_chips) | set(self._header_thumbs)
+        for url in urls:
             def _dl(u=url):
                 try:
                     req = _url_req.Request(u, headers={"User-Agent": _UA})
-                    with _url_req.urlopen(req, timeout=8) as r:
+                    with _open_url(req, timeout=10) as r:
                         data = r.read(2_000_000)
                     if data:
                         self._thumb_ready.emit(u, data)
                 except Exception:
-                    pass   # no preview — the chip stays text-only
+                    pass
             threading.Thread(target=_dl, daemon=True).start()
 
     def _on_thumb_ready(self, url: str, data: bytes):
-        chip = self._img_chips.get(url)
-        if chip is None:
-            return
         try:
             px = QPixmap()
-            if px.loadFromData(data):
-                from ui.helpers import scaled_for_screen
-                chip.setIcon(QIcon(scaled_for_screen(px, 48, 30)))
-                chip.setIconSize(QSize(48, 30))
-                chip.setFixedHeight(38)
+            if not px.loadFromData(data):
+                return
+            from ui.helpers import scaled_for_screen
+            chip = self._img_chips.get(url)
+            if chip is not None:
+                thumb = scaled_for_screen(px, self._IMG_W, self._IMG_H)
+                chip.setText("")
+                chip.setIcon(QIcon(thumb))
+                chip.setIconSize(QSize(self._IMG_W, self._IMG_H))
+            hdr = self._header_thumbs.get(url)
+            if hdr is not None:
+                hdr.setPixmap(scaled_for_screen(px, 56, 36))
+                hdr.setText("")
         except RuntimeError:
             pass   # dialog already closed
 

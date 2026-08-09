@@ -1,8 +1,15 @@
 """
 SaveSync - Credential Store
-Securely stores sync provider credentials using the OS keyring (Windows Credential Manager,
-macOS Keychain, Linux Secret Service). Falls back to AES-256 encrypted local file if keyring
-is unavailable.
+
+Primary store: OS keyring (Windows Credential Manager, macOS Keychain,
+Linux Secret Service).
+
+File fallback (when keyring is unavailable): AES-256-GCM of the blob under
+USER_DATA_DIR. The per-install salt that feeds key derivation is NOT kept as
+plaintext next to credentials.enc — it is wrapped with the OS user secret
+store when possible (Windows DPAPI; keyring for salt on other platforms).
+A same-key redundancy copy may exist as credentials.backup.enc; the old
+hardcoded-string "backup key" is read-only for migration and never written.
 """
 import base64
 import json
@@ -19,42 +26,181 @@ logger = logging.getLogger(__name__)
 
 _SERVICE = "SaveSync"
 _ACCOUNT = "sync_credentials"
+_SALT_ACCOUNT = "encryption_salt"
 _FALLBACK_PATH = USER_DATA_DIR / "credentials.enc"
 _BACKUP_PATH = USER_DATA_DIR / "credentials.backup.enc"
 _SALT_PATH = USER_DATA_DIR / "salt"
+# Wrapped salt on disk (DPAPI / opaque blob). Legacy plaintext lives at _SALT_PATH.
+_SALT_PROTECTED_PATH = USER_DATA_DIR / "salt.protected"
+_SALT_FILE_MAGIC = b"SSALT1\n"
 
 
 _salt_lock = threading.Lock()
 _cached_salt: str | None = None
 
+
+def _dpapi_protect(data: bytes) -> bytes:
+    """Windows DPAPI (user scope) — ciphertext only decrypts for this login."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    blob_in = DATA_BLOB(
+        len(data),
+        ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)),
+    )
+    blob_out = DATA_BLOB()
+    if not crypt32.CryptProtectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        raise OSError("CryptProtectData failed")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    blob_in = DATA_BLOB(
+        len(data),
+        ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)),
+    )
+    blob_out = DATA_BLOB()
+    if not crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        raise OSError("CryptUnprotectData failed")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _wrap_secret(plaintext: str) -> bytes:
+    """Wrap *plaintext* so a stolen data-dir alone is not enough to recover it."""
+    raw = plaintext.encode("utf-8")
+    if platform.system() == "Windows":
+        return _SALT_FILE_MAGIC + _dpapi_protect(raw)
+    # Prefer OS keyring for the salt even when the credential *blob* uses
+    # the file fallback — keyring often still works for a short secret.
+    try:
+        if not os.environ.get("SAVESYNC_DISABLE_KEYRING"):
+            import keyring
+            keyring.set_password(_SERVICE, _SALT_ACCOUNT, plaintext)
+            return _SALT_FILE_MAGIC + b"KEYRING"
+    except Exception as e:
+        logger.debug(f"Keyring salt wrap unavailable: {e}")
+    # Last resort: plaintext marker — honest obfuscation only.
+    return _SALT_FILE_MAGIC + b"PLAIN:" + raw
+
+
+def _unwrap_secret(blob: bytes) -> str:
+    if not blob.startswith(_SALT_FILE_MAGIC):
+        # Legacy plaintext salt file (no magic).
+        return blob.decode("utf-8").strip()
+    body = blob[len(_SALT_FILE_MAGIC):]
+    if body == b"KEYRING":
+        import keyring
+        val = keyring.get_password(_SERVICE, _SALT_ACCOUNT)
+        if not val:
+            raise ValueError("Salt marked KEYRING but missing from OS store")
+        return val.strip()
+    if body.startswith(b"PLAIN:"):
+        return body[len(b"PLAIN:"):].decode("utf-8").strip()
+    if platform.system() == "Windows":
+        return _dpapi_unprotect(body).decode("utf-8").strip()
+    raise ValueError("Unsupported protected-salt payload")
+
+
+def _persist_salt(salt: str) -> None:
+    """Write salt wrapped; migrate away from legacy plaintext when possible."""
+    from core import atomic_replace as _atomic_replace
+    wrapped = _wrap_secret(salt)
+    tmp = _SALT_PROTECTED_PATH.with_name(_SALT_PROTECTED_PATH.name + ".tmp")
+    tmp.write_bytes(wrapped)
+    _atomic_replace(tmp, _SALT_PROTECTED_PATH)
+    # Drop legacy plaintext salt once the protected copy is in place —
+    # unless wrap fell back to PLAIN (then the plaintext file is the store).
+    if wrapped.startswith(_SALT_FILE_MAGIC + b"PLAIN:"):
+        return
+    if _SALT_PATH.exists():
+        try:
+            _SALT_PATH.unlink()
+        except OSError:
+            pass
+
+
 def _get_or_create_salt() -> str:
-    """Get or create a per-installation random salt.
-    Thread-safe: uses a lock to prevent two threads from generating
-    different salts simultaneously.  Caches the salt in memory so that
-    even if disk writes fail, the same salt is used within the session."""
+    """Get or create a per-installation random salt (OS-wrapped on disk)."""
     global _cached_salt
     with _salt_lock:
         if _cached_salt is not None:
             return _cached_salt
+
+        # 1) Protected file
+        if _SALT_PROTECTED_PATH.exists():
+            try:
+                existing = _unwrap_secret(_SALT_PROTECTED_PATH.read_bytes())
+                if existing:
+                    _cached_salt = existing
+                    return existing
+            except Exception as e:
+                logger.warning(f"Could not unwrap protected salt: {e}")
+
+        # 2) Keyring-only salt (no local file yet)
+        if not os.environ.get("SAVESYNC_DISABLE_KEYRING"):
+            try:
+                import keyring
+                existing = keyring.get_password(_SERVICE, _SALT_ACCOUNT)
+                if existing:
+                    _cached_salt = existing.strip()
+                    try:
+                        _persist_salt(_cached_salt)
+                    except Exception:
+                        pass
+                    return _cached_salt
+            except Exception:
+                pass
+
+        # 3) Legacy plaintext salt — migrate into protected storage
         if _SALT_PATH.exists():
             try:
                 existing = _SALT_PATH.read_text(encoding="utf-8").strip()
                 if existing:
                     _cached_salt = existing
+                    try:
+                        _persist_salt(existing)
+                        logger.info("Migrated credential salt into OS-protected storage")
+                    except Exception as e:
+                        logger.warning(f"Salt migration to protected storage failed: {e}")
                     return existing
             except Exception:
                 pass
+
         import secrets
         salt = secrets.token_hex(16)
         try:
-            from core import atomic_replace as _atomic_replace
-            tmp_path = _SALT_PATH.with_name(_SALT_PATH.name + ".tmp")
-            tmp_path.write_text(salt, encoding="utf-8")
-            _atomic_replace(tmp_path, _SALT_PATH)
+            _persist_salt(salt)
         except Exception:
-            # If atomic write fails, try direct write as fallback
             try:
                 _SALT_PATH.write_text(salt, encoding="utf-8")
+                logger.warning(
+                    "Could not OS-protect encryption salt; wrote plaintext salt "
+                    "(file-fallback credentials remain obfuscation-only if the "
+                    "whole data directory is copied)"
+                )
             except Exception:
                 logger.warning(
                     "Could not persist encryption salt to disk; "
@@ -63,73 +209,58 @@ def _get_or_create_salt() -> str:
         _cached_salt = salt
         return salt
 
-# Generate strong encryption key derived from machine ID and additional entropy
+
 def _derive_encryption_key() -> bytes:
     """Derive a 256-bit encryption key from machine ID and system entropy."""
     from core.machine import get_machine_id
     import hashlib
-    
+
     machine_id = get_machine_id()
-    # Add system-specific entropy sources (no PID - it changes every run)
     entropy_sources = [
         machine_id,
         os.getenv("COMPUTERNAME", ""),
         os.getenv("USERNAME", ""),
-        _get_or_create_salt()  # Per-installation random salt
+        _get_or_create_salt(),
     ]
-    
-    # Always include all sources (empty string instead of filtering)
-    # to keep key derivation deterministic regardless of env var presence
     combined = "|".join(s or "" for s in entropy_sources).encode("utf-8")
     return hashlib.sha256(combined).digest()
 
-def _derive_flexible_key() -> bytes:
-    """Derive encryption key with fallback options for machine migration.
 
-    Uses a different domain separator ("flexible") so the derived key is
-    always distinct from the primary key, providing genuine migration
-    resilience.  Falls back to more stable system identifiers when the
-    primary sources are mostly empty.
-    """
+def _derive_flexible_key() -> bytes:
+    """Legacy migration key (domain-separated). Used only for decrypt attempts."""
     from core.machine import get_machine_id
     import hashlib
 
     salt = _get_or_create_salt()
-
     primary_sources = [
         get_machine_id(),
         os.getenv("COMPUTERNAME", ""),
         os.getenv("USERNAME", ""),
-        salt
+        salt,
     ]
-
     filtered = [s or "" for s in primary_sources]
     if sum(1 for s in filtered if s) >= 2:
-        # Use a distinct domain separator so this key differs from _derive_encryption_key
         combined = ("flexible|" + "|".join(filtered)).encode("utf-8")
         return hashlib.sha256(combined).digest()
 
-    # Fallback to more stable identifiers
     fallback_sources = [
         os.getenv("USERPROFILE", "") or os.getenv("HOME", ""),
         os.getenv("USERDOMAIN", ""),
         platform.node(),
-        "SaveSync2024"
+        "SaveSync2024",  # legacy only — never used to encrypt new blobs
     ]
     combined = ("flexible|" + "|".join(filter(None, fallback_sources))).encode("utf-8")
     return hashlib.sha256(combined).digest()
 
+
 def _create_backup_key() -> bytes:
-    """Create a backup key using only stable system identifiers."""
+    """Legacy weak backup key (hardcoded app string). Decrypt-only for migration."""
     import hashlib
-    
-    # Use only very stable identifiers that rarely change
     stable_sources = [
-        platform.node(),  # Computer name
-        os.getenv("USERNAME", ""),  # Username
-        "SaveSync2024"  # App salt
+        platform.node(),
+        os.getenv("USERNAME", ""),
+        "SaveSync2024",
     ]
-    
     combined = "|".join(s or "" for s in stable_sources).encode("utf-8")
     return hashlib.sha256(combined).digest()
 
@@ -159,13 +290,13 @@ def decrypt_data(encrypted_data: bytes, key: bytes) -> bytes:
     return aesgcm.decrypt(nonce, ciphertext, None)
 
 def _try_decrypt_with_multiple_keys(encrypted_data: bytes) -> tuple[bytes, str]:
-    """Try to decrypt with multiple keys for migration support."""
+    """Try primary key first; legacy flexible/weak-backup keys only for migration."""
     keys_to_try = [
         (_derive_encryption_key(), "primary"),
         (_derive_flexible_key(), "flexible"),
-        (_create_backup_key(), "backup")
+        (_create_backup_key(), "legacy_backup"),
     ]
-    
+
     last_error = None
     for key, key_type in keys_to_try:
         try:
@@ -173,11 +304,10 @@ def _try_decrypt_with_multiple_keys(encrypted_data: bytes) -> tuple[bytes, str]:
             logger.debug(f"Successfully decrypted with {key_type} key")
             return decrypted, key_type
         except (ValueError, Exception) as e:
-            # Log each attempt's failure for diagnostics
             logger.debug(f"Decryption with {key_type} key failed: {type(e).__name__}: {e}")
             last_error = e
             continue
-    
+
     raise ValueError(f"All decryption attempts failed (last error: {last_error})")
 
 
@@ -239,7 +369,10 @@ class CredentialStore:
             
             return True
         except Exception as e:
-            logger.info(f"OS keyring unavailable - using obfuscated local fallback. Error: {type(e).__name__}: {e}")
+            logger.info(
+                f"OS keyring unavailable — using local file fallback "
+                f"(salt OS-wrapped when possible). Error: {type(e).__name__}: {e}"
+            )
             logger.debug(f"Keyring failure traceback: {traceback.format_exc()}")
             return False
 
@@ -286,16 +419,16 @@ class CredentialStore:
                     data = json.loads(raw.decode("utf-8"))
                     logger.info(f"Loaded credentials from {file_type} file using {key_type} key")
 
-                    if key_type != "primary" and file_path == _FALLBACK_PATH:
+                    # Anything opened with a legacy key is rewritten under the
+                    # primary key (and the same-key backup copy) so the weak
+                    # hardcoded backup scheme is retired on disk.
+                    if key_type != "primary":
                         try:
-                            new_key = _derive_encryption_key()
-                            enc = encrypt_data(raw, new_key)
-                            enc_b64 = base64.b64encode(enc)
-                            from core import atomic_replace as _atomic_replace
-                            tmp = _FALLBACK_PATH.with_suffix(".tmp")
-                            tmp.write_bytes(enc_b64)
-                            _atomic_replace(tmp, _FALLBACK_PATH)
-                            logger.info("Re-encryption with primary key succeeded")
+                            self._write_fallback_files(raw)
+                            logger.info(
+                                f"Re-encrypted credentials with primary key "
+                                f"(was {key_type})"
+                            )
                         except Exception as e:
                             logger.warning(f"Re-encryption failed: {e}")
 
@@ -333,29 +466,28 @@ class CredentialStore:
                 logger.warning(f"Keyring save failed ({e}), using fallback")
 
         try:
-            raw = payload.encode("utf-8")
-            key = _derive_encryption_key()
-            encrypted = encrypt_data(raw, key)
-            encoded = base64.b64encode(encrypted)
-            from core import atomic_replace as _atomic_replace
-            tmp_fallback = _FALLBACK_PATH.with_suffix(".tmp")
-            tmp_fallback.write_bytes(encoded)
-            _atomic_replace(tmp_fallback, _FALLBACK_PATH)
-
-            try:
-                backup_key = _create_backup_key()
-                backup_encrypted = encrypt_data(raw, backup_key)
-                backup_encoded = base64.b64encode(backup_encrypted)
-                tmp_backup = _BACKUP_PATH.with_suffix(".tmp")
-                tmp_backup.write_bytes(backup_encoded)
-                _atomic_replace(tmp_backup, _BACKUP_PATH)
-            except Exception as e:
-                logger.debug(f"Could not create backup: {e}")
-
+            self._write_fallback_files(payload.encode("utf-8"))
             return True
         except Exception as e:
             logger.error(f"Credential save failed: {e}")
             return False
+
+    def _write_fallback_files(self, raw: bytes) -> None:
+        """Write credentials.enc + same-key redundancy copy (not a weaker key)."""
+        from core import atomic_replace as _atomic_replace
+        key = _derive_encryption_key()
+        encoded = base64.b64encode(encrypt_data(raw, key))
+        tmp_fallback = _FALLBACK_PATH.with_suffix(".tmp")
+        tmp_fallback.write_bytes(encoded)
+        _atomic_replace(tmp_fallback, _FALLBACK_PATH)
+        try:
+            # Same ciphertext material / same primary key — survives a
+            # half-written primary without opening the old weak-key shortcut.
+            tmp_backup = _BACKUP_PATH.with_suffix(".tmp")
+            tmp_backup.write_bytes(encoded)
+            _atomic_replace(tmp_backup, _BACKUP_PATH)
+        except Exception as e:
+            logger.debug(f"Could not create same-key credential backup: {e}")
 
     # ── Public API ───────────────────────────────────────────────────────────
 
