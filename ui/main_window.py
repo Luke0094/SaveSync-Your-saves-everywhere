@@ -12,7 +12,7 @@ from typing import Optional, Callable
 logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import Qt, QTimer, Slot, Signal
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtGui import QIcon, QAction, QPainter, QColor, QBrush
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QFrame, QStackedWidget,
@@ -43,15 +43,23 @@ from sync import get_orchestrator
 
 
 class NavButton(QPushButton):
+    """Sidebar entry. Optional trailing status dot for put-away background work:
+    blinking while running, solid green when done, solid red on failure."""
+
     def __init__(self, text: str, icon: str = "", parent=None):
         super().__init__(parent)
         self._icon  = icon
         self._label = text
+        self._status = ""          # "" | "running" | "done" | "failed"
+        self._blink_on = True
         self._update_text()
         self.setObjectName("nav_btn")
         self.setCheckable(False)
         self.setFixedHeight(44)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._blink = QTimer(self)
+        self._blink.setInterval(520)
+        self._blink.timeout.connect(self._on_blink)
 
     def _update_text(self):
         self.setText(f"  {self._icon}  {self._label}" if self._icon else f"  {self._label}")
@@ -64,6 +72,50 @@ class NavButton(QPushButton):
     def update_label(self, text: str):
         self._label = text
         self._update_text()
+
+    def set_status(self, status: str):
+        """Show a trailing status indicator (running / done / failed / clear)."""
+        status = (status or "").strip()
+        if status not in ("", "running", "done", "failed"):
+            status = ""
+        self._status = status
+        self.setProperty("notice", "true" if status else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if status == "running":
+            self._blink_on = True
+            if not self._blink.isActive():
+                self._blink.start()
+        else:
+            self._blink.stop()
+            self._blink_on = True
+        self.update()
+
+    def _on_blink(self):
+        self._blink_on = not self._blink_on
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._status:
+            return
+        if self._status == "running" and not self._blink_on:
+            return
+        if self._status == "running":
+            color = QColor(palette("accent"))
+        elif self._status == "done":
+            color = QColor(palette("success"))
+        else:
+            color = QColor(palette("error"))
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
+        d = 8
+        x = self.width() - 16
+        y = (self.height() - d) // 2
+        painter.drawEllipse(x, y, d, d)
+        painter.end()
 
 
 class MainWindow(CloudFlowsMixin, QMainWindow):
@@ -285,6 +337,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._search_nav_btn.clicked.connect(self._show_game_search_panel)
         self._search_nav_btn.setVisible(False)
         sl.addWidget(self._search_nav_btn)
+
+        # Same idea for Add/Edit Game: ✕ during exe/web/detect shelves the
+        # dialog. Several shelved dialogs can coexist — one NavButton each.
+        self._shelved_adds_host = QWidget()
+        self._shelved_adds_layout = QVBoxLayout(self._shelved_adds_host)
+        self._shelved_adds_layout.setContentsMargins(0, 0, 0, 0)
+        self._shelved_adds_layout.setSpacing(0)
+        self._shelved_adds_host.setVisible(False)
+        sl.addWidget(self._shelved_adds_host)
+        # [{dlg, btn}, ...] — order matches sidebar top→bottom
+        self._shelved_add_entries: list[dict] = []
 
         sl.addStretch()
 
@@ -1598,7 +1661,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         Only the page on screen is refreshed now. The others are flagged and
         catch up in _switch_page, on the way in: over 90% of the app's widgets
         belong to pages nobody is looking at, and restyling them all was the
-        larger half of what made the switch pause."""
+        larger half of what made the switch pause.
+
+        Sidebar chrome (Credits, nav polish, machine id) is ALWAYS refreshed
+        here — it used to live inside _refresh_page_styles, which never runs
+        when the theme is changed from Settings (that page is not in the
+        list below), so Credits kept the previous theme until the next tab
+        switch.
+        """
         for page in (self._overview_page, self._library_page,
                      self._sync_page, self._backups_page):
             if not callable(getattr(page, "refresh_styles", None)):
@@ -1607,6 +1677,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 page._styles_stale = True
                 continue
             self._refresh_page_styles(page)
+        # Always — independent of which stack page is visible.
+        self._refresh_sidebar_chrome()
 
     def _refresh_page_styles(self, page):
         """Run a page's style cascade and clear its stale flag."""
@@ -1616,14 +1688,34 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except Exception:
             logger.debug("Page refresh_styles failed", exc_info=True)
 
+    def _refresh_sidebar_chrome(self):
+        """Restyle sidebar pieces that use inline palette() or need a re-polish.
+
+        Called on every theme switch (and not deferred to the next tab change).
+        """
         self._update_sidebar_status()
 
-        # Sidebar chrome + overlay (never rebuilt — restyle in place).
         for btn in self._nav_buttons:
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+            btn.update()
+        for btn in (self._search_nav_btn, self._cheats_nav_btn):
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            btn.update()
+        for entry in self._shelved_add_entries:
+            btn = entry.get("btn")
+            if btn is not None:
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+                btn.update()
         self._style_credits_btn()
-        self._machine_lbl.setStyleSheet(f"color: {palette('text_hint')}; font-size: 10px; padding: 0 16px 12px;")
+        # Force Qt to drop any cached :hover painting from the previous theme.
+        self._credits_btn.style().unpolish(self._credits_btn)
+        self._credits_btn.style().polish(self._credits_btn)
+        self._credits_btn.update()
+        self._machine_lbl.setStyleSheet(
+            f"color: {palette('text_hint')}; font-size: 10px; padding: 0 16px 12px;")
         if self._overlay:
             self._overlay.refresh_styles()
 
@@ -3177,6 +3269,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         if runner.start(list(game_ids)):
             self._search_nav_btn.setVisible(True)
+            self._search_nav_btn.set_status("running")
+            self._search_nav_btn.setToolTip(t("game_search.minimize_tooltip"))
             self._show_game_search_panel()
 
     def _game_search_runner(self):
@@ -3214,17 +3308,24 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._library_page._load_library()
         except Exception:
             logger.debug("Library refresh after batch search failed", exc_info=True)
+        if self._search_nav_btn.isVisible():
+            self._search_nav_btn.set_status("failed" if _cancelled else "done")
+            self._search_nav_btn.setToolTip(
+                t("game_search.nav_tooltip_failed" if _cancelled
+                  else "game_search.nav_tooltip_done"))
 
     def _on_batch_search_dismissed(self):
         """The user closed a finished run: retire it, so the sidebar entry
         doesn't linger pointing at a search nobody is waiting on any more."""
         self._search_panel = None
         self._search_nav_btn.setVisible(False)
+        self._search_nav_btn.set_status("")
         runner = getattr(self, "_search_runner", None)
         if runner is not None and not runner.running:
             self._search_runner = None
 
     def _show_add_game(self, name: str = "", exe_path: str = ""):
+        # Never steal focus back to a different shelved card — open a new one.
         dlg = AddGameDialog(name=name, exe_path=exe_path, parent=self)
         def _on_added(entry):
             # Clean up all tracking for this exe when game is added
@@ -3234,7 +3335,131 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # Also remove from pending unknown
             self._pending_unknown.pop(entry.exe_path, None)
         dlg.game_added.connect(_on_added)
-        dlg.exec()
+        self._wire_add_game_shelve(dlg)
+        # show() — not exec()/open(): exec nests a loop; open() forces
+        # WindowModal with bookkeeping that fights shelving. WindowModal is
+        # already set on the dialog; show() keeps the parent usable after ✕.
+        dlg.show()
+
+    def _wire_add_game_shelve(self, dlg: AddGameDialog):
+        """Keep a shelved Add/Edit dialog alive and reachable from the sidebar."""
+        dlg.shelved.connect(lambda d=dlg: self._on_add_game_shelved(d))
+        dlg.background_idle.connect(lambda d=dlg: self._on_add_game_background_idle(d))
+        dlg.background_status_changed.connect(
+            lambda status, d=dlg: self._on_add_game_bg_status(d, status))
+        dlg.finished.connect(lambda _r, d=dlg: self._on_add_game_dialog_finished(d))
+
+    def _shelved_entry_for(self, dlg) -> dict | None:
+        for entry in self._shelved_add_entries:
+            if entry.get("dlg") is dlg:
+                return entry
+        return None
+
+    def _on_add_game_shelved(self, dlg):
+        entry = self._shelved_entry_for(dlg)
+        if entry is None:
+            btn = NavButton(t("add_game.shelved_nav"), "📋")
+            btn.clicked.connect(lambda _=False, d=dlg: self._resurrect_shelved_add_game(d))
+            self._shelved_adds_layout.addWidget(btn)
+            entry = {"dlg": dlg, "btn": btn}
+            self._shelved_add_entries.append(entry)
+            self._shelved_adds_host.setVisible(True)
+        try:
+            status = dlg._bg_notice_status or (
+                "running" if dlg._has_shelvable_work() else "done")
+        except RuntimeError:
+            status = "running"
+        entry["btn"].set_status(status)
+        self._sync_add_dlg_nav_tip(dlg)
+        # Next tick: clear any phantom modal still grabbing the main window.
+        QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
+
+    def _clear_phantom_add_game_modal(self, dlg=None):
+        """If a shelved (hidden) Add/Edit is still Qt's active modal widget,
+        force NonModal so the library stays clickable."""
+        targets = [dlg] if dlg is not None else [
+            e["dlg"] for e in self._shelved_add_entries]
+        for d in targets:
+            if d is None:
+                continue
+            try:
+                if d.isVisible():
+                    continue
+                modal = QApplication.activeModalWidget()
+                if modal is d or d.isModal():
+                    d.setWindowModality(Qt.WindowModality.NonModal)
+            except RuntimeError:
+                pass
+
+    def _on_add_game_background_idle(self, dlg=None):
+        self._sync_add_dlg_nav_tip(dlg)
+
+    def _on_add_game_bg_status(self, dlg, status: str):
+        entry = self._shelved_entry_for(dlg)
+        if entry is None:
+            # Still visible (not shelved yet) — ignore sidebar updates.
+            return
+        entry["btn"].set_status(status or "")
+        self._sync_add_dlg_nav_tip(dlg)
+
+    def _sync_add_dlg_nav_tip(self, dlg=None):
+        targets = (
+            [self._shelved_entry_for(dlg)] if dlg is not None
+            else list(self._shelved_add_entries)
+        )
+        for entry in targets:
+            if not entry:
+                continue
+            d, btn = entry.get("dlg"), entry.get("btn")
+            if d is None or btn is None:
+                continue
+            try:
+                btn.update_label(d.shelve_nav_label())
+                btn.setToolTip(d.shelve_nav_tooltip())
+            except RuntimeError:
+                continue
+
+    def _resurrect_shelved_add_game(self, dlg=None) -> bool:
+        """Re-show a shelved Add/Edit. If *dlg* is None, re-show the first."""
+        if dlg is None:
+            if not self._shelved_add_entries:
+                return False
+            dlg = self._shelved_add_entries[0]["dlg"]
+        try:
+            dlg.unshelve()
+            return True
+        except RuntimeError:
+            self._remove_shelved_add_entry(dlg)
+            return False
+
+    def resurrect_shelved_add_for_entry(self, entry_id: str):
+        """Re-show the shelved edit for *entry_id*, or None if none."""
+        if not entry_id:
+            return None
+        for entry in list(self._shelved_add_entries):
+            d = entry.get("dlg")
+            try:
+                ed = getattr(d, "_editing_entry", None)
+                if ed is not None and ed.id == entry_id:
+                    d.unshelve()
+                    return d
+            except RuntimeError:
+                self._remove_shelved_add_entry(d)
+        return None
+
+    def _remove_shelved_add_entry(self, dlg):
+        entry = self._shelved_entry_for(dlg)
+        if entry is None:
+            return
+        self._shelved_add_entries.remove(entry)
+        btn = entry.get("btn")
+        if btn is not None:
+            self._shelved_adds_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._shelved_adds_host.setVisible(bool(self._shelved_add_entries))
+
+    def _on_add_game_dialog_finished(self, dlg):
+        self._remove_shelved_add_entry(dlg)
 
     def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False):
         """Create a backup for a game in a background thread to avoid UI freeze.
@@ -3809,10 +4034,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 monitor.clear_seen_exe(exe_path)
 
     def _edit_game(self, game_id: str):
+        # Same game already shelved → reopen that card; otherwise a new edit.
+        if self.resurrect_shelved_add_for_entry(game_id) is not None:
+            return
         entry = get_library().get_by_id(game_id)
         if entry:
             dlg = AddGameDialog(entry=entry, parent=self)
-            dlg.exec()
+            self._wire_add_game_shelve(dlg)
+            dlg.show()
 
     def _sync_game(self, game_id: str):
         entry = get_library().get_by_id(game_id)
@@ -3860,6 +4089,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._nav_buttons[i].update_label(t(key))
         # Not in _nav_defs — it sits under Credits, not with the others.
         self._cheats_nav_btn.update_label(t('cheats.nav'))
+        self._search_nav_btn.update_label(t("game_search.nav"))
+        self._sync_add_dlg_nav_tip()
         if hasattr(self._cheats_page, 'update_locale'):
             self._cheats_page.update_locale()
         # Tray menu — rebuild with translated strings

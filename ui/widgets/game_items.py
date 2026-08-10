@@ -497,15 +497,31 @@ def _web_search_game_dialog(item: QWidget, game_id: str):
     entry = get_library().get_by_id(game_id)
     if not entry:
         return
-    # Create dialog with no parent to ensure it's shown correctly
-    dialog = AddGameDialog(entry=entry, parent=None)
+    host = item.window()
+    if host is not None and hasattr(host, "resurrect_shelved_add_for_entry"):
+        existing = host.resurrect_shelved_add_for_entry(game_id)
+        if existing is not None:
+            # Same card already shelved — reopen it; start search only if idle.
+            try:
+                if not existing._has_shelvable_work():
+                    QTimer.singleShot(200, existing._web_search)
+            except RuntimeError:
+                pass
+            return
+    dialog = AddGameDialog(entry=entry, parent=host)
+    if host is not None and hasattr(host, "_wire_add_game_shelve"):
+        host._wire_add_game_shelve(dialog)
+
+    def _refresh_after_close(_result: int = 0):
+        refreshed = get_library().get_by_id(game_id)
+        if refreshed:
+            item.refresh(refreshed)
+
+    dialog.finished.connect(_refresh_after_close)
     # Start search after dialog is shown
     QTimer.singleShot(200, dialog._web_search)
-    dialog.exec()
-    # Refresh after dialog closes (entry may have been updated)
-    refreshed = get_library().get_by_id(game_id)
-    if refreshed:
-        item.refresh(refreshed)
+    # show() — not exec()/open(): shelving must release WindowModal cleanly.
+    dialog.show()
 
 
 # ── Game Card (grid view) ─────────────────────────────────────────────────────

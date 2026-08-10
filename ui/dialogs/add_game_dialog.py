@@ -198,6 +198,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     # gen, reachable — primary-page probe finished off the GUI thread
     primary_reachability_done = Signal(int, bool)
     _placeholder_signal = Signal(str)
+    # Closed with ✕ while exe/web search still runs — keep working, reopen
+    # from the sidebar (same idea as GameSearchPanel).
+    shelved = Signal()
+    # Background work finished while the dialog was shelved (sidebar tip).
+    background_idle = Signal()
+    # Sidebar status dot: "running" | "done" | "failed"
+    background_status_changed = Signal(str)
 
     def __init__(self, name: str = "", exe_path: str = "",
                  entry: Optional[GameEntry] = None, parent=None):
@@ -205,6 +212,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._detect_worker: Optional[DetectWorker] = None
         self._detection_in_progress = False
         self._cancel_event = threading.Event()
+        self._exe_resolve_active = False
+        self._web_search_active = False
+        self._pending_search_payload = None  # (result, error) while shelved
+        self._force_close = False  # True for Accept / Cancel — never shelve those
+        self._bg_notice_status = ""  # running | done | failed
+        self._bg_work_kind = ""  # exe | search | detect — sidebar label while shelved
         self._save_paths: list[str] = []   # current path list
         # Rows the user trashed (✕) in this dialog session. Kept locally and
         # written to the ignored-paths store on Save, so Cancel discards them
@@ -1812,8 +1825,32 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._auto_detect_image(path)
 
     def _on_name_changed(self, text: str):
-        """Enable/disable web search button based on name field."""
-        self._web_search_btn.setEnabled(bool(text.strip()))
+        """Enable/disable web search button based on name field + bg mutex."""
+        self._sync_bg_action_gates()
+
+    def _sync_bg_action_gates(self):
+        """Gate Save + search / URL-fetch / detect while a bg op runs.
+
+        Form fields and manual save-path rows stay editable; Cancel stays
+        available. Save is locked so a mid-flight search cannot be committed.
+        """
+        busy = self._has_shelvable_work()
+        if hasattr(self, "_add_btn"):
+            self._add_btn.setEnabled(not busy)
+        name_ok = bool(self._name_edit.text().strip()) if hasattr(self, "_name_edit") else False
+        if hasattr(self, "_web_search_btn"):
+            self._web_search_btn.setEnabled((not busy) and name_ok)
+        if hasattr(self, "_url_fetch_btn"):
+            self._url_fetch_btn.setEnabled(not busy)
+        if hasattr(self, "_detect_btn") and not self._detection_in_progress:
+            exe = self._exe_edit.text().strip() if hasattr(self, "_exe_edit") else ""
+            name = self._name_edit.text().strip() if hasattr(self, "_name_edit") else ""
+            from core.resolvers import is_launcher_url
+            can_detect = (not busy) and bool(name or exe) and not (exe and is_launcher_url(exe))
+            self._detect_btn.setEnabled(can_detect)
+        if hasattr(self, "_extended_scan_btn"):
+            if busy or self._detection_in_progress:
+                self._extended_scan_btn.setEnabled(False)
 
     def _find_game_by_launcher(self, url: str = "", appid: str = ""):
         """Library entry already registered for this launcher URL / appid.
@@ -1885,22 +1922,33 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 self._exe_edit.setPlaceholderText("")
                 return
 
-        # Disable save button during resolution
-        self._add_btn.setEnabled(False)
-        self._detect_btn.setEnabled(False)
+        # One bg op per card — web search / detect must not race URL→exe.
+        if self._has_shelvable_work():
+            return
+
+        # Progress only — form fields and manual paths stay editable.
         self._search_progress.setVisible(True)
-        
+        self._exe_resolve_active = True
+        self._bg_work_kind = "exe"
+        self._emit_bg_status("running")
+        self._sync_bg_action_gates()
+
         def update_placeholder(text: str):
             self._placeholder_signal.emit(text)
-        
+
         def _re_enable_buttons():
-            self._add_btn.setEnabled(True)
-            self._detect_btn.setEnabled(True)
+            self._exe_resolve_active = False
             from PySide6.QtCore import QMetaObject, Qt
             QMetaObject.invokeMethod(
                 self._search_progress, "hide",
                 Qt.ConnectionType.QueuedConnection,
             )
+            QTimer.singleShot(0, self._sync_bg_action_gates)
+            if not self._web_search_active and not self._detection_in_progress:
+                try:
+                    self.background_idle.emit()
+                except RuntimeError:
+                    pass
         
         # Update placeholder immediately from main thread
         self._exe_edit.setPlaceholderText(t('add_game.exe_searching'))
@@ -1950,11 +1998,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 if not parsed:
                     logger.warning(f"Could not parse URL: {url}")
                     update_placeholder("")
+                    self._emit_bg_status("failed")
                     _re_enable_buttons()
                     return
                 
                 if self._cancel_event.is_set():
                     update_placeholder(t('add_game.exe_search_cancelled'))
+                    self._emit_bg_status("failed")
                     _re_enable_buttons()
                     return
                 
@@ -1990,16 +2040,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 
                 if self._cancel_event.is_set():
                     update_placeholder(t('add_game.exe_search_cancelled'))
+                    self._emit_bg_status("failed")
                     _re_enable_buttons()
                     return
                 
                 if time.time() - start_time >= timeout:
                     update_placeholder(t('add_game.exe_timed_out'))
+                    self._emit_bg_status("failed")
                     _re_enable_buttons()
                     return
                 
                 if exe_path:
                     update_placeholder("")
+                    self._emit_bg_status("done")
                     from PySide6.QtCore import QMetaObject, Qt, Q_ARG
                     QMetaObject.invokeMethod(
                         self._exe_edit, "setText",
@@ -2008,9 +2061,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     )
                 else:
                     update_placeholder(t('add_game.exe_not_found'))
+                    self._emit_bg_status("failed")
             except Exception as e:
                 logger.error(f"Async URL resolution failed: {e}")
                 update_placeholder(f"Error: {str(e)[:30]}")
+                self._emit_bg_status("failed")
             finally:
                 _re_enable_buttons()
         
@@ -2598,6 +2653,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _start_detect(self, general_scan: bool = False):
         if self._detection_in_progress:
             return
+        # One bg op per card — do not race URL→exe or web search.
+        if self._exe_resolve_active or self._web_search_active:
+            return
         from core.save_detector import reset_cancel
         reset_cancel()
         name = self._name_edit.text().strip()
@@ -2608,11 +2666,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if exe and is_launcher_url(exe):
             return
         self._detection_in_progress = True
-        self._add_btn.setEnabled(False)
-        self._detect_btn.setEnabled(False)
+        self._bg_work_kind = "detect"
+        self._emit_bg_status("running")
         self._detect_btn.setText(t("add_game.detecting"))
         self._detect_progress.setVisible(True)
-        self._extended_scan_btn.setEnabled(False)  # disable while scanning
+        self._sync_bg_action_gates()
 
         if self._detect_worker and self._detect_worker.isRunning():
             try:
@@ -2644,12 +2702,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
     def _on_detected(self, paths: list[str], is_live_tracking: bool = False):
         self._detection_in_progress = False
-        self._add_btn.setEnabled(True)
-        self._detect_btn.setEnabled(True)
         self._detect_btn.setText(t("add_game.detect"))
         self._detect_progress.setVisible(False)
-        # Re-enable extended scan button now that the normal scan is done
-        self._extended_scan_btn.setEnabled(True)
+        self._sync_bg_action_gates()
+        # Extended scan is offered after a finished detect, unless another
+        # bg op took over the card in the meantime.
+        if not self._has_shelvable_work():
+            self._extended_scan_btn.setEnabled(True)
 
         # Store the live tracking info for status display
         self._is_live_tracking = is_live_tracking
@@ -2682,6 +2741,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
             self._status_lbl.setText(status_msg)
             self._status_lbl.setStyleSheet(style)
+            self._emit_bg_status("done")
 
             # If we found paths via live tracking, we can be more confident
             if is_live_tracking and added > 0:
@@ -2691,9 +2751,17 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # already listed. That's a confirmation, not a failure.
             self._status_lbl.setText(t("add_game.paths_already_saved"))
             self._status_lbl.setStyleSheet(f"color:{palette('success')};font-size:12px;")
+            self._emit_bg_status("done")
         else:
             self._status_lbl.setText(t("add_game.not_detected"))
             self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+            self._emit_bg_status("failed")
+
+        if not self._exe_resolve_active and not self._web_search_active:
+            try:
+                self.background_idle.emit()
+            except RuntimeError:
+                pass
 
     def _auto_select_detected_paths(self):
         """Auto-select paths that were found via live tracking since they're 100% accurate"""
@@ -2777,8 +2845,22 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 shutil.rmtree(icon_dir, ignore_errors=True)
         self._created_icon_dirs.clear()
 
+    def accept(self):
+        """Save completed — always close for real, never shelve."""
+        self._force_close = True
+        self._cancel_event.set()
+        self._exe_resolve_active = False
+        self._web_search_active = False
+        self._pending_search_payload = None
+        super().accept()
+
     def reject(self):
-        """Override reject to cancel in-flight detection and clean up icon cache before closing."""
+        """Cancel — stop background work and discard the dialog."""
+        self._force_close = True
+        self._cancel_event.set()
+        self._exe_resolve_active = False
+        self._web_search_active = False
+        self._pending_search_payload = None
         self._cancel_detection()
         self._cleanup_session_icon_dirs()
         try:
@@ -2803,7 +2885,92 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._detect_worker.deleteLater()
             self._detect_worker = None
 
+    def _emit_bg_status(self, status: str):
+        """Update sidebar notice status (safe from worker threads via QueuedConnection)."""
+        self._bg_notice_status = status or ""
+        try:
+            self.background_status_changed.emit(self._bg_notice_status)
+        except RuntimeError:
+            pass
+        # Refresh action gates on the GUI thread (may be called from workers).
+        QTimer.singleShot(0, self._sync_bg_action_gates)
+
+    def shelve_nav_label(self) -> str:
+        """Sidebar entry text: game hint + which background job is running."""
+        editing = bool(self._editing_entry)
+        mode = "edit" if editing else "add"
+        name = ""
+        if hasattr(self, "_name_edit"):
+            name = self._name_edit.text().strip()
+        if not name and self._editing_entry:
+            name = (self._editing_entry.name or "").strip()
+        if len(name) > 18:
+            name = name[:16] + "…"
+        busy = self._has_shelvable_work() or self._bg_notice_status == "running"
+        if busy:
+            kind = self._bg_work_kind or "search"
+            op = t(f"add_game.shelved_op_{kind}")
+            return f"{name} — {op}" if name else t(f"add_game.shelved_nav_{mode}_{kind}")
+        if self._bg_notice_status == "failed":
+            op = t("add_game.shelved_op_failed")
+            return f"{name} — {op}" if name else t(f"add_game.shelved_nav_{mode}_failed")
+        op = t("add_game.shelved_op_done")
+        return f"{name} — {op}" if name else t(f"add_game.shelved_nav_{mode}_done")
+
+    def shelve_nav_tooltip(self) -> str:
+        """Sidebar tip matching the current background job."""
+        editing = bool(self._editing_entry)
+        mode = "edit" if editing else "add"
+        busy = self._has_shelvable_work() or self._bg_notice_status == "running"
+        if busy:
+            kind = self._bg_work_kind or "search"
+            return t(f"add_game.shelved_tooltip_{mode}_{kind}")
+        if self._bg_notice_status == "failed":
+            return t(f"add_game.shelved_tooltip_{mode}_failed")
+        return t(f"add_game.shelved_tooltip_{mode}_done")
+
+    def _has_shelvable_work(self) -> bool:
+        """Exe resolve, web search, or path detect still in flight — ✕ shelves."""
+        return bool(self._exe_resolve_active or self._web_search_active
+                    or self._detection_in_progress)
+
+    def _shelve(self):
+        """Hide while background work continues; sidebar brings this back.
+
+        Callers must use ``show()`` (not ``exec()``). Critical order: hide
+        *while still WindowModal* so Qt runs leaveModal; setting NonModal
+        first would skip leaveModal and leave the main window input-blocked
+        forever (common after drag-and-drop → URL resolve → ✕).
+        """
+        self.hide()
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.shelved.emit()
+
+    def unshelve(self):
+        """Re-show after a sidebar click; replay any search result stored while hidden."""
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        pending = self._pending_search_payload
+        if pending is not None:
+            self._pending_search_payload = None
+            self._on_search_finished(*pending)
+
     def closeEvent(self, event):
+        # ✕ while a search runs = put away (like the batch web-search panel).
+        # Accept / Cancel set _force_close so they always tear down for real.
+        if (not self._force_close
+                and self._has_shelvable_work()
+                and not self._cancel_event.is_set()):
+            event.ignore()
+            self._shelve()
+            return
+        self._force_close = True
+        self._cancel_event.set()
+        self._exe_resolve_active = False
+        self._web_search_active = False
+        self._pending_search_payload = None
         self._cancel_detection()
         self._cleanup_session_icon_dirs()
         try:

@@ -53,6 +53,25 @@ QMainWindow, QDialog {
     padding: 0 20px 20px 20px;
 }
 
+#credits_logo {
+    background: transparent;
+    border: none;
+}
+#credits_github_btn {
+    color: #e8e8ea;
+    background: #1a1a22;
+    border: 1px solid #1e1e24;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+#credits_github_btn:hover {
+    background: #76b900;
+    border-color: #76b900;
+    color: #000000;
+}
+
 /* ── Nav buttons ───────────────────────────────────────────────────── */
 #nav_btn {
     background: transparent;
@@ -63,6 +82,9 @@ QMainWindow, QDialog {
     padding: 10px 20px;
     border-radius: 0;
     border-left: 3px solid transparent;
+}
+#nav_btn[notice="true"] {
+    padding: 10px 28px 10px 20px;
 }
 
 #nav_btn:hover {
@@ -1307,6 +1329,25 @@ QMainWindow, QDialog {
     padding: 0 20px 20px 20px;
 }
 
+#credits_logo {
+    background: transparent;
+    border: none;
+}
+#credits_github_btn {
+    color: #1a1a2e;
+    background: #f0f0f5;
+    border: 1px solid #e0e0ea;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+#credits_github_btn:hover {
+    background: #5a9400;
+    border-color: #5a9400;
+    color: #ffffff;
+}
+
 /* ── Nav buttons ───────────────────────────────────────────────────── */
 #nav_btn {
     background: transparent;
@@ -1317,6 +1358,9 @@ QMainWindow, QDialog {
     padding: 10px 20px;
     border-radius: 0;
     border-left: 3px solid transparent;
+}
+#nav_btn[notice="true"] {
+    padding: 10px 28px 10px 20px;
 }
 
 #nav_btn:hover {

@@ -50,6 +50,11 @@ class SearchFlowMixin:
             self._status_lbl.setStyleSheet(f"color:{palette('error')};")
             return
 
+        # One bg op per card — URL→exe / detect must not race web search.
+        # Fallbacks clear ``_web_search_active`` before re-entering here.
+        if self._has_shelvable_work():
+            return
+
         exe_path = self._exe_edit.text().strip()
 
         appid = None
@@ -60,14 +65,18 @@ class SearchFlowMixin:
         self._status_lbl.setText(status_msg or t('add_game.searching'))
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
         self._search_progress.setVisible(True)
+        self._web_search_active = True
+        self._pending_search_payload = None
+        self._bg_work_kind = "search"
+        self._emit_bg_status("running")
 
         # A new search invalidates any candidate popup from the previous one
         # (nothing to do here now — CandidatePreviewDialog is transient and
         # already closed by the time a new search can be triggered).
 
-        # Disable save/search buttons during search
-        self._add_btn.setEnabled(False)
-        self._web_search_btn.setEnabled(False)
+        # Gate conflicting actions; form fields / Cancel / manual paths stay usable.
+        # Save is locked via _sync_bg_action_gates while this search runs.
+        self._sync_bg_action_gates()
 
         # Store current state to check for overwrite
         self._original_name = self._name_edit.text().strip()
@@ -199,9 +208,27 @@ class SearchFlowMixin:
     def _on_search_finished(self, result, error):
         """Handle search completion."""
         self._search_progress.setVisible(False)
-        if not self.isVisible() or self._cancel_event.is_set():
-            self._add_btn.setEnabled(True)
-            self._web_search_btn.setEnabled(bool(self._name_edit.text().strip()))
+        if self._cancel_event.is_set():
+            self._web_search_active = False
+            self._sync_bg_action_gates()
+            self._emit_bg_status("failed")
+            try:
+                self.background_idle.emit()
+            except Exception:
+                pass
+            return
+        # Shelved (✕ while searching): keep the dialog alive, stash the
+        # outcome, and let the sidebar reopen apply it — same as the batch
+        # web-search panel. Do not run modal follow-ups on a hidden window.
+        if not self.isVisible():
+            self._web_search_active = False
+            self._pending_search_payload = (result, error)
+            self._sync_bg_action_gates()
+            self._emit_bg_status("failed" if error else "done")
+            try:
+                self.background_idle.emit()
+            except Exception:
+                pass
             return
 
         # The worker emits a best-first list of candidates (may be empty);
@@ -212,10 +239,11 @@ class SearchFlowMixin:
         self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
 
         if error:
-            self._add_btn.setEnabled(True)
-            self._web_search_btn.setEnabled(True)
+            self._web_search_active = False
+            self._sync_bg_action_gates()
             self._status_lbl.setText(t('add_game.search_error', error=str(error)[:50]))
             self._status_lbl.setStyleSheet(f"color:{palette('error')};font-size:12px;")
+            self._emit_bg_status("failed")
             return
 
         _current_phase = getattr(self, '_current_search_phase', 'api')
@@ -227,8 +255,7 @@ class SearchFlowMixin:
 
         if not results:
             self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
-            self._add_btn.setEnabled(True)
-            self._web_search_btn.setEnabled(True)
+            self._sync_bg_action_gates()
             _hint_fwd = getattr(self, '_last_search_folder_hint', '')
             # When every web engine is in a rate-limit cooldown, "not found"
             # is misleading — nothing was actually searched. Tell the user
@@ -258,6 +285,9 @@ class SearchFlowMixin:
                 if _r == QMessageBox.StandardButton.Yes:
                     self._web_search(skip_primary_apis=True, enable_targeted_fallback=True,
                                      extra_folder_hint=_hint_fwd)
+                else:
+                    self._web_search_active = False
+                    self._emit_bg_status("failed")
             elif _current_phase == 'targeted':
                 self._status_lbl.setText(
                     _rate_limited or
@@ -274,7 +304,12 @@ class SearchFlowMixin:
                 if _r == QMessageBox.StandardButton.Yes:
                     self._web_search(skip_primary_apis=True, enable_generic_fallback=True,
                                      extra_folder_hint=_hint_fwd)
+                else:
+                    self._web_search_active = False
+                    self._emit_bg_status("failed")
             else:
+                self._web_search_active = False
+                self._emit_bg_status("failed")
                 self._status_lbl.setText(
                     _rate_limited or t('add_game.search_not_found')
                 )
@@ -285,6 +320,8 @@ class SearchFlowMixin:
         # arrows simply disabled for a single result) instead of silently
         # taking the first one. Drop sources already applied when they
         # carry no material news (a rewritten description alone is not news).
+        self._web_search_active = False
+        self._emit_bg_status("done")
         self._show_search_candidates(results)
 
     def _source_label(self, raw_source: str) -> str:
@@ -312,8 +349,7 @@ class SearchFlowMixin:
         thread — never on the GUI thread — and the carousel is refreshed
         when that answer arrives.
         """
-        self._add_btn.setEnabled(True)
-        self._web_search_btn.setEnabled(True)
+        self._sync_bg_action_gates()
         # Full set kept for same-tier merge peers; carousel only shows
         # candidates that would actually change something (or soft-promote
         # a dead primary). Re-offering Steam after a Steam save + VNDB
@@ -385,8 +421,7 @@ class SearchFlowMixin:
         _current_phase = getattr(self, '_current_search_phase', 'api')
         _hint_fwd = getattr(self, '_last_search_folder_hint', '')
         self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
-        self._add_btn.setEnabled(True)
-        self._web_search_btn.setEnabled(True)
+        self._sync_bg_action_gates()
         if _current_phase == 'api':
             self._status_lbl.setText(
                 t('add_game.enrichment_step_status',
@@ -432,8 +467,7 @@ class SearchFlowMixin:
         # those were being discarded together with the duplicate text.
         if not diff['has_changes']:
             self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
-            self._add_btn.setEnabled(True)
-            self._web_search_btn.setEnabled(True)
+            self._sync_bg_action_gates()
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
             return False
 
@@ -456,8 +490,7 @@ class SearchFlowMixin:
 
         self._status_lbl.setText(t('add_game.data_saved'))
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
-        self._add_btn.setEnabled(True)
-        self._web_search_btn.setEnabled(True)
+        self._sync_bg_action_gates()
 
         if offer_enrichment:
             _peers = [r for r in (getattr(self, '_last_search_candidates', None) or [])
@@ -1303,6 +1336,8 @@ class SearchFlowMixin:
         all behave as for a search result. A failed fetch stays inside the
         modal — with the failure REASON (anti-bot wall, unreachable page,
         no metadata) — so the user can correct the link and retry."""
+        if self._has_shelvable_work():
+            return
         prefill = (self._url_input.text().strip()
                    or (self._store_urls[0] if self._store_urls else ""))
         dlg = _UrlFetchDialog(self, prefill)

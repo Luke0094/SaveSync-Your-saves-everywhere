@@ -5,12 +5,12 @@ Opened from the sidebar button (above the Online/Offline status). Built
 fresh on every open, so it always picks up the CURRENT theme palette and
 language — no refresh_styles/update_locale wiring needed.
 """
-import sys
 import webbrowser
-from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtGui import (
+    QColor, QFont, QPainter, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QVBoxLayout,
@@ -28,49 +28,59 @@ _WALLETS = [
 _LOGO_PX = 72
 
 
-def _assets_dir() -> Path:
-    # Same resolution as splash / main.py (dev tree or PyInstaller _MEIPASS).
-    return Path(getattr(sys, "_MEIPASS",
-                        Path(__file__).resolve().parent.parent.parent)) / "assets"
+def _logo_pixmap(logical: int = _LOGO_PX) -> QPixmap:
+    """Credits mark: same S + border + arrows as the app icon, no dark card.
 
-
-def _logo_pixmap(size: int = _LOGO_PX) -> QPixmap:
-    """The app icon already loaded for the window/tray, or from assets.
-
-    The sidebar brand is text-only (#sidebar_logo) — the PNG/ICO under
-    assets/ is only applied at startup as QApplication.windowIcon. Prefer
-    that icon so credits shows the same art without a second path guess;
-    fall back to loading assets the same way main.py does.
+    Drawn at *physical* pixels for the current DPR so HiDPI stays sharp
+    (scaling the 256px PNG to 72 logical looked soft/pixelated on 125–200%).
+    Transparent fill so light and dark dialog backgrounds show through.
     """
+    from PySide6.QtCore import QRectF
+
     app = QApplication.instance()
-    dpr = float(app.devicePixelRatio() if app is not None else 1.0) or 1.0
-    pixel = max(1, int(round(size * dpr)))
-    target = QSize(pixel, pixel)
+    dpr = float(app.devicePixelRatio() if app is not None else 1.0)
+    size = max(1, int(round(logical * dpr)))
 
-    def _from_icon(icon: QIcon) -> QPixmap:
-        if icon is None or icon.isNull():
-            return QPixmap()
-        px = icon.pixmap(target)
-        if px.isNull():
-            return QPixmap()
-        px.setDevicePixelRatio(dpr)
-        return px
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-    if app is not None:
-        px = _from_icon(app.windowIcon())
-        if not px.isNull():
-            return px
+    margin = max(1, size // 32)
+    radius = size * 0.18
+    # Accent ring only — no filled card (that read as a second rectangle).
+    pen = QPen(QColor("#76b900"), max(1, size // 32))
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(margin, margin, size - margin * 2, size - margin * 2,
+                      radius, radius)
 
-    # main.py prefers .ico (multi-size for the taskbar); use QIcon so Qt
-    # picks the closest size — QPixmap(path) on an .ico often yields 16×16.
-    for name in ("icon.ico", "icon.png"):
-        path = _assets_dir() / name
-        if not path.is_file():
-            continue
-        px = _from_icon(QIcon(str(path)))
-        if not px.isNull():
-            return px
-    return QPixmap()
+    font = QFont("Segoe UI", int(size * 0.52), QFont.Weight.Bold)
+    p.setFont(font)
+    p.setPen(QColor("#76b900"))
+    p.drawText(QRectF(0, -size * 0.02, size, size),
+               int(Qt.AlignmentFlag.AlignCenter), "S")
+
+    if size >= 48:
+        # Mid gray reads on both light and dark dialog backgrounds
+        # (the app-icon silver was for the dark card fill).
+        arrow_pen = QPen(QColor(palette("text_secondary")), max(1, size // 40))
+        arrow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(arrow_pen)
+        cx, cy = size * 0.5, size * 0.78
+        span = size * 0.18
+        p.drawLine(int(cx - span), int(cy), int(cx + span), int(cy))
+        p.drawLine(int(cx + span), int(cy),
+                   int(cx + span - size * 0.06), int(cy - size * 0.05))
+        cy2 = cy + size * 0.08
+        p.drawLine(int(cx + span), int(cy2), int(cx - span), int(cy2))
+        p.drawLine(int(cx - span), int(cy2),
+                   int(cx - span + size * 0.06), int(cy2 - size * 0.05))
+
+    p.end()
+    pm.setDevicePixelRatio(dpr)
+    return pm
 
 
 class _CopyOnClickField(QLineEdit):
@@ -148,9 +158,10 @@ class CreditsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("credits.title"))
-        self.setFixedSize(440, 460)
+        self.setFixedSize(440, 480)
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setStyleSheet(f"QDialog{{background:{palette('bg')};}}")
         self._build_ui()
 
     def _build_ui(self):
@@ -159,18 +170,21 @@ class CreditsDialog(QDialog):
         root.setContentsMargins(28, 24, 28, 20)
 
         # ── Brand + running version ───────────────────────────────────────────
-        # Logo = window icon from assets (set in main.py), not the sidebar
-        # text label. Fixed box so the layout cannot collapse an empty-looking
-        # pixmap row under the global QLabel stylesheet.
+        # Logo from assets/icon.png. Slightly larger label than the pixmap so
+        # antialiased edges are not clipped; no fill — a filled QLabel read as
+        # a rectangle behind the icon in the light theme.
         logo_px = _logo_pixmap()
         logo = QLabel()
         logo.setObjectName("credits_logo")
-        logo.setFixedSize(_LOGO_PX, _LOGO_PX)
+        logo.setFixedSize(_LOGO_PX + 4, _LOGO_PX + 4)
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setStyleSheet("background: transparent; border: none;")
+        logo.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        logo.setStyleSheet(
+            "QLabel#credits_logo{background:transparent;border:none;padding:0;}")
         if not logo_px.isNull():
             logo.setPixmap(logo_px)
         logo_row = QHBoxLayout()
+        logo_row.setContentsMargins(0, 0, 0, 0)
         logo_row.addStretch()
         logo_row.addWidget(logo)
         logo_row.addStretch()
@@ -215,25 +229,13 @@ class CreditsDialog(QDialog):
         dev_row.addWidget(name_lbl)
 
         github_btn = QPushButton("GitHub")
+        github_btn.setObjectName("credits_github_btn")
         github_btn.setFixedWidth(100)
         github_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         github_btn.setToolTip(t("credits.github_tooltip"))
-        # At rest: the ordinary border. It used to be border_hover, which in
-        # the light theme IS the accent — so the button sat there looking
-        # permanently hovered, and hovering it changed nothing.
-        #
-        # On hover: fill with the accent and put BLACK on it, the same as
-        # every primary button in the app. Turning the text accent-coloured
-        # instead left it green on near-white, which reads at 3.3:1 — under
-        # what small bold text needs. Black on either green is 8.7:1 and
-        # 5.7:1, and it is the one colour that works on both.
-        github_btn.setStyleSheet(
-            f"QPushButton{{color:{palette('text')};background:{palette('bg_elevated')};"
-            f"border:1px solid {palette('border')};border-radius:4px;"
-            f"padding:4px 10px;font-size:11px;font-weight:600;}}"
-            f"QPushButton:hover{{background:{palette('accent')};"
-            f"border-color:{palette('accent')};color:#000000;}}"
-        )
+        # Colours live in the theme (#credits_github_btn) so light/dark hover
+        # both resolve correctly — an inline sheet baked at open time could
+        # keep the dark-theme hover after a theme switch.
         github_btn.clicked.connect(lambda: webbrowser.open(GITHUB_URL))
         dev_row.addWidget(github_btn)
         dev_row.addStretch()

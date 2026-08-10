@@ -131,20 +131,49 @@ _VER_NUM_RE = re.compile(
 )
 
 
+def _title_tokens(text: str) -> set[str]:
+    """Words that identify the game title — not packaging, codes, or version.
+
+    Version/build markers (``v0.93.1``, ``build 12``…), trailing platform/
+    lang/edition noise (``Win``, ``PC``, ``ENG``…), and DLsite product codes
+    are useful as *search hints* (tier-2 keeps title+version for site:
+    queries) but must never be required of a store page title. Bare sequel
+    numbers stay (``Example 3`` ≠ ``Example 2``).
+    """
+    from core.constants import strip_version_tokens
+    cleaned = strip_version_tokens(text).replace("'", "").replace("’", "")
+    cleaned = _strip_release_noise(cleaned, drop_version=True) or cleaned
+    out: set[str] = set()
+    for w in _fuzzy_words(cleaned):
+        if w in _RELEASE_NOISE:
+            continue
+        if _is_product_code(w) or re.match(r'^(?:rj|re|vj)\d{4,10}$', w):
+            continue
+        # Version-shaped leftovers (``v0931`` if a marker slipped through).
+        if re.match(r'^(?:v|ver|version|b|build)\d', w):
+            continue
+        out.add(w)
+    return out
+
+
+def _title_slug(text: str) -> str:
+    """Slug of the title only — version / packaging noise stripped first."""
+    from core.constants import strip_version_tokens
+    cleaned = strip_version_tokens(text)
+    cleaned = _strip_release_noise(cleaned, drop_version=True) or cleaned
+    return _fuzzy_slug(cleaned)
+
+
 def _fuzzy_score(query: str, target: str) -> float:
     """Calculate fuzzy match score between query and target.
 
     Mandatory-word rule:
-      EVERY query word must appear in the target — no stop-word list and no
-      length threshold, so even 1-char words count. A candidate that drops a
-      leading article, preposition or single letter is a DIFFERENT title and
-      is rejected ("The Example" ≠ "Example", "X Example" ≠ "Example"). Both
-      sides are first version-stripped (a "v0.4.8" / "build 2" marker is not a
-      word) and apostrophe-normalised (a possessive "Name's" → the single word
-      "names", never a stray "s"). A bare sequel number is mandatory too
-      ("Example 3" ≠ "Example 2"), and a Roman sequel numeral is canonicalised
-      to Arabic, so "Example VII" matches "Example 7" (single letters I/V/X are
-      left alone, being real words more often than 1/5/10).
+      EVERY *title* word of the query must appear in the target. Packaging
+      noise (``Win``/``PC``/``ENG``…), product codes (``RJ…``), and software
+      versions (``v0.93.1``) are NOT mandatory — they are search hints only.
+      A leading article or single letter that is part of the title still
+      counts ("The Example" ≠ "Example"). Bare sequel numbers stay mandatory
+      ("Example 3" ≠ "Example 2"); Roman numerals are canonicalised to Arabic.
 
     Missing mandatory words halve the score per absent word, floored at 5,
     always landing below MIN_ACCEPT (45).
@@ -154,8 +183,8 @@ def _fuzzy_score(query: str, target: str) -> float:
     # Canonicalise Roman sequel numerals to Arabic so "…VII" and "…7" match.
     query = _normalize_numerals(query)
     target = _normalize_numerals(target)
-    query_slug = _fuzzy_slug(query)
-    target_slug = _fuzzy_slug(target)
+    query_slug = _title_slug(query)
+    target_slug = _title_slug(target)
 
     if not query_slug or not target_slug:
         return 0.0
@@ -178,26 +207,12 @@ def _fuzzy_score(query: str, target: str) -> float:
     if not (_has_latin(query_slug) and _has_latin(target_slug)):
         return 0.0
 
-    query_words = _fuzzy_words(query)
-    target_words = _fuzzy_words(target)
+    # Title words only — version / Win / RJ… excluded from both the
+    # mandatory gate and the Jaccard score.
+    query_words = _title_tokens(query)
+    target_words = _title_tokens(target)
 
-    # ── Mandatory-word gate ──────────────────────────────────────────────
-    # EVERY word must appear in the target — no stop-word list, no length
-    # threshold, so 1-char words count too (a leading article or single letter
-    # a candidate drops makes it a different title). Two normalisations,
-    # applied to BOTH sides so they compare on equal footing: version/build
-    # markers are stripped (a folder's "v0.4.8" must not force the store title
-    # to carry it), and apostrophes are removed so a possessive does not split
-    # into a stray "s" ("Name's" → one word "names"). Bare sequel numbers /
-    # Roman numerals are ordinary words and so stay mandatory ("Example 3" ≠
-    # "Example 2").
-    from core.constants import strip_version_tokens
-
-    def _mandatory_tokens(text: str) -> set[str]:
-        cleaned = strip_version_tokens(text).replace("'", "").replace("’", "")
-        return _fuzzy_words(cleaned)
-
-    missing = _mandatory_tokens(query) - _mandatory_tokens(target)
+    missing = query_words - target_words
     if missing:
         penalty = 0.5 ** len(missing)
         return max(5.0, 40.0 * penalty)
@@ -896,6 +911,11 @@ def _clean_game_name(game_name: str) -> str:
     _tw = _TWO_WORD_TRAILING.sub("", cleaned).strip(" ._-")
     if _tw:
         cleaned = _tw
+    # Align with folder display names and targeted-site queries: peel a
+    # trailing platform/lang/edition run ("… - Win", "… PC", "… ENG") that
+    # is never part of the store title. Version tokens are already gone
+    # above; only the trailing noise run is removed (see _strip_release_noise).
+    cleaned = _strip_release_noise(cleaned, drop_version=False) or cleaned
     # Never strip a name down to nothing: a game genuinely called by one of
     # these words keeps it, since having the wrong name is still better than
     # having none to search with.

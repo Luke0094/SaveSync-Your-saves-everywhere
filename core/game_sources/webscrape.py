@@ -2147,13 +2147,9 @@ def _search_targeted_sites(primary: str,
     _search_hints = [h for h in all_hints if h.lower() not in _GENERIC_EXE_STEMS] or all_hints[:1]
     _scoring_hints = [h for h in all_hints if h.lower() not in _GENERIC_EXE_STEMS] or all_hints[:1]
     # SCORING ONLY (never queries): add release-noise-stripped variants so a
-    # base-name candidate ("Dilmur") isn't penalised against a hint carrying
-    # platform noise ("Dilmur - Win") — _clean_game_name drops version but NOT
-    # "Win"/"PC"/"ENG"…, so the trailing "Win" counts as a missing mandatory
-    # word and sinks the score. _search_hints is derived above from the raw
-    # hints, so the live query set is unchanged — important, since extra
-    # queries would only worsen engine rate-limiting. Applied to all_hints
-    # (itch/DLsite _collect scoring) and _scoring_hints (Wikipedia scoring).
+    # base-name candidate isn't penalised against a hint that still carries
+    # leftover separators. Trailing platform noise is already peeled by
+    # _clean_game_name; this keeps scoring robust for raw secondary hints.
     for _hset in (all_hints, _scoring_hints):
         for _h in list(_hset):
             _stripped = _strip_release_noise(_h, drop_version=True)
@@ -2170,6 +2166,18 @@ def _search_targeted_sites(primary: str,
         for _v in ([_sp, _h] if _sp != _h else [_h]):
             if _v not in _q_hints:
                 _q_hints.append(_v)
+    # Prefer release-noise-stripped forms for non-itch keyword queries
+    # (DLSite / Moby / Wiki). itch strips per-query below; without this,
+    # "_q_hints[0]" stayed "Hail Dicktator - Win" and site: searches missed.
+    _pref: list[str] = []
+    for _h in list(_q_hints):
+        _bare_h = _strip_release_noise(_h, drop_version=True)
+        if _bare_h and _bare_h not in _pref:
+            _pref.append(_bare_h)
+    for _h in _q_hints:
+        if _h not in _pref:
+            _pref.append(_h)
+    _q_hints = _pref or _q_hints
     # Self-published stores often keep the version in the page title
     # ("My Game v0.4.8"). From the raw folder keep only title + version
     # via _title_keep_version — not pc/publisher/RJ. Tier 3 stays verbatim.
@@ -2231,8 +2239,10 @@ def _search_targeted_sites(primary: str,
         _itch_hints = [primary]  # always have at least the primary name
     if 'itch' not in _skip:
         try:
-            # site: itch: bare title + title-with-version only
-            # ("My Game" / "My Game v0.3.6.2"). Not the full folder.
+            # site: itch: ALWAYS try bare title AND title-with-version
+            # ("HailDicktator" / "HailDicktator v0.93.1"). Packaging noise
+            # (Win/PC/…) is stripped first; the raw folder's version is kept
+            # via _title_keep_version on raw hints above.
             _itch_seen: set[str] = set()
             for hint in _itch_hints:
                 _ver = _title_keep_version(hint)
@@ -2464,6 +2474,16 @@ def _web_search_urls_single(query: str,
     # variants. Generic-web indexing rewards the full folder/title; cleaning
     # is a tier-2 site: exception only (itch/DLsite/…).
     _scoring_hints = [h for h in hints if h.lower() not in _GENERIC_EXE_STEMS] or hints[:1]
+    # Scoring only: add bare-title variants so a folder like
+    # "HailDicktator v0.93.1 - Win" does not force mandatory "win" against a
+    # clean store title (score ~20 < MIN 30 → false "not found").
+    for _h in list(_scoring_hints):
+        _stripped = _strip_release_noise(_h, drop_version=True)
+        if _stripped and _stripped not in _scoring_hints:
+            _scoring_hints.append(_stripped)
+        _spaced = re.sub(CAMEL_SPLIT_RE, ' ', _stripped or _h).strip()
+        if _spaced and _spaced not in _scoring_hints:
+            _scoring_hints.append(_spaced)
     # Early-exit: if every hint is a generic stem, nothing useful to search for.
     if not any(h.lower() not in _GENERIC_EXE_STEMS for h in hints):
         logger.debug(
@@ -2510,13 +2530,17 @@ def _web_search_urls_single(query: str,
     for hint in query_hints:
         if stop or len(candidates) >= MAX_GENERIC_RESULTS:
             break
-        # Verbatim only — engines index the specific string (version, "pc",
-        # …). Do NOT strip/clean here; tier-2 site: queries are the place
-        # that tries bare + versioned forms. Early-stop only on a strong
-        # TITLE score — a version match in a random URL must not freeze the
-        # search on a weak page.
+        # Verbatim forms keep recall for versioned indexes; also query the
+        # bare title so "… v0.93.1 - Win" still finds "Hail Dicktator".
         _hv = _hint_version(hint)
         _forms = [hint, f'"{hint}"']
+        _bare_q = _strip_release_noise(hint, drop_version=True)
+        if _bare_q and _bare_q.casefold() != hint.casefold():
+            _forms.extend([_bare_q, f'"{_bare_q}"'])
+        _spaced_q = re.sub(CAMEL_SPLIT_RE, ' ', _bare_q or hint).strip()
+        if (_spaced_q and _spaced_q.casefold() != hint.casefold()
+                and _spaced_q.casefold() != (_bare_q or "").casefold()):
+            _forms.extend([_spaced_q, f'"{_spaced_q}"'])
         # _target counts VALID candidates per query — results dropped AFTER
         # their fetch (failed scrape, film/TV page) don't consume it. The URL
         # pool is fetched 2× deeper so each dropped result is replaced by the

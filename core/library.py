@@ -677,6 +677,29 @@ class LibraryManager(QObject):
             n += 1
         return f"{base}_{n}"
 
+    def unique_display_name(self, base: str, exclude_id: str = "", also_taken=None) -> str:
+        """Return *base*, or ``base_2`` / ``base_3`` / … when another library
+        entry already uses that display title (case-insensitive).
+
+        Same suffix scheme as ``unique_folder_name`` / keep-both: two distinct
+        games whose cleaned titles collide stay visually distinct in the list.
+        An already-free *base* is returned unchanged."""
+        if not base:
+            return base
+        taken = {
+            (g.name or "").casefold()
+            for gid, g in self._games.items()
+            if gid != exclude_id and (g.name or "").strip()
+        }
+        if also_taken:
+            taken = taken | {s.casefold() for s in also_taken if s}
+        if base.casefold() not in taken:
+            return base
+        n = 2
+        while f"{base}_{n}".casefold() in taken:
+            n += 1
+        return f"{base}_{n}"
+
     def folder_name_in_use_by_other(self, folder_name: str, exclude_id: str = "") -> bool:
         """True when a live entry OTHER than *exclude_id* currently resolves to
         *folder_name* (case-insensitive).

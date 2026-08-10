@@ -94,6 +94,7 @@ class DetectWorker(QThread):
                     logger.debug(f"General scan failed for {self._game_name}: {e}")
             
             if self._should_stop:
+                self.found.emit([], False)
                 return
             
             method = "live tracking" if is_live else ("general scan" if self._general_scan else "filesystem scan")

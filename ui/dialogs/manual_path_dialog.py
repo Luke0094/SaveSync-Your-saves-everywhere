@@ -498,8 +498,10 @@ class ManualPathDialog(QDialog):
         """Write the folders into the library.
 
         Display titles are the cleaned form (versions/noise stripped). The
-        full release folder name is kept as a name_hint so two games that
-        clean to the same title stay distinguishable.
+        full release folder name is kept as a name_hint. When two genuinely
+        different games still clean to the same title (match declined), the
+        new entry's display name gets a ``_2`` / ``_3`` suffix — same scheme
+        as keep-both / ``unique_folder_name``.
 
         Skip when:
           - that exact save path is already registered, or
@@ -555,8 +557,12 @@ class ManualPathDialog(QDialog):
                 updated += 1
                 continue
 
+            base_title = cleaned or item.name
+            # Distinct games that cleaned to the same title (find_manual_game_match
+            # returned None) need a visible suffix, not only a name_hint.
+            display = lib.unique_display_name(base_title)
             entry = GameEntry(
-                name=cleaned or item.name,
+                name=display,
                 exe_path="",
                 save_paths=[item.path],
                 save_paths_confirmed=True,
@@ -564,14 +570,13 @@ class ManualPathDialog(QDialog):
                 auto_added=False,
                 machine_id=get_machine_id(),
                 computed_folder_name=get_folder_name_for_save(
-                    cleaned or item.name, "", ""),
+                    base_title, "", ""),
                 save_chain=chain,
             )
             entry.record_name(entry.name)
             entry.record_path_chain(item.path, chain)
             # Full folder name (with version/RJ/…) for recognition — not the
-            # cleaned display title. Homonyms that strip to the same clean
-            # name stay distinct via these hints.
+            # cleaned display title.
             entry.record_name_hint(raw)
             entry.computed_folder_name = lib.unique_folder_name(
                 entry.computed_folder_name, entry.id)
