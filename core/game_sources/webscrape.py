@@ -2168,7 +2168,7 @@ def _search_targeted_sites(primary: str,
                 _q_hints.append(_v)
     # Prefer release-noise-stripped forms for non-itch keyword queries
     # (DLSite / Moby / Wiki). itch strips per-query below; without this,
-    # "_q_hints[0]" stayed "Hail Dicktator - Win" and site: searches missed.
+    # "_q_hints[0]" could stay "My Game - Win" and site: searches missed.
     _pref: list[str] = []
     for _h in list(_q_hints):
         _bare_h = _strip_release_noise(_h, drop_version=True)
@@ -2240,7 +2240,7 @@ def _search_targeted_sites(primary: str,
     if 'itch' not in _skip:
         try:
             # site: itch: ALWAYS try bare title AND title-with-version
-            # ("HailDicktator" / "HailDicktator v0.93.1"). Packaging noise
+            # ("My Game" / "My Game v0.3.6.2"). Packaging noise
             # (Win/PC/…) is stripped first; the raw folder's version is kept
             # via _title_keep_version on raw hints above.
             _itch_seen: set[str] = set()
@@ -2475,7 +2475,7 @@ def _web_search_urls_single(query: str,
     # is a tier-2 site: exception only (itch/DLsite/…).
     _scoring_hints = [h for h in hints if h.lower() not in _GENERIC_EXE_STEMS] or hints[:1]
     # Scoring only: add bare-title variants so a folder like
-    # "HailDicktator v0.93.1 - Win" does not force mandatory "win" against a
+    # "My Game v0.9 - Win" does not force mandatory "win" against a
     # clean store title (score ~20 < MIN 30 → false "not found").
     for _h in list(_scoring_hints):
         _stripped = _strip_release_noise(_h, drop_version=True)
@@ -2531,7 +2531,7 @@ def _web_search_urls_single(query: str,
         if stop or len(candidates) >= MAX_GENERIC_RESULTS:
             break
         # Verbatim forms keep recall for versioned indexes; also query the
-        # bare title so "… v0.93.1 - Win" still finds "Hail Dicktator".
+        # bare title so "… v0.9 - Win" still finds the clean store title.
         _hv = _hint_version(hint)
         _forms = [hint, f'"{hint}"']
         _bare_q = _strip_release_noise(hint, drop_version=True)

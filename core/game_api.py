@@ -421,8 +421,8 @@ def search_game_info_multi(game_name: str, appid: Optional[str] = None,
                 logger.info("Falling back to targeted site search.")
                 # Pass the RAW primary (version/platform still intact) so
                 # tier-2 can build both bare and title+version itch queries.
-                # Passing primary_clean here used to drop "v0.93.1" before
-                # _title_keep_version could see it.
+                # Passing primary_clean here used to drop the version token
+                # before _title_keep_version could see it.
                 targeted = _search_targeted_sites(primary, secondary,
                                                    skip_sources=skip_targeted_sources,
                                                    return_all=True)
