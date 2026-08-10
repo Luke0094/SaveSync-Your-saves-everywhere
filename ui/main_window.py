@@ -5,6 +5,7 @@ NVIDIA App-inspired sidebar with Overview, Library, Sync, Backups, Settings.
 import logging
 import platform
 import sys
+import threading
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -198,6 +199,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # hotkey re-summons it for as long as it sits here. Only the
         # acknowledge button and an actual restore take it out.
         self._pending_regression: dict[str, tuple[str, bool]] = {}
+        # In-flight regression check + rearm (same pattern as watcher.py):
+        # a second call for the same game does not start a parallel scan, but
+        # is replayed when the current one finishes — so a genuine new session
+        # still gets its _regression_warned / _pending_regression reset.
+        self._regression_check_lock = threading.Lock()
+        self._regression_checking: set[str] = set()
+        self._regression_rearm: dict[str, bool] = {}
         self._setup_backup_verify()
         self._setup_auto_export_config()
         # A previous run may have died between suspending a game for a forced
@@ -1557,6 +1565,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         a launcher's own cloud sync gets a chance to overwrite what is on
         disk. Never on a timer: the check is per-game and event-driven on
         purpose, so a hundred games in the library cost nothing.
+
+        Concurrent calls for the same game (e.g. false-positive exit then
+        auto re-launch while the first scan is still on disk) coalesce: one
+        worker runs, later intents are rearmed and replayed on the GUI thread
+        when it finishes — same idiom as watcher.py / backups_page download.
         """
         entry = get_library().get_by_id(game_id)
         if entry is None or not entry.save_paths:
@@ -1566,7 +1579,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._pending_regression.pop(game_id, None)
         if game_id in self._regression_warned:
             return
-        import threading
+
+        with self._regression_check_lock:
+            if game_id in self._regression_checking:
+                # Keep the latest after_restore intent; do not drop a genuine
+                # new-session reset that arrived while a prior scan was flying.
+                self._regression_rearm[game_id] = after_restore
+                return
+            self._regression_checking.add(game_id)
+
         from core.backup import get_backup_manager
 
         def _run():
@@ -1575,13 +1596,23 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 expected = self._last_restored.get(game_id, "")
                 older = mgr.detect_regression(game_id, list(entry.save_paths),
                                               expected_backup_id=expected)
-                if older is None:
-                    return
-                backups = mgr.get_backups_for_game(game_id)
-                newest = backups[0].backup_id if backups else ""
-                self.save_regression_found.emit(game_id, newest, after_restore)
+                if older is not None:
+                    backups = mgr.get_backups_for_game(game_id)
+                    newest = backups[0].backup_id if backups else ""
+                    self.save_regression_found.emit(game_id, newest, after_restore)
             except Exception as e:
                 logger.debug(f"Save regression check failed for {game_id}: {e}")
+            finally:
+                with self._regression_check_lock:
+                    self._regression_checking.discard(game_id)
+                    rearm = self._regression_rearm.pop(game_id, None)
+                if rearm is not None:
+                    # Marshal back to the GUI thread (same as
+                    # backups_page._download_then_restore).
+                    QTimer.singleShot(
+                        0,
+                        lambda gid=game_id, ar=rearm:
+                            self._check_save_regression(gid, ar))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2364,6 +2395,38 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 )
 
     def _on_game_exited(self, entry: GameEntry):
+        # Guard FIRST: the monitor can emit false positives when a poll briefly
+        # misses the process. Teardown (watcher, in-game backup timer, live
+        # tracking, pins) must not run until we confirm the process is gone —
+        # otherwise a blip leaves those down for poll_interval + ~6s until
+        # game_launched re-arms them, with pinned notes flickering off/on.
+        if entry.exe_path:
+            exe_name = Path(entry.exe_path).name
+            still_running = False
+            try:
+                import psutil
+                for proc in psutil.process_iter(('pid', 'name', 'exe')):
+                    try:
+                        pinfo = proc.info
+                        if pinfo.get('exe'):
+                            if Path(pinfo['exe']).resolve() == Path(entry.exe_path).resolve():
+                                still_running = True
+                                break
+                        elif pinfo.get('name', '').lower() == exe_name.lower():
+                            if proc.is_running():
+                                still_running = True
+                                break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception:
+                pass  # fallback: treat as genuine exit
+            if still_running:
+                logger.debug(
+                    f"_on_game_exited: {entry.name!r} process still running — "
+                    "ignoring false-positive exit (no teardown)"
+                )
+                return
+
         self._update_sidebar_status()
         self._stop_ingame_backup_timer(entry.id)
         # Stop watching save paths for this game — no need to watch when not running
@@ -2392,36 +2455,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Re-fetch entry from library to get current save_paths (may have been updated during gameplay)
         entry = get_library().get_by_id(entry.id) or entry
-
-        # Guard: verify the game process is actually gone. The monitor can emit
-        # false positives if its poll cycle briefly misses the process. If the
-        # PID or any matching process is still alive, skip the exit dialog.
-        if entry.exe_path:
-            exe_name = Path(entry.exe_path).name
-            still_running = False
-            try:
-                import psutil
-                for proc in psutil.process_iter(('pid', 'name', 'exe')):
-                    try:
-                        pinfo = proc.info
-                        if pinfo.get('exe'):
-                            if Path(pinfo['exe']).resolve() == Path(entry.exe_path).resolve():
-                                still_running = True
-                                break
-                        elif pinfo.get('name', '').lower() == exe_name.lower():
-                            if proc.is_running():
-                                still_running = True
-                                break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-            except Exception:
-                pass  # fallback: let the dialog show
-            if still_running:
-                logger.debug(
-                    f"_on_game_exited: {entry.name!r} process still running — "
-                    "skipping exit dialog (false positive from monitor)"
-                )
-                return
 
         # Genuine exit — bring the window back from the tray (unless another
         # game is still playing).

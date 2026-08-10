@@ -3,11 +3,12 @@ SaveSync - Web-search / enrichment flow for the Add-Edit Game dialog.
 
 SearchFlowMixin hosts the whole search machine extracted verbatim from
 AddGameDialog: tiered web search + result handling, the candidate carousel
-hand-off, the authoritative-candidate apply (init/overwrite/enrich), the
-same-tier fill-only enrichment offer with its chip merge model, source-tier
-bookkeeping, and direct fetch-from-URL. AddGameDialog provides the widgets
-and state the methods use (self._name_input, self._search_btn,
-self._last_search_candidates, ...); the mixin MUST come first in the MRO.
+hand-off, the authoritative-candidate apply (init / enrich / soft-promote),
+the same-tier fill-only enrichment offer with its chip merge model, source
+bookkeeping (applied sources + primary reachability), and direct
+fetch-from-URL. AddGameDialog provides the widgets and state the methods
+use (self._name_input, self._search_btn, self._last_search_candidates, ...);
+the mixin MUST come first in the MRO.
 """
 import logging
 import threading
@@ -282,7 +283,9 @@ class SearchFlowMixin:
         # One distinct title or several: always review through the same
         # candidate-preview popup (‹ › browse when there's more than one,
         # arrows simply disabled for a single result) instead of silently
-        # taking the first one.
+        # taking the first one. Drop sources already applied when they
+        # carry no material news (a rewritten description alone is not news).
+        self._invalidate_primary_reachability()
         self._show_search_candidates(results)
 
     def _source_label(self, raw_source: str) -> str:
@@ -308,18 +311,27 @@ class SearchFlowMixin:
         """
         self._add_btn.setEnabled(True)
         self._web_search_btn.setEnabled(True)
-        n = len(results)
+        # Full set kept for same-tier merge peers; carousel only shows
+        # candidates that would actually change something (or soft-promote
+        # a dead primary). Re-offering Steam after a Steam save + VNDB
+        # enrich with nothing new is exactly what this filters out.
+        self._last_search_candidates = list(results)
+        useful = [r for r in results
+                  if self._compute_candidate_diff(r).get('has_changes')]
+        if not useful:
+            self._status_lbl.setText(t('add_game.candidate_no_changes'))
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('text_secondary')};font-size:12px;")
+            return
+        n = len(useful)
         self._status_lbl.setText(
             t('add_game.candidates_found', n=n) if n > 1
             else t('add_game.candidate_found_single')
         )
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
-        # Remember this result set: confirming one candidate offers the OTHER
-        # candidates of the SAME set as enrichment pieces (same-tier merge).
-        self._last_search_candidates = list(results)
         while True:
             dlg = CandidatePreviewDialog(
-                results, self._compute_candidate_diff, self,
+                useful, self._compute_candidate_diff, self,
                 extra_note=t('add_game.enrich_note') if n > 1 else '',
             )
             if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected is None:
@@ -395,13 +407,21 @@ class SearchFlowMixin:
             return False
 
         # ── Apply — the user already confirmed this exact candidate ───────
+        # Destructive overwrite is no longer driven by "description looks
+        # different" or a higher tier alone. A dead primary may be replaced
+        # as the marker, but filled fields stay (enrich path).
         if not diff['has_existing']:
             self._apply_result_init(result)
-        elif diff['is_overwrite']:
-            self._apply_result_overwrite(result)
         else:
             self._apply_result_enrich(result, diff['new_tags'])
-        self._store_result_fingerprint(_raw_source, result, diff['result_year'])
+        self._store_result_fingerprint(
+            _raw_source, result, diff['result_year'],
+            as_primary=bool(
+                not diff['has_existing']
+                or diff.get('promote_primary')
+                or diff.get('same_origin')
+            ),
+        )
 
         self._status_lbl.setText(t('add_game.data_saved'))
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
@@ -446,22 +466,25 @@ class SearchFlowMixin:
 
         Returns a dict with:
           has_existing        — form already has saved data
-          is_overwrite         — Case C/D (higher tier, or same tier with
-                                  >40% content difference) vs Case E (enrich)
-          same_origin_no_diff  — same source as saved data, content barely
-                                  differs: nothing worth showing at all
-          has_enrich           — Case E actually has something new to add
-          has_changes           — applying this candidate would change ANYTHING
+          is_overwrite         — always False for search apply now (kept for
+                                  preview callers); filled fields are never
+                                  replaced just because text differs
+          promote_primary      — current primary page is unreachable; confirming
+                                  may adopt this source as the new primary
+                                  marker without wiping saved fields
+          same_origin          — candidate source matches the saved primary
+          same_origin_no_diff  — source already applied and no material news
+                                  (carousel filters these out)
+          has_enrich           — something additive to fill/union
+          has_changes           — worth showing / applying (material news or
+                                  soft primary promote)
           result_year           — extracted 4-digit year, if any
-          fields                — {field: {'old': str|None, 'new': str}} for
-                                   name/description/developer/year — 'old' is
-                                   None when the field is simply being FILLED
-                                   IN (nothing to strike through), and present
-                                   when it's being REPLACED with materially
-                                   different content
+          fields                — {field: {'old': str|None, 'new': str}} —
+                                   only EMPTY→fill (or rename); never a
+                                   description replacement driven by rewrite
           new_tags / new_urls   — additive (tags/URLs are always a union,
                                   never cleared)
-          new_image             — whether a new/updated cover would be set
+          new_image             — whether a cover would be set (only if none)
           new_reviews           — the source's own verdict, when it isn't
                                   already on the form (one per source)
         """
@@ -482,89 +505,72 @@ class SearchFlowMixin:
         raw_source  = getattr(result, 'source', '') or ''
         result_year = self._extract_result_year(result)
 
-        # ── Tier ranking vs the source already saved ───────────────────
         _fp = getattr(self, '_enrichment_source_fingerprint', {}) or {}
         _existing_src  = _fp.get('source', '') or ''
-        _existing_tier = self._get_source_tier(_existing_src) if _existing_src else 'generic'
-        _result_tier   = self._get_source_tier(raw_source)
-        _rank = {'api': 3, 'trusted': 2, 'generic': 1}
-        _is_better = _rank.get(_result_tier, 1) > _rank.get(_existing_tier, 1)
-
-        # ── Content similarity: NEW result vs CURRENT saved content ────
-        _cur_content = (current_desc + ' ' + current_dev + ' ' + current_year).strip()
-        _new_content = (
-            (result.description or '') + ' ' +
-            (getattr(result, 'developer', '') or '') + ' ' +
-            (result_year or '')
-        ).strip()
-        # Both sides empty → nothing changed (1.0); exactly one side empty
-        # → maximal difference (0.0) — otherwise a same-source result looks
-        # identical after the user clears the fields, silently skipping the
-        # search instead of offering the data back as a replacement.
-        _sim = (
-            self._source_content_similarity(_cur_content, _new_content)
-            if (_cur_content and _new_content)
-            else (1.0 if (not _cur_content and not _new_content) else 0.0)
-        )
-        _is_diff = _sim < 0.60   # more than 40% different → "new data"
-
         _existing_src_base = (_existing_src or '').split('+')[0]
         _result_src_base   = (raw_source or '').split('+')[0]
         _is_same_origin = bool(
             _existing_src_base and _result_src_base and
             _existing_src_base == _result_src_base
         )
-        same_origin_no_diff = bool(has_existing and _is_same_origin and not _is_diff)
-
-        is_overwrite = _is_better or (_is_diff and _result_tier == _existing_tier)
 
         new_tags = [g for g in (result.genres or []) if g not in current_tags]
         new_urls = self._new_result_site_urls(result)
-        new_image = bool(result.image_url and (is_overwrite or not has_image))
+        new_image = bool(result.image_url and not has_image)
         new_reviews = self._new_result_reviews(result)
 
-        # ── Per-field diff (for display — strikethrough old, show new) ──
+        fills_empty = bool(
+            (result.description and not current_desc)
+            or new_image
+            or (getattr(result, 'developer', '') and not current_dev)
+            or (result_year and not current_year)
+        )
+        name_change = bool(result.name and result.name != current_name)
+        # Material news: empty-field fills, additive tags/urls/reviews, or a
+        # confirmed rename. A different description while one is already
+        # saved is NOT material — that used to force primary overwrite.
+        has_material = bool(
+            fills_empty or name_change or new_tags or new_urls or new_reviews
+        )
+
+        already_applied = bool(
+            _result_src_base and _result_src_base in self._applied_enrichment_sources()
+        )
+        # Soft-promote only when the saved primary page is gone AND this
+        # candidate is a different source. Never promote on text rewrite.
+        promote_primary = bool(
+            has_existing and _existing_src_base and not _is_same_origin
+            and not self._is_primary_source_reachable()
+        )
+
+        is_overwrite = False
+        same_origin_no_diff = bool(already_applied and not has_material
+                                   and not promote_primary)
+
+        # ── Per-field diff (for display — fill empty / rename only) ─────
         fields: dict = {}
-        if result.name and result.name != current_name:
+        if name_change:
             fields['name'] = {'old': current_name or None, 'new': result.name}
 
         _rd = result.description or ''
-        if _rd:
-            if not current_desc:
-                fields['description'] = {'old': None, 'new': _rd}
-            elif is_overwrite and self._source_content_similarity(current_desc, _rd) < 0.85:
-                fields['description'] = {'old': current_desc, 'new': _rd}
+        if _rd and not current_desc:
+            fields['description'] = {'old': None, 'new': _rd}
 
         _rv = getattr(result, 'developer', '') or ''
-        if _rv:
-            if not current_dev:
-                fields['developer'] = {'old': None, 'new': _rv}
-            elif is_overwrite and _rv.lower() != current_dev.lower():
-                fields['developer'] = {'old': current_dev, 'new': _rv}
+        if _rv and not current_dev:
+            fields['developer'] = {'old': None, 'new': _rv}
 
-        if result_year:
-            if not current_year:
-                fields['year'] = {'old': None, 'new': result_year}
-            elif is_overwrite and result_year != current_year:
-                fields['year'] = {'old': current_year, 'new': result_year}
+        if result_year and not current_year:
+            fields['year'] = {'old': None, 'new': result_year}
 
-        has_enrich = bool(
-            (result.description and not current_desc)
-            or (result.image_url and not has_image)
-            or (getattr(result, 'developer', '') and not current_dev)
-            or (result_year and not current_year)
-            or new_tags
-            or new_reviews
-        )
-        # A source whose only news is its score still has news: without
-        # reviews counted here a rating-only candidate is dropped as "nothing
-        # to apply" and the score never reaches the form.
-        has_changes = bool(fields or new_tags or new_urls or new_image
-                           or new_reviews)
+        has_enrich = bool(has_material)
+        has_changes = bool(has_material or promote_primary)
 
         return {
             'has_existing': has_existing,
             'is_overwrite': is_overwrite,
+            'promote_primary': promote_primary,
+            'same_origin': _is_same_origin,
             'same_origin_no_diff': same_origin_no_diff,
             'has_enrich': has_enrich,
             'has_changes': has_changes,
@@ -737,18 +743,146 @@ class SearchFlowMixin:
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
 
-    def _store_result_fingerprint(self, src: str, result, result_year: str):
-        """Remember source/content so a later same-source result can be
-        recognized as "nothing new" (same_origin_no_diff above)."""
+    def _store_result_fingerprint(self, src: str, result, result_year: str,
+                                  *, as_primary: bool = True):
+        """Remember primary source + every source that contributed.
+
+        *as_primary* False keeps the existing primary marker (enrich from
+        another site) so a later Steam hit is still recognized as already
+        applied after a VNDB fill-in. Soft-promote / first apply / same
+        origin pass True.
+        """
+        prev = getattr(self, '_enrichment_source_fingerprint', None) or {}
+        applied = list(prev.get('applied') or [])
+        base = (src or '').split('+')[0]
+        if base and base not in applied:
+            applied.append(base)
+        for s in self._applied_enrichment_sources():
+            if s not in applied:
+                applied.append(s)
+        primary = src if as_primary or not prev.get('source') else prev.get('source')
         self._enrichment_source_fingerprint = {
-            'source': src,
-            'name':   result.name or '',   # preserved even if display name changes later
+            'source': primary or src,
+            'name':   result.name or prev.get('name', ''),
             'content': (
                 (result.description or '') + ' ' +
                 (getattr(result, 'developer', '') or '') + ' ' +
                 (result_year or '')
-            ).strip(),
+            ).strip() if as_primary or not prev.get('content') else prev.get('content', ''),
+            'applied': applied,
         }
+        if as_primary:
+            self._invalidate_primary_reachability()
+
+    def _mark_source_applied(self, src: str) -> None:
+        """Record that *src* contributed (merge chips, URL fetch, …)."""
+        base = (src or '').split('+')[0]
+        if not base or base in ('user', 'web'):
+            return
+        fp = getattr(self, '_enrichment_source_fingerprint', None)
+        if not isinstance(fp, dict):
+            self._enrichment_source_fingerprint = {
+                'source': '', 'content': '', 'applied': [base],
+            }
+            return
+        applied = list(fp.get('applied') or [])
+        if base not in applied:
+            applied.append(base)
+            fp['applied'] = applied
+
+    @staticmethod
+    def _source_from_url(url: str) -> str:
+        """Map a store/page URL to a known source id, or ''."""
+        u = (url or '').lower()
+        if not u:
+            return ''
+        hints = (
+            ('store.steampowered.com', 'steam'),
+            ('steampowered.com', 'steam'),
+            ('vndb.org', 'vndb'),
+            ('itch.io', 'itch'),
+            ('dlsite.com', 'dlsite'),
+            ('mobygames.com', 'mobygames'),
+            ('wikipedia.org', 'wikipedia'),
+            ('pcgamingwiki.com', 'pcgamingwiki'),
+        )
+        for needle, src in hints:
+            if needle in u:
+                return src
+        return ''
+
+    def _applied_enrichment_sources(self) -> set[str]:
+        """Sources already reflected on the form (fingerprint, reviews, URLs)."""
+        out: set[str] = set()
+        fp = getattr(self, '_enrichment_source_fingerprint', None) or {}
+        for s in fp.get('applied') or []:
+            b = (s or '').split('+')[0]
+            if b:
+                out.add(b)
+        primary = (fp.get('source') or '').split('+')[0]
+        if primary:
+            out.add(primary)
+        for r in (getattr(self, '_reviews', None) or []):
+            if not isinstance(r, dict):
+                continue
+            b = (r.get('source') or '').split('+')[0]
+            if b and b not in ('user', 'web'):
+                out.add(b)
+        for u in (getattr(self, '_store_urls', None) or []):
+            b = self._source_from_url(u)
+            if b:
+                out.add(b)
+        return out
+
+    def _invalidate_primary_reachability(self) -> None:
+        self._primary_reachability_cache = None
+
+    def _is_primary_source_reachable(self) -> bool:
+        """Whether the saved primary's page still answers.
+
+        Cached per search presentation. No URL for that source → assume
+        reachable (cannot justify a soft promote). Probe failure → dead.
+        """
+        cached = getattr(self, '_primary_reachability_cache', None)
+        if cached is not None:
+            return cached
+        fp = getattr(self, '_enrichment_source_fingerprint', None) or {}
+        primary = (fp.get('source') or '').split('+')[0]
+        if not primary:
+            self._primary_reachability_cache = True
+            return True
+        urls = [u for u in (getattr(self, '_store_urls', None) or [])
+                if self._source_from_url(u) == primary]
+        if not urls:
+            self._primary_reachability_cache = True
+            return True
+        ok = False
+        for u in urls[:2]:
+            if self._probe_page_reachable(u):
+                ok = True
+                break
+        self._primary_reachability_cache = ok
+        return ok
+
+    @staticmethod
+    def _probe_page_reachable(url: str, timeout: float = 4.0) -> bool:
+        """Cheap GET: HTTP < 400 counts as alive. Network errors → dead."""
+        if not url:
+            return False
+        try:
+            import urllib.request
+            from core.net import open_url
+            req = urllib.request.Request(
+                url,
+                headers={'User-Agent': 'SaveSync/1.0 (enrichment reachability)'},
+                method='GET',
+            )
+            with open_url(req, timeout=timeout) as resp:
+                code = getattr(resp, 'status', None) or resp.getcode()
+                return 200 <= int(code) < 400
+        except Exception as e:
+            logger.debug(f"Primary source probe failed for {url!r}: {e}")
+            return False
 
     # ── Enrichment chain ─────────────────────────────────────────────────────
 
@@ -784,7 +918,9 @@ class SearchFlowMixin:
         """Seed _enrichment_source_fingerprint from a path/URL if not already set by a search."""
         _src = self._infer_source_from_path(path_or_url)
         if _src and not (getattr(self, '_enrichment_source_fingerprint', {}) or {}).get('source'):
-            self._enrichment_source_fingerprint = {'source': _src, 'content': ''}
+            self._enrichment_source_fingerprint = {
+                'source': _src, 'content': '', 'applied': [_src],
+            }
 
     def _source_content_similarity(self, text1: str, text2: str) -> float:
         """Jaccard word-overlap similarity between two strings (0.0 – 1.0)."""
@@ -1026,10 +1162,15 @@ class SearchFlowMixin:
             self._apply_web_tags(sel['tags'])
         if sel.get('reviews'):
             self._merge_reviews(sel['reviews'])
+            for r in sel['reviews']:
+                if isinstance(r, dict):
+                    self._mark_source_applied(r.get('source') or '')
         _new_urls = [u for u in sel.get('urls', []) if u not in self._store_urls]
         if _new_urls:
             self._store_urls.extend(_new_urls)
             self._rebuild_url_chips()
+            for u in _new_urls:
+                self._mark_source_applied(self._source_from_url(u))
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
         self._status_lbl.setText(t('add_game.data_saved'))

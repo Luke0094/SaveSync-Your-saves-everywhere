@@ -342,11 +342,25 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 urls = [u.strip() for u in entry.store_url.split(',') if u.strip()]
                 self._store_urls = urls
                 self._rebuild_url_chips()
-            # Seed source fingerprint so replacement-tier logic works across
-            # sessions (without this, _existing_tier always defaults to 'generic'
-            # and every search wrongly looks like a higher-tier overwrite candidate).
+            # Seed source fingerprint so already-applied sources are not
+            # re-offered without material news, and so a dead primary can be
+            # soft-promoted without wiping saved fields.
             _saved_src = getattr(entry, 'info_source', '') or ''
-            if _saved_src:
+            _applied: list[str] = []
+            _base = (_saved_src or '').split('+')[0]
+            if _base:
+                _applied.append(_base)
+            for _r in (getattr(entry, 'reviews', None) or []):
+                if not isinstance(_r, dict):
+                    continue
+                _rs = (_r.get('source') or '').split('+')[0]
+                if _rs and _rs not in ('user', 'web') and _rs not in _applied:
+                    _applied.append(_rs)
+            for _u in (getattr(self, '_store_urls', None) or []):
+                _us = self._source_from_url(_u) if hasattr(self, '_source_from_url') else ''
+                if _us and _us not in _applied:
+                    _applied.append(_us)
+            if _saved_src or _applied:
                 self._enrichment_source_fingerprint = {
                     'source': _saved_src,
                     'content': (
@@ -354,6 +368,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                         (getattr(entry, 'developer', '') or '') + ' ' +
                         (getattr(entry, 'release_year', '') or '')
                     ).strip(),
+                    'applied': _applied,
                 }
             self._add_btn.setText(t("common.save_changes"))
         else:

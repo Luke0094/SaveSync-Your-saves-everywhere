@@ -38,6 +38,9 @@ class OneDriveProvider(SyncProvider):
         super().__init__(credentials)
         self._token: Optional[str] = None
         self._token_expires_at: Optional[float] = None
+        # Separate from expiry: after a failed MSAL refresh, stay False until
+        # this time so callers do not treat the dead token as "session ready".
+        self._refresh_backoff_until: Optional[float] = None
         self._msal_app = None
         self._msal_cache = None
         self._msal_cache_path: str = ""
@@ -91,6 +94,7 @@ class OneDriveProvider(SyncProvider):
         # is stale (personal tokens typically expire in 1 hour).
         import time
         self._token_expires_at = time.time() + 3600
+        self._refresh_backoff_until = None
         # Validate token by fetching user info
         if not self._validate_token():
             logger.error("OneDrive access token is invalid or expired")
@@ -172,6 +176,7 @@ class OneDriveProvider(SyncProvider):
             expires_in = result_dict.get("expires_in")
             if expires_in:
                 self._token_expires_at = time.time() + int(expires_in)
+            self._refresh_backoff_until = None
 
         # Case 1: cached token already refreshed by sync_page
         if preauth_token:
@@ -188,6 +193,7 @@ class OneDriveProvider(SyncProvider):
             else:
                 self._token = preauth_token
                 self._token_expires_at = time.time() + 3600
+                self._refresh_backoff_until = None
             _save_cache(preauth_cache)
             _store_msal_state(preauth_app, preauth_cache, preauth_cache_path)
             self._setup_session()
@@ -354,11 +360,20 @@ class OneDriveProvider(SyncProvider):
         if self._token_expires_at is not None and self._msal_app is not None:
             with self._refresh_lock:
                 import time
-                if time.time() >= self._token_expires_at - 300:  # refresh 5 min before expiry
+                now = time.time()
+                # Failed refresh → refuse the session until backoff ends.
+                # Do NOT push _token_expires_at forward: that made the
+                # pre-refresh window look healthy and returned True with a
+                # token that had just failed.
+                if (self._refresh_backoff_until is not None
+                        and now < self._refresh_backoff_until):
+                    return False
+                if now >= self._token_expires_at - 300:  # refresh 5 min before expiry
                     try:
                         accounts = self._msal_app.get_accounts()
                         if accounts:
-                            result = self._msal_app.acquire_token_silent(_SCOPES, account=accounts[0])
+                            result = self._msal_app.acquire_token_silent(
+                                _SCOPES, account=accounts[0])
                             if result and "access_token" in result:
                                 new_token = result["access_token"]
                                 expires_in = result.get("expires_in")
@@ -367,42 +382,52 @@ class OneDriveProvider(SyncProvider):
                                 # not affected by the token update.
                                 import requests as _req
                                 new_session = _req.Session()
-                                new_session.headers.update({"Authorization": f"Bearer {new_token}"})
-                                # Atomic swap: update token + session together
+                                new_session.headers.update(
+                                    {"Authorization": f"Bearer {new_token}"})
                                 old_session = self._session
                                 self._token = new_token
                                 self._session = new_session
                                 if expires_in:
                                     self._token_expires_at = time.time() + int(expires_in)
+                                self._refresh_backoff_until = None
                                 if old_session is not None:
                                     try:
                                         old_session.close()
                                     except Exception:
                                         pass
-                                # Save updated cache
                                 if self._msal_cache and self._msal_cache_path:
                                     try:
-                                        cache_dir = os.path.dirname(os.path.abspath(self._msal_cache_path))
+                                        cache_dir = os.path.dirname(
+                                            os.path.abspath(self._msal_cache_path))
                                         os.makedirs(cache_dir, exist_ok=True)
-                                        fd = os.open(self._msal_cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                                        fd = os.open(
+                                            self._msal_cache_path,
+                                            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                            0o600)
                                         with os.fdopen(fd, "w") as _f:
                                             _f.write(self._msal_cache.serialize())
                                         _restrict_file_acl(self._msal_cache_path)
                                     except Exception as e:
-                                        logger.warning(f"Failed to save refreshed MSAL cache: {e}")
+                                        logger.warning(
+                                            f"Failed to save refreshed MSAL cache: {e}")
                                 logger.info("OneDrive token refreshed successfully")
                             else:
-                                logger.error("OneDrive token refresh failed: no access token in response")
-                                # Back off 60s to avoid a tight retry loop on persistent failures
-                                self._token_expires_at = time.time() + 360  # backoff 60s (300 pre-refresh + 60)
+                                logger.error(
+                                    "OneDrive token refresh failed: "
+                                    "no access token in response")
+                                self._refresh_backoff_until = time.time() + 60
+                                self.last_error = "token refresh failed"
                                 return False
                         else:
-                            logger.error("OneDrive token refresh failed: no accounts found")
-                            self._token_expires_at = time.time() + 360  # backoff 60s (300 pre-refresh + 60)
+                            logger.error(
+                                "OneDrive token refresh failed: no accounts found")
+                            self._refresh_backoff_until = time.time() + 60
+                            self.last_error = "token refresh failed — no accounts"
                             return False
                     except Exception as e:
                         logger.error(f"OneDrive token refresh failed: {e}")
-                        self._token_expires_at = time.time() + 360  # backoff 60s (300 pre-refresh + 60)
+                        self._refresh_backoff_until = time.time() + 60
+                        self.last_error = f"token refresh failed: {e}"
                         return False
         return True
 

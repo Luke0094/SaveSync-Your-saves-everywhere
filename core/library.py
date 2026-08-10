@@ -295,16 +295,27 @@ class GameEntry:
         return [r for r in (self.reviews or []) if review_rating(r) > 0]
 
     def average_rating(self) -> float:
-        """Mean rating across reviews, on the quarter-star grid; 0 if none.
+        """Vote-weighted mean rating on the quarter-star grid; 0 if none.
 
-        Unrated reviews (text only) are left out of the mean instead of
-        counting as zero, which would drag the score down for saying nothing.
+        Aggregate store scores (Steam / VNDB) weigh by ``vote_count`` so
+        300 Steam opinions and 32 VNDB votes are not averaged as two equal
+        rows. Individual reviews weigh 1. Unrated (text-only) rows are
+        left out instead of counting as zero.
         """
         rated = self.rated_reviews()
         if not rated:
             return 0.0
-        return quantize_rating(
-            sum(review_rating(r) for r in rated) / len(rated))
+        total_w = 0
+        acc = 0.0
+        for r in rated:
+            w = review_vote_count(r)
+            if w <= 0:
+                continue
+            acc += review_rating(r) * w
+            total_w += w
+        if total_w <= 0:
+            return 0.0
+        return quantize_rating(acc / total_w)
 
     def __post_init__(self):
         if self.sync_status not in VALID_SYNC_STATUSES:

@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QHBoxLayout,
                                QTextEdit, QVBoxLayout, QWidget)
 
 from core.game_sources.common import source_label
-from core.library import quantize_rating, review_rating, review_vote_count
+from core.library import (quantize_rating, review_rating, review_vote_count,
+                          reviews_display_count)
 from i18n import t
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
@@ -450,12 +451,25 @@ class ReviewsDialog(QDialog):
     # ── Rendering ────────────────────────────────────────────────────────────
 
     def _refresh(self):
-        rated = [review_rating(r) for r in self._reviews
-                 if review_rating(r) > 0]
-        self._avg.set_value(sum(rated) / len(rated) if rated else 0.0)
-        self._avg_caption.setText(
-            t("reviews.average_n", count=len(rated)) if rated
-            else t("reviews.average"))
+        # Same vote-weighted mean as GameEntry.average_rating — aggregates
+        # (Steam/VNDB) count by vote_count, not as a single row.
+        rated = [r for r in self._reviews if review_rating(r) > 0]
+        if rated:
+            total_w = 0
+            acc = 0.0
+            for r in rated:
+                w = review_vote_count(r)
+                if w <= 0:
+                    continue
+                acc += review_rating(r) * w
+                total_w += w
+            avg = quantize_rating(acc / total_w) if total_w else 0.0
+            self._avg.set_value(avg)
+            self._avg_caption.setText(
+                t("reviews.average_n", count=reviews_display_count(rated)))
+        else:
+            self._avg.set_value(0.0)
+            self._avg_caption.setText(t("reviews.average"))
 
         while self._list.count():
             item = self._list.takeAt(0)

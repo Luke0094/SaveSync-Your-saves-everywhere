@@ -264,7 +264,8 @@ def find_key(raw: bytes, binaries, on_tick=None) -> tuple:
                 return key.hex(), how
         for stride in _STRIDES:
             for size in _KEY_SIZES:
-                for off in range(0, max(0, len(blob) - size), stride):
+                # Inclusive end: last valid window starts at len(blob) - size.
+                for off in range(0, max(0, len(blob) - size + 1), stride):
                     if not (off & _TICK_MASK) and not carry_on():
                         return "", ""
                     how = test(blob[off:off + size])

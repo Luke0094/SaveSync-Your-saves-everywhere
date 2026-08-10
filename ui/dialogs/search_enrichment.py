@@ -302,9 +302,15 @@ class CandidatePreviewDialog(QDialog):
             self._inspect_btn.setVisible(False)
 
         # ── Description ──────────────────────────────────────────────────
+        # Only advertise a description the confirm path would actually write
+        # (empty→fill). A rewritten page text must not look like a replace.
         _desc_field = fields.get('description')
-        _new_desc = (_desc_field['new'] if _desc_field else (c.description or '')) or ''
-        _new_desc = _new_desc.strip()
+        if _desc_field:
+            _new_desc = (_desc_field.get('new') or '').strip()
+        elif not diff.get('has_existing'):
+            _new_desc = (c.description or '').strip()
+        else:
+            _new_desc = ''
         if _new_desc:
             _snip = _new_desc if len(_new_desc) <= 380 else _new_desc[:380].rstrip() + '…'
             if _desc_field and _desc_field.get('old'):

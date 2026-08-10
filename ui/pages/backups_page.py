@@ -163,7 +163,13 @@ class BackupRow(QFrame, ThemedMixin):
         from core.library import get_library
 
         orch = get_orchestrator()
-        provider = orch.provider
+        # Cloud-only rows carry origin = PROVIDER_ID (set when listed).
+        # Never use orch.provider (first connected) — the zip may live on
+        # another connected store.
+        origin = (getattr(self._entry, "origin", "") or "").strip()
+        provider = orch.get_provider(origin) if origin and origin != "local" else None
+        if provider is not None and not provider.is_connected:
+            provider = None
         if not provider:
             warning_window_modal(self, t("common.error"), t("sync.provider_disconnected"))
             return
@@ -1501,13 +1507,18 @@ class BackupsPage(QWidget, ThemedMixin):
                 from sync import get_orchestrator
                 from core.constants import get_install_folder_name
                 orch = get_orchestrator()
-                provider = orch.provider
-                if provider:
+                # Every connected store — orch.provider is only the first and
+                # hid cloud-only backups that lived on the second.
+                providers = list(orch.get_connected_providers())
+                if is_provider_specific:
+                    providers = [p for p in providers if p.PROVIDER_ID == filt]
+                for provider in providers:
                     from core.backup import BackupEntry
                     def _append_cloud_only(rd: dict, fallback_gid: str, fallback_name: str,
-                                           remote_folder: str = ""):
+                                           remote_folder: str = "",
+                                           _prov=provider):
                         bid = rd.get("backup_id", "")
-                        if not bid or bid in local_ids:
+                        if not bid or bid in local_ids or bid in cloud_only_ids:
                             return
                         rd.setdefault("game_id", fallback_gid)
                         rd.setdefault("game_name", fallback_name)
@@ -1523,7 +1534,7 @@ class BackupsPage(QWidget, ThemedMixin):
                             # target this folder even if the local install
                             # name carries a different version suffix.
                             rd["cloud_metadata"]["remote_folder"] = remote_folder
-                        rd["origin"] = provider.PROVIDER_ID
+                        rd["origin"] = _prov.PROVIDER_ID
                         try:
                             backups.append(BackupEntry.from_dict(rd))
                             cloud_only_ids.add(bid)
