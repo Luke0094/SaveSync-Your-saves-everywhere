@@ -195,6 +195,8 @@ from ui.widgets.file_pickers import ExePickerDialog as _ExePickerDialog  # noqa:
 class AddGameDialog(SearchFlowMixin, QDialog):
     game_added = Signal(object)   # GameEntry
     search_finished = Signal(object, object)  # list[GameInfo] | GameInfo | None, error
+    # gen, reachable — primary-page probe finished off the GUI thread
+    primary_reachability_done = Signal(int, bool)
     _placeholder_signal = Signal(str)
 
     def __init__(self, name: str = "", exe_path: str = "",
@@ -253,7 +255,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # exactly as it already does for tags — so the dialog shows clean
             # text and re-saving persists it clean.
             self._name_edit.setText(self._clean_tag(entry.name))
-            self._exe_edit.setText(entry.exe_path or "")
+            from core.resolvers import is_launcher_url as _is_lurl_edit
+            _exe_load = entry.exe_path or ""
+            if _exe_load and _is_lurl_edit(_exe_load):
+                # Legacy: URL was wrongly stored as exe_path — show it as launch id.
+                if not entry.appid:
+                    self._appid_edit.setText(_exe_load)
+                self._exe_edit.setText("")
+            else:
+                self._exe_edit.setText(_exe_load)
             self._exe_edit.blockSignals(False)
             # Load appid if present
             if entry.appid:
@@ -407,6 +417,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         self._placeholder_signal.connect(self._exe_edit.setPlaceholderText)
         self.search_finished.connect(self._on_search_finished)
+        self.primary_reachability_done.connect(self._on_primary_reachability_done)
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -1637,77 +1648,22 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     # ── Browse ────────────────────────────────────────────────────────────────
 
     def _resolve_launcher_url(self, url_or_path: str) -> tuple[Optional[str], Optional[str]]:
-        """Resolve a launcher URL to executable path and appid.
-        
-        Returns:
-            (resolved_exe_path, appid) or (None, None) if not a valid URL
+        """Parse a launcher URL for its appid — no disk walk.
+
+        The fuzzy exe search is deliberately NOT done here: it blocks the GUI
+        for many seconds. Callers must keep the URL as ``exe_path`` and use
+        ``MainWindow.schedule_launcher_exe_resolve`` (or
+        ``_resolve_exe_from_url_async`` while the dialog is open) instead.
         """
         url_or_path = url_or_path.strip()
         if not url_or_path:
             return None, None
-        
+
         try:
-            from core.resolvers import parse_launcher_url, get_appid_from_url, is_launcher_url
+            from core.resolvers import get_appid_from_url, is_launcher_url
             if not is_launcher_url(url_or_path):
                 return None, None
-            
-            parsed = parse_launcher_url(url_or_path)
-            if not parsed:
-                return None, None
-            
-            appid = get_appid_from_url(url_or_path)
-            user_game_name = self._name_edit.text().strip()
-            
-            game_name = self._shortcut_name if self._shortcut_name else user_game_name
-            game_name = game_name if game_name else None
-            
-            from core.resolvers import find_executable_by_fuzzy_name, _get_suggested_exe_search_paths
-            import os
-            import time as _time
-            # This path is SYNCHRONOUS on the GUI thread — bound it hard:
-            # better a partial answer after 20s than a frozen window.
-            _deadline = _time.monotonic() + 20
-
-            # Build paths the same way as async version
-            paths = _get_suggested_exe_search_paths()
-            if self._shortcut_dir:
-                sd = Path(self._shortcut_dir)
-                if sd.exists() and sd not in paths:
-                    paths.insert(0, sd)
-            if os.name == 'nt':
-                added = {str(p) for p in paths}
-                for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-                    drive = f"{letter}:/"
-                    if not Path(drive).exists():
-                        continue
-                    for sub in ["Program Files", "Program Files (x86)", "ProgramData"]:
-                        p = Path(drive) / sub
-                        if p.exists() and str(p) not in added:
-                            paths.append(p)
-                            added.add(str(p))
-                    users = Path(drive) / "Users"
-                    if users.exists():
-                        for user_dir in users.iterdir():
-                            games_dir = user_dir / "Games"
-                            if games_dir.exists() and str(games_dir) not in added:
-                                paths.append(games_dir)
-                                added.add(str(games_dir))
-            
-            exe_path = None
-            if game_name:
-                exe_path = find_executable_by_fuzzy_name(game_name, paths,
-                                                         deadline=_deadline)
-
-            if not exe_path and appid:
-                exe_path = find_executable_by_fuzzy_name(appid, paths,
-                                                         deadline=_deadline)
-
-            if not exe_path:
-                # No executable found, but still return the parsed appid
-                # so launcher URLs (battlenet://, etc.) can be saved for launching
-                return None, appid
-            
-            return str(exe_path), appid
+            return None, get_appid_from_url(url_or_path)
         except Exception as e:
             logger.error(f"Error resolving launcher URL: {e}")
             return None, None
@@ -3316,39 +3272,32 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _add_game(self):
         exe = self._exe_edit.text().strip()
         lib = get_library()
-        
-        from core.resolvers import is_launcher_url
-        
-        # If exe is empty but appid contains a launcher URL, promote it to exe
-        appid_from_field = self._appid_edit.text().strip()
-        if not exe and appid_from_field and is_launcher_url(appid_from_field):
-            exe = appid_from_field
-            self._exe_edit.setText(exe)
-        
-        appid = None
-        # Capture the launcher URL BEFORE resolution replaces `exe` with a
-        # filesystem path — it is the only reliable identity for a game whose
-        # exe can't be (or is wrongly) resolved, and the duplicate check below
-        # needs it.
-        _launcher_url = exe if (exe and is_launcher_url(exe)) else (
-            appid_from_field if is_launcher_url(appid_from_field) else "")
-        if exe and is_launcher_url(exe):
-            resolved_exe, appid = self._resolve_launcher_url(exe)
-            if resolved_exe:
-                exe = resolved_exe
-                self._exe_edit.setText(exe)
-                if appid:
-                    self._appid_edit.setText(appid)
-        
-        if not appid:
-            appid = appid_from_field
 
-        # Auto-fill game name from launcher URL (the parsed launcher entry
-        # carries the game's display name)
+        from core.resolvers import is_launcher_url
+
+        appid_from_field = self._appid_edit.text().strip()
+        # A launcher URL belongs in appid (launch), never in exe_path. If one
+        # landed in the exe field (legacy / paste), move it across.
+        if exe and is_launcher_url(exe):
+            if not appid_from_field:
+                appid_from_field = exe
+                self._appid_edit.setText(exe)
+            self._exe_edit.clear()
+            exe = ""
+
+        _launcher_url = (
+            appid_from_field if appid_from_field and is_launcher_url(appid_from_field)
+            else ""
+        )
+        # Full launcher URL stays in appid so Play works before/without a
+        # resolved filesystem exe. Fuzzy search fills exe_path later.
+        appid = appid_from_field
+
+        # Auto-fill game name from launcher URL when the parser has one
         name = self._name_edit.text().strip()
-        if not name and appid_from_field and is_launcher_url(appid_from_field):
+        if not name and _launcher_url:
             from core.resolvers import parse_launcher_url
-            parsed = parse_launcher_url(appid_from_field)
+            parsed = parse_launcher_url(_launcher_url)
             if parsed and parsed.get("game_name"):
                 name = parsed["game_name"]
                 self._name_edit.setText(name)
@@ -3382,12 +3331,18 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 self.accept()
                 return
 
-        # Skip exe existence check for URLs (they launch via launcher, not directly)
-        is_url = exe and is_launcher_url(exe)
-        if exe and not is_url and not Path(exe).exists():
+        # Empty exe is fine when a launcher URL is present (launch via appid).
+        if exe and not Path(exe).exists():
             self._status_lbl.setText(t('add_game.executable_not_found', exe=exe))
             self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
             return
+        if not exe and not _launcher_url and not self._editing_entry:
+            # Manual-path games may have no exe; allow only when editing or
+            # when save paths already exist on the form — otherwise require
+            # something to launch/track. Existing flow already allows empty
+            # exe for library games added by save folder; keep that.
+            pass
+
 
         if self._editing_entry:
             entry = self._editing_entry
@@ -3595,5 +3550,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
             _keep_dir = _ICON_CACHE_DIR / _keep_folder
         self._prune_stale_icon_dirs(_keep_dir)
+
+        # URL→exe fuzzy search in background (dialog may close immediately).
+        # appid already holds the launch URL; only fill exe_path when found.
+        if _launcher_url:
+            cur_exe = (entry.exe_path or "").strip()
+            needs_exe = (not cur_exe) or is_launcher_url(cur_exe)
+            if needs_exe:
+                host = self.window()
+                if host is not None and hasattr(host, "schedule_launcher_exe_resolve"):
+                    host.schedule_launcher_exe_resolve(
+                        entry.id, _launcher_url,
+                        game_name=entry.name or name or "",
+                        shortcut_dir=getattr(self, "_shortcut_dir", None) or "",
+                    )
 
         self.accept()

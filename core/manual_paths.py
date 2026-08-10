@@ -15,9 +15,11 @@ A SINGLE typed path is the one case with something to work out, since the user
 may type a relative one — three kinds, in the order they are tested:
 
   ACTUAL      an absolute path, or one that starts under a user-profile root
-              ("utente\\...", "AppData\\Roaming\\...", "LocalLow\\..."). These
-              name a real location, so they are taken literally; the
-              user-profile roots are expanded to this machine's own user.
+              ("utente\\...", "AppData\\Roaming\\...", "LocalLow\\..."), or that
+              CONTAINS such a marker after a leading game-folder label
+              ("MyGame\\AppData\\Roaming\\..."). These name a real location, so
+              they are taken literally; the user-profile roots are expanded to
+              this machine's own user.
 
   RESOLVED    a bare relative chain ("gioco\\game\\save") that WAS found under
               a known game location — an existing library entry's install
@@ -83,15 +85,70 @@ def _profile_root() -> Path:
     return Path(os.path.expanduser("~"))
 
 
+def _canonical_profile_parts(parts: list[str]) -> list[str]:
+    """Normalize well-known profile segment spellings for this OS tree.
+
+    Typed input is often all-lowercase ("appdata/roaming/…"); joining that
+    under the home folder still works on Windows, but restore/display look
+    wrong next to the real ``AppData\\Roaming`` tree. Only rewrite known
+    markers — game/studio folder names stay as typed.
+    """
+    canon = {
+        "appdata": "AppData",
+        "roaming": "Roaming",
+        "local": "Local",
+        "locallow": "LocalLow",
+        "localappdata": "AppData",  # expanded specially below when alone
+        "documents": "Documents",
+        "documenti": "Documents",
+        "saved games": "Saved Games",
+        "savedgames": "Saved Games",
+        "my games": "My Games",
+        "mygames": "My Games",
+        "my documents": "Documents",
+        "library": "Library",
+        "application support": "Application Support",
+    }
+    out: list[str] = []
+    for seg in parts:
+        key = seg.strip().lower()
+        out.append(canon.get(key, seg))
+    return out
+
+
+def _profile_anchor_index(parts: list[str]) -> int:
+    """Index of the first profile/system marker in *parts*, or -1.
+
+    A hand-typed or mirrored chain often keeps the game folder in front
+    ("MyGame/AppData/Roaming/…"). The marker — not the leading title — is
+    what names a real location under this machine's user profile.
+    """
+    for i, seg in enumerate(parts):
+        key = seg.strip().lower()
+        if key in _USER_ROOT_TOKENS or _is_profile_subroot(key):
+            return i
+    return -1
+
+
 def _expand_user_root(parts: list[str]) -> Optional[Path]:
     """Turn a profile-relative chain into this machine's real path.
 
-    "utente/games/x"       → C:/Users/<me>/games/x
-    "Users/someone/games/x"→ C:/Users/<me>/games/x   (account slot replaced)
-    "AppData/Roaming/x"    → C:/Users/<me>/AppData/Roaming/x
+    "utente/games/x"              → C:/Users/<me>/games/x
+    "Users/someone/games/x"       → C:/Users/<me>/games/x   (account slot replaced)
+    "AppData/Roaming/x"           → C:/Users/<me>/AppData/Roaming/x
+    "MyGame/AppData/Roaming/x"    → C:/Users/<me>/AppData/Roaming/x
+         (leading game folder is only a label; AppData marks the real root)
     """
     if not parts:
         return None
+
+    # Drop a leading game/release folder when a system marker appears later.
+    # Without this, "Title\\AppData\\Roaming\\…" stays PREDICTED even though
+    # the trailing chain is an unambiguous profile path.
+    anchor = _profile_anchor_index(parts)
+    if anchor > 0:
+        parts = parts[anchor:]
+
     head = parts[0].strip().lower()
     if head in _USER_ROOT_TOKENS:
         rest = parts[1:]
@@ -100,13 +157,20 @@ def _expand_user_root(parts: list[str]) -> Optional[Path]:
         # which means the chain was written without an account at all.
         if head in _USER_CONTAINER_TOKENS and rest and not _is_profile_subroot(rest[0]):
             rest = rest[1:]
+        rest = _canonical_profile_parts(rest)
         return _profile_root().joinpath(*rest) if rest else _profile_root()
     if _is_profile_subroot(head):
         # AppData/... is the natural spelling of AppData\Roaming\...
+        # LocalLow / Roaming alone imply they sit under AppData.
         if head in ("roaming", "locallow") and "appdata" not in (p.lower() for p in parts):
-            return _profile_root() / "AppData" / parts[0] / Path(*parts[1:]) \
-                if len(parts) > 1 else _profile_root() / "AppData" / parts[0]
-        return _profile_root().joinpath(*parts)
+            tail = _canonical_profile_parts(parts)
+            return (_profile_root() / "AppData").joinpath(*tail)
+        if head == "localappdata":
+            # "LocalAppData/Studio/Game" → ~/AppData/Local/Studio/Game
+            rest = _canonical_profile_parts(parts[1:])
+            base = _profile_root() / "AppData" / "Local"
+            return base.joinpath(*rest) if rest else base
+        return _profile_root().joinpath(*_canonical_profile_parts(parts))
     return None
 
 
@@ -488,6 +552,139 @@ def names_of(game) -> set:
     return {n for n in names if n}
 
 
+def latest_save_mtime(path_str: str) -> float:
+    """Newest write under a save folder (bounded scan). 0 if unreadable."""
+    if not path_str:
+        return 0.0
+    try:
+        from core.save_detector import _latest_write_ts
+        return float(_latest_write_ts(path_str) or 0.0)
+    except Exception:
+        return 0.0
+
+
+_PRODUCT_CODE_RE = re.compile(r"(?<![a-zA-Z0-9])((?:RJ|RE|VJ)\d{4,10})(?![a-zA-Z0-9])",
+                              re.IGNORECASE)
+
+
+def product_codes(text: str) -> set[str]:
+    """DLsite-family product codes in *text* (RJ/RE/VJ + digits), uppercased.
+
+    These — not bare version tokens like ``v1.2`` — are strong enough to say
+    two similarly named folders are different games.
+    """
+    if not text:
+        return set()
+    return {m.group(1).upper() for m in _PRODUCT_CODE_RE.finditer(text)}
+
+
+def _game_product_codes(game) -> set[str]:
+    codes: set[str] = set()
+    codes |= product_codes(getattr(game, "name", "") or "")
+    for past in (getattr(game, "name_history", None) or []):
+        codes |= product_codes(past or "")
+    for hint in (getattr(game, "name_hints", None) or []):
+        codes |= product_codes(hint or "")
+    exe = getattr(game, "exe_path", "") or ""
+    if exe:
+        try:
+            codes |= product_codes(Path(exe).parent.name)
+        except Exception:
+            pass
+    return codes
+
+
+def _clean_title_keys(game) -> set[str]:
+    """Version-stripped titles this game answers to (casefolded)."""
+    from core.constants import strip_version_tokens
+    keys: set[str] = set()
+    for raw in (
+        [getattr(game, "name", "") or ""]
+        + list(getattr(game, "name_history", None) or [])
+    ):
+        cleaned = strip_version_tokens((raw or "").strip())
+        if cleaned:
+            keys.add(cleaned.casefold())
+    return keys
+
+
+def find_manual_game_match(games: list, cleaned_name: str, raw_folder: str):
+    """Which library entry a hand-added folder belongs to, if any.
+
+    Version tokens alone do NOT split identity: ``My Game v1`` and
+    ``My Game v2`` are the same game. Distinct product codes (RJ/RE/VJ…)
+    or an exact raw-folder hit do — those are the hints strong enough to
+    classify two similarly named releases as different.
+
+      1. Exact full folder name in names_of / hints.
+      2. Same cleaned title, rejecting candidates whose product codes
+         conflict with the incoming folder's codes.
+    """
+    raw_key = (raw_folder or "").strip().casefold()
+    if raw_key:
+        for g in games:
+            if raw_key in names_of(g):
+                return g
+
+    clean_key = (cleaned_name or "").strip().casefold()
+    if not clean_key:
+        from core.constants import strip_version_tokens
+        clean_key = strip_version_tokens((raw_folder or "").strip()).casefold()
+    if not clean_key:
+        return None
+
+    incoming_codes = product_codes(raw_folder)
+    hits: list[tuple] = []  # (game, codes)
+    for g in games:
+        if clean_key not in _clean_title_keys(g):
+            # Also allow the live cleaned display name equality.
+            title = (getattr(g, "name", "") or "").strip().casefold()
+            if title != clean_key:
+                continue
+        codes = _game_product_codes(g)
+        # Both sides carry codes and they share none → different products.
+        if incoming_codes and codes and incoming_codes.isdisjoint(codes):
+            continue
+        hits.append((g, codes))
+
+    if not hits:
+        return None
+
+    def _uniq(games_list: list):
+        out, seen = [], set()
+        for g in games_list:
+            gid = getattr(g, "id", id(g))
+            if gid in seen:
+                continue
+            seen.add(gid)
+            out.append(g)
+        return out
+
+    if incoming_codes:
+        same_code = _uniq([g for g, c in hits if c & incoming_codes])
+        if len(same_code) == 1:
+            return same_code[0]
+        if len(same_code) > 1:
+            return None
+        # Incoming has a code no library game shares. Other coded titles for
+        # this clean name are different products — do not attach to them.
+        # An uncoded entry with the same clean title is the same game seen
+        # first without its RJ tag (or a version-only rename).
+        other_coded = [g for g, c in hits if c]
+        uncoded = _uniq([g for g, c in hits if not c])
+        if other_coded and not uncoded:
+            return None
+        if len(uncoded) >= 1:
+            return uncoded[0]
+        return None
+
+    # No product code on the incoming folder: version noise is irrelevant —
+    # any single clean-title hit is a match; several are version variants of
+    # the same title, so join the first rather than spawning another entry.
+    uniq = _uniq([g for g, _c in hits])
+    return uniq[0] if uniq else None
+
+
 _names_of = names_of        # kept: the old private spelling is used elsewhere
 
 
@@ -550,13 +747,26 @@ def adopt_manual_entries_for(game) -> int:
     for placeholder in waiting:
         gained: list = []
         chain = getattr(placeholder, "pending_save_chain", "")
-        if chain and install is not None:
-            candidate = install / Path(*_split(chain))
+        if chain:
+            # Profile chains ("AppData/Roaming/…") name a location under THIS
+            # machine's user folder — never under the install directory.
             try:
-                if candidate.exists():
-                    gained.append(str(candidate))
-            except OSError:
-                pass
+                profile = profile_destination(chain)
+            except Exception:
+                profile = None
+            if profile is not None:
+                try:
+                    if profile.exists():
+                        gained.append(str(profile))
+                except OSError:
+                    pass
+            elif install is not None:
+                candidate = install / Path(*_split(chain))
+                try:
+                    if candidate.exists():
+                        gained.append(str(candidate))
+                except OSError:
+                    pass
         gained.extend(placeholder.save_paths or [])
 
         if not gained:

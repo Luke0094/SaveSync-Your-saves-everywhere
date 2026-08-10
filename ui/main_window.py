@@ -72,6 +72,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     backup_verify_problems = Signal(int, int)   # bad, total
     # Same reason: the regression check runs on a worker thread.
     save_regression_found = Signal(str, str, bool)  # game_id, newest_backup_id, after_restore
+    # Launcher URL → exe fuzzy search finished off the GUI thread.
+    launcher_exe_resolved = Signal(str, str, str)  # game_id, url, exe_path ("" if none)
+    # GitHub Releases check finished off the GUI thread.
+    update_available = Signal(object)  # ReleaseInfo
 
     def __init__(self):
         super().__init__()
@@ -186,6 +190,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._setup_cleanup()
         self.backup_verify_problems.connect(self._on_backup_verify_problems)
         self.save_regression_found.connect(self._on_save_regression)
+        self.launcher_exe_resolved.connect(self._on_launcher_exe_resolved)
         # backup_id SaveSync itself last restored, per game — landing on that
         # state is the intended outcome, not something to warn about.
         self._last_restored: dict[str, str] = {}
@@ -208,6 +213,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._regression_rearm: dict[str, bool] = {}
         self._setup_backup_verify()
         self._setup_auto_export_config()
+        self._setup_update_check()
         # A previous run may have died between suspending a game for a forced
         # restore and resuming it. The game would still be frozen, with
         # nothing on screen to explain why.
@@ -1147,6 +1153,106 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         finally:
             self._handling_focus_change = False
 
+    def schedule_launcher_exe_resolve(self, game_id: str, url: str,
+                                      game_name: str = "",
+                                      shortcut_dir: str = "",
+                                      timeout: int = 30):
+        """Find the real exe for a launcher URL on a worker thread.
+
+        The fuzzy disk walk often takes many seconds — never run it on the
+        GUI thread. When an exe is found, ``launcher_exe_resolved`` updates
+        the library entry (exe_path + keep URL in appid for launching).
+        """
+        if not game_id or not url:
+            return
+        import threading
+        import time
+        from pathlib import Path
+        from core.resolvers import (
+            find_executable_by_fuzzy_name, get_appid_from_url,
+            parse_launcher_url, _get_suggested_exe_search_paths,
+            _get_default_exe_search_paths, _get_launcher_install_paths,
+        )
+
+        def _bg(gid=game_id, launch_url=url, name=game_name, sdir=shortcut_dir):
+            exe_found = ""
+            try:
+                if not parse_launcher_url(launch_url):
+                    self.launcher_exe_resolved.emit(gid, launch_url, "")
+                    return
+                deadline = time.monotonic() + timeout
+                appid = get_appid_from_url(launch_url) or ""
+                paths = list(_get_suggested_exe_search_paths())
+                if sdir:
+                    sd = Path(sdir)
+                    if sd.exists() and sd not in paths:
+                        paths.insert(0, sd)
+                # Prefer launcher install roots, then the wide default set.
+                try:
+                    for _dirs in _get_launcher_install_paths().values():
+                        for d in _dirs:
+                            p = Path(d)
+                            if p.exists() and p not in paths:
+                                paths.append(p)
+                except Exception:
+                    pass
+                try:
+                    for d in _get_default_exe_search_paths():
+                        p = Path(d)
+                        if p.exists() and p not in paths:
+                            paths.append(p)
+                except Exception:
+                    pass
+                if name and time.monotonic() < deadline:
+                    hit = find_executable_by_fuzzy_name(
+                        name, paths, deadline=deadline)
+                    if hit:
+                        exe_found = str(hit)
+                if not exe_found and appid and time.monotonic() < deadline:
+                    hit = find_executable_by_fuzzy_name(
+                        appid, paths, deadline=deadline)
+                    if hit:
+                        exe_found = str(hit)
+            except Exception as e:
+                logger.debug(f"Background launcher exe resolve failed: {e}")
+            self.launcher_exe_resolved.emit(gid, launch_url, exe_found)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    @Slot(str, str, str)
+    def _on_launcher_exe_resolved(self, game_id: str, url: str, exe_path: str):
+        """Apply a background URL→exe hit to the library entry."""
+        if not exe_path:
+            return
+        from core.resolvers import is_launcher_url
+        from core.library import get_library
+        lib = get_library()
+        entry = lib.get_by_id(game_id)
+        if entry is None:
+            return
+        # Do not clobber a path the user already set by hand.
+        cur = (entry.exe_path or "").strip()
+        if cur and not is_launcher_url(cur) and Path(cur).exists():
+            return
+        entry.exe_path = exe_path
+        # Launch URL stays in appid — never move it into exe_path.
+        if url:
+            entry.appid = url
+        try:
+            entry.record_exe_hints(exe_path)
+        except Exception:
+            pass
+        lib.update_game(entry)
+        logger.info(f"Resolved launcher URL for '{entry.name}' → {exe_path}")
+        try:
+            get_monitor().start_tracking(entry, exe_path)
+        except Exception:
+            pass
+        try:
+            self._library_page.refresh_game_status(game_id)
+        except Exception:
+            pass
+
     def _auto_add_game_from_overlay(self, exe_path: str, force_folder_name: str = "",
                                     force_local_wins: bool = False):
         """Automatically add a game to library from overlay detection.
@@ -1161,83 +1267,39 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         set for the "keep local saves" choices."""
         from core.library import get_library, GameEntry
         from core.monitor import get_monitor, get_pending_appid
-        from core.resolvers import get_appid_from_url, find_executable_by_fuzzy_name, _get_launcher_install_paths, _get_default_exe_search_paths
+        from core.resolvers import get_appid_from_url, is_launcher_url
 
-        # Check if exe_path is a launcher URL and resolve it
-        from core.resolvers import is_launcher_url
+        # Launcher URL: keep it in appid for launching; leave exe_path empty
+        # until the background fuzzy search finds the real file. Never store
+        # steam://… (etc.) as exe_path.
         original_url = exe_path if exe_path and is_launcher_url(exe_path) else None
         appid = None
         game_name = None
         if original_url:
-            appid = get_appid_from_url(original_url)
-
-            # Try to get game name from parent process
+            appid = original_url
             game_name = get_pending_appid(original_url)
+            exe_path = ""
 
-            # Build search paths
-            recommended_paths = []
-            launcher_paths = _get_launcher_install_paths()
-            for launcher, dirs in launcher_paths.items():
-                recommended_paths.extend(dirs)
-
-            # Bounded resolution: the fuzzy walk honours the deadline
-            # internally and returns the best candidate found so far —
-            # a cold-cache disk never wedges this path anymore.
-            import time as _time
-            _deadline = _time.monotonic() + 30
-
-            # Resolve URL to actual exe path using launcher paths first
-            exe_path = None
-            if game_name:
-                exe_path = find_executable_by_fuzzy_name(
-                    game_name, recommended_paths, deadline=_deadline)
-
-            if not exe_path and appid:
-                exe_path = find_executable_by_fuzzy_name(
-                    appid, recommended_paths, deadline=_deadline)
-
-            # Wide scan if not found
-            if not exe_path:
-                wide_paths = _get_default_exe_search_paths()
-                if game_name:
-                    exe_path = find_executable_by_fuzzy_name(
-                        game_name, wide_paths, deadline=_deadline)
-                if not exe_path and appid:
-                    exe_path = find_executable_by_fuzzy_name(
-                        appid, wide_paths, deadline=_deadline)
-            
-            if exe_path:
-                logger.info(f"Resolved launcher URL to {exe_path}")
-                exe_path = str(exe_path)  # Convert Path to string
-                # Never name a game after a generic exe stem ("game",
-                # "launcher"…) — fall back to the install-folder name.
-                from core.save_detector import derive_display_name
-                game_name = derive_display_name(exe_path)
-            else:
-                # Keep the URL as-is if resolution failed
-                logger.info(f"Could not resolve launcher URL, keeping: {original_url}")
-                exe_path = original_url
-        
         # Extract game name from executable — prefer detected name from
         # overlay; a queued (no longer running) detection falls back to the
         # name recorded in the unknown-game history.
         from core.save_detector import derive_display_name as _derive_name
-        pending_name = self._pending_unknown.get(exe_path)
-        if not pending_name:
+        pending_key = original_url or exe_path
+        pending_name = self._pending_unknown.get(pending_key) if pending_key else None
+        if not pending_name and pending_key:
             pending_name = next(
                 (h.get("name") for h in get_config().get("unknown_game_history", [])
-                 if isinstance(h, dict) and h.get("exe") == exe_path and h.get("name")),
+                 if isinstance(h, dict) and h.get("exe") == pending_key and h.get("name")),
                 None)
-        name = game_name or pending_name or _derive_name(exe_path)
-        
+        if original_url:
+            name = game_name or pending_name or get_appid_from_url(original_url) or "Game"
+        else:
+            name = game_name or pending_name or _derive_name(exe_path)
+
         # Try to get appid from pending (detected from parent process)
         if not appid:
-            appid = get_pending_appid(exe_path)
-        
-        # If original was a URL and we resolved exe, keep URL in appid for launching
-        if original_url and exe_path != original_url:
-            appid = original_url  # Store full URL like "steam://rungameid/1046930"
-        
+            appid = get_pending_appid(exe_path) if exe_path else None
+
         # Create new game entry
         entry = GameEntry(
             name=name,
@@ -1252,10 +1314,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             suppressed_overlay=False,
             appid=appid,
         )
-        
+
         # The names as found on disk — release folder and executable stem —
         # kept for matching, never for display.
-        entry.record_exe_hints(exe_path)
+        if exe_path:
+            entry.record_exe_hints(exe_path)
 
         if appid:
             logger.info(f"Auto-adding game with launcher appid: {appid}")
@@ -1273,15 +1336,23 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Add to library
         get_library().add_game(entry)
-        
-        # Start tracking the process immediately via public API
+
+        # Start tracking only when we already know a real process path.
         monitor = get_monitor()
-        monitor.start_tracking(entry, exe_path)
-        
+        if exe_path:
+            monitor.start_tracking(entry, exe_path)
+
         # Remove from pending unknown list
-        self._pending_unknown.pop(exe_path, None)
-        
+        if pending_key:
+            self._pending_unknown.pop(pending_key, None)
+        if original_url:
+            self._pending_unknown.pop(original_url, None)
+
         logger.info(f"Auto-added game to library: {name}")
+
+        if original_url:
+            self.schedule_launcher_exe_resolve(
+                entry.id, original_url, game_name=name or "")
 
         # Show only the "added" confirmation here. The tracking notification
         # is deliberately NOT chained from this overlay any more: adding the
@@ -1292,7 +1363,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if self._overlay:
             from core.engines.game_engine import engine_display, engine_for_game
             self._overlay.show_game_added(
-                name, exe_path, then_track=False,
+                name, exe_path or original_url or "", then_track=False,
                 engine=engine_display(engine_for_game(entry)))
 
     def _on_suppress_overlay(self, exe_path: str):
@@ -1751,6 +1822,78 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         self._auto_export_thread = threading.Thread(target=_run, daemon=True)
         self._auto_export_thread.start()
+
+    # ── GitHub Releases check ─────────────────────────────────────────────────
+
+    # Same late/hourly pattern as backup verify. The interval itself lives in
+    # config with jitter (~12 h ± 2 h); this timer only asks "is it due?".
+    _UPDATE_RECHECK_MS = 60 * 60 * 1000
+
+    def _setup_update_check(self):
+        self._update_check_thread = None
+        self._update_dialog_open = False
+        self.update_available.connect(self._on_update_available)
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(self._UPDATE_RECHECK_MS)
+        self._update_timer.timeout.connect(self._maybe_check_for_updates)
+        self._update_timer.start()
+        from core.update_check import first_delay_ms
+        QTimer.singleShot(first_delay_ms(), self._maybe_check_for_updates)
+
+    def _maybe_check_for_updates(self):
+        """Poll GitHub Releases when enabled and the jittered interval is due."""
+        from core.config_manager import get_config
+        from core.update_check import (
+            fetch_latest_release, is_check_due, mark_check_attempted,
+            should_notify,
+        )
+        cfg = get_config()
+        if not cfg.get("check_for_updates", True):
+            return
+        if self._update_check_thread is not None and self._update_check_thread.is_alive():
+            return
+        if not is_check_due(cfg):
+            return
+        if self._update_dialog_open:
+            return
+
+        import threading
+
+        def _run():
+            try:
+                info = fetch_latest_release()
+                mark_check_attempted(get_config())
+                if info is None:
+                    return
+                if should_notify(info, get_config()):
+                    self.update_available.emit(info)
+            except Exception as e:
+                logger.debug(f"Update check failed: {e}")
+                try:
+                    mark_check_attempted(get_config())
+                except Exception:
+                    pass
+
+        self._update_check_thread = threading.Thread(target=_run, daemon=True)
+        self._update_check_thread.start()
+
+    @Slot(object)
+    def _on_update_available(self, info):
+        if self._update_dialog_open or info is None:
+            return
+        from core.config_manager import get_config
+        from core.update_check import mark_notified
+        from ui.dialogs.update_dialog import UpdateAvailableDialog
+
+        self._update_dialog_open = True
+        try:
+            dlg = UpdateAvailableDialog(info, self)
+            dlg.exec()
+            mark_notified(get_config(), info.version)
+        except Exception as e:
+            logger.debug(f"Update dialog failed: {e}")
+        finally:
+            self._update_dialog_open = False
 
     @staticmethod
     def _prune_save_edit_copies():

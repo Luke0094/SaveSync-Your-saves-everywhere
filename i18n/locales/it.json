@@ -362,6 +362,8 @@
     "backup_on_exit_tooltip": "Crea automaticamente un backup completo quando un gioco monitorato si chiude",
     "auto_scan_on_exit": "Scansione automatica percorsi salvataggio",
     "auto_scan_on_exit_tooltip": "Abilita il rilevamento live dei file di salvataggio durante il gioco e la proposta di conferma dei percorsi trovati. I percorsi rilevati in tempo reale vengono usati anche per i backup automatici periodici.",
+    "check_for_updates": "Avvisami quando è disponibile una nuova versione",
+    "check_for_updates_tooltip": "Circa ogni dodici ore controlla le release su GitHub. Scarichi tu l’aggiornamento: l’eseguibile onefile non può aggiornarsi da solo.",
     "max_size_mb": "Dimensione massima backup (MB)",
     "poll_interval": "Intervallo scansione processi",
     "invalid_hotkey": "Hotkey non valido: '{hotkey}'",
@@ -913,6 +915,7 @@
   },
   "credits": {
     "title": "Crediti",
+    "version": "Versione {version}",
     "developer": "Sviluppatore",
     "donations": "Donazioni",
     "github_tooltip": "Apri la pagina di SaveSync su GitHub",
@@ -1037,10 +1040,12 @@
     "drop_hint": "oppure trascina qui un salvataggio — clicca per sceglierlo",
     "edit_hint": "L'originale viene copiato a parte prima di scrivere qualsiasi cosa, così ogni modifica è annullabile dalla schermata precedente.",
     "editing": "{name} — letto come {engine}.",
+    "editing_read_only": "{name} — letto come {engine} (sola lettura).",
     "err_cannot_read": "Impossibile leggere {name}: {reason}",
     "err_copy_gone": "Quella copia non c'è più.",
     "err_empty": "Il file è vuoto.",
     "err_known_not_editable": "{name} sembra un salvataggio {engine}, che SaveSync non sa ancora modificare: {reason}",
+    "err_read_only": "Questo salvataggio si può leggere ma non riscrivere in modo sicuro.",
     "err_unreadable": "{name} non è un formato di salvataggio che SaveSync sa leggere.",
     "err_unreal_new": "{name} è un salvataggio Unreal Engine, ma SaveSync non è riuscito a leggerlo fino in fondo, quindi non ci scrive nemmeno.",
     "filter_values": "Filtra valori…",
@@ -1060,6 +1065,7 @@
     "hold_failed": "Ho smesso di tenere fermi i valori: {error}",
     "hold_pending": "{count} valore/i bloccati — riapplicati solo mentre questo gioco è in esecuzione.",
     "hold_tip": "Blocca questo valore: dopo Applica viene rimesso ogni volta che il gioco lo sovrascrive, ma solo mentre questo gioco è in esecuzione",
+    "hold_tip_read_only": "Non si possono bloccare valori su un salvataggio in sola lettura",
     "holding": "{count} valore/i tenuto/i fermo/i · rimesso {rounds} volta/e",
     "kept_copies": "COPIE CONSERVATE PRIMA DELLE MODIFICHE",
     "menu": "Cheats",
@@ -1079,6 +1085,7 @@
     "pick_save": "FILE DI SALVATAGGIO",
     "pick_save_engine": "Realizzato con {engine}. Scegli il salvataggio da modificare.",
     "pick_save_hint": "Scegli il salvataggio da modificare.",
+    "read_only_hint": "Riconosciuto come {engine}, ma la riscrittura non ricostruisce gli stessi byte — mostrato in sola lettura così non viene scritto nulla.",
     "reload_warning": "{name} è in esecuzione. Tiene in memoria la propria copia del salvataggio e riscriverà questo file al prossimo salvataggio: ricarica ora il salvataggio nel gioco perché la modifica abbia effetto.",
     "restore": "Ripristina",
     "restored": "{name} è stato ripristinato.",
@@ -1087,5 +1094,13 @@
     "title": "Editor salvataggi",
     "too_many": "Mostrati {shown} valori su {total} — usa il filtro per raggiungere gli altri.",
     "write_failed": "Impossibile scrivere il salvataggio: {error}"
+  },
+  "update": {
+    "title": "Aggiornamento disponibile",
+    "available": "È uscito SaveSync {version} — tu hai la {current}.",
+    "manual_note": "SaveSync non può aggiornarsi da solo (build onefile). Scarica il nuovo eseguibile dalla pagina della release.",
+    "no_notes": "Nessuna nota di rilascio per questa versione.",
+    "open_page": "Apri pagina di download",
+    "later": "Più tardi"
   }
 }

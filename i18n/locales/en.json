@@ -362,6 +362,8 @@
     "backup_on_exit_tooltip": "Automatically create a full backup when a tracked game closes",
     "auto_scan_on_exit": "Auto-scan save paths",
     "auto_scan_on_exit_tooltip": "Enable live detection of save files during gameplay and confirmation of found paths on exit. Paths detected in real time are also used for automatic periodic backups.",
+    "check_for_updates": "Notify me when a new version is available",
+    "check_for_updates_tooltip": "About every twelve hours, check GitHub Releases for a newer SaveSync. You download it yourself — the onefile build cannot update in place.",
     "max_size_mb": "Max backup size (MB)",
     "poll_interval": "Process scan interval",
     "invalid_hotkey": "Invalid hotkey: '{hotkey}'",
@@ -913,6 +915,7 @@
   },
   "credits": {
     "title": "Credits",
+    "version": "Version {version}",
     "developer": "Developer",
     "donations": "Donations",
     "github_tooltip": "Open the SaveSync page on GitHub",
@@ -1037,10 +1040,12 @@
     "drop_hint": "or drop a save file here — click to choose one",
     "edit_hint": "The original is copied aside before anything is written, so any edit can be undone from the previous screen.",
     "editing": "{name} — read as {engine}.",
+    "editing_read_only": "{name} — read as {engine} (read-only).",
     "err_cannot_read": "{name} could not be read: {reason}",
     "err_copy_gone": "That copy is no longer there.",
     "err_empty": "That file is empty.",
     "err_known_not_editable": "{name} looks like a {engine} save, which SaveSync cannot edit yet: {reason}",
+    "err_read_only": "This save can be read but not rewritten safely.",
     "err_unreadable": "{name} is not a save format SaveSync can read.",
     "err_unreal_new": "{name} is an Unreal Engine save, but SaveSync could not read all the way through it, so it will not write to it either.",
     "filter_values": "Filter values…",
@@ -1060,6 +1065,7 @@
     "hold_failed": "Stopped holding values: {error}",
     "hold_pending": "{count} value(s) locked — re-applied only while this game is running.",
     "hold_tip": "Lock this value: after Apply it is put back whenever the game overwrites it, but only while this game is running",
+    "hold_tip_read_only": "Cannot lock values on a read-only save",
     "holding": "Holding {count} value(s) · put back {rounds} time(s)",
     "kept_copies": "COPIES KEPT BEFORE EDITING",
     "menu": "Cheats",
@@ -1079,6 +1085,7 @@
     "pick_save": "SAVE FILES",
     "pick_save_engine": "Built with {engine}. Pick the save file to edit.",
     "pick_save_hint": "Pick the save file to edit.",
+    "read_only_hint": "Recognised as {engine}, but re-encoding does not rebuild the original bytes — shown read-only so nothing is written.",
     "reload_warning": "{name} is running. It holds its own copy of the save in memory and will write over this file the next time it saves — load the save in the game now for the change to take.",
     "restore": "Restore",
     "restored": "{name} was put back.",
@@ -1087,5 +1094,13 @@
     "title": "Save editor",
     "too_many": "Showing {shown} of {total} values — use the filter to reach the rest.",
     "write_failed": "Could not write the save: {error}"
+  },
+  "update": {
+    "title": "Update available",
+    "available": "SaveSync {version} is out — you are on {current}.",
+    "manual_note": "SaveSync cannot update itself (onefile build). Download the new executable from the release page.",
+    "no_notes": "No release notes for this version.",
+    "open_page": "Open download page",
+    "later": "Later"
   }
 }

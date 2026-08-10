@@ -285,7 +285,6 @@ class SearchFlowMixin:
         # arrows simply disabled for a single result) instead of silently
         # taking the first one. Drop sources already applied when they
         # carry no material news (a rewritten description alone is not news).
-        self._invalidate_primary_reachability()
         self._show_search_candidates(results)
 
     def _source_label(self, raw_source: str) -> str:
@@ -308,6 +307,10 @@ class SearchFlowMixin:
         After confirm, same-tier peers open the chip merge dialog. Back there
         restores the form snapshot and reopens this carousel so the user can
         pick another candidate without being stuck.
+
+        Primary-page reachability (soft-promote) is probed on a worker
+        thread — never on the GUI thread — and the carousel is refreshed
+        when that answer arrives.
         """
         self._add_btn.setEnabled(True)
         self._web_search_btn.setEnabled(True)
@@ -316,13 +319,32 @@ class SearchFlowMixin:
         # a dead primary). Re-offering Steam after a Steam save + VNDB
         # enrich with nothing new is exactly what this filters out.
         self._last_search_candidates = list(results)
+        self._pending_reachability_results = list(results)
+        self._candidate_show_deferred = False
+        self._active_candidate_dialog = None
+        self._invalidate_primary_reachability()
+        probing = self._start_primary_reachability_probe()
+
         useful = [r for r in results
                   if self._compute_candidate_diff(r).get('has_changes')]
         if not useful:
+            if probing:
+                # Only promote_primary could unlock a candidate — wait for
+                # the probe without freezing the UI (same Signal pattern as
+                # search_finished / _UrlFetchDialog._fetch_done).
+                self._candidate_show_deferred = True
+                self._status_lbl.setText(t('add_game.searching'))
+                self._status_lbl.setStyleSheet(
+                    f"color:{palette('text_secondary')};font-size:12px;")
+                return
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
             self._status_lbl.setStyleSheet(
                 f"color:{palette('text_secondary')};font-size:12px;")
             return
+        self._open_candidate_carousel(useful)
+
+    def _open_candidate_carousel(self, useful: list):
+        """Modal carousel loop for an already-filtered useful list."""
         n = len(useful)
         self._status_lbl.setText(
             t('add_game.candidates_found', n=n) if n > 1
@@ -334,16 +356,25 @@ class SearchFlowMixin:
                 useful, self._compute_candidate_diff, self,
                 extra_note=t('add_game.enrich_note') if n > 1 else '',
             )
-            if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected is None:
-                self._candidates_rejected()
+            self._active_candidate_dialog = dlg
+            try:
+                if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected is None:
+                    self._candidates_rejected()
+                    return
+                snap = self._capture_search_form()
+                if not self._process_search_result(dlg.selected, offer_enrichment=False):
+                    return
+                if self._run_same_tier_merge(dlg.selected):
+                    self._restore_search_form(snap)
+                    useful = [r for r in (self._last_search_candidates or [])
+                              if self._compute_candidate_diff(r).get('has_changes')]
+                    if not useful:
+                        return
+                    n = len(useful)
+                    continue
                 return
-            snap = self._capture_search_form()
-            if not self._process_search_result(dlg.selected, offer_enrichment=False):
-                return
-            if self._run_same_tier_merge(dlg.selected):
-                self._restore_search_form(snap)
-                continue
-            return
+            finally:
+                self._active_candidate_dialog = None
 
     def _candidates_rejected(self):
         """No candidate confirmed (Reject / closed the popup): proceed
@@ -836,37 +867,96 @@ class SearchFlowMixin:
 
     def _invalidate_primary_reachability(self) -> None:
         self._primary_reachability_cache = None
+        self._primary_reachability_gen = getattr(self, '_primary_reachability_gen', 0) + 1
+
+    def _primary_urls_to_probe(self) -> list[str]:
+        """Store URLs that belong to the saved primary source, if any."""
+        fp = getattr(self, '_enrichment_source_fingerprint', None) or {}
+        primary = (fp.get('source') or '').split('+')[0]
+        if not primary:
+            return []
+        return [u for u in (getattr(self, '_store_urls', None) or [])
+                if self._source_from_url(u) == primary]
 
     def _is_primary_source_reachable(self) -> bool:
         """Whether the saved primary's page still answers.
 
-        Cached per search presentation. No URL for that source → assume
-        reachable (cannot justify a soft promote). Probe failure → dead.
+        Reads only the cache filled by `_start_primary_reachability_probe`.
+        Unknown (probe pending / not started) → True (optimistic): never
+        soft-promote until a background probe has proven the page dead, and
+        never block the GUI thread on open_url.
         """
         cached = getattr(self, '_primary_reachability_cache', None)
-        if cached is not None:
-            return cached
-        fp = getattr(self, '_enrichment_source_fingerprint', None) or {}
-        primary = (fp.get('source') or '').split('+')[0]
-        if not primary:
-            self._primary_reachability_cache = True
+        if cached is None:
             return True
-        urls = [u for u in (getattr(self, '_store_urls', None) or [])
-                if self._source_from_url(u) == primary]
+        return bool(cached)
+
+    def _start_primary_reachability_probe(self) -> bool:
+        """Probe primary URLs on a worker thread. Returns True if a probe
+        was started (caller may defer UI that depends on promote_primary)."""
+        urls = self._primary_urls_to_probe()
         if not urls:
             self._primary_reachability_cache = True
-            return True
-        ok = False
-        for u in urls[:2]:
-            if self._probe_page_reachable(u):
-                ok = True
-                break
-        self._primary_reachability_cache = ok
-        return ok
+            return False
+        gen = getattr(self, '_primary_reachability_gen', 0)
+        probe_urls = list(urls[:2])
+
+        def _bg(urls=probe_urls, gen=gen):
+            ok = False
+            try:
+                for u in urls:
+                    if self._probe_page_reachable(u):
+                        ok = True
+                        break
+            except Exception as e:
+                logger.debug(f"Primary reachability probe crashed: {e}")
+                ok = False
+            try:
+                self.primary_reachability_done.emit(gen, ok)
+            except RuntimeError:
+                pass  # dialog already destroyed
+
+        threading.Thread(target=_bg, daemon=True).start()
+        return True
+
+    def _on_primary_reachability_done(self, gen: int, reachable: bool):
+        """GUI-thread slot: apply probe result and refresh candidate UI."""
+        if gen != getattr(self, '_primary_reachability_gen', 0):
+            return
+        if not self.isVisible():
+            return
+        self._primary_reachability_cache = bool(reachable)
+        results = getattr(self, '_pending_reachability_results', None)
+        if not results:
+            return
+        useful = [r for r in results
+                  if self._compute_candidate_diff(r).get('has_changes')]
+
+        dlg = getattr(self, '_active_candidate_dialog', None)
+        if dlg is not None:
+            if useful:
+                try:
+                    dlg.set_candidates(useful)
+                except RuntimeError:
+                    pass
+            return
+
+        if not getattr(self, '_candidate_show_deferred', False):
+            return
+        self._candidate_show_deferred = False
+        if useful:
+            self._open_candidate_carousel(useful)
+        else:
+            self._status_lbl.setText(t('add_game.candidate_no_changes'))
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('text_secondary')};font-size:12px;")
 
     @staticmethod
     def _probe_page_reachable(url: str, timeout: float = 4.0) -> bool:
-        """Cheap GET: HTTP < 400 counts as alive. Network errors → dead."""
+        """Cheap GET: HTTP < 400 counts as alive. Network errors → dead.
+
+        Must only run off the GUI thread (see `_start_primary_reachability_probe`).
+        """
         if not url:
             return False
         try:

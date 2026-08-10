@@ -8,8 +8,14 @@ import platform
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 APP_ID = "com.savesync.app"
+GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
+GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
+GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
+GITHUB_RELEASES_API = (
+    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+)
 
 # Paths — platform-aware data directory
 def _user_data_dir() -> Path:

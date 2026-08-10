@@ -64,6 +64,13 @@ _DEFAULTS: dict[str, Any] = {
     "auto_export_config_enabled": False,
     "auto_export_config_interval_days": 7,
     "auto_export_config_last": "",  # ISO datetime of last successful/skipped run
+    # GitHub Releases check. No auto-update (onefile build): notify only.
+    # Interval is stored in seconds with jitter (~12 h ± 2 h) so every
+    # install does not poll on the same clock.
+    "check_for_updates": True,
+    "update_check_last": "",
+    "update_check_interval_sec": 0,
+    "update_notified_version": "",
     # Pinned notes/images: only paths and window geometry. The files stay
     # where the player put them and are never copied into SaveSync.
     "pins_recent": {},             # game_id -> recently pinned files, newest first

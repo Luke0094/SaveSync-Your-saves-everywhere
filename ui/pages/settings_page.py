@@ -147,6 +147,9 @@ class SettingsPage(QWidget):
         self._auto_scan_cb = QCheckBox(t("settings.auto_scan_on_exit"))
         self._auto_scan_cb.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
         beh_form.addRow("", self._auto_scan_cb)
+        self._updates_cb = QCheckBox(t("settings.check_for_updates"))
+        self._updates_cb.setToolTip(t("settings.check_for_updates_tooltip"))
+        beh_form.addRow("", self._updates_cb)
 
         # ── Per-game suppression list ─────────────────────────────────────────
         # Shows games that have "don't confirm scan" or "don't show notification"
@@ -590,6 +593,7 @@ class SettingsPage(QWidget):
         self._backup_on_exit_cb.stateChanged.connect(self._mark_dirty)
         self._auto_sync_cb.stateChanged.connect(self._mark_dirty)
         self._auto_scan_cb.stateChanged.connect(self._mark_dirty)
+        self._updates_cb.stateChanged.connect(self._mark_dirty)
         self._overlay_launch_cb.stateChanged.connect(self._mark_dirty)
         self._overlay_unknown_cb.stateChanged.connect(self._mark_dirty)
         self._overlay_cloud_cb.stateChanged.connect(self._mark_dirty)
@@ -865,6 +869,7 @@ class SettingsPage(QWidget):
             "backup_exit": self._backup_on_exit_cb.isChecked(),
             "auto_sync": self._auto_sync_cb.isChecked(),
             "auto_scan": self._auto_scan_cb.isChecked(),
+            "check_updates": self._updates_cb.isChecked(),
             "overlay_launch": self._overlay_launch_cb.isChecked(),
             "overlay_unknown": self._overlay_unknown_cb.isChecked(),
             "overlay_cloud": self._overlay_cloud_cb.isChecked(),
@@ -922,6 +927,7 @@ class SettingsPage(QWidget):
         self._backup_on_exit_cb.setChecked(config.get("backup_on_exit", True))
         self._auto_sync_cb.setChecked(config.get("auto_sync_after_backup", False))
         self._auto_scan_cb.setChecked(config.get("auto_scan_on_exit", True))
+        self._updates_cb.setChecked(config.get("check_for_updates", True))
         self._load_suppression_list()
         self._overlay_launch_cb.setChecked(config.get("show_overlay_on_launch", True))
         self._overlay_unknown_cb.setChecked(config.get("show_overlay_on_unknown", True))
@@ -984,6 +990,7 @@ class SettingsPage(QWidget):
         config.set("backup_on_exit",         self._backup_on_exit_cb.isChecked())
         config.set("auto_sync_after_backup", self._auto_sync_cb.isChecked())
         config.set("auto_scan_on_exit",      self._auto_scan_cb.isChecked())
+        config.set("check_for_updates",      self._updates_cb.isChecked())
         config.set("show_overlay_on_launch", self._overlay_launch_cb.isChecked())
         config.set("show_overlay_on_unknown", self._overlay_unknown_cb.isChecked())
         config.set("show_overlay_on_cloud",  self._overlay_cloud_cb.isChecked())
@@ -1422,6 +1429,7 @@ class SettingsPage(QWidget):
             "backup_on_exit":         True,
             "auto_sync_after_backup": False,
             "auto_scan_on_exit":      True,
+            "check_for_updates":      True,
             "show_overlay_on_launch": True,
             "show_overlay_on_unknown": True,
             "show_overlay_on_cloud":  True,
@@ -1518,6 +1526,8 @@ class SettingsPage(QWidget):
         self._auto_sync_cb.setText(t("settings.auto_sync_after_backup"))
         self._auto_scan_cb.setText(t("settings.auto_scan_on_exit"))
         self._auto_scan_cb.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
+        self._updates_cb.setText(t("settings.check_for_updates"))
+        self._updates_cb.setToolTip(t("settings.check_for_updates_tooltip"))
         self._lang_combo.setToolTip(t("settings.language_tooltip"))
         self._theme_combo.setToolTip(t("settings.theme_tooltip"))
         self._startup_cb.setToolTip(t("settings.launch_on_startup_tooltip"))

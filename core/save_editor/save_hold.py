@@ -176,6 +176,17 @@ class SaveHold(QObject):
                 self.stop()
             return
         self._read_failures = 0
+        if getattr(doc, "read_only", False):
+            # The file opened, but writing it would not rebuild the original —
+            # holding values requires a write, so stop rather than mangle it.
+            from .base import explain
+            err = SaveEditorError(
+                "this save can be read but not rewritten safely",
+                "cheats.err_read_only")
+            logger.info(f"Hold stopped on read-only {self._path.name}")
+            self.failed.emit(explain(err))
+            self.stop()
+            return
 
         # Resolve afresh every round, by name, and only when the name is
         # unambiguous in the file as it is NOW.

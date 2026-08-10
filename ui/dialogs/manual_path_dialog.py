@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 from i18n import t
 from core.manual_paths import (
     resolve_manual_path, derive_folder_name, scan_save_collection,
-    save_chain_of, names_of, profile_destination,
+    save_chain_of, profile_destination,
     ACTUAL, RESOLVED, PREDICTED,
 )
 from ui.helpers import ElidedLabel
@@ -444,11 +444,14 @@ class ManualPathDialog(QDialog):
                 # row's own chain wins only because it was read before the
                 # user could edit the path.
                 chain = row.chain() or save_chain_of(item.path)
-                # The folder's own name, decoration and all. The title beside
-                # it has been tidied; this is what still carries the release
-                # code and version, and it is what matches the game's install
-                # folder exactly.
-                raw = Path(item.path).name if item.path else ""
+                # Full release folder name (version/RJ/… intact) for name_hints.
+                # Prefer the collection folder when present — the leaf of a
+                # deep save path may just be "save", which is useless for
+                # homonym recognition.
+                if row._source:
+                    raw = Path(row._source).name
+                else:
+                    raw = Path(item.path).name if item.path else ""
                 pending.append((row.game_name(), item, chain, raw))
             else:
                 # Only a typed path can end up here: a folder read out of a
@@ -494,67 +497,87 @@ class ManualPathDialog(QDialog):
     def _store(self, pending: list) -> tuple:
         """Write the folders into the library.
 
-        A folder already registered on some game is left alone; a name that
-        matches an existing game joins that game rather than creating a
-        second, near-identical entry; everything else becomes a new entry with
-        no executable — legitimate here, backups only ever need the paths.
+        Display titles are the cleaned form (versions/noise stripped). The
+        full release folder name is kept as a name_hint so two games that
+        clean to the same title stay distinguishable.
+
+        Skip when:
+          - that exact save path is already registered, or
+          - a matched game already has saves whose newest write is at least
+            as recent as the folder being added (stale collection re-import).
         """
         from core.library import GameEntry, get_library
         from core.machine import get_machine_id
         from core.constants import get_folder_name_for_save
+        from core.manual_paths import (
+            find_manual_game_match, latest_save_mtime,
+        )
 
         lib = get_library()
         games = lib.all_games()
         by_path = {p.casefold(): g for g in games for p in (g.save_paths or [])}
-        # Every name a game answers to, its former titles included: a folder
-        # named after the game must find that game even if the library has
-        # since renamed it. The current title wins where two entries collide.
-        by_name = {}
-        for g in games:
-            for known in names_of(g):
-                by_name.setdefault(known, g)
-        for g in games:
-            title = (g.name or "").strip().casefold()
-            if title:
-                by_name[title] = g
 
         added = updated = skipped = 0
         for name, item, chain, raw in pending:
-            if item.path.casefold() in by_path:
+            path_key = (item.path or "").casefold()
+            if path_key and path_key in by_path:
                 skipped += 1
                 continue
-            existing = by_name.get((name or "").strip().casefold())
+
+            # Prefer the cleaned title from the folder walk; fall back to the
+            # row text. Never store a raw "v1.2" title as the display name
+            # when derive_folder_name can clean it.
+            cleaned = (name or "").strip() or (item.name or "").strip()
+            if item.path and not (name or "").strip():
+                cleaned = derive_folder_name(item.path) or cleaned
+
+            existing = find_manual_game_match(games, cleaned, raw)
             if existing is not None:
+                incoming_ts = latest_save_mtime(item.path) if item.exists else 0.0
+                existing_ts = 0.0
+                for p in (existing.save_paths or []):
+                    existing_ts = max(existing_ts, latest_save_mtime(p))
+                # Matched game already holds equal/newer saves → nothing to add.
+                if existing_ts and incoming_ts and incoming_ts <= existing_ts:
+                    # Still remember the full release name if it was missing.
+                    if raw:
+                        existing.record_name_hint(raw)
+                        lib.update_game(existing)
+                    skipped += 1
+                    continue
                 existing.save_paths = list(existing.save_paths or []) + [item.path]
                 existing.save_paths_confirmed = True
-                # Per path: this game may already have a folder pointing
-                # somewhere else entirely, and its destination must survive.
                 existing.record_path_chain(item.path, chain)
                 existing.record_name_hint(raw)
                 lib.update_game(existing)
-                by_path[item.path.casefold()] = existing
+                by_path[path_key] = existing
                 self.added_entries.append(existing)
                 updated += 1
                 continue
+
             entry = GameEntry(
-                name=name or item.name,
+                name=cleaned or item.name,
                 exe_path="",
                 save_paths=[item.path],
                 save_paths_confirmed=True,
                 requires_confirmation=False,
                 auto_added=False,
                 machine_id=get_machine_id(),
-                computed_folder_name=get_folder_name_for_save(name or item.name, "", ""),
+                computed_folder_name=get_folder_name_for_save(
+                    cleaned or item.name, "", ""),
                 save_chain=chain,
             )
             entry.record_name(entry.name)
             entry.record_path_chain(item.path, chain)
+            # Full folder name (with version/RJ/…) for recognition — not the
+            # cleaned display title. Homonyms that strip to the same clean
+            # name stay distinct via these hints.
             entry.record_name_hint(raw)
             entry.computed_folder_name = lib.unique_folder_name(
                 entry.computed_folder_name, entry.id)
             lib.add_game(entry)
-            by_path[item.path.casefold()] = entry
-            by_name[(entry.name or "").strip().casefold()] = entry
+            games.append(entry)
+            by_path[path_key] = entry
             self.added_entries.append(entry)
             added += 1
             logger.info(f"Manually added save folder for {entry.name}: {item.path}")

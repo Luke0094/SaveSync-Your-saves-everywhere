@@ -5,24 +5,72 @@ Opened from the sidebar button (above the Online/Offline status). Built
 fresh on every open, so it always picks up the CURRENT theme palette and
 language — no refresh_styles/update_locale wiring needed.
 """
+import sys
 import webbrowser
+from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer
+from PySide6.QtGui import QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QVBoxLayout,
 )
 
 from i18n import t
+from core.constants import APP_NAME, APP_VERSION, GITHUB_URL
 from ui.styles.theme import palette
-
-_GITHUB_URL = "https://github.com/Luke0094/SaveSync-Your-saves-everywhere"
 
 _WALLETS = [
     ("Bitcoin",  "3G3MDNUh51g6iK7ZRSQPX4EeBXEb3UyAtw"),
     ("Litecoin", "MEmeHh7A3Cfp9KvcqurviaJXpYL9HXuVJV"),
 ]
+
+_LOGO_PX = 72
+
+
+def _assets_dir() -> Path:
+    # Same resolution as splash / main.py (dev tree or PyInstaller _MEIPASS).
+    return Path(getattr(sys, "_MEIPASS",
+                        Path(__file__).resolve().parent.parent.parent)) / "assets"
+
+
+def _logo_pixmap(size: int = _LOGO_PX) -> QPixmap:
+    """The app icon already loaded for the window/tray, or from assets.
+
+    The sidebar brand is text-only (#sidebar_logo) — the PNG/ICO under
+    assets/ is only applied at startup as QApplication.windowIcon. Prefer
+    that icon so credits shows the same art without a second path guess;
+    fall back to loading assets the same way main.py does.
+    """
+    app = QApplication.instance()
+    dpr = float(app.devicePixelRatio() if app is not None else 1.0) or 1.0
+    pixel = max(1, int(round(size * dpr)))
+    target = QSize(pixel, pixel)
+
+    def _from_icon(icon: QIcon) -> QPixmap:
+        if icon is None or icon.isNull():
+            return QPixmap()
+        px = icon.pixmap(target)
+        if px.isNull():
+            return QPixmap()
+        px.setDevicePixelRatio(dpr)
+        return px
+
+    if app is not None:
+        px = _from_icon(app.windowIcon())
+        if not px.isNull():
+            return px
+
+    # main.py prefers .ico (multi-size for the taskbar); use QIcon so Qt
+    # picks the closest size — QPixmap(path) on an .ico often yields 16×16.
+    for name in ("icon.ico", "icon.png"):
+        path = _assets_dir() / name
+        if not path.is_file():
+            continue
+        px = _from_icon(QIcon(str(path)))
+        if not px.isNull():
+            return px
+    return QPixmap()
 
 
 class _CopyOnClickField(QLineEdit):
@@ -100,7 +148,7 @@ class CreditsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("credits.title"))
-        self.setFixedSize(440, 380)
+        self.setFixedSize(440, 460)
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
         self._build_ui()
@@ -109,6 +157,41 @@ class CreditsDialog(QDialog):
         root = QVBoxLayout(self)
         root.setSpacing(14)
         root.setContentsMargins(28, 24, 28, 20)
+
+        # ── Brand + running version ───────────────────────────────────────────
+        # Logo = window icon from assets (set in main.py), not the sidebar
+        # text label. Fixed box so the layout cannot collapse an empty-looking
+        # pixmap row under the global QLabel stylesheet.
+        logo_px = _logo_pixmap()
+        logo = QLabel()
+        logo.setObjectName("credits_logo")
+        logo.setFixedSize(_LOGO_PX, _LOGO_PX)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet("background: transparent; border: none;")
+        if not logo_px.isNull():
+            logo.setPixmap(logo_px)
+        logo_row = QHBoxLayout()
+        logo_row.addStretch()
+        logo_row.addWidget(logo)
+        logo_row.addStretch()
+        root.addLayout(logo_row)
+
+        brand = QLabel(APP_NAME)
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand_font = QFont()
+        brand_font.setPointSize(16)
+        brand_font.setBold(True)
+        brand.setFont(brand_font)
+        brand.setStyleSheet(f"color:{palette('text')};")
+        root.addWidget(brand)
+
+        ver = QLabel(t("credits.version", version=APP_VERSION))
+        ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ver.setStyleSheet(
+            f"color:{palette('text_secondary')};font-size:12px;")
+        root.addWidget(ver)
+
+        root.addWidget(_hsep())
 
         # ── Developer ─────────────────────────────────────────────────────────
         dev_lbl = QLabel(t("credits.developer"))
@@ -151,7 +234,7 @@ class CreditsDialog(QDialog):
             f"QPushButton:hover{{background:{palette('accent')};"
             f"border-color:{palette('accent')};color:#000000;}}"
         )
-        github_btn.clicked.connect(lambda: webbrowser.open(_GITHUB_URL))
+        github_btn.clicked.connect(lambda: webbrowser.open(GITHUB_URL))
         dev_row.addWidget(github_btn)
         dev_row.addStretch()
         root.addLayout(dev_row)

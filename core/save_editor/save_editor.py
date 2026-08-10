@@ -13,13 +13,14 @@ something that tampers with programs.
 Two rules the whole module is built around:
 
 - **Never guess.** A format is either understood well enough to rebuild it
-  byte-for-byte, or it is reported as unsupported. A half-understood binary
-  format that is written back anyway produces a save the game refuses to
-  load — and the player finds out hours later.
+  byte-for-byte, or it is named and left alone (read-only). A half-understood
+  binary format that is written back anyway produces a save the game refuses
+  to load — and the player finds out hours later.
 - **Prove the round trip.** Before any file is offered for editing, it is
   decoded and re-encoded, and the result must match the original exactly.
-  If it does not, the file is read-only. This catches every parsing gap
-  without having to enumerate them.
+  If it does not, the file is still opened read-only when the format was
+  recognised: values can be inspected, writing is refused. This catches
+  every parsing gap without having to enumerate them.
 """
 import logging
 import os
@@ -270,11 +271,20 @@ def _candidates(path: Path, data: bytes) -> list:
 
 @dataclass
 class SaveDocument:
-    """A save file opened for editing."""
+    """A save file opened for viewing — and editing when the round trip holds.
+
+    ``read_only`` is True when the format was recognised and values could be
+    listed, but re-encoding does not rebuild the original bytes (or the
+    equivalent value check for formats that never claim byte identity). The
+    file is named and shown; writing is refused. That is the principle in
+    the module docstring: reconstruct byte-for-byte, or name it and leave
+    it alone — never a silent mangled write.
+    """
     path: Path
     format_name: str
     engine: str
     fields: list = _field(default_factory=list)
+    read_only: bool = False
     _fmt: object = None
     _original: bytes = b""
     # Set when the save is a registry key rather than a file — see open_save.
@@ -284,6 +294,10 @@ class SaveDocument:
     _baseline: tuple = ()
 
     def set_value(self, path: tuple, value) -> None:
+        if self.read_only:
+            raise SaveEditorError(
+                "this save can be read but not rewritten safely",
+                "cheats.err_read_only")
         self._fmt.set_field(path, value)
         for f in self.fields:
             if f.path == path:
@@ -300,6 +314,8 @@ class SaveDocument:
         modified it. For those the values are what is compared, which is
         what the question is actually asking.
         """
+        if self.read_only:
+            return False
         if getattr(self._fmt, "verify_exact", True):
             return self._fmt.dump() != self._original
         return self._value_snapshot() != self._baseline
@@ -313,6 +329,10 @@ class SaveDocument:
         Returns the path of the copy that was set aside — the thing "undo"
         needs. Writing happens only after that copy exists.
         """
+        if self.read_only:
+            raise SaveEditorError(
+                "this save can be read but not rewritten safely",
+                "cheats.err_read_only")
         if self._registry:
             # Nothing to copy aside on disk, so the copy IS the export: the
             # key exactly as it stands, written where a file's backup would
@@ -336,6 +356,10 @@ class SaveDocument:
         the save mid-write sees either the old file or the new one, never
         half of each.
         """
+        if self.read_only:
+            raise SaveEditorError(
+                "this save can be read but not rewritten safely",
+                "cheats.err_read_only")
         data = self._fmt.dump()
         if self._registry:
             from core.registry_saves import import_registry_tree
@@ -417,6 +441,52 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
             fmt.progress = progress
         return fmt
 
+    def engine_label_for(cls):
+        label = cls.engine
+        # When the library knows the game's engine, prefer that label for
+        # formats that are shared across engines (plain JSON, key/value text)
+        # so a WebGL or Java title is not shown as a generic "JSON" save.
+        if game_dir and cls in (JsonFormat, KeyValueFormat, TadsRecFormat,
+                                SqliteFormat, _LzStringJson, SugarCubeFormat):
+            try:
+                from core.engines.game_engine import detect_engine, label as eng_label
+                detected = detect_engine(game_dir=str(game_dir))
+                if detected in ("webgl", "tads", "java"):
+                    label = eng_label(detected) or label
+            except Exception:
+                pass
+        return label
+
+    def make_doc(cls, fmt, *, read_only=False):
+        fields = fmt.fields()
+        # Plain JSON (and WebGL shells that write it) can be a valid save with
+        # no leaf values yet — e.g. {"saves": []}. Rejecting that made empty
+        # but real save files look "unreadable".
+        if not fields and cls is not JsonFormat and not issubclass(cls, JsonFormat):
+            return None
+        doc = SaveDocument(
+            path=p, format_name=cls.name, engine=engine_label_for(cls),
+            fields=fields, read_only=read_only, _fmt=fmt, _original=data,
+            _registry=registry)
+        doc._baseline = doc._value_snapshot()
+        return doc
+
+    # A candidate that loaded but failed the round trip is kept aside while
+    # later readers are still tried — a writable match must win. Only if
+    # nothing writes safely do we return the named read-only document, so
+    # the file is not demoted to "unrecognised" after we already understood it.
+    readonly_doc = None
+
+    def remember_readonly(cls, fmt, why: str):
+        nonlocal readonly_doc
+        if readonly_doc is not None:
+            return
+        doc = make_doc(cls, fmt, read_only=True)
+        if doc is None:
+            return
+        logger.info(f"{p.name}: {cls.name} {why} — read-only")
+        readonly_doc = doc
+
     for cls in ([PlayerPrefsFormat] if registry else _candidates(p, data)):
         fmt = prepare(cls)
         try:
@@ -434,6 +504,7 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         try:
             rebuilt = fmt.dump()
         except Exception:
+            remember_readonly(cls, fmt, "dump failed after load")
             continue
         # Asked of the reader, not of its class: a format can only know
         # which guarantee it can offer once it has seen the file. Naninovel
@@ -448,36 +519,21 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
                 probe.load(rebuilt)
                 if ([(f.label, f.value) for f in probe.fields()]
                         != [(f.label, f.value) for f in fmt.fields()]):
+                    remember_readonly(cls, fmt, "value round trip differs")
                     continue
             except Exception:
+                remember_readonly(cls, fmt, "value round trip failed")
                 continue
         elif rebuilt != data:
-            logger.info(f"{p.name}: {cls.name} round trip differs — read-only")
+            remember_readonly(cls, fmt, "round trip differs")
             continue
-        fields = fmt.fields()
-        # Plain JSON (and WebGL shells that write it) can be a valid save with
-        # no leaf values yet — e.g. {"saves": []}. Rejecting that made empty
-        # but real save files look "unreadable".
-        if not fields and cls is not JsonFormat and not issubclass(cls, JsonFormat):
+        doc = make_doc(cls, fmt, read_only=False)
+        if doc is None:
             continue
-        engine_label = cls.engine
-        # When the library knows the game's engine, prefer that label for
-        # formats that are shared across engines (plain JSON, key/value text)
-        # so a WebGL or Java title is not shown as a generic "JSON" save.
-        if game_dir and cls in (JsonFormat, KeyValueFormat, TadsRecFormat,
-                                SqliteFormat, _LzStringJson, SugarCubeFormat):
-            try:
-                from core.engines.game_engine import detect_engine, label as eng_label
-                detected = detect_engine(game_dir=str(game_dir))
-                if detected in ("webgl", "tads", "java"):
-                    engine_label = eng_label(detected) or engine_label
-            except Exception:
-                pass
-        doc = SaveDocument(path=p, format_name=cls.name, engine=engine_label,
-                           fields=fields, _fmt=fmt, _original=data,
-                           _registry=registry)
-        doc._baseline = doc._value_snapshot()
         return doc
+
+    if readonly_doc is not None:
+        return readonly_doc
 
     known = describe(p)
     if known:

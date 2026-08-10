@@ -990,9 +990,19 @@ class CheatsPage(QWidget, ThemedMixin):
         self._hold_armed = False
         self._page = 0
         self.show_step(self.STEP_EDIT)
-        self._subtitle.setText(t("cheats.editing",
-                                 name=path.name, engine=self._doc.engine))
-        self._edit_hint.setText(t("cheats.edit_hint"))
+        ro = bool(getattr(self._doc, "read_only", False))
+        if ro:
+            self._subtitle.setText(t("cheats.editing_read_only",
+                                     name=path.name, engine=self._doc.engine))
+            self._edit_hint.setText(t("cheats.read_only_hint",
+                                      engine=self._doc.engine))
+        else:
+            self._subtitle.setText(t("cheats.editing",
+                                     name=path.name, engine=self._doc.engine))
+            self._edit_hint.setText(t("cheats.edit_hint"))
+        self._save_btn.setEnabled(not ro)
+        self._save_btn.setToolTip(
+            t("cheats.read_only_hint", engine=self._doc.engine) if ro else "")
         self._field_filter.clear()
         self._fill_groups()
         self._render_page()
@@ -1105,15 +1115,23 @@ class CheatsPage(QWidget, ThemedMixin):
 
         # Open/closed padlock. Marks stay selected; the re-apply loop runs
         # only while THIS game is running (see _watch_hold_game).
+        # Read-only documents cannot be written, so the lock is inert — showing
+        # it as a usable control would promise a rewrite that will never run.
         marked = f.label in self._held
         hold = QPushButton("🔒" if marked else "🔓")
         hold.setObjectName("cheats_hold_btn")
         hold.setCheckable(True)
         hold.setFixedSize(24, 24)
-        hold.setCursor(Qt.CursorShape.PointingHandCursor)
-        hold.setToolTip(t("cheats.hold_tip"))
         hold.setChecked(marked)
-        hold.toggled.connect(lambda on, fld=f, btn=hold: self._toggle_hold(fld, on, btn))
+        if getattr(self._doc, "read_only", False):
+            hold.setEnabled(False)
+            hold.setCursor(Qt.CursorShape.ArrowCursor)
+            hold.setToolTip(t("cheats.hold_tip_read_only"))
+        else:
+            hold.setCursor(Qt.CursorShape.PointingHandCursor)
+            hold.setToolTip(t("cheats.hold_tip"))
+            hold.toggled.connect(
+                lambda on, fld=f, btn=hold: self._toggle_hold(fld, on, btn))
         line.addWidget(hold)
         return row
 
@@ -1146,6 +1164,9 @@ class CheatsPage(QWidget, ThemedMixin):
             w.setMinimumWidth(180)
             w.textChanged.connect(lambda v, p=f.path: self._remember(p, v))
         w.setObjectName("cheats_value")
+        if getattr(self._doc, "read_only", False):
+            w.setEnabled(False)
+            w.setToolTip(t("cheats.read_only_hint", engine=self._doc.engine))
         self._editors[f.path] = (w, f.kind)
         return w
 
@@ -1164,7 +1185,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._render_page()
 
     def _apply_edits(self):
-        if self._doc is None:
+        if self._doc is None or getattr(self._doc, "read_only", False):
             return
         # Pause an active hold across the write: both write this same file.
         was_holding = self._hold is not None and self._hold.is_running()
@@ -1210,6 +1231,12 @@ class CheatsPage(QWidget, ThemedMixin):
 
     def _toggle_hold(self, field, on: bool, btn=None):
         """Toggle a lock mark. Marks stay; the file loop needs Apply + game running."""
+        if self._doc is None or getattr(self._doc, "read_only", False):
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+            return
         if on:
             self._held[field.label] = self._pending.get(field.path, field.value)
             if btn is not None:
@@ -1230,7 +1257,8 @@ class CheatsPage(QWidget, ThemedMixin):
         from core.save_editor import SaveHold
 
         if (not self._hold_armed or not self._held
-                or not self._playing() or self._doc is None):
+                or not self._playing() or self._doc is None
+                or getattr(self._doc, "read_only", False)):
             return
         if self._hold is not None:
             self._hold.set_values(self._held)

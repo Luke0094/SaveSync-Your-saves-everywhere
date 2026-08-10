@@ -88,6 +88,26 @@ class CandidatePreviewDialog(QDialog):
         self._build()
         self._update()
 
+    def set_candidates(self, candidates: list):
+        """Replace the browse list (e.g. soft-promote unlocked after an
+        async primary-reachability probe). Keeps the current selection when
+        that candidate is still present."""
+        new = [c for c in (candidates or []) if c]
+        if not new:
+            return
+        cur = None
+        if self._candidates and 0 <= self._idx < len(self._candidates):
+            cur = self._candidates[self._idx]
+        self._candidates = new
+        if cur is not None:
+            try:
+                self._idx = self._candidates.index(cur)
+            except ValueError:
+                self._idx = 0
+        else:
+            self._idx = 0
+        self._update()
+
     # ── Construction ───────────────────────────────────────────────────────
 
     def _build(self):
