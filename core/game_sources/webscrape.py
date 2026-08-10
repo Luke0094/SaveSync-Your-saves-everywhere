@@ -1688,7 +1688,14 @@ _SEARX_SEED = (
     "https://etsi.me",
     "https://ooglester.com",
 )
-_SEARX_MAX_TRY = 8          # instances probed per search before giving up
+# Cap per query — NOT "try the whole pool". Public instances are mostly
+# bot-walled (homepage decoy / Anubis / 403); a live probe (2026-08) found
+# ~2/47 usable from this IP. With a low cap the unlucky shuffle never
+# reaches those two and the old code then engine-blocked SearXNG for 5 min,
+# freezing the remaining pool mid-tier. Cap is high enough to usually hit a
+# live instance; untried instances stay available for the next query (see
+# _iter_search_engine_html — engine cooldown only when the pool is exhausted).
+_SEARX_MAX_TRY = 16
 _searx_pool_cache: Optional[list[str]] = None
 
 
@@ -1732,16 +1739,29 @@ def _searx_instances() -> list[str]:
 _SEARX_INSTANCE_COOLDOWN_S = 1800.0   # failed instance sit-out
 _searx_instance_blocked: dict[str, float] = {}   # base_url → blocked_until
 _searx_sticky: list = [None]   # last instance that worked this process — tried first
+# link_token ping cache: base → unix time until which the CSS handshake is
+# still valid (SearXNG PING_LIVE_TIME is 3600s; renew a bit sooner).
+_searx_warmed_until: dict[str, float] = {}
+_SEARX_WARM_TTL_S = 3000.0
 
-# SearXNG's built-in bot detection rejects requests without the Sec-Fetch-*
-# browser headers (302 back to the index page) and 429s clients whose
-# Accept-Encoding lacks gzip/deflate — so send both and decompress manually
-# (urllib doesn't).
+# SearXNG botdetection (docs.searxng.org/src/searx.botdetection.html):
+#   • http_accept_encoding — needs gzip AND deflate (urllib defaults to
+#     identity → bot)
+#   • http_connection — Connection: close → 429 (urllib adds close unless
+#     we override with keep-alive)
+#   • http_sec_fetch — Mode navigate|cors, Dest document|empty, Site
+#     same-origin|same-site|none; invalid → 302 to index
+#   • link_token — without a prior GET of /client<token>.css the IP is
+#     "suspicious"; after a few hits /search is 302'd to the homepage
+#     (the decoy we kept seeing). Browser loads that CSS from the index
+#     page automatically; we must do the same handshake.
+# gzip/deflate is decompressed manually (urllib won't).
 _SEARX_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
@@ -1755,8 +1775,18 @@ _SEARX_CHALLENGE_RE = re.compile(
     r"(making sure you're not a bot|checking request|anubis|proof-of-work"
     r"|verification could not run)", re.IGNORECASE)
 
+# link_token stylesheet embedded in the instance index page.
+_SEARX_CLIENT_CSS_RE = re.compile(
+    r"""(?:href|src)=["']([^"']*client[^"']*\.css[^"']*)["']""",
+    re.IGNORECASE,
+)
 
-def _searx_http_get(url: str, timeout: int = 12) -> tuple[int, str]:
+
+def _searx_http_get(
+    url: str,
+    timeout: int = 12,
+    extra_headers: dict | None = None,
+) -> tuple[int, str]:
     """GET *url* with the headers SearXNG's bot detection requires.
     Returns (status, html); HTTPError becomes its status code."""
     import gzip
@@ -1774,8 +1804,10 @@ def _searx_http_get(url: str, timeout: int = 12) -> tuple[int, str]:
             pass
         return data.decode("utf-8", errors="replace")
 
-    req = urllib.request.Request(
-        url, headers={**_DEFAULT_HEADERS, **_SEARX_HEADERS})
+    hdrs = {**_DEFAULT_HEADERS, **_SEARX_HEADERS}
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, headers=hdrs)
     try:
         with _open_url(req, timeout=timeout) as r:
             return r.status, _decode(r)
@@ -1784,6 +1816,55 @@ def _searx_http_get(url: str, timeout: int = 12) -> tuple[int, str]:
             return e.code, _decode(e)
         except Exception:
             return e.code, ""
+
+
+def _searx_link_token_warmup(base: str, timeout: int = 8) -> bool:
+    """Homepage + /client<token>.css ping so link_token stops decoying /search.
+
+    Returns True when the instance looks usable afterward (or has no
+    link_token at all). False on hard failure to even load the index.
+    Cached per base for ``_SEARX_WARM_TTL_S`` so a sticky instance does not
+    re-handshake on every query.
+    """
+    import time as _time
+    now = _time.time()
+    with _engine_lock:
+        if now < _searx_warmed_until.get(base, 0.0):
+            return True
+    try:
+        status, body = _searx_http_get(
+            base + "/",
+            timeout=timeout,
+            extra_headers={"Sec-Fetch-Site": "none"},
+        )
+    except Exception:
+        return False
+    if status != 200 or not body:
+        return False
+    if _SEARX_CHALLENGE_RE.search(body[:4000]):
+        return False
+    m = _SEARX_CLIENT_CSS_RE.search(body)
+    if m:
+        css_url = urllib.parse.urljoin(base + "/", m.group(1))
+        try:
+            # Dest must be document|empty for http_sec_fetch; browsers use
+            # style, but that value is rejected and 302'd back to index.
+            _searx_http_get(
+                css_url,
+                timeout=timeout,
+                extra_headers={
+                    "Accept": "text/css,*/*;q=0.1",
+                    "Referer": base + "/",
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+            )
+        except Exception:
+            pass  # ping best-effort; search will tell us if it worked
+    with _engine_lock:
+        _searx_warmed_until[base] = _time.time() + _SEARX_WARM_TTL_S
+    return True
 
 
 def _searx_page_relevant(html: str, query: str) -> bool:
@@ -1810,45 +1891,64 @@ def _searx_page_relevant(html: str, query: str) -> bool:
     return any(t in joined for t in tokens)
 
 
-def _searx_fetch_one(base: str, q: str, query: str, timeout: int = 6) -> tuple[str, Optional[str]]:
-    """ONE request to *base* (asking for JSON to dodge the <article> markup
-    drift). Returns (kind, html):
-      ('ok', html)    — usable results. JSON → synthetic <a href> HTML built
-                        from results[].url (so the shared link extractor works
-                        unchanged); HTML results page (instance ignored
-                        &format=json) → that HTML, when relevant.
-      ('empty', None) — the instance ANSWERED with valid JSON but zero
-                        results. The instance works; the query just has no
-                        hits there. Callers must NOT punish it for this —
-                        treating a valid empty answer as a failure is what
-                        used to cool the instance down for 30 min and, after
-                        _SEARX_MAX_TRY of them, block the whole engine.
-      ('bad', None)   — error/challenge/decoy: the instance is unusable.
-    Deliberately a SINGLE request per instance — probing twice (JSON then a
-    separate HTML request) doubles our footprint and is exactly what gets
-    public instances to challenge/ban us."""
+def _searx_fetch_one(base: str, q: str, query: str, timeout: int = 8) -> tuple[str, Optional[str]]:
+    """Warm link_token, then ONE HTML search against *base*.
+
+    Returns (kind, html):
+      ('ok', html)    — usable results page (query tokens in <article>s).
+      ('empty', None) — instance answered a real results page with zero hits
+                        (``no results`` / no articles after a non-decoy SERP).
+                        Callers must NOT punish it — that used to cool the
+                        instance for 30 min and starve the pool.
+      ('bad', None)   — error / challenge / homepage decoy / irrelevant SERP.
+
+    ``format=json`` is intentionally NOT used: ip_limit.API_MAX is ~4/hour
+    per IP on many public instances, so JSON burns the quota across a pool
+    walk. HTML after the link_token handshake is what browsers do and what
+    clears the homepage-decoy redirect.
+    """
+    if not _searx_link_token_warmup(base, timeout=timeout):
+        return "bad", None
     try:
-        status, body = _searx_http_get(f"{base}/search?q={q}&format=json", timeout=timeout)
+        # same-origin + Referer: we "navigated" from the index after the
+        # CSS ping — matches a real browser session on this instance.
+        status, body = _searx_http_get(
+            f"{base}/search?q={q}",
+            timeout=timeout,
+            extra_headers={
+                "Referer": base + "/",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
     except Exception:
         return "bad", None
     if status != 200 or not body:
         return "bad", None
-    # JSON response?
-    if body.lstrip()[:1] in ("[", "{"):
-        try:
-            data = json.loads(body)
-        except (ValueError, TypeError):
-            data = None
-        if isinstance(data, dict) and isinstance(data.get("results"), list):
-            urls = [r.get("url", "") for r in data["results"] if isinstance(r, dict)]
-            urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
-            if urls:
-                return "ok", "".join(f'<a href="{u}"></a>' for u in urls)
-            return "empty", None
-    # HTML results page (instance ignored &format=json)
-    if not _SEARX_CHALLENGE_RE.search(body[:4000]) and _searx_page_relevant(body, query):
+    if _SEARX_CHALLENGE_RE.search(body[:4000]):
+        return "bad", None
+    # Homepage decoy: link_token redirect lands on index with no <article>.
+    if _searx_page_relevant(body, query):
         return "ok", body
+    # Real empty SERP (search UI present, zero organic hits) vs decoy.
+    if re.search(r"no results|nothing found|0 results", body[:8000], re.I):
+        return "empty", None
+    articles = re.findall(r'<article[\s\S]*?</article>', body)
+    if not articles and ('name="q"' in body or "search_url" in body):
+        return "empty", None
     return "bad", None
+
+
+def _searx_pool_available() -> tuple[int, int]:
+    """Return ``(available_now, pool_size)`` — instances not in per-instance cooldown."""
+    import time as _time
+    pool = _searx_instances()
+    now = _time.time()
+    with _engine_lock:
+        avail = sum(
+            1 for b in pool
+            if now >= _searx_instance_blocked.get(b, 0.0)
+        )
+    return avail, len(pool)
 
 
 def _searx_fetch(q: str, query: str):
@@ -1866,7 +1966,8 @@ def _searx_fetch(q: str, query: str):
       1. reuse the last instance that worked this process (sticky) FIRST, so a
          whole search rides one instance instead of probing fresh ones per query;
       2. exactly ONE request per instance (see _searx_fetch_one);
-      3. at most _SEARX_MAX_TRY non-cooled instances before giving up."""
+      3. at most _SEARX_MAX_TRY non-cooled instances before giving up
+         (failed ones stay cooled; the next query walks further into the pool)."""
     import time as _time
     order: list[str] = []
     _s = _searx_sticky[0]
@@ -1876,6 +1977,7 @@ def _searx_fetch(q: str, query: str):
         if base not in order:
             order.append(base)
     tried = 0
+    n_bad = 0
     first_empty: Optional[str] = None
     for base in order:
         if tried >= _SEARX_MAX_TRY:
@@ -1896,6 +1998,7 @@ def _searx_fetch(q: str, query: str):
             logger.debug(f"searxng {base} answered empty for {query!r}")
             first_empty = first_empty or base
             continue
+        n_bad += 1
         logger.debug(f"searxng {base} unusable for {query!r}")
         with _engine_lock:
             _searx_instance_blocked[base] = _time.time() + _SEARX_INSTANCE_COOLDOWN_S
@@ -1905,6 +2008,12 @@ def _searx_fetch(q: str, query: str):
         if not _searx_sticky[0]:
             _searx_sticky[0] = first_empty   # a healthy instance beats none
         return "empty"
+    if tried:
+        avail, pool_n = _searx_pool_available()
+        logger.info(
+            f"searxng: probed {tried} instance(s) for {query!r} "
+            f"({n_bad} unusable); {avail}/{pool_n} still available in pool"
+        )
     return None
 
 
@@ -1996,7 +2105,23 @@ def _iter_search_engine_html(query: str):
             _engine_mark_ok("searxng")
             yield "searxng", html
         else:
-            _engine_block("searxng", "all instances failed/challenged")
+            # Most of the searx.space list is bot-walled from any given IP;
+            # a single query only probes _SEARX_MAX_TRY. Cooling the whole
+            # engine here used to freeze the remaining (still-untried)
+            # instances for 5 min mid-tier. Only engine-block when the pool
+            # is actually exhausted — otherwise the next query walks on.
+            avail, pool_n = _searx_pool_available()
+            if avail <= 0:
+                _engine_block(
+                    "searxng",
+                    f"all {pool_n} instances failed/challenged",
+                )
+            else:
+                logger.info(
+                    f"searxng: no usable answer for {query!r} this round "
+                    f"({avail}/{pool_n} instances still untried) — "
+                    f"not cooling engine"
+                )
 
     # DuckDuckGo static HTML endpoints, LAST: largely redundant with Bing (whose
     # index it draws on) and it 202-blocks aggressively, so a healthy engine
