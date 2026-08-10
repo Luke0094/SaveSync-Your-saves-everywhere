@@ -322,8 +322,8 @@ class SearchFlowMixin:
         # One distinct title or several: always review through the same
         # candidate-preview popup (‹ › browse when there's more than one,
         # arrows simply disabled for a single result) instead of silently
-        # taking the first one. Drop sources already applied when they
-        # carry no material news (a rewritten description alone is not news).
+        # taking the first one. Near-duplicate sources that only differ in
+        # description are dropped on purpose (see _dedupe_except_description).
         self._web_search_active = False
         self._emit_bg_status("done")
         self._show_search_candidates(results)
@@ -367,6 +367,9 @@ class SearchFlowMixin:
 
         useful = [r for r in results
                   if self._compute_candidate_diff(r).get('has_changes')]
+        # Sources that match another candidate on everything except
+        # description are skipped on purpose — only one of them is proposed.
+        useful = self._dedupe_except_description(useful)
         if not useful:
             if probing:
                 # Only promote_primary could unlock a candidate — wait for
@@ -406,8 +409,10 @@ class SearchFlowMixin:
                     return
                 if self._run_same_tier_merge(dlg.selected):
                     self._restore_search_form(snap)
-                    useful = [r for r in (self._last_search_candidates or [])
-                              if self._compute_candidate_diff(r).get('has_changes')]
+                    useful = self._dedupe_except_description([
+                        r for r in (self._last_search_candidates or [])
+                        if self._compute_candidate_diff(r).get('has_changes')
+                    ])
                     if not useful:
                         return
                     n = len(useful)
@@ -801,7 +806,9 @@ class SearchFlowMixin:
             self._name_edit.setText(result.name)
         if result.description and not current_desc:
             self._desc_edit.setPlainText(result.description)
-        if result.image_url and not self._original_image_path:
+        if result.image_url and not (
+                self._original_image_path or getattr(self, '_image_path', '')
+        ):
             self._download_and_set_image(result.image_url)
         if getattr(result, 'developer', '') and not current_dev:
             self._developer_edit.setText(result.developer)
@@ -970,8 +977,10 @@ class SearchFlowMixin:
         results = getattr(self, '_pending_reachability_results', None)
         if not results:
             return
-        useful = [r for r in results
-                  if self._compute_candidate_diff(r).get('has_changes')]
+        useful = self._dedupe_except_description([
+            r for r in results
+            if self._compute_candidate_diff(r).get('has_changes')
+        ])
 
         dlg = getattr(self, '_active_candidate_dialog', None)
         if dlg is not None:
@@ -1061,15 +1070,49 @@ class SearchFlowMixin:
         if not w1 or not w2:  return 0.0
         return len(w1 & w2) / len(w1 | w2)
 
+    def _payload_fingerprint_except_desc(self, result) -> tuple:
+        """Identity of a candidate ignoring description text.
+
+        Used to skip sources that are 1:1 with another (or the confirmed
+        base) on name/developer/year/cover/tags and only differ in prose.
+        """
+        name = (getattr(result, 'name', '') or '').strip().casefold()
+        dev = (getattr(result, 'developer', '') or '').strip().casefold()
+        year = self._extract_result_year(result)
+        img = (getattr(result, 'image_url', '') or '').strip()
+        if "/thumb/" in img:
+            img = img.replace("/thumb/", "/", 1)
+        tags = tuple(sorted({
+            g.strip().casefold()
+            for g in (getattr(result, 'genres', None) or [])
+            if (g or '').strip()
+        }))
+        return (name, dev, year, img, tags)
+
+    def _dedupe_except_description(self, results: list) -> list:
+        """Keep the first of each payload; drop later 1:1-except-desc clones."""
+        kept: list = []
+        seen: list = []
+        for r in results:
+            fp = self._payload_fingerprint_except_desc(r)
+            if fp in seen:
+                continue
+            seen.append(fp)
+            kept.append(r)
+        return kept
+
     def _same_tier_peers(self, base_result, others: list) -> list:
         """Peers for chip enrichment after a candidate is confirmed.
 
         Same *tier* only (no lower-tier search). The confirmed *source* is
         excluded entirely — picking Steam title 1 must not re-offer Steam
         title 2. Other sources keep every distinct title (VNDB 1 + VNDB 2).
+        A peer that matches the confirmed candidate on everything except
+        description is skipped on purpose (no chip merge for prose-only twin).
         """
         _base_src = (getattr(base_result, 'source', '') or '').split('+')[0]
         _base_tier = self._get_source_tier(_base_src)
+        _base_fp = self._payload_fingerprint_except_desc(base_result)
         peers = []
         for r in others:
             if r is base_result:
@@ -1079,6 +1122,8 @@ class SearchFlowMixin:
                 continue               # same source already declared
             if self._get_source_tier(src) != _base_tier:
                 continue
+            if self._payload_fingerprint_except_desc(r) == _base_fp:
+                continue               # 1:1 except description → skip
             peers.append(r)
         return peers
 

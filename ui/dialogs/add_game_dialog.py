@@ -8,6 +8,7 @@ SaveSync - Add/Edit Game Dialog
 import os
 import threading
 import logging
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -457,17 +458,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         img_nav_row = QHBoxLayout()
         img_nav_row.setSpacing(2)
 
-        _img_arrow_css = (
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
-            f"border:1px solid {palette('border_hover')};border-radius:4px;"
-            f"font-weight:700;font-size:12px;padding:0;}}"
-            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
-            f"QPushButton:disabled{{color:{palette('text_muted')};border-color:{palette('border')};}}"
-        )
-        self._img_prev_btn = QPushButton("◀")
+        from ui.styles.arrow_icons import chevron_button_style as _chevron_btn
+        self._img_prev_btn = QPushButton("")
         self._img_prev_btn.setFixedSize(22, 56)
         self._img_prev_btn.setToolTip(t('add_game.previous_image'))
-        self._img_prev_btn.setStyleSheet(_img_arrow_css)
+        self._img_prev_btn.setStyleSheet(
+            _chevron_btn("left", extra=f"border-color:{palette('border_hover')};")
+        )
         self._img_prev_btn.setEnabled(False)
         self._img_prev_btn.clicked.connect(self._prev_image)
 
@@ -509,10 +506,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # Keep the preview on top of the stacked widget
         img_preview_layout.setCurrentIndex(1)
 
-        self._img_next_btn = QPushButton("▶")
+        self._img_next_btn = QPushButton("")
         self._img_next_btn.setFixedSize(22, 56)
         self._img_next_btn.setToolTip(t('add_game.next_image') if t('add_game.next_image') != 'add_game.next_image' else "Next image")
-        self._img_next_btn.setStyleSheet(_img_arrow_css)
+        self._img_next_btn.setStyleSheet(
+            _chevron_btn("right", extra=f"border-color:{palette('border_hover')};")
+        )
         self._img_next_btn.setEnabled(False)
         self._img_next_btn.clicked.connect(self._next_image)
 
@@ -788,14 +787,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         tag_layout.setContentsMargins(0, 0, 0, 0)
         tag_layout.setSpacing(4)
 
-        # Filled triangles — ASCII "<"/">" (and thin ‹ ›) vanish on some fonts /
-        # Windows DPI scales; same fix as the image nav arrows above.
-        self._tag_left_btn = QPushButton("◀")
-        self._tag_left_btn.setFixedWidth(24)
-        self._tag_left_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;font-size:11px;}}"
-            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
-        )
+        # SVG chevrons from arrow_icons (same assets as theme scrollbars) —
+        # Unicode ◀/▶ vanish on some Windows fonts / DPI scales.
+        from ui.styles.arrow_icons import chevron_button_style
+        self._tag_left_btn = QPushButton("")
+        self._tag_left_btn.setFixedSize(24, 28)
+        self._tag_left_btn.setStyleSheet(chevron_button_style("left"))
         self._tag_left_btn.setVisible(False)
         self._tag_left_btn.clicked.connect(self._scroll_tags_left)
 
@@ -860,12 +857,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         self._tag_scroll.setWidget(self._tag_container)
 
-        self._tag_right_btn = QPushButton("▶")
-        self._tag_right_btn.setFixedWidth(24)
-        self._tag_right_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};border:1px solid {palette('border')};border-radius:4px;font-weight:bold;font-size:11px;}}"
-            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};}}"
-        )
+        self._tag_right_btn = QPushButton("")
+        self._tag_right_btn.setFixedSize(24, 28)
+        self._tag_right_btn.setStyleSheet(chevron_button_style("right"))
         self._tag_right_btn.setVisible(False)
         self._tag_right_btn.clicked.connect(self._scroll_tags_right)
 
@@ -2229,13 +2223,31 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             )
+            # Prefer JPEG/PNG over AVIF when the CDN honours Accept. Some
+            # attachment hosts still force AVIF — pillow_avif handles that
+            # below. Forum attachment CDNs usually require the parent-site
+            # origin as Referer (attachments.example.com → example.com).
+            _parts = urllib.parse.urlsplit(url)
+            _referer = f"{_parts.scheme}://{_parts.netloc}/"
+            _host = (_parts.netloc or "").lower()
+            if _host.startswith("attachments."):
+                _origin = _host.split(".", 1)[-1]
+                _referer = f"https://{_origin}/"
+            # Forum thumbs are tiny; prefer the full attachment when linked.
+            if "/thumb/" in (_parts.path or ""):
+                _full = urllib.parse.urlunsplit(
+                    (_parts.scheme, _parts.netloc,
+                     (_parts.path or "").replace("/thumb/", "/", 1),
+                     _parts.query, _parts.fragment)
+                )
+                url = _full
             req = urllib.request.Request(
                 url,
                 headers={
                     "User-Agent": _UA,
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept": "image/jpeg,image/png,image/webp,image/*,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "/".join(url.split("/")[:3]) + "/",
+                    "Referer": _referer,
                 }
             )
             from core.net import open_url as _open_url
@@ -2292,10 +2304,20 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     filename = f"{safe_name}_{uuid.uuid4().hex[:8]}.jpg"
                     cache_path = game_icon_dir / filename
 
-            # Try to decode with Qt first (supports JPEG/PNG/WebP/AVIF via system plugins)
+            # AVIF from attachment CDNs: register pillow_avif before Qt so
+            # the PIL re-encode path below can open the buffer even when Qt
+            # has no AVIF plugin (common on Windows without the store codec).
+            _is_avif = image_data[:12][4:8] == b"ftyp" and b"avif" in image_data[:32]
+            if _is_avif:
+                try:
+                    import pillow_avif  # noqa: F401
+                except ImportError:
+                    pass
+
+            # Try to decode with Qt first (JPEG/PNG/WebP; AVIF only with plugins)
             _qt_ok = False
             _px = QPixmap()
-            if _px.loadFromData(image_data) and not _px.isNull():
+            if (not _is_avif) and _px.loadFromData(image_data) and not _px.isNull():
                 self._pending_pixmap = _px
                 _qt_ok = True
 

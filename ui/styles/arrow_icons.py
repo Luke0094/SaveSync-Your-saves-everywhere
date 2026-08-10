@@ -43,3 +43,36 @@ def ensure_arrow_icons(theme: str) -> dict[str, str]:
         # Forward slashes + quotes: Windows paths with spaces break unquoted url().
         urls[name] = f'url("{path.resolve().as_posix()}")'
     return urls
+
+
+def chevron_button_style(
+    direction: str,
+    *,
+    theme: str | None = None,
+    size_px: int = 10,
+    extra: str = "",
+) -> str:
+    """QSS for a text-less QPushButton showing an SVG chevron.
+
+    *direction* is one of ``left`` / ``right`` / ``up`` / ``down``. Unicode
+    glyphs (◀ ▶) vanish on some Windows fonts/DPI scales — these icons are
+    the same assets the global theme injects into scrollbars.
+    """
+    if theme is None:
+        try:
+            from ui.styles.theme import get_theme_manager
+            theme = get_theme_manager().current
+        except Exception:
+            theme = "dark"
+    urls = ensure_arrow_icons(theme)
+    icon = urls.get(direction) or urls.get("right")
+    from ui.styles.theme import palette
+    return (
+        f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
+        f"border:1px solid {palette('border')};border-radius:4px;"
+        f"padding:0;image:{icon};image-position:center;{extra}}}"
+        f"QPushButton:hover{{background:{palette('accent')};"
+        f"border-color:{palette('accent')};}}"
+        f"QPushButton:disabled{{background:{palette('bg')};"
+        f"border-color:{palette('border')};}}"
+    )

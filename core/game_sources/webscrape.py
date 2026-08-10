@@ -18,6 +18,7 @@ from typing import Optional
 from core.constants import CAMEL_SPLIT_RE
 from core.game_sources.common import (GameInfo, _clean_game_name,
                                       _decode_entities, _dedupe_candidates,
+                                      _earliest_forum_date,
                                       _fetch_json, _fuzzy_score, _fuzzy_slug,
                                       _is_favicon_like,
                                       _is_non_game_media_title,
@@ -1076,6 +1077,14 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                     image_url = src
                     break
 
+    # Attachment CDNs often serve a /thumb/ preview in <img src> while the
+    # parent <a href> points at the full file — prefer the full URL.
+    if image_url and "/thumb/" in image_url:
+        image_url = image_url.replace("/thumb/", "/", 1)
+    if image_url and _is_favicon_like(image_url):
+        logger.debug(f"Rejecting favicon/icon as cover: {image_url}")
+        image_url = ""
+
     # Genres from meta keywords / tags
     genres: list[str] = []
     kw = _meta("keywords", "og:video:tag", "genre")
@@ -1084,12 +1093,20 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
 
     # Game-related JSON-LD type keywords (ignore Article/BreadcrumbList/WebSite)
     _GAME_LD_TYPES = ("game", "videogame", "softwareapplication", "product", "creativework")
+    # Forum thread JSON-LD still carries the original post date — useful when
+    # the labelled "Release Date" is just the bump stamp.
+    _FORUM_LD_TYPES = ("discussionforumposting", "discussionforum", "socialmediaposting")
 
     def _ld_is_game_related(ld: dict) -> bool:
         t = (ld.get("@type") or "").lower().replace(" ", "")
         return any(gt in t for gt in _GAME_LD_TYPES)
 
+    def _ld_is_forum_post(ld: dict) -> bool:
+        t = (ld.get("@type") or "").lower().replace(" ", "")
+        return any(ft in t for ft in _FORUM_LD_TYPES)
+
     ld_dates: list[str] = []
+    ld_forum_dates: list[str] = []
     ld_publishers: list[str] = []
     ld_developers: list[str] = []
     # Aggregate score from JSON-LD (itch.io, MobyGames, Product pages…).
@@ -1109,6 +1126,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                 if not isinstance(ld, dict):
                     continue
                 is_game = _ld_is_game_related(ld)
+                is_forum = _ld_is_forum_post(ld)
                 if not title and ld.get("name"):
                     title = str(ld["name"])
                 if not description and ld.get("description"):
@@ -1124,7 +1142,17 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                     elif not img.startswith(("http://", "https://")):
                         from urllib.parse import urljoin as _urljoin
                         img = _urljoin(url, img)
-                    image_url = img
+                    if not _is_favicon_like(img):
+                        image_url = img
+                # Forum posts: datePublished is the original thread date —
+                # compared later with the labelled Release Date (earlier wins).
+                # Never use the forum JSON-LD image (usually an avatar).
+                if is_forum:
+                    for dk in ("datePublished", "dateCreated"):
+                        dv = ld.get(dk)
+                        if dv:
+                            ld_forum_dates.append(str(dv))
+                            break
                 # Only extract game-specific fields from game-related types
                 if is_game:
                     for dk in ("datePublished", "releaseDate"):
@@ -1356,16 +1384,16 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     if not developer and publisher:
         developer = publisher
 
-    # Forum thread pages label everything inside the description — split it
-    # into the proper fields (Overview→description, Developer/Release Date/Tags)
-    # rather than dumping the whole truncated blob into the description.
+    # Forum thread pages label everything inside the first post — split it
+    # into proper fields. Description = the Overview segment only (text after
+    # Overview: until the next labelled field such as Release Date /
+    # Developer / Version), never the field block itself.
     #
     # The labelled header lives IN FULL in the first post's BODY; the
     # og:description is only a truncated preview of it, so labels that fall
     # beyond the preview cut (often Tags:/Developer:) never reach the parser
-    # from the meta tag alone. Like the per-site extractors above, read the
-    # structured source directly: the first XenForo-style message body on the
-    # page, tags stripped, entities decoded. Fallback order: full post body →
+    # from the meta tag alone. Read the first message body on the page, tags
+    # stripped, entities decoded. Fallback order: full post body →
     # raw og:description → whatever description another origin (JSON-LD,
     # site-specific extractor) produced. Only fills fields that a
     # higher-quality source didn't already provide.
@@ -1415,11 +1443,25 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     if not _forum and description and description != _raw_description[:600]:
         _forum = _parse_forum_description(description)
     if _forum:
-        description = _forum["overview"][:600]
+        # Overview is already bounded by the next labelled field — keep it
+        # intact (do not clip to the generic OG 600-char preview budget).
+        _ov = (_forum.get("overview") or "").strip()
+        # Drop zero-width leftovers from &#8203; / spoiler markers.
+        _ov = re.sub(r'[\u200b\u200c\u200d\ufeff]+', '', _ov).strip()
+        if _ov:
+            description = _ov
         developer = developer or _forum.get("developer", "")
-        release_date = release_date or _forum.get("release_date", "")
+        _forum_rd = _forum.get("release_date", "") or ""
+        # Release Date on these threads can mean commercial launch OR the
+        # current-build publish date; datePublished is the thread's original
+        # post. Whichever comes first chronologically is the year we keep.
+        _picked = _earliest_forum_date(_forum_rd, *(ld_forum_dates or []))
+        if _picked:
+            release_date = release_date or _picked
         if not genres and _forum.get("tags"):
             genres = _forum["tags"]
+    elif ld_forum_dates and not release_date:
+        release_date = ld_forum_dates[0]
 
     # Last resort for forum threads: the thread's native tag list (XenForo
     # "tagItem" anchors under the title). It lives OUTSIDE the post body —

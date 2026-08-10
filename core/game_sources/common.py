@@ -547,6 +547,7 @@ def _is_non_game_media_title(title: str) -> bool:
 # style names and tiny WxH markers (≤64px, e.g. "favicon-32x32").
 _FAVICON_IMG_RE = re.compile(
     r'(?:favicon|apple-touch-icon|mstile|android-chrome|site[-_]?icon|/icons?/'
+    r'|/data/avatars?/|[-_/]avatars?/|avatar[-_]'
     r'|[-_/](?:16|24|32|48|64)x(?:16|24|32|48|64)(?:[-_.]|$))',
     re.IGNORECASE,
 )
@@ -559,11 +560,12 @@ def _is_favicon_like(image_url: str) -> bool:
 
 
 # Forum thread pages (game-forum threads in general) cram everything
-# into one labelled og:description — "Overview: … Developer: … Release Date: …
-# Tags: …" — with CONSTANT labels. Split it into the proper fields instead of
-# dumping the whole (truncated) blob into the description. The label set is
-# the EXPLICIT reference for what fills which field — parsing is by these
-# labels, never by character position alone.
+# into one labelled block — "Overview: … Thread Updated: … Release Date: …
+# Developer: … Tags: …" — with CONSTANT labels. The description is the
+# Overview segment only: everything after Overview: until the next labelled
+# field (Release Date, Developer, Version, …), never the field block itself.
+# Split by these labels instead of dumping the whole (truncated) blob into
+# the description.
 _FORUM_LABEL_RE = re.compile(
     r'\b(overview|description|story|synopsis|plot'
     r'|developer\s*/\s*publisher|developers?|publishers?|artist|author|circle|dev'
@@ -633,6 +635,47 @@ _FORUM_DATE_RE = re.compile(
 )
 
 
+def _forum_date_sort_key(date_str: str) -> tuple:
+    """Comparable key for forum/JSON-LD date strings (earlier → smaller).
+
+    Accepts ISO-ish ``YYYY-MM-DD``, dotted/slashed forms, and bare years.
+    Unparseable values sort last so a real date always wins over noise.
+    """
+    if not date_str:
+        return (9999, 12, 31)
+    s = date_str.strip()
+    m = re.match(r'^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.match(r'^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})', s)
+    if m:
+        return (int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    m = re.search(r'\b((?:19|20)\d{2})\b', s)
+    if m:
+        return (int(m.group(1)), 1, 1)
+    return (9999, 12, 31)
+
+
+def _earliest_forum_date(*candidates: str) -> str:
+    """Return the chronologically earliest non-empty date string.
+
+    Forum ``Release Date`` may mean the commercial launch *or* the publish
+    date of the current build; JSON-LD ``datePublished`` is the thread's
+    original post date. The earlier of the two is the year we want.
+    """
+    best = ""
+    best_key = (9999, 12, 31)
+    for raw in candidates:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        key = _forum_date_sort_key(s)
+        if key < best_key:
+            best_key = key
+            best = s
+    return best
+
+
 def _parse_forum_description(text: str) -> dict:
     """Split a forum-thread og:description into fields by its inline labels.
 
@@ -640,8 +683,9 @@ def _parse_forum_description(text: str) -> dict:
     labelled forum blob, {} otherwise (ordinary prose is left untouched).
 
     Recognised shapes:
-      - "Overview: … Developer: … Tags: …"  — classic labelled blob;
-      - "Overview: …" alone at the START     — the label is stripped, the rest
+      - "Overview: … Release Date: … Developer: …" — description is the
+        Overview segment up to the next labelled field;
+      - "Overview: …" alone at the START — the label is stripped, the rest
         is the description (a lone label mid-prose never triggers);
       - "<description text> Developer: … Version: …" — the description
         PRECEDES the labels: the preamble becomes the overview, provided at
@@ -674,7 +718,10 @@ def _parse_forum_description(text: str) -> dict:
         key = _norm_key(m.group(1))
         start = m.end()
         end = labels[i + 1].start() if i + 1 < len(labels) else len(text)
-        seg[key] = text[start:end].strip().strip('.,;·|-–— ')
+        # First key wins when a label repeats; overview must stay the block
+        # that runs until the next field, not a later duplicate.
+        if key not in seg:
+            seg[key] = text[start:end].strip().strip('.,;·|-–— ')
 
     has_struct = any(k in seg for k in _FORUM_STRUCT_KEYS)
     overview = next((seg[k] for k in _FORUM_OVERVIEW_KEYS if seg.get(k)), None)
@@ -708,11 +755,11 @@ def _parse_forum_description(text: str) -> dict:
         if m and m.start() > 0:
             dev = dev[:m.start()]
         out['developer'] = dev.strip(' -–—|·,;')[:80].strip()
-    rel = next((seg[k] for k in ('release date', 'released', 'thread updated',
-                                 'updated') if seg.get(k)), None)
+    # Only the labelled Release Date / Released — never Thread Updated.
+    # (Bump stamps are not a release year; comparison with datePublished
+    # happens in the scraper via _earliest_forum_date.)
+    rel = next((seg[k] for k in ('release date', 'released') if seg.get(k)), None)
     if rel:
-        # Prefer an explicit date token over the raw segment — the segment
-        # runs to the next label (or end of text) and can drag prose along.
         m = _FORUM_DATE_RE.search(rel)
         out['release_date'] = m.group(1) if m else rel[:40].strip()
     tagstr = next((seg[k] for k in ('tags', 'tag', 'genres', 'genre') if seg.get(k)), None)

@@ -322,15 +322,11 @@ class CandidatePreviewDialog(QDialog):
             self._inspect_btn.setVisible(False)
 
         # ── Description ──────────────────────────────────────────────────
-        # Only advertise a description the confirm path would actually write
-        # (empty→fill). A rewritten page text must not look like a replace.
+        # Same contract as confirm: only show an empty→fill description.
+        # Never hide a fillable description behind "has_existing" when the
+        # diff already put it in fields (tags/dev alone can make has_existing).
         _desc_field = fields.get('description')
-        if _desc_field:
-            _new_desc = (_desc_field.get('new') or '').strip()
-        elif not diff.get('has_existing'):
-            _new_desc = (c.description or '').strip()
-        else:
-            _new_desc = ''
+        _new_desc = ((_desc_field.get('new') if _desc_field else '') or '').strip()
         if _new_desc:
             _snip = _new_desc if len(_new_desc) <= 380 else _new_desc[:380].rstrip() + '…'
             if _desc_field and _desc_field.get('old'):
@@ -347,13 +343,15 @@ class CandidatePreviewDialog(QDialog):
             self._desc_lbl.setVisible(False)
 
         # ── Developer / Year meta row ────────────────────────────────────
-        def _meta_piece(label_key: str, field_key: str, fallback: str) -> str:
+        # Only fields the confirm path would write — no fallback to scraped
+        # values that enrich/init will skip (looked "identified" but unsaved).
+        def _meta_piece(label_key: str, field_key: str) -> str:
             _f = fields.get(field_key)
-            _new = (_f['new'] if _f else fallback) or ''
+            _new = ((_f.get('new') if _f else '') or '').strip()
             if not _new:
                 return ''
             _lbl = _h.escape(t(label_key))
-            if _f and _f.get('old'):
+            if _f.get('old'):
                 return (
                     f"<b>{_lbl}:</b> "
                     f"<span style='color:{palette('text_muted')};text-decoration:line-through;'>"
@@ -361,8 +359,8 @@ class CandidatePreviewDialog(QDialog):
                 )
             return f"<b>{_lbl}:</b> {_h.escape(_new)}"
 
-        _dev_piece = _meta_piece('add_game.developer', 'developer', getattr(c, 'developer', '') or '')
-        _yr_piece  = _meta_piece('add_game.year', 'year', diff.get('result_year', '') or '')
+        _dev_piece = _meta_piece('add_game.developer', 'developer')
+        _yr_piece  = _meta_piece('add_game.year', 'year')
         _meta_bits = [p for p in (_dev_piece, _yr_piece) if p]
         self._meta_lbl.setText('&nbsp;&nbsp;&nbsp;'.join(_meta_bits))
         self._meta_lbl.setVisible(bool(_meta_bits))
