@@ -261,6 +261,40 @@ _DLSITE_WORK_RE = re.compile(
 )
 
 
+# Purchase geo-block banner on DLsite work pages. Metadata (OG title, …) may
+# still be present underneath; a shell with only this message is unusable.
+_DLSITE_REGION_LOCK_RE = re.compile(
+    r'you cannot buy this product from the country/region you live in',
+    re.IGNORECASE,
+)
+_DLSITE_SORRY_TITLE_RE = re.compile(r'^\s*sorry\b', re.IGNORECASE)
+
+
+def _dlsite_region_locked(html: str) -> bool:
+    return bool(html and _DLSITE_REGION_LOCK_RE.search(html))
+
+
+def _dlsite_finish(url: str, html: str) -> Optional[GameInfo]:
+    """Run OpenGraph scrape for a DLsite page, logging region locks.
+
+    Region-locked purchase banners are common on ``?locale=en_US`` work
+    pages. When OG metadata is still there we keep it (and log the lock);
+    when the page is only the SORRY shell we skip and say so at INFO.
+    """
+    locked = _dlsite_region_locked(html)
+    info = _scrape_opengraph(url, html=html)
+    if locked:
+        name = (info.name if info else "") or ""
+        if not info or not name or _DLSITE_SORRY_TITLE_RE.match(name):
+            logger.info(f"DLSite: region-locked — skipping {url}")
+            return None
+        logger.info(
+            f"DLSite: region-locked for purchase — keeping metadata "
+            f"{name!r} from {url}"
+        )
+    return info
+
+
 def _scrape_dlsite_en(product_url: str) -> Optional[GameInfo]:
     """Scrape a DLsite work page in the ENGLISH locale.
 
@@ -299,8 +333,8 @@ def _scrape_dlsite_en(product_url: str) -> Optional[GameInfo]:
                 logger.debug(f"DLSite: followed canonical to {canon_url}")
                 # Reviews are attached inside _scrape_opengraph for every
                 # dlsite.com URL, so the locale redirect does not have to.
-                return _scrape_opengraph(canon_url, html=canon_html)
-    return _scrape_opengraph(url, html=html)
+                return _dlsite_finish(canon_url, canon_html)
+    return _dlsite_finish(url, html)
 
 
 # How many DLsite user reviews to pull in one go. Matches the reviews panel's
@@ -959,6 +993,11 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         '', title, flags=re.IGNORECASE,
     ).strip()
     if not title:
+        return None
+    # DLsite region-lock shells sometimes surface "SORRY..." as the title —
+    # never treat that as a game. Full lock logging lives in _dlsite_finish.
+    if "dlsite.com" in (url or "").lower() and _DLSITE_SORRY_TITLE_RE.match(title):
+        logger.info(f"DLSite: region-locked — skipping {url}")
         return None
 
     _raw_description = _meta("og:description", "description", "twitter:description")
@@ -2656,6 +2695,11 @@ def _search_targeted_sites(primary: str,
                     f"{info.name!r} (name_score={name_score:.0f}, final={_score:.0f})"
                 )
                 results.append((info, _score))
+            else:
+                logger.info(
+                    f"DLSite product code {code}: no usable page "
+                    f"(missing or region-locked)"
+                )
 
     # 3. DLSite keyword search (by name, no RJ code needed)
     #
@@ -2819,21 +2863,85 @@ def _web_search_urls_single(query: str,
     as a last-resort fallback when primary APIs and trusted targeted sites
     have all been exhausted.
 
-    Note: hints are sent verbatim (no name cleaning) because search engines
-    index full titles including version strings, product codes etc. —
-    stripping them would hurt recall.
+    Note: version / release markers stay on the query (they help recall), but
+    packed folder spellings (``name_game``, ``NameGame``) are spaced out —
+    search engines index the readable form, not the filesystem packing.
     """
     raw_hints = [h for h in (all_hints or [query]) if h]
-    # Reorder: folder_name (usually the most descriptive) first, then
-    # game_name (query), then exe_stem last — the folder name typically
-    # carries the most complete title for web search indexing.
-    hints = [h for h in raw_hints if h != query] + [query]
-    # Build a separate list for scoring that excludes generic stems, so that
-    # a Wikipedia hit for "Game" doesn't get a high score via the generic query.
-    # Score against the same specific strings we query — no stripped/clean
-    # variants. Generic-web indexing rewards the full folder/title; cleaning
-    # is a tier-2 site: exception only (itch/DLsite/…).
-    _scoring_hints = [h for h in hints if h.lower() not in _GENERIC_EXE_STEMS] or hints[:1]
+    # Product codes are HINTS only — never a standalone SERP query. Tier 3
+    # keeps version markers on the title; when a code is present the lead
+    # query is "[CODE] <title>" (title spaced from _ / CamelCase).
+    _DL_CODE_ONLY_RE = re.compile(r'^(RJ|RE|VJ)\d{4,10}$', re.IGNORECASE)
+    _DL_CODE_FIND_RE = re.compile(r'(RJ|RE|VJ)\d{4,10}', re.IGNORECASE)
+
+    def _strip_leading_dl_code(text: str) -> str:
+        return re.sub(
+            r'^[\s\[\(\{]*(?:RJ|RE|VJ)\d{4,10}[\s\]\)\}\-_–—|,.;]*',
+            '', (text or '').strip(), flags=re.IGNORECASE,
+        ).strip(' [](){}-_–—|.,;')
+
+    def _space_packed_title(text: str) -> str:
+        """Turn ``name_game`` / ``NameGame`` into readable SERP words.
+
+        Underscores and CamelCase are filesystem packing — always spaced.
+        Hyphens inside words (``yama-san``) and version dots stay as-is.
+        """
+        t = (text or "").replace("_", " ")
+        t = re.sub(CAMEL_SPLIT_RE, " ", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    _dl_codes: list[str] = []
+    for _h in raw_hints:
+        for _m in _DL_CODE_FIND_RE.finditer(_h or ''):
+            _c = _m.group(0).upper()
+            if _c not in _dl_codes:
+                _dl_codes.append(_c)
+
+    # Title hints (not bare codes): keep version, space out packed spellings.
+    _title_hints: list[str] = []
+    for _h in raw_hints:
+        if not _h or _DL_CODE_ONLY_RE.match(_h.strip()):
+            continue
+        _t = _space_packed_title(_strip_leading_dl_code(_h) or _h.strip())
+        if _t and _t not in _title_hints:
+            _title_hints.append(_t)
+    _main_title = ""
+    if query and not _DL_CODE_ONLY_RE.match(query.strip()):
+        _main_title = _space_packed_title(
+            _strip_leading_dl_code(query) or query.strip())
+    if not _main_title and _title_hints:
+        _main_title = _title_hints[0]
+    # Prefer a longer hint that still carries the same title (folder often
+    # keeps "Title v1.01" when the primary lost the version).
+    if _main_title:
+        _prim_cf = _main_title.casefold()
+        _prim_words = [w for w in _prim_cf.split() if len(w) >= 3]
+        for _t in _title_hints:
+            _tcf = _t.casefold()
+            if len(_t) <= len(_main_title):
+                continue
+            if _prim_cf in _tcf or (
+                _prim_words and all(w in _tcf for w in _prim_words)
+            ):
+                _main_title = _t
+
+    hints: list[str] = []
+    if _main_title and _dl_codes:
+        hints.append(f"[{_dl_codes[0]}] {_main_title}")
+    if _main_title and _main_title not in hints:
+        hints.append(_main_title)
+    for _t in _title_hints:
+        if _t not in hints:
+            hints.append(_t)
+    if not hints:
+        # Absolute last resort: bare codes only (no title anywhere).
+        hints = list(_dl_codes) or list(raw_hints)
+
+    # Scoring: unclean titles + bare codes (a page that cites the code matches).
+    _scoring_hints = [
+        h for h in (hints + _dl_codes)
+        if h and h.lower() not in _GENERIC_EXE_STEMS
+    ] or hints[:1]
     # Scoring only: add bare-title variants so a folder like
     # "My Game v0.9 - Win" does not force mandatory "win" against a
     # clean store title (score ~20 < MIN 30 → false "not found").
@@ -2865,11 +2973,13 @@ def _web_search_urls_single(query: str,
         if h.lower() in _GENERIC_EXE_STEMS:
             logger.debug(f"Generic web: skipping generic exe stem {h!r}")
             continue
-        spaced = re.sub(_camel_re, ' ', h).strip()
-        slug = _fuzzy_slug(h)
+        # Titles are already spaced above; re-apply for any leftover packed
+        # stem / combined "[CODE] …" form that skipped that path.
+        spaced = re.sub(r'\s+', ' ', re.sub(_camel_re, ' ', h.replace('_', ' '))).strip()
+        slug = _fuzzy_slug(spaced)
         if not slug:
             continue
-        best_form = spaced if len(spaced.split()) > len(h.split()) else h
+        best_form = spaced if len(spaced.split()) >= len(h.replace('_', ' ').split()) else h
         if slug not in _by_slug:
             _by_slug[slug] = best_form
             _order.append(slug)
@@ -2887,8 +2997,13 @@ def _web_search_urls_single(query: str,
     seen_urls: set[str] = set()
     stop = False
 
+    def _usable_count() -> int:
+        # Low-score scrapes must not exhaust the budget and skip later hints
+        # (e.g. a product-code SERP filling six weak pages before the title).
+        return sum(1 for _, s in candidates if s >= 30.0)
+
     for hint in query_hints:
-        if stop or len(candidates) >= MAX_GENERIC_RESULTS:
+        if stop or _usable_count() >= MAX_GENERIC_RESULTS:
             break
         # Verbatim forms keep recall for versioned indexes; also query the
         # bare title so "… v0.9 - Win" still finds the clean store title.
@@ -2909,17 +3024,22 @@ def _web_search_urls_single(query: str,
         # happen only 1:1 for rejected results, bounded by the pool size.
         _target = 8 if _hv else 4
         for q in _forms:
-            if stop or len(candidates) >= MAX_GENERIC_RESULTS:
+            if stop or _usable_count() >= MAX_GENERIC_RESULTS:
                 break
             urls = _web_search_urls(q, max_results=_target * 2)
             _query_valid = 0
             for url in urls:
-                if _query_valid >= _target or len(candidates) >= MAX_GENERIC_RESULTS:
+                if _query_valid >= _target or _usable_count() >= MAX_GENERIC_RESULTS:
                     break
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
-                info = _scrape_opengraph(url)
+                # DLsite work pages go through the locale helper so region
+                # locks are logged the same way as tier-2 product lookups.
+                if "dlsite.com" in (url or "").lower() and "/work/=" in (url or "").lower():
+                    info = _scrape_dlsite_en(url)
+                else:
+                    info = _scrape_opengraph(url)
                 if not info or not info.name:
                     continue
                 # Same film/TV/band rejection as the Wikipedia tier — generic

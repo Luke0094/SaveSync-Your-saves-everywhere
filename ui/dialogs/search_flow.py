@@ -158,14 +158,22 @@ class SearchFlowMixin:
         if not _folder_name and extra_folder_hint:
             _folder_name = extra_folder_hint
 
-        # If the folder found via directory walking contains a DLsite product code
-        # (e.g. "RJ01234567] Example Game v1.0.19b"), use ONLY the clean code.
-        # Passing the raw folder name (with brackets, version strings, etc.) as a
-        # search hint produces garbage secondary queries.
+        # Folder may embed a product code plus the unclean title/version
+        # ("RJ01234567] My Game v1.01"). Keep the FULL string — tier 2
+        # extracts the code itself; tier 3 needs the title+version beside it.
+        # Only collapse to the bare code when the folder is nothing else.
         if _folder_name:
-            _folder_dl = _hint_re.search(r'(RJ|RE|VJ)(\d{4,10})', _folder_name, _hint_re.IGNORECASE)
+            _folder_dl = _hint_re.search(
+                r'(RJ|RE|VJ)(\d{4,10})', _folder_name, _hint_re.IGNORECASE)
             if _folder_dl:
-                _folder_name = _folder_dl.group(0).upper()
+                _code = (_folder_dl.group(1) + _folder_dl.group(2)).upper()
+                _rest = _hint_re.sub(
+                    r'(RJ|RE|VJ)\d{4,10}', '', _folder_name,
+                    flags=_hint_re.IGNORECASE,
+                )
+                _rest = _rest.strip(' [](){}-_–—|.,;')
+                if not _rest:
+                    _folder_name = _code
 
         # If the game name was renamed after the last accepted result, the
         # original accepted name (stored in the fingerprint) can help the
