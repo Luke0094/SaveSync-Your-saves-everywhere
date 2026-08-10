@@ -9,6 +9,7 @@ replace something the user typed.
 """
 import logging
 import re
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -36,11 +37,24 @@ def download_cover(url: str, game_name: str, entry_id: str = "",
         from core.constants import get_install_folder_name
         from ui.image_cache import _ICON_CACHE_DIR, _compress_image_to_cache
 
+        # Match Add/Edit download: prefer JPEG/PNG in Accept, parent-site
+        # Referer for attachment CDNs, and full-size over /thumb/.
+        parts = urllib.parse.urlsplit(url)
+        referer = f"{parts.scheme}://{parts.netloc}/"
+        host = (parts.netloc or "").lower()
+        if host.startswith("attachments."):
+            referer = f"https://{host.split('.', 1)[-1]}/"
+        if "/thumb/" in (parts.path or ""):
+            url = urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc,
+                 (parts.path or "").replace("/thumb/", "/", 1),
+                 parts.query, parts.fragment)
+            )
         request = urllib.request.Request(url, headers={
             "User-Agent": _UA,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept": "image/jpeg,image/png,image/webp,image/*,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "/".join(url.split("/")[:3]) + "/",
+            "Referer": referer,
         })
         with open_url(request, timeout=timeout) as response:
             content_type = response.headers.get("Content-Type", "")

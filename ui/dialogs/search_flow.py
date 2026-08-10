@@ -1081,8 +1081,11 @@ class SearchFlowMixin:
     def _payload_fingerprint_except_desc(self, result) -> tuple:
         """Identity of a candidate ignoring description text.
 
-        Used to skip sources that are 1:1 with another (or the confirmed
-        base) on name/developer/year/cover/tags and only differ in prose.
+        Two sources that match on this fingerprint and only differ in
+        description are treated as duplicates — the later one is not
+        proposed at all. Extra tags, URLs, ratings, … change the
+        fingerprint, so that fuller source is proposed complete (desc
+        included).
         """
         name = (getattr(result, 'name', '') or '').strip().casefold()
         dev = (getattr(result, 'developer', '') or '').strip().casefold()
@@ -1095,17 +1098,39 @@ class SearchFlowMixin:
             for g in (getattr(result, 'genres', None) or [])
             if (g or '').strip()
         }))
-        return (name, dev, year, img, tags)
+        urls = []
+        for u in (
+            [getattr(result, 'store_url', '') or '']
+            + list(getattr(result, 'extra_urls', None) or [])
+        ):
+            u = (u or '').strip()
+            if u and u not in urls:
+                urls.append(u)
+        try:
+            rating = round(float(getattr(result, 'rating', 0) or 0), 2)
+        except (TypeError, ValueError):
+            rating = 0.0
+        try:
+            votes = int(getattr(result, 'vote_count', 0) or 0)
+        except (TypeError, ValueError):
+            votes = 0
+        rev_n = len(getattr(result, 'reviews', None) or [])
+        return (name, dev, year, img, tags, tuple(urls), rating, votes, rev_n)
 
     def _dedupe_except_description(self, results: list) -> list:
-        """Keep the first of each payload; drop later 1:1-except-desc clones."""
+        """Drop a source that is 1:1 with an earlier one except description.
+
+        Kept sources are always proposed whole (whatever fields they have,
+        description included). No merging/picking of the "better" prose —
+        a prose-only twin is simply not offered.
+        """
         kept: list = []
-        seen: list = []
+        seen: set = set()
         for r in results:
             fp = self._payload_fingerprint_except_desc(r)
             if fp in seen:
                 continue
-            seen.append(fp)
+            seen.add(fp)
             kept.append(r)
         return kept
 

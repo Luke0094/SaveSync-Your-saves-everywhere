@@ -106,7 +106,7 @@ def review_identity(review) -> str:
     rid = str(review.get("id") or "").strip()
     if src and rid:
         return f"{src}:{rid}"
-    if src in ("steam", "vndb"):
+    if src in ("steam", "vndb", "itch"):
         return src
     who = str(review.get("reviewer") or "").strip()
     text = str(review.get("text") or "").strip()[:80]

@@ -322,11 +322,15 @@ class CandidatePreviewDialog(QDialog):
             self._inspect_btn.setVisible(False)
 
         # ── Description ──────────────────────────────────────────────────
-        # Same contract as confirm: only show an empty→fill description.
-        # Never hide a fillable description behind "has_existing" when the
-        # diff already put it in fields (tags/dev alone can make has_existing).
+        # Always surface the scraped description for candidate identity.
+        # Confirm still only *writes* it when the form field is empty
+        # (fields['description']); skipping a whole source that is 1:1
+        # except description is handled in search_flow dedupe, not here.
         _desc_field = fields.get('description')
-        _new_desc = ((_desc_field.get('new') if _desc_field else '') or '').strip()
+        _new_desc = (
+            ((_desc_field.get('new') if _desc_field else '') or '').strip()
+            or (c.description or '').strip()
+        )
         if _new_desc:
             _snip = _new_desc if len(_new_desc) <= 380 else _new_desc[:380].rstrip() + '…'
             if _desc_field and _desc_field.get('old'):

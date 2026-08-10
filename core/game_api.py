@@ -369,9 +369,9 @@ def search_game_info_multi(game_name: str, appid: Optional[str] = None,
         if 'vndb' not in _skip_api:
             _api_fns.append(search_vndb)
         for fn in _api_fns:
+            # One query per API — secondary folder/exe hints only boost
+            # scoring via _score_against_hints, they do not fire extra searches.
             _collect(fn, primary, is_secondary=False)
-            for hint in secondary:
-                _collect(fn, hint, is_secondary=True)
 
     # ── Pick accepted candidates ──────────────────────────────────────────────
     if candidates:

@@ -277,22 +277,16 @@ def _dlsite_region_locked(html: str) -> bool:
 def _dlsite_finish(url: str, html: str) -> Optional[GameInfo]:
     """Run OpenGraph scrape for a DLsite page, logging region locks.
 
-    Region-locked purchase banners are common on ``?locale=en_US`` work
-    pages. When OG metadata is still there we keep it (and log the lock);
-    when the page is only the SORRY shell we skip and say so at INFO.
+    Region-locked purchase banners mean the work is not buyable here.
+    In that case keep ONLY the product link (no title/desc/dev/cover) —
+    metadata from a locked shell is unreliable and must not fill the form.
     """
     locked = _dlsite_region_locked(html)
-    info = _scrape_opengraph(url, html=html)
     if locked:
-        name = (info.name if info else "") or ""
-        if not info or not name or _DLSITE_SORRY_TITLE_RE.match(name):
-            logger.info(f"DLSite: region-locked — skipping {url}")
-            return None
-        logger.info(
-            f"DLSite: region-locked for purchase — keeping metadata "
-            f"{name!r} from {url}"
-        )
-    return info
+        base = (url or "").split("?")[0]
+        logger.info(f"DLSite: region-locked — keeping link only: {base}")
+        return GameInfo(name="", store_url=base, source="dlsite")
+    return _scrape_opengraph(url, html=html)
 
 
 def _scrape_dlsite_en(product_url: str) -> Optional[GameInfo]:
@@ -675,22 +669,24 @@ _STORE_LINK_HOST_RE = re.compile(
     r'|gamejolt\.com|nutaku\.net)', re.IGNORECASE)
 
 
-def _ld_aggregate_rating(ld: dict) -> tuple[float, str, str]:
+def _ld_aggregate_rating(ld: dict) -> tuple[float, str, str, int]:
     """Pull a 5-star score out of a JSON-LD node's aggregateRating.
 
-    Returns (stars, reviewer_label, summary_text), or (0, "", "") when the
-    node has no usable score. Scales whatever bestRating the site declared
-    (itch uses 5, some Product pages use 100) onto SaveSync's five stars.
+    Returns (stars, reviewer_label, summary_text, vote_count), or
+    (0, "", "", 0) when the node has no usable score. Scales whatever
+    bestRating the site declared (itch uses 5, some Product pages use 100)
+    onto SaveSync's five stars. *vote_count* is the underlying ratingCount
+    / reviewCount so a store average is never treated as one opinion.
     """
     agg = ld.get("aggregateRating")
     if not isinstance(agg, dict):
-        return 0.0, "", ""
+        return 0.0, "", "", 0
     try:
         value = float(agg.get("ratingValue") or 0)
     except (TypeError, ValueError):
-        return 0.0, "", ""
+        return 0.0, "", "", 0
     if value <= 0:
-        return 0.0, "", ""
+        return 0.0, "", "", 0
     try:
         best = float(agg.get("bestRating") or 5)
     except (TypeError, ValueError):
@@ -708,10 +704,11 @@ def _ld_aggregate_rating(ld: dict) -> tuple[float, str, str]:
         count_n = 0
     # Reviewer label is filled by the caller from the page's source id
     # (itch / mobygames / …); leave it blank here so the source wins.
+    # Display shape matches Steam/VNDB aggregates: "4.6/5 (1575)".
     summary = f"{value:g}/{best:g}"
     if count_n:
         summary = f"{summary} ({count_n})"
-    return stars, "", summary
+    return stars, "", summary, count_n
 
 
 # How many forum user reviews to pull from the Reviews tab's first page.
@@ -1070,15 +1067,55 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
             resolved = _urljoin(url, src)
             return resolved if resolved.startswith("http") else None
 
-        # Pass 1: URLs ending in known image extensions
-        for m in _re.finditer(
-            r'<img[^>]+src=([\'"])(.*?\.(?:png|jpg|jpeg|webp|gif|avif|bmp))(?:\?[^\1]*)?\1',
-            html, _re.IGNORECASE,
-        ):
-            src = _resolve_src(m.group(2))
-            if src:
-                image_url = src
-                break
+        # Forum threads: prefer the first full-size attachment linked from
+        # the OP body (<a href=…attachments…/file.jpg>) over later thumbs
+        # or avatars elsewhere on the page.
+        _op = (
+            _re.search(
+                r'<article[^>]+class=["\'][^"\']*message-body[^"\']*["\'][^>]*>'
+                r'([\s\S]*?)</article>',
+                html, _re.IGNORECASE,
+            )
+            or _re.search(
+                r'<div[^>]+class=["\'][^"\']*\bbbWrapper\b[^"\']*["\'][^>]*>'
+                r'([\s\S]{0,30000})',
+                html, _re.IGNORECASE,
+            )
+        )
+        _op_html = _op.group(1) if _op else ""
+        if _op_html:
+            for _am in _re.finditer(
+                r'<a[^>]+href=(["\'])(https?://[^"\']*attachments\.[^"\']+\.'
+                r'(?:png|jpg|jpeg|webp|gif|avif|bmp)(?:\?[^"\']*)?)\1',
+                _op_html, _re.IGNORECASE,
+            ):
+                _href = _am.group(2)
+                if "/thumb/" in _href:
+                    _href = _href.replace("/thumb/", "/", 1)
+                if not _SKIP_IMG.search(_href):
+                    image_url = _href
+                    break
+            if not image_url:
+                for _im in _re.finditer(
+                    r'<img[^>]+src=(["\'])(https?://[^"\']+\.'
+                    r'(?:png|jpg|jpeg|webp|gif|avif|bmp)(?:\?[^"\']*)?)\1',
+                    _op_html, _re.IGNORECASE,
+                ):
+                    src = _resolve_src(_im.group(2))
+                    if src:
+                        image_url = src
+                        break
+
+        # Pass 1: URLs ending in known image extensions (whole page)
+        if not image_url:
+            for m in _re.finditer(
+                r'<img[^>]+src=([\'"])(.*?\.(?:png|jpg|jpeg|webp|gif|avif|bmp))(?:\?[^\1]*)?\1',
+                html, _re.IGNORECASE,
+            ):
+                src = _resolve_src(m.group(2))
+                if src:
+                    image_url = src
+                    break
 
         # Pass 2: any img src with a path that looks like an image (no extension needed, CDNs)
         if not image_url:
@@ -1155,6 +1192,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     ld_rating: float = 0.0
     ld_reviewer: str = ""
     ld_review_text: str = ""
+    ld_vote_count: int = 0
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL | re.IGNORECASE
@@ -1225,9 +1263,10 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                                 if str(g) not in genres:
                                     genres.append(str(g))
                     if not ld_rating:
-                        stars, who, summary = _ld_aggregate_rating(ld)
+                        stars, who, summary, votes = _ld_aggregate_rating(ld)
                         if stars:
                             ld_rating, ld_reviewer, ld_review_text = stars, who, summary
+                            ld_vote_count = votes
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -1239,14 +1278,37 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     if "dlsite.com" in url:
         # DLSite: extract release, developer, genre from HTML tables
 
-        # Developer: try Brand (pro) or Circle (maniax) label, fallback itemprop
-        bm = re.search(r'<th>(?:ブランド名|サークル名|Brand|Circle)</th>\s*<td>[\s\S]*?<a[^>]*>([^<]+)</a>', html)
-        if bm and not developer:
-            developer = bm.group(1).strip()
-        if not developer:
-            ipm = re.search(r'itemprop=["\']brand["\'][^>]*>[\s\S]*?<a[^>]*>([^<]+)</a>', html)
-            if ipm:
-                developer = ipm.group(1).strip()
+        # Developer: Brand (pro) / Circle (maniax), then itemprop.
+        # Stay inside the <td> — a loose [\s\S]*?<a> on region-locked shells
+        # walks into the page footer and captures "Back to Top".
+        def _dlsite_dev_ok(name: str) -> bool:
+            n = (name or "").strip()
+            if not n or len(n) > 80:
+                return False
+            return not re.search(
+                r'^(back\s*to\s*top|top\s*of\s*(?:the\s*)?page'
+                r'|ページの先頭|ページトップ|ページ上部へ)',
+                n, re.IGNORECASE,
+            )
+
+        for _pat in (
+            r'<th>(?:ブランド名|サークル名|Brand|Circle)</th>\s*'
+            r'<td\b[^>]*>([\s\S]*?)</td>',
+            r'itemprop=["\']brand["\'][^>]*>\s*<a[^>]*>([^<]+)</a>',
+        ):
+            if developer:
+                break
+            _dm = re.search(_pat, html, re.IGNORECASE)
+            if not _dm:
+                continue
+            _chunk = _dm.group(1)
+            _am = re.search(r'<a[^>]*>([^<]+)</a>', _chunk) if '<' in _chunk else None
+            _cand = (_am.group(1) if _am else _chunk).strip()
+            _cand = re.sub(r'<[^>]+>', '', _cand).strip()
+            if _dlsite_dev_ok(_cand):
+                developer = _cand
+        if developer and not _dlsite_dev_ok(developer):
+            developer = ""
 
         # Release date (販売日 / Release)
         dm = re.search(r'<th>(?:販売日|Release\s*date)</th>\s*<td>(?:<a[^>]*>)?([^<]+)(?:</a>)?', html)
@@ -1569,15 +1631,23 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     # JSON-LD aggregate → a single-verdict review for sites that publish one
     # (itch ratings, MobyScore, …). DLsite's user-review list is richer and
     # is attached just below; the aggregate is only the fallback there.
+    # itch.io: "itch.io: 4.6/5 (1575)" with vote_count — not one fake entry.
     _rating = 0.0
     _reviewer = ""
     _review_text = ""
+    _vote_count = 0
     if ld_rating and _source != "dlsite":
         from core.library import quantize_rating
         _rating = quantize_rating(ld_rating)
         _reviewer = ld_reviewer or source_label(_source) or _source
-        _review_text = (f"{_reviewer}: {ld_review_text}"
-                        if ld_review_text else f"{_reviewer}: {_rating:g}/5")
+        _vote_count = int(ld_vote_count or 0)
+        if _source == "itch":
+            _review_text = f"{_reviewer}: {_rating:g}/5"
+            if _vote_count:
+                _review_text = f"{_review_text} ({_vote_count})"
+        else:
+            _review_text = (f"{_reviewer}: {ld_review_text}"
+                            if ld_review_text else f"{_reviewer}: {_rating:g}/5")
 
     info = GameInfo(
         name=title,
@@ -1593,6 +1663,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         rating=_rating,
         reviewer=_reviewer,
         review_text=_review_text,
+        vote_count=_vote_count if _rating else 0,
     )
     # DLsite user reviews live behind a Vue stub on the work page; every
     # dlsite.com scrape (locale redirect, direct opengraph, pasted link)
@@ -2519,65 +2590,47 @@ def _search_targeted_sites(primary: str,
     primary = _clean_game_name(primary) or primary
     secondary = [_clean_game_name(h) or h for h in secondary]
     all_hints = [primary] + secondary
-    # Filter out generic stems from search queries and scoring
-    _search_hints = [h for h in all_hints if h.lower() not in _GENERIC_EXE_STEMS] or all_hints[:1]
+    # Scoring uses every hint (folder/exe/code) as a BONUS only — they must
+    # not fire extra SERP round-trips. Engines already index the title.
     _scoring_hints = [h for h in all_hints if h.lower() not in _GENERIC_EXE_STEMS] or all_hints[:1]
-    # SCORING ONLY (never queries): add release-noise-stripped variants so a
-    # base-name candidate isn't penalised against a hint that still carries
-    # leftover separators. Trailing platform noise is already peeled by
-    # _clean_game_name; this keeps scoring robust for raw secondary hints.
-    for _hset in (all_hints, _scoring_hints):
-        for _h in list(_hset):
-            _stripped = _strip_release_noise(_h, drop_version=True)
-            if _stripped and _stripped not in _hset:
-                _hset.append(_stripped)
-    # Query hints prefer the CamelCase-split form: pages write the spaced
-    # form ("Super Game Story"), not the compound one ("SuperGameStory"),
-    # so the spaced variant is what the engines can actually retrieve
-    # (scoring is unaffected — _fuzzy_score splits camelCase on its own).
-    _camel_re = CAMEL_SPLIT_RE
-    _q_hints: list[str] = []
-    for _h in _search_hints:
-        _sp = re.sub(_camel_re, ' ', _h).strip()
-        for _v in ([_sp, _h] if _sp != _h else [_h]):
-            if _v not in _q_hints:
-                _q_hints.append(_v)
-    # Prefer release-noise-stripped forms for non-itch keyword queries
-    # (DLSite / Moby / Wiki). itch strips per-query below; without this,
-    # "_q_hints[0]" could stay "My Game - Win" and site: searches missed.
-    _pref: list[str] = []
-    for _h in list(_q_hints):
-        _bare_h = _strip_release_noise(_h, drop_version=True)
-        if _bare_h and _bare_h not in _pref:
-            _pref.append(_bare_h)
-    for _h in _q_hints:
-        if _h not in _pref:
-            _pref.append(_h)
-    _q_hints = _pref or _q_hints
-    # Self-published stores often keep the version in the page title
-    # ("My Game v0.4.8"). From the raw folder keep only title + version
-    # via _title_keep_version — not pc/publisher/RJ. Tier 3 stays verbatim.
-    _q_slugs = {_fuzzy_slug(h) for h in _q_hints}
+    for _h in list(_scoring_hints):
+        _stripped = _strip_release_noise(_h, drop_version=True)
+        if _stripped and _stripped not in _scoring_hints:
+            _scoring_hints.append(_stripped)
+        _spaced_h = re.sub(CAMEL_SPLIT_RE, ' ', _stripped or _h).strip()
+        if _spaced_h and _spaced_h not in _scoring_hints:
+            _scoring_hints.append(_spaced_h)
+    # ONE title form for site: queries (spaced + noise-stripped). Optional
+    # same-title+version variant when the raw folder still carries it.
+    _q_best = re.sub(CAMEL_SPLIT_RE, ' ', primary).replace('_', ' ').strip() or primary
+    _q_best = _strip_release_noise(_q_best, drop_version=True) or _q_best
+    _q_ver = ""
+    _prim_slug = _fuzzy_slug(_q_best)
     for _rh in _raw_all_hints:
         _rh = (_rh or '').strip()
         if not _rh or _rh.lower() in _GENERIC_EXE_STEMS:
+            continue
+        if re.match(r'^(RJ|RE|VJ)\d{4,10}$', _rh, re.IGNORECASE):
             continue
         _with_ver = _title_keep_version(_rh)
         _bare = _strip_release_noise(_with_ver, drop_version=True) or _with_ver
         if (not _with_ver or not _bare
                 or _with_ver.casefold() == _bare.casefold()):
-            continue                   # no version token to preserve
-        _rslug = _fuzzy_slug(_with_ver)
-        if _rslug and _rslug not in _q_slugs:
-            _q_slugs.add(_rslug)
-            _q_hints.append(_with_ver)
+            continue
+        if _prim_slug and _fuzzy_slug(_bare) == _prim_slug:
+            _q_ver = re.sub(CAMEL_SPLIT_RE, ' ', _with_ver).replace('_', ' ')
+            _q_ver = re.sub(r'\s+', ' ', _q_ver).strip()
+            break
+    _q_forms = [_q_best]
+    if _q_ver and _q_ver.casefold() != _q_best.casefold():
+        _q_forms.append(_q_ver)
     MIN_SCORE = 40.0
     results: list[tuple[GameInfo, float]] = []
 
     def _collect(source_name: str, info: GameInfo | None, score_bonus: float = 0.0) -> None:
         """Collect result from source. *score_bonus* is added for high-precision matches."""
         if info and info.name:
-            score = max(_fuzzy_score(h, info.name) for h in all_hints)
+            score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
             score = min(100.0, score + score_bonus)
             bonus_str = f", base+{score_bonus:.0f}bonus" if score_bonus else ""
             accepted = score >= MIN_SCORE
@@ -2589,68 +2642,39 @@ def _search_targeted_sites(primary: str,
             if accepted:
                 results.append((info, score))
 
-    # 1. itch.io (direct search — best for indie games)
-    # RJ/VJ/RE product codes are DLSite-specific — searching itch.io with them
-    # is meaningless.  Build a separate hint list that strips those codes.
-    # Take at most one spelling per TITLE (slug-dedup): _q_hints interleaves
-    # the spaced and compact spelling of the same name, and both spellings
-    # of the primary would otherwise crowd out the other hints. Up to four
-    # distinct titles are queried (was 3) so a version-preserving hint always
-    # gets a turn even when 3 cleaned hints already filled the earlier slots
-    # — the install-folder hint alone can be too vague to find the right page.
-    _DL_CODE_RE = re.compile(r'^(RJ|RE|VJ)\d{4,10}$', re.IGNORECASE)
-    _itch_hints: list[str] = []
-    _itch_slugs: set[str] = set()
-    for _h in _q_hints:
-        if _DL_CODE_RE.match(_h.strip()):
-            continue
-        _slug = _fuzzy_slug(_h)
-        if _slug in _itch_slugs:
-            continue
-        _itch_slugs.add(_slug)
-        _itch_hints.append(_h)
-        if len(_itch_hints) == 4:
-            break
-    if not _itch_hints:
-        _itch_hints = [primary]  # always have at least the primary name
+    # 1. itch.io — one title (bare), then same title+version if available.
+    # Secondary hints score hits; they do not add more site: queries.
     if 'itch' not in _skip:
         try:
-            # site: itch: ALWAYS try bare title AND title-with-version
-            # ("My Game" / "My Game v0.3.6.2"). Packaging noise
-            # (Win/PC/…) is stripped first; the raw folder's version is kept
-            # via _title_keep_version on raw hints above.
             _itch_seen: set[str] = set()
-            for hint in _itch_hints:
-                _ver = _title_keep_version(hint)
-                _bare = _strip_release_noise(_ver, drop_version=True) or _ver
-                for _q in (_bare, _ver):
-                    _q = (_q or "").strip()
-                    _key = _q.casefold()
-                    if not _q or _key in _itch_seen:
-                        continue
-                    _itch_seen.add(_key)
+            _itch_hit = False
+            for _q in _q_forms:
+                _q = (_q or "").strip()
+                _key = _q.casefold()
+                if not _q or _key in _itch_seen:
+                    continue
+                _itch_seen.add(_key)
+                url = _find_itch_url_via_search(
+                    f'"{_q}" site:itch.io',
+                    game_name=_q,
+                )
+                if not url:
                     url = _find_itch_url_via_search(
-                        f'"{_q}" site:itch.io',
+                        f'{_q} site:itch.io',
                         game_name=_q,
                     )
-                    # Quoted site: queries sometimes only surface a removed
-                    # official page; the unquoted form can still list mirrors.
-                    if not url:
-                        url = _find_itch_url_via_search(
-                            f'{_q} site:itch.io',
-                            game_name=_q,
-                        )
-                    if url:
-                        info = _scrape_opengraph(url)
-                        if info:
-                            _collect("itch.io", info)
-                        else:
-                            logger.info(
-                                f"Targeted itch.io: reached {url} but "
-                                f"metadata scrape failed"
-                            )
-                    else:
-                        logger.info(f"Targeted itch.io: no page for {_q!r}")
+                if url:
+                    info = _scrape_opengraph(url)
+                    if info:
+                        _collect("itch.io", info)
+                        _itch_hit = True
+                        break
+                    logger.info(
+                        f"Targeted itch.io: reached {url} but "
+                        f"metadata scrape failed"
+                    )
+            if not _itch_hit:
+                logger.info(f"Targeted itch.io: no page for {_q_best!r}")
         except Exception as e:
             logger.debug(f"itch.io targeted search failed: {e}")
 
@@ -2663,6 +2687,7 @@ def _search_targeted_sites(primary: str,
             code = (m.group(1) + m.group(2)).upper()
             if code not in _dl_codes:
                 _dl_codes.append(code)
+    _dlsite_locked_urls: list[str] = []
     if _dl_codes and 'dlsite' not in _skip:
         # One candidate per product code. The section list is a fallback, not
         # a set of distinct sources: a code is only listed in the one section
@@ -2681,24 +2706,31 @@ def _search_targeted_sites(primary: str,
                 except Exception as e:
                     logger.debug(f"DLSite product direct ({_dl_sub}) failed: {e}")
                     info = None
-                if info and info.name:
+                if info and (info.name or info.store_url):
                     break
             if info and info.name:
                 # Product code ensures we found the right game, but score
                 # by name so better-matched sources (itch.io with English
                 # name) win.  Floor at 40 so a code-only hit (Japanese
                 # title vs English folder) is included but not dominant.
-                name_score = max(_fuzzy_score(h, info.name) for h in all_hints)
+                name_score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
                 _score = max(name_score, 40.0)
                 logger.info(
                     f"Web fallback via DLSite product code {code}: "
                     f"{info.name!r} (name_score={name_score:.0f}, final={_score:.0f})"
                 )
                 results.append((info, _score))
+            elif info and info.store_url:
+                # Region-locked: link only — no title/desc/dev/cover.
+                _u = info.store_url
+                if _u not in _dlsite_locked_urls:
+                    _dlsite_locked_urls.append(_u)
+                logger.info(
+                    f"DLSite product code {code}: region-locked — link only"
+                )
             else:
                 logger.info(
-                    f"DLSite product code {code}: no usable page "
-                    f"(missing or region-locked)"
+                    f"DLSite product code {code}: no usable page"
                 )
 
     # 3. DLSite keyword search (by name, no RJ code needed)
@@ -2708,7 +2740,7 @@ def _search_targeted_sites(primary: str,
     #      B) No code                -> web-indexed search via _find_dlsite_url_via_search
     #                                   (shared engine layer, filtered with site:dlsite.com)
     #    No /fsr/ direct endpoint - unreliable, no structured parsing needed.
-    _dl_keyword = _q_hints[0] if _q_hints else primary
+    _dl_keyword = _q_best or primary
     if 'dlsite' not in _skip:
         _dl_url = _find_dlsite_url_via_search(_dl_keyword)
         if _dl_url:
@@ -2717,12 +2749,24 @@ def _search_targeted_sites(primary: str,
             # product-code hits (section 2 above) where the match is guaranteed.
             # Same English-locale handling as the code lookup — a search hit
             # can land on any section, including one that ignores the locale.
-            _collect("DLSite (web)", _scrape_dlsite_en(_dl_url))
+            _dl_info = _scrape_dlsite_en(_dl_url)
+            if _dl_info and _dl_info.name:
+                _collect("DLSite (web)", _dl_info)
+            elif _dl_info and _dl_info.store_url:
+                _u = _dl_info.store_url
+                if _u not in _dlsite_locked_urls:
+                    _dlsite_locked_urls.append(_u)
+                logger.info(
+                    f"Targeted DLSite: region-locked — link only for "
+                    f"{_dl_keyword!r}"
+                )
+            else:
+                logger.info(f"Targeted DLSite: no product for {_dl_keyword!r}")
         else:
             logger.info(f"Targeted DLSite: no product for {_dl_keyword!r}")
 
     # 4. MobyGames (mainstream / commercial games) — use first non-generic hint
-    _mg_keyword = _q_hints[0] if _q_hints else primary
+    _mg_keyword = _q_best or primary
     _mg_found = False
     if 'mobygames' not in _skip:
         try:
@@ -2776,7 +2820,7 @@ def _search_targeted_sites(primary: str,
         try:
             wiki_hits: list[tuple[str, str, float]] = []
             for suffix, min_score in [("", 55.0), (" video game", MIN_SCORE)]:
-                _wiki_query = (_q_hints[0] if _q_hints else primary) + suffix
+                _wiki_query = (_q_best or primary) + suffix
                 hits = _mediawiki_search(
                     "https://en.wikipedia.org/w/api.php", _wiki_query
                 )
@@ -2802,6 +2846,31 @@ def _search_targeted_sites(primary: str,
                 logger.info("Targeted Wikipedia: no qualifying article")
         except Exception as e:
             logger.debug(f"Wikipedia failed: {e}")
+
+    # Region-locked DLsite pages contribute ONLY their product link — attach
+    # it to whatever candidates we already have (or a title stub if alone).
+    if _dlsite_locked_urls:
+        if results:
+            for _info, _ in results:
+                _extras = list(_info.extra_urls or [])
+                for _u in _dlsite_locked_urls:
+                    if _u and _u not in _extras and _u != (_info.store_url or ""):
+                        _extras.append(_u)
+                if not (_info.store_url or "").strip() and _dlsite_locked_urls:
+                    _info.store_url = _dlsite_locked_urls[0]
+                    _extras = [u for u in _extras if u != _info.store_url]
+                _info.extra_urls = _extras
+        else:
+            results.append((GameInfo(
+                name=primary,
+                store_url=_dlsite_locked_urls[0],
+                source="dlsite",
+                extra_urls=list(_dlsite_locked_urls[1:]),
+            ), 40.0))
+            logger.info(
+                "DLSite region-locked: proposing link-only stub under "
+                f"search title {primary!r}"
+            )
 
     # No merging of fields from multiple sources — enrichment from
     # additional sources is handled separately by the caller
@@ -2966,113 +3035,74 @@ def _web_search_urls_single(query: str,
     # would just burn engine quota. When two hints share a slug the
     # more-worded (spaced) variant wins. Capped to bound the number of
     # throttled engine round-trips.
-    _camel_re = CAMEL_SPLIT_RE
-    _by_slug: dict[str, str] = {}
-    _order: list[str] = []
-    for h in hints:
-        if h.lower() in _GENERIC_EXE_STEMS:
-            logger.debug(f"Generic web: skipping generic exe stem {h!r}")
-            continue
-        # Titles are already spaced above; re-apply for any leftover packed
-        # stem / combined "[CODE] …" form that skipped that path.
-        spaced = re.sub(r'\s+', ' ', re.sub(_camel_re, ' ', h.replace('_', ' '))).strip()
-        slug = _fuzzy_slug(spaced)
-        if not slug:
-            continue
-        best_form = spaced if len(spaced.split()) >= len(h.replace('_', ' ').split()) else h
-        if slug not in _by_slug:
-            _by_slug[slug] = best_form
-            _order.append(slug)
-        elif len(best_form.split()) > len(_by_slug[slug].split()):
-            _by_slug[slug] = best_form
-    query_hints = [_by_slug[s] for s in _order][:3]
-    # Query the version-bearing hint first (it is the most specific), and keep
-    # the version so a candidate carrying it can be lifted over namesakes.
-    _folder_ver = next((v for h in query_hints if (v := _hint_version(h))), None)
+    # ONE SERP query: lead hint is already "[CODE] title" or the spaced
+    # title. Extra folder/exe strings stay in _scoring_hints only — the
+    # engine index does the heavy matching; we do not re-query per hint.
+    _lead = next(
+        (h for h in hints if h and h.lower() not in _GENERIC_EXE_STEMS),
+        "",
+    )
+    if not _lead:
+        logger.info("Generic web: no usable title query")
+        return [] if return_all else None
+    _folder_ver = _hint_version(_lead) or next(
+        (v for h in hints if (v := _hint_version(h))), None)
     _ver_re = _version_match_re(_folder_ver) if _folder_ver else None
-    query_hints.sort(key=lambda h: _hint_version(h) is None)   # stable: versioned first
+    # Unquoted first (broader recall), then quoted if needed — not both
+    # bare/spaced/version permutations of every secondary hint.
+    _forms = [_lead]
+    _bare_lead = _strip_release_noise(_lead, drop_version=True)
+    if _bare_lead and _bare_lead.casefold() != _lead.casefold():
+        # Drop the code prefix from a bare retry when present.
+        _bare_nocode = re.sub(
+            r'^\[(?:RJ|RE|VJ)\d{4,10}\]\s*', '', _bare_lead, flags=re.I,
+        ).strip()
+        if _bare_nocode and _bare_nocode.casefold() != _lead.casefold():
+            _forms.append(_bare_nocode)
 
     MAX_GENERIC_RESULTS = 6
     candidates: list[tuple[GameInfo, float]] = []
     seen_urls: set[str] = set()
     stop = False
+    _target = 8 if _folder_ver else 6
 
-    def _usable_count() -> int:
-        # Low-score scrapes must not exhaust the budget and skip later hints
-        # (e.g. a product-code SERP filling six weak pages before the title).
-        return sum(1 for _, s in candidates if s >= 30.0)
-
-    for hint in query_hints:
-        if stop or _usable_count() >= MAX_GENERIC_RESULTS:
+    for q in _forms:
+        if stop or len([1 for _, s in candidates if s >= 30.0]) >= MAX_GENERIC_RESULTS:
             break
-        # Verbatim forms keep recall for versioned indexes; also query the
-        # bare title so "… v0.9 - Win" still finds the clean store title.
-        _hv = _hint_version(hint)
-        _forms = [hint, f'"{hint}"']
-        _bare_q = _strip_release_noise(hint, drop_version=True)
-        if _bare_q and _bare_q.casefold() != hint.casefold():
-            _forms.extend([_bare_q, f'"{_bare_q}"'])
-        _spaced_q = re.sub(CAMEL_SPLIT_RE, ' ', _bare_q or hint).strip()
-        if (_spaced_q and _spaced_q.casefold() != hint.casefold()
-                and _spaced_q.casefold() != (_bare_q or "").casefold()):
-            _forms.extend([_spaced_q, f'"{_spaced_q}"'])
-        # _target counts VALID candidates per query — results dropped AFTER
-        # their fetch (failed scrape, film/TV page) don't consume it. The URL
-        # pool is fetched 2× deeper so each dropped result is replaced by the
-        # next URL in line; the old fixed top-N slice shrank with every
-        # post-fetch rejection and could dwindle to zero. Extra page fetches
-        # happen only 1:1 for rejected results, bounded by the pool size.
-        _target = 8 if _hv else 4
-        for q in _forms:
-            if stop or _usable_count() >= MAX_GENERIC_RESULTS:
+        urls = _web_search_urls(q, max_results=_target * 2)
+        _query_valid = 0
+        for url in urls:
+            if (_query_valid >= _target
+                    or len([1 for _, s in candidates if s >= 30.0]) >= MAX_GENERIC_RESULTS):
                 break
-            urls = _web_search_urls(q, max_results=_target * 2)
-            _query_valid = 0
-            for url in urls:
-                if _query_valid >= _target or _usable_count() >= MAX_GENERIC_RESULTS:
-                    break
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                # DLsite work pages go through the locale helper so region
-                # locks are logged the same way as tier-2 product lookups.
-                if "dlsite.com" in (url or "").lower() and "/work/=" in (url or "").lower():
-                    info = _scrape_dlsite_en(url)
-                else:
-                    info = _scrape_opengraph(url)
-                if not info or not info.name:
-                    continue
-                # Same film/TV/band rejection as the Wikipedia tier — generic
-                # web results can surface an encyclopedia/fandom page whose
-                # og:title is "<Name> (film)" / "(TV series)" / "(band)".
-                if _is_non_game_media_title(info.name):
-                    logger.debug(f"Generic web skip (non-game media): {info.name!r}")
-                    continue
-                # Generic web results must always be labeled "web" regardless
-                # of the actual site (DLsite, Wikipedia, etc.) — the user
-                # rejected targeted results from these sources already.
-                info.source = "web"
-                info.store_url = info.store_url or url
-                base_score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
-                score = base_score
-                # The folder's version appearing in the candidate's title or
-                # URL is a high-precision same-game signal — lift it over a
-                # clean-titled namesake (whose padded title would otherwise
-                # out-score the correct, noisier one).
-                if _ver_re and (_ver_re.search(info.name or "") or _ver_re.search(url)):
-                    score = max(score, 90.0)
-                    logger.debug(
-                        f"Generic web: version {_folder_ver} matched in "
-                        f"{url[:45]} → boosted to {score:.0f}")
-                logger.debug(f"Generic web: {url[:55]} → {info.name!r} (score={score:.0f})")
-                candidates.append((info, score))
-                _query_valid += 1
-                if base_score >= 60:
-                    # Strong title hit: stop burning engine quota on more
-                    # queries. Version-only boosts do not early-stop.
-                    logger.info(f"Generic web early hit: {info.name!r} (score={score:.0f})")
-                    stop = True
-                    break
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if "dlsite.com" in (url or "").lower() and "/work/=" in (url or "").lower():
+                info = _scrape_dlsite_en(url)
+            else:
+                info = _scrape_opengraph(url)
+            if not info or not info.name:
+                continue
+            if _is_non_game_media_title(info.name):
+                logger.debug(f"Generic web skip (non-game media): {info.name!r}")
+                continue
+            info.source = "web"
+            info.store_url = info.store_url or url
+            base_score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
+            score = base_score
+            if _ver_re and (_ver_re.search(info.name or "") or _ver_re.search(url)):
+                score = max(score, 90.0)
+                logger.debug(
+                    f"Generic web: version {_folder_ver} matched in "
+                    f"{url[:45]} → boosted to {score:.0f}")
+            logger.debug(f"Generic web: {url[:55]} → {info.name!r} (score={score:.0f})")
+            candidates.append((info, score))
+            _query_valid += 1
+            if base_score >= 60:
+                logger.info(f"Generic web early hit: {info.name!r} (score={score:.0f})")
+                stop = True
+                break
 
     if not candidates:
         logger.info("Generic web: no results found")
