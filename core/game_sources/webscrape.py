@@ -30,6 +30,131 @@ from core.net import open_url as _open_url
 logger = logging.getLogger(__name__)
 
 
+def _normalize_itch_game_url(url: str) -> str | None:
+    """Return a canonical ``https://author.itch.io/game`` URL, or None.
+
+    Unwraps Wayback embeds (``web.archive.org/web/…/https://…itch.io/…``)
+    and drops non-game itch paths (search/profile/jam/…).
+    """
+    if not url:
+        return None
+    u = urllib.parse.unquote(url.replace("&amp;", "&")).strip()
+    m = re.search(
+        r'(https?://[a-zA-Z0-9-]+\.itch\.io/[a-z0-9][a-z0-9-]*)',
+        u, re.IGNORECASE,
+    )
+    if not m:
+        return None
+    u = m.group(1).rstrip("/")
+    domain = u.split("://", 1)[-1].split("/", 1)[0].lower()
+    if domain in {"static.itch.io", "api.itch.io", "img.itch.io", "itch.io"}:
+        return None
+    path = u.split("itch.io", 1)[-1]
+    if any(path.startswith(s) for s in (
+        "/search", "/games", "/jam", "/profile", "/login", "/register",
+        "/docs", "/t/", "/devlogs/", "/main", "/community",
+    )):
+        return None
+    return u
+
+
+def _itch_url_live(url: str, timeout: int = 10) -> tuple[bool, str]:
+    """True when *url* is a reachable itch game page (not a 404 shell).
+
+    Prefers the lightweight ``/data.json`` probe (``invalid game`` ⇒ gone);
+    falls back to a full GET and rejects the generic itch.io 404 title.
+    Returns ``(ok, html_or_empty)`` — html is filled only on the GET path
+    so a subsequent OG scrape can reuse it.
+    """
+    if not url:
+        return False, ""
+    try:
+        st, body = _fetch_html_ex(url.rstrip("/") + "/data.json", timeout=timeout)
+        if st == 200 and body.lstrip().startswith("{"):
+            # Official "gone" marker only — do not treat any JSON that
+            # merely contains an "errors" key as dead.
+            if "invalid game" in body:
+                return False, ""
+            # Valid JSON payload ⇒ game exists; still need HTML for OG.
+    except Exception:
+        pass
+    st, html = _fetch_html_ex(url, timeout=timeout)
+    if not (200 <= st < 300) or not html:
+        return False, ""
+    m = re.search(r'<title>(.*?)</title>', html, re.I | re.S)
+    title = re.sub(r'\s+', ' ', (m.group(1) if m else "")).strip()
+    # The itch 404/soft-delete shell titles itself just "itch.io".
+    if not title or title.lower() in {"itch.io", "itch"}:
+        return False, ""
+    return True, html
+
+
+def _pick_live_itch_url(
+    candidates: list[str],
+    game_name: str,
+    *,
+    max_probe: int = 8,
+) -> Optional[str]:
+    """Pick the best *live* itch game URL from *candidates*.
+
+    Ranks by slug similarity to *game_name*, probes live pages (skips
+    404 / ``invalid game``), and requires a title fuzzy-score ≥ 40 so a
+    SERP full of unrelated 200-OK itch links does not win.
+    """
+    name = (game_name or "").strip()
+    name_slug = _fuzzy_slug(name)
+    ranked: list[tuple[float, str]] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        u = _normalize_itch_game_url(raw)
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        slug = _fuzzy_slug(u.rstrip("/").rsplit("/", 1)[-1])
+        # Exact slug match first; otherwise keep a mild slug score so we
+        # still probe near-misses (versioned slugs like title-v0891).
+        if name_slug and slug == name_slug:
+            pri = 200.0
+        elif name_slug and name_slug in slug:
+            pri = 120.0
+        else:
+            pri = _fuzzy_score(name, slug.replace("-", " ")) if name else 0.0
+        ranked.append((pri, u))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    for pri, u in ranked[:max_probe]:
+        ok, html = _itch_url_live(u)
+        if not ok:
+            logger.info(f"itch.io candidate dead/unavailable: {u}")
+            continue
+        title = _scrape_itch_title(u) if not html else None
+        if html and not title:
+            m = re.search(r'<title>(.*?)</title>', html, re.I | re.S)
+            if m:
+                title = re.sub(r'\s+by\s+\S+\s*$', '', m.group(1).strip())
+                title = re.sub(r'\s+', ' ', title).strip()
+        title = title or u
+        score = _fuzzy_score(name, title) if name else 100.0
+        if score < 40.0 and pri < 120.0:
+            logger.debug(
+                f"itch.io candidate rejected (score={score:.0f}): {u} title={title!r}"
+            )
+            continue
+        # Exact/near slug match: accept even when the live title is noisy
+        # ("… PC Free Game by …") as long as the page is real.
+        if score < 40.0 and pri >= 120.0:
+            logger.info(
+                f"itch.io: accepting slug-matched live page despite "
+                f"noisy title (score={score:.0f}): {u}"
+            )
+        else:
+            logger.info(
+                f"itch.io: live page {u} (title={title!r}, score={score:.0f})"
+            )
+        return u
+    return None
+
+
 def _find_itch_url_via_search(
     query: str,
     game_name: str | None = None,
@@ -40,37 +165,46 @@ def _find_itch_url_via_search(
     *query* is the full search string (e.g. ``'"Example Game" site:itch.io'``).
     *game_name* is the plain game name used for fuzzy scoring on direct itch.io results
     (falls back to the query string if not given).
+
+    Engine hits are collected and *probed* before returning: returning the
+    first SERP itch URL used to silently fail when the indexed page is a
+    404 / removed game (common for adult titles whose official page is
+    gone but still ranks in search).
     """
     _ITCH_GAME_RE = re.compile(
         r'https?://[a-zA-Z0-9-]+\.itch\.io/[a-z0-9][a-z0-9-]*'
     )
-    _SKIP_SUFFIXES = ("/search", "/games", "/jam", "/profile",
-                      "/login", "/register", "/docs", "/t/", "/devlogs/", "/main")
-    _SKIP_DOMAINS = {"static.itch.io", "api.itch.io", "img.itch.io"}
 
     def _extract(html: str) -> list[str]:
         seen: dict[str, None] = {}
         for m in _ITCH_GAME_RE.finditer(html):
-            url = m.group(0).rstrip("/")
-            domain = url.split("://", 1)[-1].split("/")[0]
-            if domain in _SKIP_DOMAINS:
-                continue
-            path = url.split("itch.io", 1)[-1]
-            if any(path.startswith(s) for s in _SKIP_SUFFIXES):
-                continue
-            if url not in seen:
-                seen[url] = None
+            u = _normalize_itch_game_url(m.group(0))
+            if u and u not in seen:
+                seen[u] = None
         return list(seen)
 
-    # 1. Web search engines (shared layer: Brave → Bing → SearXNG → DuckDuckGo).
-    # DDG wraps result URLs percent-encoded inside its redirect links
-    # (uddg=https%3A%2F%2F…), so decode the page before pattern-matching.
+    name = game_name or query.replace('"', "").replace("site:itch.io", "").strip()
+    candidates: list[str] = []
+
+    # 1. Web search engines — gather itch URLs from the WHOLE chain, then
+    #    pick a live one. Early-returning the first hit skipped every other
+    #    engine and never noticed that the top result was a 404 shell.
     try:
         for engine, page_html in _iter_search_engine_html(query):
             urls = _extract(urllib.parse.unquote(page_html))
             if urls:
                 logger.debug(f"{engine} found itch URLs: {urls[:3]}")
-                return urls[0]
+                for u in urls:
+                    if u not in candidates:
+                        candidates.append(u)
+        hit = _pick_live_itch_url(candidates, name)
+        if hit:
+            return hit
+        if candidates:
+            logger.info(
+                f"itch.io: {len(candidates)} SERP candidate(s) for {name!r} "
+                f"but none reachable — trying direct itch search"
+            )
     except Exception as e:
         logger.debug(f"Engine search failed for {query!r}: {e}")
 
@@ -78,7 +212,6 @@ def _find_itch_url_via_search(
     # Bounded on purpose: at most 4 subquery lengths, and at most 5 titles
     # scraped per subquery — the unbounded version could quietly spend a
     # minute+ fetching pages when nothing matches, with no log trace.
-    name = game_name or query.replace('"', "").replace("site:itch.io", "").strip()
     name_slug = _fuzzy_slug(name)
     terms = name.split()
     for n_words in range(min(len(terms), 4), 0, -1):
@@ -88,31 +221,19 @@ def _find_itch_url_via_search(
             html = _fetch_html(itch_url)
             if html:
                 urls = _extract(html)
-                if urls:
-                    # Pass 1: prefer URL whose slug matches the game name
-                    for u in urls:
-                        url_slug = u.rstrip("/").rsplit("/", 1)[-1]
-                        url_slug = _fuzzy_slug(url_slug)
-                        if url_slug == name_slug:
-                            logger.debug(
-                                f"itch.io slug match: {u} == {name_slug}"
-                            )
-                            return u
-                    # Pass 2: score by page title (each title = one fetch)
-                    scored: list[tuple[float, str]] = []
-                    for u in urls[:5]:
-                        title = _scrape_itch_title(u) or u
-                        score = _fuzzy_score(name, title)
-                        if score >= 40.0:
-                            scored.append((score, u))
-                    if scored:
-                        scored.sort(key=lambda x: x[0], reverse=True)
-                        best_score, best_url = scored[0]
-                        logger.debug(
-                            f"itch.io search for {sub!r}: best={best_url} "
-                            f"(score={best_score:.0f}, n={len(scored)}/{len(urls)})"
-                        )
-                        return best_url
+                if not urls:
+                    continue
+                # Prefer slug match among *live* pages.
+                ordered = sorted(
+                    urls,
+                    key=lambda u: (
+                        0 if _fuzzy_slug(u.rsplit("/", 1)[-1]) == name_slug else 1,
+                        u,
+                    ),
+                )
+                hit = _pick_live_itch_url(ordered, name, max_probe=5)
+                if hit:
+                    return hit
         except Exception as e:
             logger.debug(f"itch.io search for {sub!r} failed: {e}")
 
@@ -2220,11 +2341,15 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
             return u
         return None
 
-    def _url_matches_query(url: str) -> bool:
+    def _url_match_strength(url: str) -> int:
+        """0 = reject; else count of query tokens present (all required)."""
         if not _q_tokens:
-            return True
+            return 1
         low = url.lower()
-        return any(t in low for t in _q_tokens)
+        # EVERY significant token must appear — "Super Adventure" must match
+        # super+adventure, not super alone (unrelated pages) or adventure alone.
+        n = sum(1 for t in _q_tokens if t in low)
+        return n if n == len(_q_tokens) else 0
 
     def _extract_links(html: str, limit: int) -> list[str]:
         seen: dict[str, None] = {}
@@ -2246,14 +2371,21 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
 
     urls: list[str] = []
     for engine, page_html in _iter_search_engine_html(query):
-        found = _extract_links(page_html, max_results * 2)
-        matched = [u for u in found if _url_matches_query(u)]
+        # Pull a wider href pool before the token filter — with a strict
+        # all-tokens gate the first N raw links are often partial matches.
+        found = _extract_links(page_html, max_results * 4)
+        ranked = sorted(
+            ((_url_match_strength(u), u) for u in found),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        matched = [u for strength, u in ranked if strength > 0]
         if found and not matched:
-            # Full SERP, zero query tokens in any URL → treat as a soft miss
-            # and keep walking the engine chain (esp. toward SearXNG).
+            # Full SERP, no URL carries every query token → soft miss; keep
+            # walking the engine chain (esp. toward SearXNG).
             logger.info(
                 f"_web_search_urls {query!r}: {engine} returned {len(found)} "
-                f"link(s) with no query-token match — trying next engine"
+                f"link(s) with no all-token match — trying next engine"
             )
             continue
         new = 0
@@ -2261,6 +2393,8 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
             if u not in urls:
                 urls.append(u)
                 new += 1
+            if len(urls) >= max_results:
+                break
         if new:
             logger.info(
                 f"_web_search_urls {query!r}: {engine} contributed {new} "
@@ -2418,8 +2552,22 @@ def _search_targeted_sites(primary: str,
                         f'"{_q}" site:itch.io',
                         game_name=_q,
                     )
+                    # Quoted site: queries sometimes only surface a removed
+                    # official page; the unquoted form can still list mirrors.
+                    if not url:
+                        url = _find_itch_url_via_search(
+                            f'{_q} site:itch.io',
+                            game_name=_q,
+                        )
                     if url:
-                        _collect("itch.io", _scrape_opengraph(url))
+                        info = _scrape_opengraph(url)
+                        if info:
+                            _collect("itch.io", info)
+                        else:
+                            logger.info(
+                                f"Targeted itch.io: reached {url} but "
+                                f"metadata scrape failed"
+                            )
                     else:
                         logger.info(f"Targeted itch.io: no page for {_q!r}")
         except Exception as e:
@@ -2521,7 +2669,14 @@ def _search_targeted_sites(primary: str,
                     None,
                 )
                 if _mgm:
-                    _collect("MobyGames (web)", _scrape_opengraph(_mgm))
+                    info = _scrape_opengraph(_mgm)
+                    if info:
+                        _collect("MobyGames (web)", info)
+                    else:
+                        logger.info(
+                            f"Targeted MobyGames: reached {_mgm} but "
+                            f"metadata scrape failed"
+                        )
                 else:
                     logger.info(f"Targeted MobyGames: nothing for {_mg_keyword!r}")
             except Exception as _be:
