@@ -2173,7 +2173,14 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
     """Return result URLs from web search engines, excluding YouTube.
 
     Iterates the shared engine layer (Brave → Bing → SearXNG → DDG)
-    and stops as soon as enough links were extracted.
+    and stops as soon as enough *query-relevant* links were extracted.
+
+    Relevance gate: an engine that returns a full SERP of unrelated links
+    (common when Bing serves a soft wall / A-B junk for scripted clients)
+    must NOT short-circuit the chain — that used to make tier-3 look
+    "done" in ~10s after a Brave 429, never reaching SearXNG, while tier-2
+    spent minutes on the same engines because ``site:`` queries kept
+    Bing on the no-b_algo path.
     """
     # Engine self-links: SearXNG pages link to their own preferences/about
     # pages, searx.space, the SearXNG GitHub/docs, and per-result cache links.
@@ -2195,6 +2202,15 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
         r'|youtube\.com|youtu\.be)',
         re.IGNORECASE,
     )
+    # Significant query tokens that should appear in a useful result URL
+    # (slug/path). Packaging noise and tiny words are ignored — same spirit
+    # as _searx_page_relevant / _title_tokens.
+    _q_tokens = {
+        t for t in re.findall(r'[a-z0-9]{4,}', query.lower())
+        if t not in ("site", "game", "https", "http", "html", "www",
+                     "com", "org", "net")
+    }
+
     def _resolve(url: str) -> str | None:
         # Unescape &amp; first: Bing wraps results as ck/a?…&amp;u=a1<b64>, and
         # the entity would otherwise break _unwrap_redirect's &u= match.
@@ -2203,6 +2219,12 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
         if u.startswith("http") and not _SKIP.search(u):
             return u
         return None
+
+    def _url_matches_query(url: str) -> bool:
+        if not _q_tokens:
+            return True
+        low = url.lower()
+        return any(t in low for t in _q_tokens)
 
     def _extract_links(html: str, limit: int) -> list[str]:
         seen: dict[str, None] = {}
@@ -2224,12 +2246,26 @@ def _web_search_urls(query: str, max_results: int = 6) -> list[str]:
 
     urls: list[str] = []
     for engine, page_html in _iter_search_engine_html(query):
+        found = _extract_links(page_html, max_results * 2)
+        matched = [u for u in found if _url_matches_query(u)]
+        if found and not matched:
+            # Full SERP, zero query tokens in any URL → treat as a soft miss
+            # and keep walking the engine chain (esp. toward SearXNG).
+            logger.info(
+                f"_web_search_urls {query!r}: {engine} returned {len(found)} "
+                f"link(s) with no query-token match — trying next engine"
+            )
+            continue
         new = 0
-        for u in _extract_links(page_html, max_results * 2):
+        for u in matched:
             if u not in urls:
                 urls.append(u)
                 new += 1
-        logger.debug(f"_web_search_urls {query!r}: {engine} contributed {new} links")
+        if new:
+            logger.info(
+                f"_web_search_urls {query!r}: {engine} contributed {new} "
+                f"relevant link(s) (total {len(urls)})"
+            )
         if len(urls) >= max_results:
             break
 

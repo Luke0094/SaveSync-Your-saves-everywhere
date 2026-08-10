@@ -10,7 +10,6 @@
 <!-- Drop a screenshot into screenshot/ and update the path below -->
 <img width="964" height="638" alt="Immagine 2026-08-10 182638" src="https://github.com/user-attachments/assets/243d76b3-32a4-41f6-ab45-b3f7ded85e97" />
 
-
 SaveSync watches the games you play, finds their save folders on its own, keeps
 versioned local backups, and mirrors everything to the cloud provider of your
 choice — with an always-on-top overlay so you never have to leave the game.
