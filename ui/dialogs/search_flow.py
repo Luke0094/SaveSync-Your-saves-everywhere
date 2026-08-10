@@ -51,7 +51,8 @@ class SearchFlowMixin:
             return
 
         # One bg op per card — URL→exe / detect must not race web search.
-        # Fallbacks clear ``_web_search_active`` before re-entering here.
+        # Tier cascades (api→targeted→generic) clear ``_web_search_active``
+        # before re-entering; a same-card concurrent start is still blocked.
         if self._has_shelvable_work():
             return
 
@@ -283,6 +284,8 @@ class SearchFlowMixin:
                                   QMessageBox.StandardButton.No:  t('common.no')}
                 )
                 if _r == QMessageBox.StandardButton.Yes:
+                    # Clear so the mutex lets this tier cascade re-enter.
+                    self._web_search_active = False
                     self._web_search(skip_primary_apis=True, enable_targeted_fallback=True,
                                      extra_folder_hint=_hint_fwd)
                 else:
@@ -302,6 +305,7 @@ class SearchFlowMixin:
                                   QMessageBox.StandardButton.No:  t('common.no')}
                 )
                 if _r == QMessageBox.StandardButton.Yes:
+                    self._web_search_active = False
                     self._web_search(skip_primary_apis=True, enable_generic_fallback=True,
                                      extra_folder_hint=_hint_fwd)
                 else:
@@ -427,6 +431,7 @@ class SearchFlowMixin:
                 t('add_game.enrichment_step_status',
                   source=t('add_game.enrich_api'), status=t('add_game.search_not_found'))
             )
+            self._web_search_active = False
             self._web_search(skip_primary_apis=True, enable_targeted_fallback=True,
                              extra_folder_hint=_hint_fwd)
         elif _current_phase == 'targeted':
@@ -434,10 +439,13 @@ class SearchFlowMixin:
                 t('add_game.enrichment_step_status',
                   source=t('add_game.enrich_targeted'), status=t('add_game.search_not_found'))
             )
+            self._web_search_active = False
             self._web_search(skip_primary_apis=True, enable_generic_fallback=True,
                              extra_folder_hint=_hint_fwd)
         else:
+            self._web_search_active = False
             self._status_lbl.setText(t('add_game.search_not_found'))
+            self._emit_bg_status("failed")
 
     def _process_search_result(self, result, offer_enrichment: bool = True) -> bool:
         """Apply ONE confirmed search result — either the only candidate
