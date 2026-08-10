@@ -2264,11 +2264,13 @@ def _search_targeted_sites(primary: str,
         except Exception as e:
             logger.debug(f"itch.io targeted search failed: {e}")
 
-    # 2. DLSite direct (product code RJ/RE/VJ in hints — precise match)
+    # 2. DLSite direct (product code RJ/RE/VJ in hints — precise match).
+    # Read codes from RAW hints: _clean_game_name / strip_version_tokens
+    # already remove RJ/RE/VJ, so cleaned all_hints would never see them.
     _dl_codes: list[str] = []
-    for h in all_hints:
+    for h in _raw_all_hints:
         for m in re.finditer(r'(?:^|[\s\[\(\{])(RJ|RE|VJ)(\d{4,10})(?:[\s\]\)\}]|$)', h, re.IGNORECASE):
-            code = m.group(0).strip().strip('[](){}')
+            code = (m.group(1) + m.group(2)).upper()
             if code not in _dl_codes:
                 _dl_codes.append(code)
     if _dl_codes and 'dlsite' not in _skip:
