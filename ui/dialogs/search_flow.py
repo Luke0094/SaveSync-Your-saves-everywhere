@@ -425,9 +425,57 @@ class SearchFlowMixin:
                         return
                     n = len(useful)
                     continue
+                # Code-hint DLsite URLs survive even when that candidate was
+                # not the one confirmed (and even if its merge URL chip was
+                # left unchecked) — the product code guarantees the work.
+                self._retain_hint_coded_dlsite_urls()
                 return
             finally:
                 self._active_candidate_dialog = None
+
+    def _retain_hint_coded_dlsite_urls(self):
+        """Keep DLsite product URLs that match a search-hint product code.
+
+        A folder/name RJ/RE/VJ code guarantees the same work: even if the
+        user rejected the DLsite candidate (wrong-looking title, region
+        lock, …) the store link stays. Keyword-only DLsite hits without a
+        matching code hint are discarded with the reject — never
+        pre-approved onto another source.
+        """
+        from core.manual_paths import product_codes
+        import re as _re_dl
+        codes: set[str] = set()
+        for bit in (
+            getattr(self, '_last_search_folder_hint', '') or '',
+            self._name_edit.text() if hasattr(self, '_name_edit') else '',
+        ):
+            codes |= product_codes(bit)
+        if not codes:
+            return
+        urls = list(getattr(self, '_store_urls', None) or [])
+        added = False
+        for r in getattr(self, '_last_search_candidates', None) or []:
+            src = (getattr(r, 'source', '') or '').split('+')[0].lower()
+            if src != 'dlsite':
+                continue
+            for u in self._result_site_urls(r):
+                m = _re_dl.search(
+                    r'product_id/((?:RJ|RE|VJ)\d{4,10})', u or '',
+                    _re_dl.IGNORECASE,
+                )
+                if not m or m.group(1).upper() not in codes:
+                    continue
+                if u not in urls:
+                    urls.append(u)
+                    added = True
+        if added:
+            self._store_urls = urls
+            if hasattr(self, '_rebuild_url_chips'):
+                self._rebuild_url_chips()
+            logger.info(
+                "Retained DLsite URL(s) matching hint product code(s) "
+                f"{sorted(codes)}"
+            )
 
     def _candidates_rejected(self):
         """No candidate confirmed (Reject / closed the popup): proceed
@@ -435,6 +483,9 @@ class SearchFlowMixin:
         result — no extra "do you want to try the next tier?" prompt, the
         user already said no once by rejecting. Mirrors the decline branch
         in _process_search_result."""
+        # Product-code DLsite links outlive a full reject; keyword-only ones
+        # do not (see _retain_hint_coded_dlsite_urls).
+        self._retain_hint_coded_dlsite_urls()
         _current_phase = getattr(self, '_current_search_phase', 'api')
         _hint_fwd = getattr(self, '_last_search_folder_hint', '')
         self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
@@ -518,6 +569,7 @@ class SearchFlowMixin:
                       if r is not result]
             if _peers:
                 self._offer_same_tier_enrichment(result, _peers)
+            self._retain_hint_coded_dlsite_urls()
 
         missing = self._get_missing_fields()
         if missing:

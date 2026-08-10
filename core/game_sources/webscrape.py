@@ -16,10 +16,12 @@ import urllib.request
 from typing import Optional
 
 from core.constants import CAMEL_SPLIT_RE
-from core.game_sources.common import (GameInfo, _clean_game_name,
+from core.game_sources.common import (GameInfo, _clean_description,
+                                      _clean_game_name,
                                       _decode_entities, _dedupe_candidates,
                                       _earliest_forum_date,
                                       _fetch_json, _fuzzy_score, _fuzzy_slug,
+                                      _is_dlsite_shop_blurb,
                                       _is_favicon_like,
                                       _is_non_game_media_title,
                                       _parse_forum_description,
@@ -275,18 +277,26 @@ def _dlsite_region_locked(html: str) -> bool:
 
 
 def _dlsite_finish(url: str, html: str) -> Optional[GameInfo]:
-    """Run OpenGraph scrape for a DLsite page, logging region locks.
+    """Scrape a DLsite work page, logging region locks.
 
-    Region-locked purchase banners mean the work is not buyable here.
-    In that case keep ONLY the product link (no title/desc/dev/cover) —
-    metadata from a locked shell is unreliable and must not fill the form.
+    A region-locked purchase banner means the work is not buyable here, but
+    title/cover (and sometimes developer/genres/…) usually remain in the
+    markup — propose whatever is recoverable. The site-wide shop footer is
+    never kept as a description (see ``_clean_description``).
     """
     locked = _dlsite_region_locked(html)
+    info = _scrape_opengraph(url, html=html)
     if locked:
         base = (url or "").split("?")[0]
-        logger.info(f"DLSite: region-locked — keeping link only: {base}")
-        return GameInfo(name="", store_url=base, source="dlsite")
-    return _scrape_opengraph(url, html=html)
+        if info and (info.name or "").strip():
+            logger.info(
+                f"DLSite: region-locked — proposing available metadata: {base}"
+            )
+        else:
+            logger.info(
+                f"DLSite: region-locked — no usable metadata: {base}"
+            )
+    return info
 
 
 def _scrape_dlsite_en(product_url: str) -> Optional[GameInfo]:
@@ -989,16 +999,26 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         r'|dlsite\.com|gamefaqs\.gamespot\.com|moby ?games?).*$',
         '', title, flags=re.IGNORECASE,
     ).strip()
-    if not title:
-        return None
-    # DLsite region-lock shells sometimes surface "SORRY..." as the title —
-    # never treat that as a game. Full lock logging lives in _dlsite_finish.
-    if "dlsite.com" in (url or "").lower() and _DLSITE_SORRY_TITLE_RE.match(title):
-        logger.info(f"DLSite: region-locked — skipping {url}")
+    # DLsite region-lock shells sometimes surface "SORRY..." as og:title —
+    # clear it and keep scraping; itemprop="name" / JSON-LD often still
+    # carry the real work title. Non-DLsite pages still require a title now.
+    _url_is_dlsite = "dlsite.com" in (url or "").lower()
+    if title and _url_is_dlsite and _DLSITE_SORRY_TITLE_RE.match(title):
+        logger.info(
+            f"DLSite: placeholder title on {url} — trying page markup"
+        )
+        title = ""
+    if not title and not _url_is_dlsite:
         return None
 
     _raw_description = _meta("og:description", "description", "twitter:description")
     description = _raw_description[:600]
+    # DLsite OG description is often the site-wide shop blurb — drop it
+    # early so the work body / JSON-LD can fill a real synopsis instead.
+    if _url_is_dlsite and description and (
+            _is_dlsite_shop_blurb(description)
+            or not _clean_description(description)):
+        description = ""
     image_url   = _meta("og:image:secure_url", "og:image", "twitter:image")
 
     # Resolve relative image URLs to absolute
@@ -1205,9 +1225,16 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                 is_game = _ld_is_game_related(ld)
                 is_forum = _ld_is_forum_post(ld)
                 if not title and ld.get("name"):
-                    title = str(ld["name"])
+                    _ld_name = str(ld["name"]).strip()
+                    if not (_url_is_dlsite
+                            and _DLSITE_SORRY_TITLE_RE.match(_ld_name)):
+                        title = _ld_name
                 if not description and ld.get("description"):
-                    description = str(ld["description"])[:600]
+                    _ld_desc = str(ld["description"])[:600]
+                    if not (_url_is_dlsite and (
+                            _is_dlsite_shop_blurb(_ld_desc)
+                            or not _clean_description(_ld_desc))):
+                        description = _ld_desc
                 if not image_url and isinstance(ld.get("image"), str):
                     img = ld["image"]
                     if img.startswith("//"):
@@ -1349,17 +1376,23 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
             if title_clean and len(title_clean) > 2:
                 title = title_clean
 
-        # Description from work_parts_container (more detailed than og:description)
+        # Description from work_parts_container (more detailed than og:description).
+        # Prefer the work body whenever present — OG is frequently only the
+        # shop footer, which would otherwise block this path.
         _wpc = re.search(
             r'<div\s+itemprop=["\']description["\']\s+class=["\']work_parts_container["\']>'
             r'\s*<div\s+class=["\']work_parts_body["\']>(.*?)</div>\s*</div>',
             html, re.S | re.I
         )
-        if _wpc and not description:
+        if _wpc:
             _d_desc = re.sub(r'<[^>]+>', '', _wpc.group(1)).strip()
             _d_desc = re.sub(r'\s+', ' ', _d_desc).strip()
-            if _d_desc and len(_d_desc) > 20:
+            if (_d_desc and len(_d_desc) > 20
+                    and not _is_dlsite_shop_blurb(_d_desc)):
                 description = _d_desc[:600]
+        if description and (_is_dlsite_shop_blurb(description)
+                            or not _clean_description(description)):
+            description = ""
 
     elif "wikipedia.org" in url:
         # Wikipedia: extract description from first substantial paragraph
@@ -1627,6 +1660,11 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         _source = "wikipedia"
     elif "vndb.org" in _url_lower:
         _source = "vndb"
+
+    # DLsite: still no real title after OG/JSON-LD/itemprop → not a candidate.
+    if _source == "dlsite" and not (title or "").strip():
+        logger.info(f"DLSite: no usable title for {url}")
+        return None
 
     # JSON-LD aggregate → a single-verdict review for sites that publish one
     # (itch ratings, MobyScore, …). DLsite's user-review list is richer and
@@ -2687,7 +2725,25 @@ def _search_targeted_sites(primary: str,
             code = (m.group(1) + m.group(2)).upper()
             if code not in _dl_codes:
                 _dl_codes.append(code)
-    _dlsite_locked_urls: list[str] = []
+    # URLs safe to attach onto OTHER candidates — only when the URL's
+    # product_id matches a search-hint code (source of truth). Keyword
+    # hits without a matching hint code are never attached.
+    _dlsite_attach_urls: list[str] = []
+
+    def _dlsite_url_code(u: str) -> str:
+        m = re.search(r'product_id/((?:RJ|RE|VJ)\d{4,10})', u or '', re.I)
+        return m.group(1).upper() if m else ""
+
+    def _remember_dlsite_attach(u: str) -> None:
+        base = (u or "").split("?")[0].strip()
+        if not base:
+            return
+        code = _dlsite_url_code(base)
+        if not code or code not in _dl_codes:
+            return
+        if base not in _dlsite_attach_urls:
+            _dlsite_attach_urls.append(base)
+
     if _dl_codes and 'dlsite' not in _skip:
         # One candidate per product code. The section list is a fallback, not
         # a set of distinct sources: a code is only listed in the one section
@@ -2696,18 +2752,28 @@ def _search_targeted_sites(primary: str,
         # candidates. Which section is asked first no longer matters either —
         # _scrape_dlsite_en follows the canonical link, so a work living in a
         # section not even listed here (girls, bl, home…) still resolves.
+        # Region-locked pages still scrape title/cover/… and are proposed;
+        # the product code guarantees the same work even if the user later
+        # rejects the candidate title as "wrong".
         for code in _dl_codes:
             info = None
+            _tried_url = ""
             for _dl_sub in ("maniax", "soft", "pro"):
+                _tried_url = (
+                    f"https://www.dlsite.com/{_dl_sub}/work/=/product_id/{code}.html"
+                )
                 try:
-                    info = _scrape_dlsite_en(
-                        f"https://www.dlsite.com/{_dl_sub}/work/=/product_id/{code}.html"
-                    )
+                    info = _scrape_dlsite_en(_tried_url)
                 except Exception as e:
                     logger.debug(f"DLSite product direct ({_dl_sub}) failed: {e}")
                     info = None
-                if info and (info.name or info.store_url):
+                if info and info.name:
                     break
+            # Code hint → URL is known truth: attach even when metadata
+            # scrape fails (region shell with no title, fetch error, …).
+            _remember_dlsite_attach(
+                (info.store_url if info and info.store_url else _tried_url)
+            )
             if info and info.name:
                 # Product code ensures we found the right game, but score
                 # by name so better-matched sources (itch.io with English
@@ -2720,17 +2786,10 @@ def _search_targeted_sites(primary: str,
                     f"{info.name!r} (name_score={name_score:.0f}, final={_score:.0f})"
                 )
                 results.append((info, _score))
-            elif info and info.store_url:
-                # Region-locked: link only — no title/desc/dev/cover.
-                _u = info.store_url
-                if _u not in _dlsite_locked_urls:
-                    _dlsite_locked_urls.append(_u)
-                logger.info(
-                    f"DLSite product code {code}: region-locked — link only"
-                )
             else:
                 logger.info(
-                    f"DLSite product code {code}: no usable page"
+                    f"DLSite product code {code}: no usable page "
+                    f"(URL still attachable)"
                 )
 
     # 3. DLSite keyword search (by name, no RJ code needed)
@@ -2740,6 +2799,8 @@ def _search_targeted_sites(primary: str,
     #      B) No code                -> web-indexed search via _find_dlsite_url_via_search
     #                                   (shared engine layer, filtered with site:dlsite.com)
     #    No /fsr/ direct endpoint - unreliable, no structured parsing needed.
+    #    Keyword hits are proposed (including region-locked). Attach to other
+    #    sources ONLY when the hit's product_id matches a hint code.
     _dl_keyword = _q_best or primary
     if 'dlsite' not in _skip:
         _dl_url = _find_dlsite_url_via_search(_dl_keyword)
@@ -2752,15 +2813,10 @@ def _search_targeted_sites(primary: str,
             _dl_info = _scrape_dlsite_en(_dl_url)
             if _dl_info and _dl_info.name:
                 _collect("DLSite (web)", _dl_info)
-            elif _dl_info and _dl_info.store_url:
-                _u = _dl_info.store_url
-                if _u not in _dlsite_locked_urls:
-                    _dlsite_locked_urls.append(_u)
-                logger.info(
-                    f"Targeted DLSite: region-locked — link only for "
-                    f"{_dl_keyword!r}"
-                )
+                _remember_dlsite_attach(_dl_info.store_url or _dl_url)
             else:
+                # No candidate, but a code-matching URL may still attach.
+                _remember_dlsite_attach(_dl_url)
                 logger.info(f"Targeted DLSite: no product for {_dl_keyword!r}")
         else:
             logger.info(f"Targeted DLSite: no product for {_dl_keyword!r}")
@@ -2847,29 +2903,38 @@ def _search_targeted_sites(primary: str,
         except Exception as e:
             logger.debug(f"Wikipedia failed: {e}")
 
-    # Region-locked DLsite pages contribute ONLY their product link — attach
-    # it to whatever candidates we already have (or a title stub if alone).
-    if _dlsite_locked_urls:
+    # Attach DLsite product URLs onto other candidates ONLY when the URL
+    # matches a search-hint product code (source of truth). No hint code →
+    # no attach in any case (keyword-only hits stay separate candidates).
+    if _dlsite_attach_urls:
         if results:
             for _info, _ in results:
+                _src = (getattr(_info, "source", "") or "").split("+")[0].lower()
+                if _src == "dlsite":
+                    continue
                 _extras = list(_info.extra_urls or [])
-                for _u in _dlsite_locked_urls:
+                for _u in _dlsite_attach_urls:
                     if _u and _u not in _extras and _u != (_info.store_url or ""):
                         _extras.append(_u)
-                if not (_info.store_url or "").strip() and _dlsite_locked_urls:
-                    _info.store_url = _dlsite_locked_urls[0]
+                if not (_info.store_url or "").strip() and _dlsite_attach_urls:
+                    _info.store_url = _dlsite_attach_urls[0]
                     _extras = [u for u in _extras if u != _info.store_url]
                 _info.extra_urls = _extras
+            logger.info(
+                "DLSite: attached code-hint URL(s) to non-DLsite candidates: "
+                + ", ".join(_dlsite_attach_urls)
+            )
         else:
+            # Code is enough to propose the product link alone.
             results.append((GameInfo(
                 name=primary,
-                store_url=_dlsite_locked_urls[0],
+                store_url=_dlsite_attach_urls[0],
                 source="dlsite",
-                extra_urls=list(_dlsite_locked_urls[1:]),
+                extra_urls=list(_dlsite_attach_urls[1:]),
             ), 40.0))
             logger.info(
-                "DLSite region-locked: proposing link-only stub under "
-                f"search title {primary!r}"
+                "DLSite: proposing code-hint link under search title "
+                f"{primary!r}"
             )
 
     # No merging of fields from multiple sources — enrichment from

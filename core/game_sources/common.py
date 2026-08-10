@@ -289,8 +289,16 @@ def _find_best_match(query: str, candidates: list[dict], name_field: str = "name
 # or description arrives as "N&amp;R" or "you&#039;re". Everything is decoded
 # once, at GameInfo construction, so every source is covered uniformly and
 # the stored entry is clean.
+# Site-wide shop blurb used as og:description on many DLsite work pages
+# (including region-locked shells). Match the full banner *or* a truncated
+# OG preview that still starts as that blurb — never treat it as a game
+# description. ``.*`` (not ``.*?DLsite!``) so a cut-off meta tag is wiped too.
 _DLSITE_SIGNATURE_RE = re.compile(
-    r'[\s"\'?]*DLsite[^"\n]{0,40}["\']?\s+is a download shop\b.*?DLsite\s*!',
+    r'[\s"\'?]*DLsite[^"\n]{0,80}["\']?\s+is a download shop\b.*',
+    re.IGNORECASE | re.DOTALL,
+)
+_DLSITE_SHOP_BLURB_RE = re.compile(
+    r'^[\s"\'?]*DLsite\b.{0,100}\b(?:is a download shop|ダウンロードショップ)\b',
     re.IGNORECASE | re.DOTALL,
 )
 # Conservative HTML-tag strip — only well-known tags, never a broad
@@ -311,15 +319,34 @@ def _decode_entities(text: str) -> str:
     return html.unescape(text).replace('\xa0', ' ').strip()
 
 
+def _is_dlsite_shop_blurb(text: str) -> bool:
+    """True when *text* is (only) DLsite's site-wide download-shop banner."""
+    if not text or not text.strip():
+        return False
+    t = html.unescape(text).replace('\xa0', ' ').strip()
+    if _DLSITE_SHOP_BLURB_RE.search(t):
+        return True
+    # Short leftovers that still name the shop and nothing else.
+    if (len(t) < 220 and re.search(r'\bDLsite\b', t, re.IGNORECASE)
+            and re.search(r'\bdownload shop\b', t, re.IGNORECASE)):
+        return True
+    return False
+
+
 def _clean_description(text: str) -> str:
     """Decode entities, then remove DLsite's site-wide signature boilerplate
     and any leaked HTML tags, collapsing runs of whitespace."""
     if not text:
         return text
     text = html.unescape(text).replace('\xa0', ' ')
+    if _is_dlsite_shop_blurb(text):
+        return ""
     text = _DLSITE_SIGNATURE_RE.sub(' ', text)
     text = _HTML_TAG_RE.sub(' ', text)
-    return re.sub(r'\s{2,}', ' ', text).strip()
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    if _is_dlsite_shop_blurb(text):
+        return ""
+    return text
 
 
 @dataclass
