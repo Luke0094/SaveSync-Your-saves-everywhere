@@ -128,9 +128,10 @@ def _check_single_instance():
             if handle:
                 _kernel32.CloseHandle(handle)
             # Second launch = "show me the app": ping the running instance's
-            # focus pipe (served by main.py via QLocalServer) and exit
-            # silently. Falls back to the message box when the ping can't be
-            # delivered. Name must stay in sync with main._instance_show_name.
+            # focus pipe (served by main.py via a native Win32 named pipe on
+            # Windows, QLocalServer elsewhere) and exit silently. Falls back
+            # to the message box when the ping can't be delivered. Name must
+            # stay in sync with main._instance_show_name.
             if _ping_primary_instance():
                 _close_splash()
                 sys.exit(0)

@@ -816,12 +816,10 @@ def _parse_forum_description(text: str) -> dict:
 # as its opening word. Position tells the two apart, which is better than
 # dropping the word from the list and never stripping it at all.
 #
-# "DLC" is deliberately absent: it does not describe the same files in
-# another language, it describes different content.
 _RELEASE_MARKERS = frozenset({
     "jap", "jpn", "eng", "chs", "cht", "kor", "rus",
     "mtl", "unc", "uncen", "uncensored", "decensored", "censored",
-    "repack", "cracked", "patched", "crack", "hotfix",
+    "repack", "cracked", "patched", "crack", "hotfix", "dlc",
 })
 
 # Words that are release noise only in company. A release folder writes one
@@ -833,9 +831,11 @@ _RELEASE_MARKERS = frozenset({
 # "Steam" is here rather than among the trailing markers for exactly that
 # reason: it names the store, but it is also an ordinary English word, and a
 # title can plausibly end on it. "Kagura" and "GOG" cannot, so they need no
-# such care and are taken off the end unconditionally.
+# such care and are taken off the end unconditionally. "Test" gets the same
+# treatment: it is release noise (a playable preview), but a title can
+# legitimately end on the word, so it too is struck out only in company.
 _CONTEXTUAL_MARKERS = frozenset({
-    "fix", "fixed", "steam",
+    "fix", "fixed", "steam", "test",
 })
 
 # Who a release came from — the store it was bought from, or the publisher
@@ -845,11 +845,16 @@ _CONTEXTUAL_MARKERS = frozenset({
 # half. Where the word sits is what separates the title from the label stuck
 # on the end of it.
 _TRAILING_MARKERS = frozenset({
-    "kagura", "gog",
+    # Store / publisher labels stuck on the end of a release folder name.
+    "kagura", "gog", "dlsite",
+    # Release-edition labels: machine-translated build (f95 convention).
+    "mtl",
     # Concatenated store label (MangaGamer / mangagamer). The spaced form is
     # handled by _TWO_WORD_TRAILING — "manga" or "gamer" alone must never
     # come off a title that happens to end on either word.
     "mangagamer",
+    # Store label fused with the DLC descriptor ("SteamDLC").
+    "steamdlc",
 })
 
 # "Hot fix" written as two words, folded into the one word the marker list
@@ -1030,8 +1035,8 @@ _NOISE_PLATFORM = frozenset({
     "android", "apk", "linux", "ios", "x86", "x64",
 })
 _NOISE_TAG = frozenset({
-    "uncensored", "censored", "decensored", "premium", "complete", "completed",
-    "full", "demo", "trial", "test", "beta", "alpha", "final", "deluxe",
+    "uncensored", "unc", "uncen", "censored", "decensored", "premium", "complete", "completed",
+    "full", "demo", "trial", "beta", "alpha", "final", "deluxe",
     "goty", "remaster", "remastered", "repack", "cracked", "crack", "patched",
     "dlc", "edition", "standalone", "portable", "rip",
 })
@@ -1062,9 +1067,131 @@ def _strip_release_noise(name: str, drop_version: bool = False) -> str:
         s = strip_version_tokens(s)
     s = re.sub(r'[\(\)\{\}\[\]\-_]', ' ', s)          # brackets + separators
     tokens = s.split()
-    while tokens and tokens[-1].lower() in _RELEASE_NOISE:
+    while tokens and (
+            tokens[-1].lower() in _RELEASE_NOISE
+            or tokens[-1].lower() in _TRAILING_MARKERS):
         tokens.pop()
     return ' '.join(tokens).strip() or name
+
+
+def _is_pure_noise_label(seg: str) -> bool:
+    """A trailing label that can never be a title word.
+
+    Store names, language markers and release decorations ("MTL", "KAGURA",
+    "Eng", "DLC"…) are unambiguous labels and come off even glued to the
+    title by a hyphen. The contextualized words ("steam", "test", "fix") are
+    ordinary English too and a title may legitimately end on them, so they
+    keep their glue — as does a hyphenated compound like "sempai-kun", which
+    is not noise at all.
+    """
+    s = seg.strip("-–—.+").casefold()
+    return (s in _TRAILING_MARKERS or s in _RELEASE_MARKERS
+            or s in _NOISE_LANG)
+
+
+def _clean_publisher_tail(tail: str, separated: bool) -> tuple[str, bool]:
+    """Strip one trailing store/publisher/language label off *tail*.
+
+    Returns ``(cleaned, changed)``. The tail comes back verbatim when it does
+    not end on a label, so a folder whose only quirk is its spelling (an
+    underscore between words, say) keeps its exact text. Language names and
+    the ordinary English words "steam" and "test" are stripped only from a
+    *separated* tail (one that sits after a delimiter): each can end a real
+    title on its own, where "… - Ita" is unmistakably a label. A bare "+" in
+    front of a label ("+DLC") is treated as part of that label. A label glued
+    to the title by a hyphen ("Loop-MTL") comes off with its hyphen when it
+    is a *pure* label, never when it is a word the title could end on.
+    """
+    two_word = _TWO_WORD_TRAILING.search(tail)
+    if two_word:
+        return tail[:two_word.start()].rstrip(" ._-"), True
+    tokens = re.split(r'[\s_]+', tail)
+    kept = list(tokens)
+    changed = False
+    while kept:
+        last = kept[-1]
+        if "-" in last and not last.startswith("-"):
+            head, sep, seg = last.rpartition("-")
+            if sep and _is_pure_noise_label(seg):
+                if head:
+                    kept[-1] = head
+                else:
+                    kept.pop()
+                changed = True
+                continue
+        bare = last.strip("-–—.+").lower()
+        if bare in _TRAILING_MARKERS or bare in _RELEASE_MARKERS:
+            kept.pop()
+            changed = True
+            continue
+        if separated and (bare in ("steam", "test") or bare in _NOISE_LANG):
+            kept.pop()
+            changed = True
+            continue
+        break
+    if not changed:
+        return tail, False
+    return " ".join(kept).strip(" ._-–—"), True
+
+
+def strip_publisher_noise(name: str) -> str:
+    """Strip a trailing store/publisher label from a registered game name.
+
+    A manual save backup registered the whole collection folder as its title,
+    store labels and all ("… KAGURA", "… - STEAM", "… mtl"). Those labels are
+    release decoration, not the game's name. The rules keep real titles
+    intact:
+
+    - only the tail AFTER the last ``-`` delimiter (or a version token) is
+      eligible; everything before it is never touched, so a hyphenated
+      compound keeps its hyphen and "Some Title Test - STEAM" loses only
+      "STEAM";
+    - "steam" and "test" are ordinary English words that can end a real
+      title, so a bare trailing one is kept while a label separated after a
+      delimiter ("… - Steam") is removed like any other store name;
+    - a label glued to the title by a hyphen ("Loop-MTL") comes off with its
+      hyphen, but only when it is a label that can never be a title word;
+    - an underscore is the folder-name separator, so it normalizes to a
+      space ("Hot Steam_2" → "Hot Steam 2") while a bare number stays — a
+      sequel marker is part of the title, never a version.
+
+    Returns *name* unchanged when nothing is removable.
+    """
+    if not name:
+        return name
+    s = re.sub(r'\[[^\]]*\]', ' ', name)
+    # A dash is a delimiter only with whitespace on one side; the hyphen in a
+    # compound word is not and must never split the title. The captured
+    # separators let the title re-assemble with its original spacing (a
+    # subtitle glued to its dash stays glued).
+    segs = re.split(r'(\s*[-–—]\s+|\s+[-–—]\s*)', s)
+    parts = segs[0::2]
+    seps = segs[1::2]
+    separated = len(parts) > 1
+    cleaned_tail, changed = _clean_publisher_tail(parts[-1], separated)
+    if changed:
+        if separated:
+            prefix = parts[0]
+            for i in range(1, len(parts) - 1):
+                prefix += seps[i - 1] + parts[i]
+            result = f"{prefix}{seps[-1]}{cleaned_tail}" if cleaned_tail else prefix
+        else:
+            result = cleaned_tail
+        result = re.sub(r'\s{2,}', ' ', result).strip(" ._-–—")
+        # The version a label sat beside ("Some Title v1.0 - Steam") is a
+        # delimiter too: drop one left exposed at the very end.
+        tokens = result.split()
+        while tokens and (_is_version_token(tokens[-1]) or _is_punctuation(tokens[-1])):
+            tokens.pop()
+        result = " ".join(tokens).strip(" ._-–—")
+    else:
+        # Only the underscore separator rule applies to an otherwise-kept
+        # name: its exact text — a trailing version, a stray "+", a Japanese
+        # trailing dash — is part of the title and is never peeled off.
+        result = s.strip()
+    result = re.sub(r'_', ' ', result)
+    result = re.sub(r'\s{2,}', ' ', result).strip()
+    return result or name
 
 
 def _title_keep_version(name: str) -> str:

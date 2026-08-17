@@ -96,6 +96,7 @@
     "status_pending": "Sync in attesa",
     "status_conflict": "Conflitto",
     "status_local_only": "Solo locale",
+    "status_archives": "Archivi (senza gioco)",
     "status_provisional": "Provvisorio",
     "status_cloud_only": "Solo cloud",
     "status_no_saves": "Nessun salvataggio trovato",
@@ -321,6 +322,8 @@
     "restore_success": "Salvataggi ripristinati per {game}",
     "restore_success_generic": "Salvataggi ripristinati",
     "restore_fallback_warning": "Non è stato possibile trovare automaticamente la cartella salvataggi su questo PC. I file sono stati esportati in:\n{path}\n\nApri Modifica Gioco e imposta manualmente il percorso corretto, poi ripristina di nuovo.",
+    "select_restore_destination": "Seleziona cartella di destinazione per il ripristino",
+    "restore_orphan_success": "Salvataggi ripristinati nella cartella selezionata: {path}",
     "resumed_frozen_game": "Un gioco rimasto congelato da una sessione precedente è stato riattivato."
   },
   "settings": {
@@ -329,6 +332,14 @@
     "theme": "Tema",
     "theme_dark": "Scuro",
     "theme_light": "Chiaro",
+    "ui_scale": "Moltiplicatore scala",
+    "ui_scale_auto": "Scala automatica (stesso aspetto)",
+    "ui_scale_auto_tooltip": "Stesso aspetto del 100% manuale su 4K @ scaling OS 150%: ideal = larghezza_logica_Qt / 2560. I DIP includono già Windows/macOS/Linux — cambiando lo scaling OS l'aspetto fisico resta uguale. Tutte le finestre crescono con la scala.",
+    "self_checks": "Esegui controlli diagnostici automatici (incl. verifica integrità backup)",
+    "self_checks_tooltip": "Esegue periodicamente controlli diagnostici interni e apre ogni backup per confermare che sia ancora leggibile e completo. Questi controlli aiutano a identificare regressioni e archivi danneggiati prima che servano, ma possono essere intensivi a livello di risorse.",
+    "self_checks_frequency": "Frequenza controlli",
+    "self_checks_frequency_tooltip": "Ogni quanto eseguire i controlli diagnostici e la verifica dei backup (in giorni).",
+    "ui_scale_quality_clamp": "Ideale ≈{ideal}% → applicato ≈{applied}% (limite leggibilità per questa risoluzione; il resto del fit è con gli scroll).",
     "hotkey": "Tasto rapido overlay",
     "launch_on_startup": "Avvia allo startup",
     "minimize_to_tray": "Minimizza nel tray",
@@ -410,6 +421,8 @@
     "search_list": "Cerca…",
     "language_tooltip": "Lingua dell'interfaccia. Si applica subito, senza riavvio.",
     "theme_tooltip": "Chiaro o scuro. Si applica subito.",
+    "ui_scale_tooltip": "Moltiplicatore manuale (50%–150%). Solo con scala automatica disattiva. Non compensa Windows: 100% = baseline di design. Anteprima al rilascio dello slider o dopo aver digitato la %.",
+    "ui_scale_effective": "≈{pct}%",
     "launch_on_startup_tooltip": "Avvia SaveSync col sistema, così i giochi sono sorvegliati dal primo avvio.",
     "minimize_to_tray_tooltip": "Chiudendo la finestra SaveSync resta attivo nella barra invece di uscire.",
     "auto_sync_after_backup_tooltip": "Carica ogni nuovo backup sul provider cloud appena viene creato.",
@@ -430,7 +443,11 @@
     "save_edit_copies": "Copie da conservare",
     "save_edit_copies_tooltip": "Quante copie di uno stesso salvataggio tenere prima di eliminare la più vecchia. Una copia viene presa a ogni scrittura, quindi è fin dove si può tornare indietro.",
     "save_edit_copy_days": "Elimina dopo",
-    "save_edit_copy_days_tooltip": "Le copie più vecchie di così vengono rimosse. La più recente resta sempre, qualunque età abbia, così c'è sempre qualcosa con cui annullare."
+    "save_edit_copy_days_tooltip": "Le copie più vecchie di così vengono rimosse. La più recente resta sempre, qualunque età abbia, così c'è sempre qualcosa con cui annullare.",
+    "run_diagnostics": "Esegui controlli diagnostici",
+    "diagnostics_running": "Esecuzione controlli diagnostici in corso...",
+    "diagnostics_success": "Controlli diagnostici completati: nessun problema rilevato",
+    "diagnostics_issues": "Rilevati problemi"
   },
   "config_transfer": {
     "preview_title": "Anteprima Importazione Configurazione",
@@ -492,6 +509,7 @@
     "shelved_op_detect": "scan…",
     "shelved_op_done": "pronto",
     "shelved_op_failed": "nessun risultato",
+    "shelved_nav": "Aggiungi/Modifica — lavoro in background",
     "shelved_nav_add_exe": "Aggiungi — risoluzione exe…",
     "shelved_nav_add_search": "Aggiungi — ricerca web…",
     "shelved_nav_add_detect": "Aggiungi — rilevamento salvataggi…",
@@ -519,8 +537,16 @@
     "backup_interval_tooltip": "Crea automaticamente un backup ogni N minuti mentre il gioco è in esecuzione",
     "auto_backup_enabled": "Abilita backup automatico",
     "select_cover_image": "Seleziona Immagine Copertina",
+    "remove_image_title": "Rimuovi immagine",
+    "remove_image_confirm": "Rimuovere questa immagine dal carosello? Il file di copertina scaricato verrà eliminato definitivamente. Puoi cercare di nuovo per ripristinarlo.",
     "select_executable": "Seleziona Eseguibile Gioco",
     "select_save_folder": "Seleziona Cartella Salvataggi",
+    "select_save_file": "Seleziona File Salvataggio",
+    "browse_pick_folder": "Cartella",
+    "browse_pick_file": "File",
+    "browse_kind_tooltip": "Sfoglia una cartella di salvataggi o un singolo file di salvataggio",
+    "pin_to_sidebar": "Aggiungi alla sidebar",
+    "unpin_from_sidebar": "Rimuovi dalla sidebar",
     "path_warning": "Avviso Percorso",
     "add_anyway_question": "{warning}\n\nAggiungere comunque?",
     "paths_found_general": "✓ {count} percorsi trovati via scansione generale — controlla attentamente",
@@ -643,6 +669,7 @@
   "main": {
     "auto_in_game": "auto (in-game)",
     "auto_pre_confirm": "auto (percorsi da confermare)",
+    "backup_before_download_note": "backup pre-download",
     "online": "● Online",
     "offline": "● Offline",
     "save_folder_detected": "📂 Cartella salvataggi rilevata per {name} — apri Libreria per scansionare e confermare"
@@ -662,11 +689,16 @@
     "no_save_files": "Nessun file di salvataggio trovato",
     "scan_error": "Errore scansione",
     "and_more": "e altri file non mostrati",
-    "registry_values": "valori di registro"
+    "registry_values": "valori di registro",
+    "exclude_file": "Escludi dai backup",
+    "restore_file": "Ripristina nei backup"
   },
+
   "notifications": {
     "backup_created": "Backup creato per {game}",
-    "backup_unchanged": "Nessuna modifica rilevata per {game} — backup saltato"
+    "backup_unchanged": "Nessuna modifica rilevata per {game} — backup saltato",
+    "cooldown_active": "Questa operazione è stata temporaneamente disabilitata, riprova tra {seconds}s",
+    "sync_no_changes": "Nessuna modifica da sincronizzare"
   },
   "backups": {
     "game_running": "Gioco in esecuzione",
@@ -676,6 +708,7 @@
     "filter_all": "Tutte le origini",
     "filter_local_only": "Solo locale",
     "filter_local_sync": "Locale + sync",
+    "filter_archive_only": "Solo archivio",
     "provider_only": "Solo origine provider",
     "filter_all_providers": "Tutte le fonti sync",
     "all_games": "— Tutti i titoli —",
@@ -697,7 +730,11 @@
     "verify_running": "Verifica {done}/{total}…",
     "verify_running_named": "Verifica {done}/{total}: {name}…",
     "verify_result_all_ok": "Tutti i {total} backup sono integri",
-    "verify_result_bad": "{bad} backup su {total} hanno un problema"
+    "verify_result_bad": "{bad} backup su {total} hanno un problema",
+    "verify_snapshots_ok": "Snapshot configurazione: ok",
+    "verify_snapshots_bad": "Snapshot configurazione: problema — {detail}",
+    "index_validate_failed": "Non è stato possibile completare il controllo dei file di backup su disco. Alcuni archivi mancanti potrebbero restare in elenco fino al prossimo controllo riuscito.",
+    "index_validate_recovered": "Controllo indice backup ripreso — gli archivi mancanti sono stati ripuliti."
   },
   "errors": {
     "path_not_found": "Percorso non trovato",
@@ -780,7 +817,10 @@
     "clear": "Cancella",
     "please_wait": "Attendi prego..",
     "cancel_search": "Interrompi la ricerca",
-    "cancelling": "Interruzione…"
+    "cancelling": "Interruzione…",
+    "to_sidebar": "Minimizza",
+    "minimize": "Minimizza",
+    "open": "Apri"
   },
   "tray": {
     "open": "Apri SaveSync",
@@ -794,6 +834,9 @@
     "offline": "● Offline",
     "no_executable": "Nessun eseguibile impostato per questo gioco"
   },
+  "self_checks": {
+    "failed": "Controllo interno non riuscito ({check}). Segnalalo se si ripete."
+  },
   "languages": {
     "en": "English",
     "it": "Italiano"
@@ -804,7 +847,8 @@
     "open_backup_folder": "Apri cartella backup per il gioco selezionato",
     "card_view": "Vista card",
     "list_view": "Vista lista",
-    "refresh": "Aggiorna",
+    "refresh": "Ricostruisci tutte le viste (ricarica Libreria, Cheats, Backup e Sync)",
+    "refresh_in_game": "Disattivato mentre un gioco è in esecuzione (una ricostruzione completa potrebbe interferire con i file di salvataggio del gioco)",
     "reset_defaults": "Ripristina tutte le impostazioni ai valori predefiniti"
   },
   "dropbox": {
@@ -977,16 +1021,40 @@
     "save": "Salva cartelle",
     "nothing_selected": "Nessuna riga selezionata.",
     "none_resolved": "Nessun percorso risolto in una cartella esistente: correggi i percorsi o usa Sfoglia.",
-    "result_added": "{count} nuove voci create.",
+    "result_added": "{count} backup archiviati (senza titolo in libreria).",
     "result_updated": "{count} percorsi aggiunti a giochi esistenti.",
-    "result_skipped": "{count} già registrati, saltati.",
+    "result_skipped": "{count} già archiviati, saltati.",
     "result_unresolved": "{count} non risolti e ignorati: {names}",
     "reading": "Lettura cartelle in corso…",
     "reading_folder": "Lettura {current}/{total} — {name}",
+    "inserting_folder": "Aggiunta {current}/{total} — {name}",
+    "storing": "Salvataggio {current}/{total} — {name}",
+    "cancelled": "Operazione annullata.",
+    "cancelling": "Annullamento in corso…",
+    "shelved_nav": "Aggiunta multipla",
+    "shelved_scanning": "Lettura cartelle in corso — clicca per riaprire",
+    "shelved_inserting": "Aggiunta righe in corso — clicca per riaprire",
+    "shelved_storing": "Creazione backup in corso — clicca per riaprire",
     "multiple_unresolved": "({count} non ancora individuati sul disco.)",
     "from_collection": "Catena rilevata: {chain}  ·  da {source}",
     "collection_hint": "La cartella raccoglitore può avere qualsiasi nome: viene letto solo un livello sotto. Ogni sottocartella identifica il gioco ed è essa stessa la fonte del backup — i salvataggi sono lì. La struttura al suo interno viene solo letta e registrata: è il percorso di destinazione, quello che serve per riportarli nel gioco. Se parte da una cartella utente (Roaming, LocalLow…) la destinazione è già nota su questa macchina e viene usata direttamente.",
-    "result_not_yet": "{count} destinazioni non ancora esistenti: registrate comunque, pronte per il ripristino."
+    "result_not_yet": "{count} destinazioni non ancora esistenti: non archiviate (servono cartelle presenti sul disco)."
+  },
+  "batch": {
+    "backup_label": "Backup",
+    "sync_label": "Sync",
+    "search_label": "Ricerca",
+    "verify_label": "Verifica",
+    "verify_snapshot": "Snapshot config",
+    "verify_index": "Indice backup",
+    "verify_done": "Verifica completata",
+    "backup_done": "Backup completato ({done})",
+    "backup_done_one": "Backup di {name} completato",
+    "backup_done_none": "Niente da salvare — tutto già aggiornato",
+    "sync_done": "Sync completato ({done})",
+    "sync_done_one": "Sync di {name} completato",
+    "search_done": "Ricerca completata ({matched}/{total})",
+    "search_done_cancelled": "Ricerca annullata ({matched}/{total})"
   },
   "exe_scan": {
     "title": "Scansiona cartella giochi",
@@ -1014,6 +1082,13 @@
     "then_search": "Poi cerca online ogni titolo",
     "then_search_tooltip": "Dopo il salvataggio avvia una ricerca web per ogni titolo aggiunto, accettando automaticamente il primo risultato valido.",
     "save": "Aggiungi selezionati",
+    "storing": "Salvataggio in libreria {current}/{total} — {name}",
+    "cancelling": "Annullamento…",
+    "cancelled": "Operazione annullata.",
+    "shelved_nav": "Scansione cartella",
+    "shelved_scanning": "Scansione in corso — clicca per riaprire",
+    "shelved_inserting": "Aggiunta righe in corso — clicca per riaprire",
+    "shelved_storing": "Salvataggio in libreria in corso — clicca per riaprire",
     "nothing_selected": "Nessun titolo selezionato.",
     "nothing_added": "Nessun titolo aggiunto.",
     "search_warning_title": "Ricerca online",
@@ -1024,13 +1099,14 @@
   },
   "game_search": {
     "title": "Ricerca online titoli",
-    "running_hint": "I titoli vengono cercati uno alla volta. SaveSync resta utilizzabile durante la ricerca, e minimizzare questa finestra non la interrompe.",
+    "running_hint": "I titoli vengono cercati uno alla volta. SaveSync resta utilizzabile; il progresso è anche nella barra laterale. Minimizza solo se vuoi: la ricerca continua e si riapre da lì.",
     "nav": "Ricerca online",
-    "nav_tooltip_done": "Ricerca online terminata — apri per rivedere.",
-    "nav_tooltip_failed": "Ricerca online annullata — apri per vedere cosa è stato fatto.",
+    "nav_tooltip_done": "Ricerca online terminata — clicca la barra laterale per rivedere.",
+    "nav_tooltip_failed": "Ricerca online annullata — clicca la barra laterale per vedere cosa è stato fatto.",
+    "sidebar_tooltip_running": "Ricerca online in corso — clicca per aprire i dettagli. Minimizzare non interrompe.",
     "progress": "{done}/{total} completati — {matched} con corrispondenza",
     "minimize": "Minimizza",
-    "minimize_tooltip": "Nascondi la finestra: la ricerca prosegue e si riapre dalla barra laterale.",
+    "minimize_tooltip": "Nascondi la finestra: la ricerca prosegue; il progresso resta nella barra laterale.",
     "cancel": "Annulla ricerca",
     "cancelling": "Annullamento… la ricerca si ferma dopo il titolo in corso.",
     "done": "Completata: {matched} titoli su {total} arricchiti.",
@@ -1071,6 +1147,10 @@
     "edit_hint": "L'originale viene copiato a parte prima di scrivere qualsiasi cosa, così ogni modifica è annullabile dalla schermata precedente.",
     "editing": "{name} — letto come {engine}.",
     "editing_read_only": "{name} — letto come {engine} (sola lettura).",
+    "loading_side": "Caricamento salvataggio…",
+    "loading_done": "Caricato {name}.",
+    "loading_cancelled": "Caricamento annullato.",
+    "loading_failed": "Caricamento non riuscito.",
     "err_cannot_read": "Impossibile leggere {name}: {reason}",
     "err_copy_gone": "Quella copia non c'è più.",
     "err_empty": "Il file è vuoto.",
@@ -1130,7 +1210,39 @@
     "available": "È uscito SaveSync {version} — tu hai la {current}.",
     "manual_note": "SaveSync non può aggiornarsi da solo (build onefile). Scarica il nuovo eseguibile dalla pagina della release.",
     "no_notes": "Nessuna nota di rilascio per questa versione.",
-    "open_page": "Apri pagina di download",
+    "open_page": "Apri pagina download",
     "later": "Più tardi"
+  },
+  "dpi": {
+    "emergency_title": "Dimensione finestra ripristinata",
+    "emergency_message": "La dimensione della finestra salvata era troppo grande per il tuo schermo. La finestra è stata adattata allo schermo.",
+    "emergency_message_auto": "La dimensione della finestra salvata era troppo grande per il tuo schermo. La finestra è stata adattata allo schermo; le impostazioni di scala non sono state modificate."
+  },
+  "file_picker": {
+    "look_in": "Cerca in:",
+    "file_name": "Nome file:",
+    "file_type": "Tipo file:",
+    "add_to_sidebar": "Aggiungi alla barra laterale",
+    "remove_from_sidebar": "Rimuovi dalla barra laterale",
+    "all_files": "Tutti i file",
+    "executables": "Eseguibili",
+    "folders": "Cartelle",
+    "save_files": "File di salvataggio",
+    "folders_and_files": "Cartelle e file",
+    "select": "Seleziona",
+    "save": "Salva",
+    "open": "Apri",
+    "filter_all_files": "Tutti i file (*.*)",
+    "filter_folders": "Cartelle",
+    "back": "Indietro",
+    "forward": "Avanti",
+    "parent_directory": "Cartella superiore",
+    "new_folder": "Nuova cartella",
+    "list_view": "Visualizzazione elenco",
+    "detail_view": "Visualizzazione dettagli",
+    "rename": "Rinomina",
+    "delete": "Elimina",
+    "show_hidden": "Mostra file nascosti",
+    "cannot_remove_system_pin": "Gli elementi di sistema non possono essere rimossi"
   }
 }

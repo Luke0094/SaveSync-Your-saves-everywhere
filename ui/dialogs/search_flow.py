@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QVBoxLayout)
 
 from i18n import t
+from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.styles.theme import palette
 from ui.dialogs.search_enrichment import (CandidatePreviewDialog,
                                           EnrichmentMergeDialog,
@@ -63,8 +64,9 @@ class SearchFlowMixin:
         if is_launcher_url(exe_path):
             appid = get_appid_from_url(exe_path)
 
+        fs = scaled(12, self)
         self._status_lbl.setText(status_msg or t('add_game.searching'))
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
         self._search_progress.setVisible(True)
         self._web_search_active = True
         self._pending_search_payload = None
@@ -244,14 +246,15 @@ class SearchFlowMixin:
         # tolerate a single GameInfo/None for any legacy emitter.
         results = [r for r in (result if isinstance(result, list) else [result]) if r]
 
-
-        self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:{fs}px;")
 
         if error:
             self._web_search_active = False
             self._sync_bg_action_gates()
             self._status_lbl.setText(t('add_game.search_error', error=str(error)[:50]))
-            self._status_lbl.setStyleSheet(f"color:{palette('error')};font-size:12px;")
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('error')};font-size:{fs}px;")
             self._emit_bg_status("failed")
             return
 
@@ -263,7 +266,8 @@ class SearchFlowMixin:
         )
 
         if not results:
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
             self._sync_bg_action_gates()
             _hint_fwd = getattr(self, '_last_search_folder_hint', '')
             # When every web engine is in a rate-limit cooldown, "not found"
@@ -386,11 +390,11 @@ class SearchFlowMixin:
                 self._candidate_show_deferred = True
                 self._status_lbl.setText(t('add_game.searching'))
                 self._status_lbl.setStyleSheet(
-                    f"color:{palette('text_secondary')};font-size:12px;")
+                    f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
                 return
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
             self._status_lbl.setStyleSheet(
-                f"color:{palette('text_secondary')};font-size:12px;")
+                f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
             return
         self._open_candidate_carousel(useful)
 
@@ -401,7 +405,8 @@ class SearchFlowMixin:
             t('add_game.candidates_found', n=n) if n > 1
             else t('add_game.candidate_found_single')
         )
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
         while True:
             dlg = CandidatePreviewDialog(
                 useful, self._compute_candidate_diff, self,
@@ -488,7 +493,7 @@ class SearchFlowMixin:
         self._retain_hint_coded_dlsite_urls()
         _current_phase = getattr(self, '_current_search_phase', 'api')
         _hint_fwd = getattr(self, '_last_search_folder_hint', '')
-        self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+        self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
         self._sync_bg_action_gates()
         if _current_phase == 'api':
             self._status_lbl.setText(
@@ -538,7 +543,8 @@ class SearchFlowMixin:
         # candidate can still carry a new cover, tag or store link, and
         # those were being discarded together with the duplicate text.
         if not diff['has_changes']:
-            self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:{fs}px;")
             self._sync_bg_action_gates()
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
             return False
@@ -561,7 +567,8 @@ class SearchFlowMixin:
         )
 
         self._status_lbl.setText(t('add_game.data_saved'))
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
         self._sync_bg_action_gates()
 
         if offer_enrichment:
@@ -575,7 +582,9 @@ class SearchFlowMixin:
         if missing:
             self._status_lbl.setText(
                 t('add_game.fields_still_missing', fields=", ".join(missing)))
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+            from ui.helpers import scaled
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
         return True
 
     # ── Shared result diff/apply helpers ──────────────────────────────────
@@ -1059,7 +1068,7 @@ class SearchFlowMixin:
         else:
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
             self._status_lbl.setStyleSheet(
-                f"color:{palette('text_secondary')};font-size:12px;")
+                f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
 
     @staticmethod
     def _probe_page_reachable(url: str, timeout: float = 4.0) -> bool:
@@ -1265,7 +1274,7 @@ class SearchFlowMixin:
                 self._status_lbl.setText(
                     t('add_game.fields_still_missing', fields=", ".join(missing)))
                 self._status_lbl.setStyleSheet(
-                    f"color:{palette('warning')};font-size:12px;")
+                    f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
         return False
 
     def _offer_same_tier_enrichment(self, base_result, others: list):
@@ -1326,7 +1335,8 @@ class SearchFlowMixin:
             if len(getattr(self, '_last_search_candidates', []) or []) > 1
             else t('add_game.candidate_found_single')
         )
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
 
     def _build_merge_model(self, collected: list) -> dict:
         """Per-field option lists for the merge preview.
@@ -1435,7 +1445,8 @@ class SearchFlowMixin:
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
         self._status_lbl.setText(t('add_game.data_saved'))
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
 
     def _result_site_urls(self, result) -> list[str]:
         """All site URLs carried by a search result: the store page plus any
@@ -1507,7 +1518,6 @@ class _UrlFetchDialog(QDialog):
         self.info = None   # set to the fetched GameInfo on accept
         self.setWindowTitle(t('add_game.fetch_url_title'))
         self.setWindowModality(Qt.WindowModality.WindowModal)
-        self.setMinimumWidth(440)
 
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
@@ -1515,7 +1525,7 @@ class _UrlFetchDialog(QDialog):
 
         intro = QLabel(t('add_game.fetch_url_msg'))
         intro.setWordWrap(True)
-        intro.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        intro.setObjectName("dialog_intro")
         lay.addWidget(intro)
 
         self._edit = QLineEdit()
@@ -1525,17 +1535,17 @@ class _UrlFetchDialog(QDialog):
 
         self._status = QLabel("")
         self._status.setWordWrap(True)
-        self._status.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        self._status.setObjectName("dialog_status")
         lay.addWidget(self._status)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton(t('common.cancel'))
-        cancel_btn.setMinimumWidth(90)
+        cancel_btn.setMinimumWidth(scaled(90, self))
         cancel_btn.clicked.connect(self.reject)
         self._fetch_btn = QPushButton(t('add_game.fetch_url_go'))
         self._fetch_btn.setObjectName("primary_btn")
-        self._fetch_btn.setMinimumWidth(90)
+        self._fetch_btn.setMinimumWidth(scaled(90, self))
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(self._fetch_btn)
         lay.addLayout(btn_row)
@@ -1543,6 +1553,8 @@ class _UrlFetchDialog(QDialog):
         self._fetch_btn.clicked.connect(self._start)
         self._edit.returnPressed.connect(self._start)
         self._fetch_done.connect(self._on_done)
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=440, min_h=200)
 
     def _start(self):
         url = self._edit.text().strip()
@@ -1551,7 +1563,7 @@ class _UrlFetchDialog(QDialog):
         self._fetch_btn.setEnabled(False)
         self._edit.setEnabled(False)
         self._status.setText(t('add_game.searching'))
-        self._status.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        self._status.setStyleSheet("")  # restore #dialog_status
 
         def _bg(url=url):
             from core.game_api import fetch_info_from_url
@@ -1585,5 +1597,5 @@ class _UrlFetchDialog(QDialog):
         else:
             msg = t('add_game.search_not_found')
         self._status.setText(msg)
-        self._status.setStyleSheet(f"color:{palette('warning')};font-size:11px;")
+        self._status.setStyleSheet(f"color:{palette('warning')};font-size:{scaled(11, self)}px;")
 

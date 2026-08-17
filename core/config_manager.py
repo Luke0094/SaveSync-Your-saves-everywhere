@@ -17,7 +17,18 @@ logger = logging.getLogger(__name__)
 _DEFAULTS: dict[str, Any] = {
     "language": "en",
     "theme": "dark",
-    "launch_on_startup": False,
+    # Accessibility / display scale. Auto ideal = logical_work_width / 2560
+    # (Qt DIPs; same look as manual 100% on typical 4K @ OS 150%). Works the
+    # same on Windows / macOS / Linux — DIPs already embed OS scale. Window
+    # geometry must grow with ui_scale. Manual = ui_scale_factor 50–150%.
+    "ui_scale_auto": True,
+    "ui_scale_factor": 1.0,
+    # Per-dialog last size/pos { "AddGameDialog": {"x","y","w","h"}, ... }.
+    # Cleared when auto scale meaningfully changes so fit can re-apply.
+    "dialog_geometries": {},
+    "window_geometry": None,
+    "window_maximized": False,
+    "launch_on_startup": True,
     "minimize_to_tray": True,
     "show_overlay_on_launch": True,
     # Popup + hotkey queue when an unknown process looks like a game.
@@ -47,10 +58,11 @@ _DEFAULTS: dict[str, Any] = {
     # Temporal correlation: claim a save-like write elsewhere on disk when it
     # lands within the window of a write to an already-known path of the
     # running game. Finds saves no name matching can (Ren'Py's roaming folder
-    # is named after the game's INTERNAL title), but it infers from timing
-    # alone, so it is opt-in — during a long session the false positives cost
-    # more than the occasional catch.
-    "save_correlation_enabled": False,
+    # is named after the game's INTERNAL title). The window is tight (1 s,
+    # weaker candidates get a stricter 0.4 s slice) and every claimed folder
+    # still passes the save-content validation pass before it is offered —
+    # on by default so save search actually finds these folders.
+    "save_correlation_enabled": True,
     "save_correlation_window_ms": 1000,
     # Periodic backup integrity check. Opens each archive and confirms every
     # member still passes its CRC — the cheap check that catches a truncated
@@ -112,7 +124,7 @@ _DEFAULTS: dict[str, Any] = {
     "library_sort_direction": "",           # "asc"/"desc" — empty = use criterion's natural default
     "library_folders": [],                  # [{name: str, color: str}, ...] user-defined folders
     # Folder tree vs tag/engine filter panes in the library sidebar (QSplitter sizes).
-    "library_filter_splitter": [260, 215],
+    "library_filter_splitter": [300, 200],
     # Unknown-game detections history — its OWN list, deliberately separate
     # from the backup/sync notification flow. Written only while
     # show_overlay_on_unknown is on; the hotkey opens this queue first when
@@ -165,9 +177,16 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "page_size_render_guard": lambda x: isinstance(x, dict),
     "library_filter_splitter": lambda x: (
         isinstance(x, (list, tuple)) and len(x) == 2
-        and all(isinstance(n, int) and n >= 0 for n in x)),
+        and all(isinstance(n, (int, float)) and n >= 0 for n in x)),
     "language": lambda x: isinstance(x, str) and x in ["en", "it"],
     "theme": lambda x: isinstance(x, str) and x in ["dark", "light"],
+    "ui_scale_auto": lambda x: isinstance(x, bool),
+    "ui_scale_factor": lambda x: isinstance(x, (int, float)) and 0.50 <= float(x) <= 1.50,
+    "dialog_geometries": lambda x: isinstance(x, dict),
+    "window_geometry": lambda x: x is None or (
+        isinstance(x, dict)
+        and all(k in x for k in ("x", "y", "w", "h"))),
+    "window_maximized": lambda x: isinstance(x, bool),
     "launch_on_startup": lambda x: isinstance(x, bool),
     "minimize_to_tray": lambda x: isinstance(x, bool),
     "show_overlay_on_launch": lambda x: isinstance(x, bool),
@@ -183,7 +202,6 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "auto_backup": lambda x: isinstance(x, bool),
 }
 
-_WRITE_DEBOUNCE_MS = 500   # batch writes within 500ms window
 _MISSING = object()  # sentinel for get() default detection
 
 
@@ -195,10 +213,12 @@ class ConfigManager(QObject):
         self._data: dict[str, Any] = {}
         self._dirty = False
         self._io_lock = threading.Lock()  # protects _dirty and _writing
-        # Debounced write timer — coalesces rapid sequential set() calls
+        # Debounced write timer — coalesces rapid sequential set() calls.
+        # Interval scales with the machine (core.concurrency).
+        from core.concurrency import config_write_debounce_ms
         self._write_timer = QTimer(self)
         self._write_timer.setSingleShot(True)
-        self._write_timer.setInterval(_WRITE_DEBOUNCE_MS)
+        self._write_timer.setInterval(config_write_debounce_ms())
         self._write_timer.timeout.connect(self._flush)
         self._writing = False  # prevent race condition during write
         self._load()

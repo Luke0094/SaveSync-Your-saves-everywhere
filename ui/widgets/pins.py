@@ -32,7 +32,7 @@ from core.config_manager import get_config
 from i18n import t
 from ui.helpers import (ElidedLabel, force_topmost, ForegroundWatcher,
                         game_is_running, popup_is_open, SystemCursor,
-                        TRACE_Z, z_report)
+                        TRACE_Z, z_report, scaled)
 from ui.styles.theme import ThemedMixin
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,7 @@ class PinGrip(QSizeGrip):
         # turn a reparent into "resize no longer holds the pointer" rather
         # than into an error.
         self._pin = parent
-        self.setFixedSize(14, 14)
+        self.setFixedSize(scaled(14, self), scaled(14, self))
         self._hot = False
         self.dragging = False
         self.setToolTip(t("pin.resize"))
@@ -227,7 +227,8 @@ class PinItem(QWidget, ThemedMixin):
 
     def _floor(self) -> QSize:
         """Smallest this pin may be — smaller for pictures, see the constant."""
-        return _IMAGE_MIN_SIZE if self._kind == "image" else _MIN_SIZE
+        base = _IMAGE_MIN_SIZE if self._kind == "image" else _MIN_SIZE
+        return QSize(scaled(base.width(), self), scaled(base.height(), self))
 
     def assert_topmost(self):
         """Put this pin back above everything else.
@@ -287,7 +288,7 @@ class PinItem(QWidget, ThemedMixin):
         # The header doubles as the drag handle — see mousePressEvent.
         self._header = QWidget()
         self._header.setObjectName("pin_header")
-        self._header.setFixedHeight(24)
+        self._header.setFixedHeight(scaled(24, self))
         head = QHBoxLayout(self._header)
         head.setContentsMargins(8, 0, 2, 0)
         head.setSpacing(2)
@@ -299,7 +300,7 @@ class PinItem(QWidget, ThemedMixin):
         # Save is offered only while there is nowhere to save to yet.
         self._save_btn = QPushButton("💾")
         self._save_btn.setObjectName("pin_icon_btn")
-        self._save_btn.setFixedSize(18, 18)
+        self._save_btn.setFixedSize(scaled(18, self), scaled(18, self))
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_btn.setToolTip(t("pin.save"))
         self._save_btn.clicked.connect(self.save_as)
@@ -308,7 +309,7 @@ class PinItem(QWidget, ThemedMixin):
 
         self._close_btn = QPushButton("✕")
         self._close_btn.setObjectName("pin_icon_btn")
-        self._close_btn.setFixedSize(18, 18)
+        self._close_btn.setFixedSize(scaled(18, self), scaled(18, self))
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.setToolTip(t("pin.close"))
         self._close_btn.clicked.connect(self.close)
@@ -348,7 +349,7 @@ class PinItem(QWidget, ThemedMixin):
         self._fade.setObjectName("pin_fade")
         self._fade.setRange(_MIN_OPACITY, 100)
         self._fade.setValue(100)
-        self._fade.setFixedSize(96, 14)
+        self._fade.setFixedSize(scaled(96, self), scaled(14, self))
         self._fade.setToolTip(t("pin.opacity"))
         self._fade.setCursor(Qt.CursorShape.PointingHandCursor)
         self._fade.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1230,7 +1231,7 @@ class PinMenuRow(QWidget):
 
         mark = QLabel("📌" if is_open else " ")
         mark.setObjectName("pin_row_mark")
-        mark.setFixedWidth(16)
+        mark.setFixedWidth(scaled(16, self))
         row.addWidget(mark)
 
         # A pin with no file has no file name to go by, so the caller says
@@ -1238,7 +1239,7 @@ class PinMenuRow(QWidget):
         name = ElidedLabel(label or Path(path).name)
         name.setObjectName("pin_row_name")
         name.setToolTip(tip or path)
-        name.setMinimumWidth(150)
+        name.setMinimumWidth(scaled(150, self))
         row.addWidget(name, 1)
 
         # A note with nowhere to live yet can be given one from here, without
@@ -1247,7 +1248,7 @@ class PinMenuRow(QWidget):
         if can_save:
             save_btn = QPushButton("💾")
             save_btn.setObjectName("pin_icon_btn")
-            save_btn.setFixedSize(18, 18)
+            save_btn.setFixedSize(scaled(18, self), scaled(18, self))
             save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             save_btn.setToolTip(t("pin.save"))
             save_btn.clicked.connect(lambda: self.save.emit(self._path))
@@ -1255,7 +1256,7 @@ class PinMenuRow(QWidget):
 
         bin_btn = QPushButton("🗑")
         bin_btn.setObjectName("pin_icon_btn")
-        bin_btn.setFixedSize(18, 18)
+        bin_btn.setFixedSize(scaled(18, self), scaled(18, self))
         bin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         bin_btn.setToolTip(t("pin.forget"))
         bin_btn.clicked.connect(lambda: self.removed.emit(self._path))

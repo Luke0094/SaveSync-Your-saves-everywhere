@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
+from ui.helpers import scaled
 from ui.styles.theme import palette
 
 logger = logging.getLogger(__name__)
@@ -98,8 +99,8 @@ class CoverCustomEditor(QWidget):
         root.setSpacing(10)
 
         hint = QLabel(t("library.cover_custom_hint"))
+        hint.setObjectName("cover_editor_hint")
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color:{palette('text_secondary')};font-size:11px;")
         root.addWidget(hint)
 
         # ── Preview, framed exactly like a card ──────────────────────────────
@@ -148,13 +149,13 @@ class CoverCustomEditor(QWidget):
         zoom_row = QHBoxLayout()
         zoom_row.setSpacing(8)
         self._zoom_lbl = QLabel()
-        self._zoom_lbl.setFixedWidth(74)
+        self._zoom_lbl.setFixedWidth(scaled(74, self))
         # Kept as attributes and styled in apply_theme: an unstyled
         # QPushButton inherits the app's default 7px/16px padding, which in a
         # 26px box leaves no room for the glyph — it renders as a bare filled
         # square, which is exactly how these two looked.
         self._zoom_out_btn = QPushButton("−")
-        self._zoom_out_btn.setFixedSize(26, 26)
+        self._zoom_out_btn.setFixedSize(scaled(26, self), scaled(26, self))
         self._zoom_out_btn.setToolTip(t("library.cover_zoom_out"))
         self._zoom_out_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._zoom_out_btn.clicked.connect(lambda: self._on_wheel(-1))
@@ -163,7 +164,7 @@ class CoverCustomEditor(QWidget):
         self._zoom_slider.setSingleStep(self._ZOOM_STEP)
         self._zoom_slider.valueChanged.connect(self._on_zoom_slider)
         self._zoom_in_btn = QPushButton("+")
-        self._zoom_in_btn.setFixedSize(26, 26)
+        self._zoom_in_btn.setFixedSize(scaled(26, self), scaled(26, self))
         self._zoom_in_btn.setToolTip(t("library.cover_zoom_in"))
         self._zoom_in_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._zoom_in_btn.clicked.connect(lambda: self._on_wheel(+1))
@@ -197,12 +198,13 @@ class CoverCustomEditor(QWidget):
             f"background:rgba({_hex_to_rgb(palette('bg_card'))},0.88);"
             f"border-radius:0 0 10px 10px;")
         self._info_name.setStyleSheet(
-            f"color:{palette('text')};font-size:12px;font-weight:600;"
+            f"color:{palette('text')};font-size:{scaled(12, self)}px;font-weight:600;"
             f"background:transparent;")
-        self._zoom_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:11px;")
+        self._zoom_lbl.setObjectName("cover_editor_hint")
+        self._zoom_lbl.setStyleSheet("")
         normal = (
             f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
-            f"border:1px solid {palette('border')};border-radius:6px;padding:5px 8px;font-size:11px;}}"
+            f"border:1px solid {palette('border')};border-radius:6px;padding:5px 8px;font-size:{scaled(11, self)}px;}}"
             f"QPushButton:hover{{border-color:{palette('accent')};}}"
             f"QPushButton:checked{{background:{palette('accent')};color:{palette('accent_text')};"
             f"border-color:{palette('accent')};}}"
@@ -214,7 +216,7 @@ class CoverCustomEditor(QWidget):
         stepper = (
             f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
             f"border:1px solid {palette('border')};border-radius:4px;padding:0px;"
-            f"font-size:15px;font-weight:600;}}"
+            f"font-size:{scaled(15, self)}px;font-weight:600;}}"
             f"QPushButton:hover{{border-color:{palette('accent')};color:{palette('accent')};}}"
             f"QPushButton:pressed{{background:{palette('bg_hover')};}}"
         )

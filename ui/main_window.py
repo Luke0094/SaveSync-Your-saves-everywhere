@@ -6,12 +6,13 @@ import logging
 import platform
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, QTimer, Slot, Signal
+from PySide6.QtCore import Qt, QTimer, Slot, Signal, QEvent
 from PySide6.QtGui import QIcon, QAction, QPainter, QColor, QBrush
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -30,7 +31,6 @@ from ui.pages.library_page import LibraryPage
 from ui.pages.sync_page import SyncPage
 from ui.pages.backups_page import BackupsPage
 from ui.pages.settings_page import SettingsPage
-from ui.pages.cheats_page import CheatsPage
 from ui.dialogs.add_game_dialog import AddGameDialog
 from ui.dialogs.auto_scan_dialog import show_auto_scan_dialog
 from core.config_manager import get_config
@@ -40,6 +40,7 @@ from core.backup import get_backup_manager
 from core.machine import get_machine_id
 from hotkeys import get_hotkey_manager
 from sync import get_orchestrator
+from ui.helpers import scaled
 
 
 class NavButton(QPushButton):
@@ -55,7 +56,7 @@ class NavButton(QPushButton):
         self._update_text()
         self.setObjectName("nav_btn")
         self.setCheckable(False)
-        self.setFixedHeight(44)
+        self.setFixedHeight(scaled(44, self))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._blink = QTimer(self)
         self._blink.setInterval(520)
@@ -124,6 +125,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     backup_verify_problems = Signal(int, int)   # bad, total
     # Same reason: the regression check runs on a worker thread.
     save_regression_found = Signal(str, str, bool)  # game_id, newest_backup_id, after_restore
+    # In-app self-check (config history restore, …) failed on a worker thread.
+    self_check_failed = Signal(str, str)  # check_id, detail
+    # Same thread: progress + completion of the automatic self-check sweep,
+    # surfaced in the sidebar like Backup/Sync Tutti instead of blocking.
+    self_check_progress = Signal(str, int, int)  # check_id, index, total
+    self_check_done = Signal()
     # Launcher URL → exe fuzzy search finished off the GUI thread.
     launcher_exe_resolved = Signal(str, str, str)  # game_id, url, exe_path ("" if none)
     # GitHub Releases check finished off the GUI thread.
@@ -132,7 +139,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(t("app.name"))
-        self.setMinimumSize(900, 620)
+        # Soft floor — keep room for scroll mediation on low res (720p).
+        # A high % min forced near-fullscreen and fought quality-limited scale.
+        from PySide6.QtWidgets import QApplication as _QApp
+        _scr = _QApp.primaryScreen()
+        if _scr is not None:
+            _ag = _scr.availableGeometry()
+            self.setMinimumSize(
+                min(720, max(640, int(_ag.width() * 0.50))),
+                min(520, max(480, int(_ag.height() * 0.55))),
+            )
+        else:
+            self.setMinimumSize(640, 480)
         # Explicitly set window icon for proper taskbar display in frozen builds.
         # Prefer .ico for Windows taskbar, fall back to .png.
         _icon = QApplication.instance().windowIcon()
@@ -147,7 +165,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     break
         if not _icon.isNull():
             self.setWindowIcon(_icon)
-        self.resize(1280, 820)  # default; overridden by _restore_window_state
+        # Default footprint tracks ui_scale so auto compensation (e.g. 4K @
+        # Win 100% ≈ 200%) still fits without page scroll on a normal open.
+        from ui.helpers import ui_scale as _ui_scale
+        _s = _ui_scale(self)
+        _dw, _dh = int(round(1360 * _s)), int(round(880 * _s))
+        if _scr is not None:
+            _ag = _scr.availableGeometry()
+            _dw = min(_dw, max(640, int(_ag.width() * 0.92)))
+            _dh = min(_dh, max(480, int(_ag.height() * 0.92)))
+        self.resize(max(640, _dw), max(480, _dh))
         self._restore_window_state()
         self._active_nav_idx   = 0
         self._nav_buttons: list[NavButton] = []
@@ -172,6 +199,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._backup_results: deque = deque()
         self._restore_lock = _th.Lock()
         self._backup_lock = _th.Lock()
+        # Adaptive backup queue (Backup Tutti + single backups share the cap).
+        self._backup_job_queue: deque = deque()   # dicts: game_id, force, silent
+        self._backup_inflight: set[str] = set()
+        self._backup_queued: set[str] = set()
+        self._backup_batch: dict | None = None    # active Tutti tally + persist
+        self._backup_max_inflight: int = 2
+        self._manual_path_dlg = None
         # game_id → has_cloud bool, written by the background thread in
         # _check_cloud_on_launch and consumed by _on_cloud_check_result on
         # the GUI thread — keeps the network round-trip off the GUI thread.
@@ -195,6 +229,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # handlers pop it). Closing the prompt does NOT pop it — that is what
         # lets _toggle_overlay() re-summon it via the hotkey until decided.
         self._pending_cloud_notification: dict[str, str] = {}
+        # library game_id → orphan backup game_id (hand-added archive to adopt
+        # when the user accepts the same cloud-saves notification).
+        self._pending_orphan_adopt: dict[str, str] = {}
         # Unanswered "is this process really that game?" prompts:
         # (process_name, game_id) → game name. Same role as the dict above —
         # it keeps the question re-summonable by the hotkey until answered.
@@ -242,6 +279,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._setup_cleanup()
         self.backup_verify_problems.connect(self._on_backup_verify_problems)
         self.save_regression_found.connect(self._on_save_regression)
+        # Index zip-existence sweep (may already have finished before connect).
+        _bm = get_backup_manager()
+        _bm.index_validation_failed.connect(self._on_index_validation_failed)
+        _bm.index_validation_recovered.connect(self._on_index_validation_recovered)
+        _err = _bm.last_validation_error()
+        if _err:
+            QTimer.singleShot(0, lambda e=_err: self._on_index_validation_failed(e))
         self.launcher_exe_resolved.connect(self._on_launcher_exe_resolved)
         # backup_id SaveSync itself last restored, per game — landing on that
         # state is the intended outcome, not something to warn about.
@@ -266,6 +310,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._setup_backup_verify()
         self._setup_auto_export_config()
         self._setup_update_check()
+        self._setup_startup_self_checks()
         # A previous run may have died between suspending a game for a forced
         # restore and resuming it. The game would still be frozen, with
         # nothing on screen to explain why.
@@ -304,6 +349,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         sidebar = QFrame()
         sidebar.setFrameShape(QFrame.Shape.NoFrame)
         sidebar.setObjectName("sidebar")
+        # Design 220 restores the classic sidebar footprint (original UI was
+        # a fixed 220px); floor resists DPI downscale crush.
+        _side_w = scaled(220, self, min_px=210)
+        sidebar.setFixedWidth(_side_w)
+        self._sidebar = sidebar
         sl = QVBoxLayout(sidebar)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(0)
@@ -331,12 +381,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             sl.addWidget(btn)
 
         # Under Settings: the way back to a batch web search that was put away.
-        # Not a page — it reopens the panel, and only exists while there is a
-        # run to reopen.
-        self._search_nav_btn = NavButton(t("game_search.nav"), "🔎")
-        self._search_nav_btn.clicked.connect(self._show_game_search_panel)
-        self._search_nav_btn.setVisible(False)
-        sl.addWidget(self._search_nav_btn)
+        # Not a page — click the search BatchProgressNotice to reopen the panel.
+        # (Legacy NavButton removed: same done/total bar as Backup/Sync Tutti.)
 
         # Same idea for Add/Edit Game: ✕ during exe/web/detect shelves the
         # dialog. Several shelved dialogs can coexist — one NavButton each.
@@ -349,6 +395,27 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # [{dlg, btn}, ...] — order matches sidebar top→bottom
         self._shelved_add_entries: list[dict] = []
 
+        # Batch Backup/Sync Tutti + online title search: done/total + thin bar.
+        from ui.widgets.batch_progress import BatchProgressNotice
+        self._backup_batch_notice = BatchProgressNotice()
+        self._sync_batch_notice = BatchProgressNotice()
+        self._search_batch_notice = BatchProgressNotice()
+        self._verify_batch_notice = BatchProgressNotice()
+        self._search_batch_notice.set_activatable(True)
+        self._search_batch_notice.activated.connect(self._show_game_search_panel)
+        # Save-editor loads that were put away to the sidebar keep reporting
+        # here; clicking one that finished reopens the loaded save's editor
+        # (same idea as the search notice reopening its panel).
+        self._cheats_load_notice = BatchProgressNotice()
+        self._cheats_load_notice.set_activatable(True)
+        self._cheats_load_notice.activated.connect(
+            lambda _=False: self._reopen_shelved_load())
+        sl.addWidget(self._backup_batch_notice)
+        sl.addWidget(self._sync_batch_notice)
+        sl.addWidget(self._search_batch_notice)
+        sl.addWidget(self._verify_batch_notice)
+        sl.addWidget(self._cheats_load_notice)
+
         sl.addStretch()
 
         # Credits button — just above the Online/Offline status
@@ -356,7 +423,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._credits_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._credits_btn.setFlat(True)
         self._credits_btn.clicked.connect(self._show_credits)
-        self._style_credits_btn()
+        self._credits_btn.setObjectName("credits_nav_btn")
         sl.addWidget(self._credits_btn)
 
         # Under Credits, but a page like any other: same NavButton, same
@@ -371,13 +438,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Status dot at bottom of sidebar
         self._sidebar_status = QLabel(t("status.offline"))
         self._sidebar_status.setStyleSheet(
-            f"color: {palette('text_muted')}; font-size: 10px; padding: 8px 16px;"
+            f"color: {palette('text_muted')}; font-size: {scaled(10, self)}px; padding: 8px 16px;"
         )
         sl.addWidget(self._sidebar_status)
 
         mid = get_machine_id()[:8]
         self._machine_lbl = QLabel(f"ID: {mid}\u2026")
-        self._machine_lbl.setStyleSheet(f"color: {palette('text_hint')}; font-size: 10px; padding: 0 16px 12px;")
+        self._machine_lbl.setObjectName("sidebar_machine")
         sl.addWidget(self._machine_lbl)
 
         root.addWidget(sidebar)
@@ -391,18 +458,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._sync_page      = SyncPage()
         self._backups_page   = BackupsPage()
         self._settings_page  = SettingsPage()
-        self._cheats_page    = CheatsPage()
+        # Cheats is built on first open — heavy editor UI unused by most sessions.
+        self._cheats_page    = None
 
         for page in (self._overview_page, self._library_page,
-                     self._sync_page, self._backups_page, self._settings_page,
-                     self._cheats_page):
+                     self._sync_page, self._backups_page, self._settings_page):
             self._stack.addWidget(page)
+        self._stack.addWidget(QWidget())  # cheats placeholder (index 5)
 
         root.addWidget(self._stack, 1)
 
         # Wire library page signals
         self._library_page.add_game_requested.connect(self._show_add_game)
         self._library_page.scan_folder_requested.connect(self._show_scan_folder)
+        self._library_page.folder_dropped.connect(self._show_scan_folder_at)
         self._library_page.cheats_requested.connect(self._open_cheats_for)
         self._library_page.backup_requested.connect(self._backup_game)
         self._library_page.restore_requested.connect(self._restore_game_latest)
@@ -414,12 +483,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Wire overview page signals
         self._overview_page.backup_requested.connect(self._backup_game)
+        self._overview_page.backup_all_requested.connect(self._start_backup_all)
         self._overview_page.open_library.connect(lambda: self._switch_page(1))
         self._overview_page.open_sync.connect(lambda: self._switch_page(2))
+        self._overview_page.refresh_all_requested.connect(self._on_refresh_all_pages)
 
         # Wire backups page signals
         self._backups_page.backup_requested.connect(self._backup_game)
+        self._backups_page.backup_all_requested.connect(self._start_backup_all)
         self._backups_page.restore_requested.connect(self._restore_game_by_id)
+        self._backups_page.manual_paths_requested.connect(self._show_manual_path_dialog)
+        # Manual "Verifica Backup" runs on a worker thread; surface it in the
+        # sidebar so the UI keeps working while the sweep runs.
+        self._backups_page.verify_started.connect(self._on_verify_batch_started)
+        self._backups_page.verify_progress.connect(self._on_verify_batch_progress)
+        self._backups_page.verify_finished.connect(self._on_verify_batch_finished)
+
+        # Sync batch progress (orchestrator → sidebar)
+        orch = get_orchestrator()
+        orch.batch_progress.connect(self._on_sync_batch_progress)
+        orch.batch_finished.connect(self._on_sync_batch_finished)
 
         # Settings
         self._settings_page.hotkey_changed.connect(self._update_hotkey)
@@ -433,25 +516,504 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         self._switch_page(0)
 
-    def _style_credits_btn(self):
-        """Inline palette style — re-applied on theme switch."""
-        self._credits_btn.setStyleSheet(
-            f"QPushButton{{color:{palette('text_secondary')};background:transparent;"
-            f"border:none;font-size:12px;font-weight:600;padding:9px 16px;"
-            f"text-align:left;}}"
-            # Hovering must make the label EASIER to read, not harder. Turning
-            # it accent-green did the opposite in the light theme: green on
-            # the hover background reads at 3.3:1, so the text faded just as
-            # the pointer reached it. The theme's own text colour is what
-            # every other sidebar button uses — near-black on light, bright on
-            # dark — and it lands at fifteen to one either way.
-            f"QPushButton:hover{{color:{palette('text')};"
-            f"background:{palette('bg_elevated')};}}"
+        # Orphanize legacy Aggiungi-percorso stubs once BackupManager exists.
+        QTimer.singleShot(200, self._migrate_manual_path_stubs)
+        # Resume unfinished Backup/Sync Tutti / Aggiunta multipla after UI is up.
+        QTimer.singleShot(400, self._resume_pending_batch_jobs)
+        # Re-apply fonts/chrome when the window moves to another monitor
+        # (resolution_scale follows availableGeometry width).
+        QTimer.singleShot(0, self._install_dpi_change_watch)
+        # Automated background memory trimmer (periodic cleanup when idle)
+        self._auto_memory_trim_timer = QTimer(self)
+        self._auto_memory_trim_timer.setInterval(60000)
+        self._auto_memory_trim_timer.timeout.connect(self._on_auto_memory_trim_tick)
+        self._auto_memory_trim_timer.start()
+
+        self._ui_scale_reapply_timer = QTimer(self)
+        self._ui_scale_reapply_timer.setSingleShot(True)
+        self._ui_scale_reapply_timer.setInterval(200)
+        self._ui_scale_reapply_timer.timeout.connect(self._reapply_ui_scale)
+        self._last_ui_scale = None
+
+    def _on_auto_memory_trim_tick(self):
+        """Periodic background memory cleanup: free working set and caches when app is idle."""
+        try:
+            from core.monitor import get_monitor
+            if get_monitor().currently_playing():
+                return  # Skip trimming while user is actively playing a game
+        except Exception:
+            pass
+        try:
+            from ui.helpers import trim_process_memory
+            trim_process_memory()
+        except Exception:
+            pass
+
+    def _install_dpi_change_watch(self):
+        """Event-driven DPI/scale change detection (Qt screen signals).
+
+        Windows scaling changes (Settings → Display → Scale) re-perceive the
+        screens: Qt then emits dots-per-inch signals on the affected QScreen
+        (see _wire_dpi_screens for the per-binding set). The previous
+        attempt listened to ``primaryScreenChanged`` / window ``screenChanged``
+        — those only fire on monitor changes, never on a scaling change, which
+        is why the 5 s poll was bolted on as the real detector.
+
+        The 30 s safety poll was REMOVED: when the app hops screens quickly
+        (a TV plugged in and out) the poll could re-apply a stale scale
+        right after the signals already fixed it, leaving the UI painted in
+        a mirrored/stale version until the next interaction — the Qt screen
+        signals are the whole detector now."""
+        from ui.helpers import ui_scale
+        self._last_ui_scale = ui_scale(self)
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._wired_screen_ids: set[int] = set()
+        self._wire_dpi_screens(app.screens())
+        app.screenAdded.connect(self._on_screen_added)
+        app.screenRemoved.connect(self._on_screen_removed)
+        wh = self.windowHandle()
+        if wh is not None:
+            wh.screenChanged.connect(self._on_host_screen_changed)
+            try:
+                if hasattr(wh, "devicePixelRatioChanged"):
+                    wh.devicePixelRatioChanged.connect(self._on_screen_dpi_changed)
+            except Exception:
+                pass
+
+    def _wire_dpi_screens(self, screens):
+        # PySide6 6.9 does not expose QScreen.devicePixelRatioChanged — the
+        # DPI re-perception after a Windows scaling change is picked up via
+        # the dots-per-inch signals (guarded per binding version).
+        for s in screens:
+            if id(s) in self._wired_screen_ids:
+                continue
+            try:
+                for sig in ("logicalDotsPerInchChanged",
+                            "physicalDotsPerInchChanged",
+                            "physicalSizeChanged",
+                            "virtualGeometryChanged"):
+                    if hasattr(s, sig):
+                        getattr(s, sig).connect(self._on_screen_dpi_changed)
+            except Exception:
+                pass
+            self._wired_screen_ids.add(id(s))
+
+    def _on_screen_added(self, screen):
+        logger.info(f"Screen added: wiring DPI signals for {screen.name()}")
+        self._wire_dpi_screens([screen])
+
+    def _on_screen_removed(self, screen):
+        self._wired_screen_ids.discard(id(screen))
+
+    def _on_screen_dpi_changed(self, _value=None):
+        logger.info("DPI change detected via Qt screen signals")
+        self._ui_scale_reapply_timer.start()
+
+    def _on_host_screen_changed(self, _screen=None):
+        logger.info(f"Screen changed signal received, triggering DPI reapply")
+        self._ui_scale_reapply_timer.start()
+        # Windows can also shrink the window while monitors are settling
+        # (a low-res TV plugged in and out). The saved size is still the
+        # user's; re-apply it once the new screen is stable.
+        QTimer.singleShot(600, self._refresh_window_geometry_after_screen)
+
+    def _refresh_window_geometry_after_screen(self):
+        """Re-apply the saved window size after a monitor change.
+
+        The DPI reapply grows the window with the scale, but a monitor swap
+        alone does not always trigger it (same scale, different resolution):
+        the window would stay small until the user manually resizes. This
+        restores the saved size — clamped to the new screen — and only ever
+        GROWS the window, never shrinks a size the user set deliberately.
+        """
+        try:
+            if self.windowState() & Qt.WindowState.WindowMaximized:
+                return
+            cfg = get_config()
+            geo = cfg.get("window_geometry", None)
+            if not isinstance(geo, dict):
+                return
+            w = max(900, int(geo.get("w", 1100)))
+            h = max(600, int(geo.get("h", 720)))
+            if self.width() >= w and self.height() >= h:
+                return
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                ag = screen.availableGeometry()
+                w = min(w, max(640, int(ag.width() * 0.96)))
+                h = min(h, max(480, int(ag.height() * 0.96)))
+            self.resize(max(self.width(), w), max(self.height(), h))
+        except Exception:
+            pass
+    
+    def _reapply_ui_scale(self):
+        """Refresh theme fonts + grow/shrink all windows when scale changed.
+
+        Single coherent flow: window geometry → theme/fonts → page style
+        cascade (via _on_theme_changed and _force_complete_refresh) →
+        fixed-dimension recalc → settings slider sync. Each piece lives in
+        exactly one place; earlier versions also refreshed pages, library
+        cards (_load_library AND _rebuild_view), sidebar and overlay from
+        here, restyling every widget 2-3 times per scale change."""
+        from ui.helpers import (
+            ui_scale, scale_all_top_level_windows,
+            _recalculate_all_scaled_dimensions, _trace_scaled_state,
+            clear_dialog_geometries,
         )
+        from ui.styles.theme import get_theme_manager
+        cur = ui_scale(self)
+        prev = self._last_ui_scale
+        if prev is not None and abs(cur - prev) < 0.02:
+            return
+        _trace_scaled_state(f"before {prev}->{cur}")
+        self._last_ui_scale = cur
+        logger.info(f"Applying UI scale change from {prev} to {cur}")
+        scale_all_top_level_windows(prev if prev is not None else 1.0, cur)
+        # Dialog footprints saved at the OLD scale would reopen stale-bigger
+        # (or smaller) until manually resized — drop them for a fresh fit.
+        # (Settings preview already clears them; this covers the live DPI path.)
+        try:
+            from core.config_manager import get_config
+            if get_config().get("ui_scale_auto", True):
+                clear_dialog_geometries()
+        except Exception:
+            pass
+        theme = get_config().get("theme", "dark")
+        get_theme_manager().apply(theme, QApplication.instance())
+        self._on_theme_changed(theme)
+
+        # Force complete refresh of all widgets
+        self._force_complete_refresh()
+
+        # Recalculate fixed-size chrome at the new scale
+        try:
+            _recalculate_all_scaled_dimensions()
+        except Exception as e:
+            logger.warning(f"Failed to recalculate scaled widgets: {e}")
+
+        # Update settings page slider and percentage to reflect new scale
+        if hasattr(self, "_settings_page") and self._settings_page is not None:
+            try:
+                current_scale = ui_scale(self)
+                # Align controls AND the dirty snapshot so the automatic DPI
+                # switch never looks like a user change.
+                self._settings_page.sync_external_ui_scale(current_scale)
+                logger.info(f"Updated settings page scale UI to {current_scale}")
+            except Exception as e:
+                logger.warning(f"Failed to update settings page scale UI: {e}")
+        _trace_scaled_state(f"after {prev}->{cur}")
+    
+    def _force_complete_refresh(self):
+        """Force complete refresh of all child widgets."""
+        try:
+            from ui.helpers import _refresh_child_widgets
+            _refresh_child_widgets(self)
+            logger.info("Forced complete refresh of all child widgets")
+            
+            # Force rebuild of problematic components
+            self._rebuild_problematic_components()
+        except Exception as e:
+            logger.warning(f"Failed to force complete refresh: {e}")
+    
+    def _rebuild_problematic_components(self):
+        """Rebuild components that don't scale properly with DPI changes."""
+        try:
+            # Rebuild sidebar navigation slots
+            if hasattr(self, "_sidebar"):
+                try:
+                    self._sidebar.updateGeometry()
+                    self._sidebar.update()
+                    logger.info("Rebuilt sidebar")
+                except Exception as e:
+                    logger.warning(f"Failed to rebuild sidebar: {e}")
+            
+            # Rebuild overlay
+            try:
+                if hasattr(self, '_overlay') and self._overlay is not None:
+                    self._overlay.updateGeometry()
+                    self._overlay.update()
+                    logger.info("Rebuilt overlay")
+                else:
+                    logger.info("No overlay instance found to rebuild")
+            except Exception as e:
+                logger.warning(f"Failed to rebuild overlay: {e}")
+            
+            # Force rebuild of game cards in library
+            if hasattr(self, "_library_page") and self._library_page is not None:
+                try:
+                    self._library_page._rebuild_view()
+                    logger.info("Rebuilt library cards")
+                except Exception as e:
+                    logger.warning(f"Failed to rebuild library cards: {e}")
+            
+            # Force rebuild of sync page components
+            if hasattr(self, "_sync_page") and self._sync_page is not None:
+                try:
+                    self._sync_page.updateGeometry()
+                    self._sync_page.update()
+                    logger.info("Rebuilt sync page")
+                except Exception as e:
+                    logger.warning(f"Failed to rebuild sync page: {e}")
+            
+            # Force rebuild of backups page components
+            if hasattr(self, "_backups_page") and self._backups_page is not None:
+                try:
+                    self._backups_page.updateGeometry()
+                    self._backups_page.update()
+                    logger.info("Rebuilt backups page")
+                except Exception as e:
+                    logger.warning(f"Failed to rebuild backups page: {e}")
+            
+            # Force rebuild of overview page components
+            if hasattr(self, "_overview_page") and self._overview_page is not None:
+                try:
+                    self._overview_page.updateGeometry()
+                    self._overview_page.update()
+                    logger.info("Rebuilt overview page")
+                except Exception as e:
+                    logger.warning(f"Failed to rebuild overview page: {e}")
+                    
+        except Exception as e:
+            logger.warning(f"Failed to rebuild problematic components: {e}")
+
+    def _migrate_manual_path_stubs(self):
+        try:
+            n = get_library().migrate_manual_path_stubs()
+            if n:
+                try:
+                    self._backups_page._load_games()
+                    self._backups_page._refresh_list()
+                except Exception:
+                    pass
+                try:
+                    self._library_page._load_library()
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Manual-path stub migration failed")
+
+    def _style_credits_btn(self):
+        """Theme-owned via #credits_nav_btn — kept as a hook for theme refresh."""
+        self._credits_btn.setObjectName("credits_nav_btn")
 
     def _show_credits(self):
         from ui.dialogs.credits_dialog import CreditsDialog
         CreditsDialog(self).exec()
+
+    def _on_sync_batch_progress(self, done: int, total: int, name: str):
+        if total <= 0:
+            return
+        if done == 0 and not self._sync_batch_notice.isVisible():
+            self._sync_batch_notice.begin(t("batch.sync_label"), total, name or "")
+        else:
+            self._sync_batch_notice.update_progress(done, total, name or "")
+
+    def _on_sync_batch_finished(self, done: int, name: str = ""):
+        if done == 1 and name:
+            msg = t("batch.sync_done_one", name=name)
+        else:
+            msg = t("batch.sync_done", done=done)
+        self._sync_batch_notice.finish(msg)
+        # One aggregated toast at the end (plain append to the already-built
+        # queue). Single-game sync toasts stay suppressed during the batch.
+        try:
+            if self._overlay:
+                self._overlay.show_batch_done("sync", done, name if done == 1 else "")
+        except Exception:
+            logger.debug("batch toast after Sync Tutti failed", exc_info=True)
+        self._update_sidebar_status()
+        try:
+            self._overview_page.refresh()
+        except Exception:
+            pass
+        # The batch moved real data — the library cards' sync status, the
+        # backups list (freshly downloaded zips) and the overview activity
+        # would otherwise stay stale until the user happens to trigger a
+        # rebuild ("Sync Tutti didn't update anything" report). Library
+        # reload is chunked and only runs when the page is visible; the
+        # backups list refreshes in place.
+        try:
+            self._library_page.wipe_and_reload()
+        except Exception:
+            pass
+        try:
+            self._backups_page._load_games()
+            self._backups_page._refresh_list()
+        except Exception:
+            pass
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(400, trim_process_memory)
+
+    def _resume_pending_batch_jobs(self):
+        """Restart Backup/Sync Tutti / Aggiunta multipla left unfinished."""
+        from core import pending_batch_jobs as _pbj
+        from core.concurrency import backup_max_inflight, sync_max_inflight
+
+        bak = _pbj.get_job(_pbj.KEY_BACKUP_ALL)
+        if bak and bak.get("pending_ids"):
+            ids = list(bak["pending_ids"])
+            completed = list(bak.get("completed_ids") or [])
+            logger.info(
+                f"Resuming Backup Tutti: {len(ids)} remaining "
+                f"({len(completed)} already done)")
+            self._backup_max_inflight = backup_max_inflight()
+            self._backup_batch = {
+                "pending_ids": ids,
+                "completed_ids": completed,
+                "force": bool(bak.get("force")),
+                "started_at": bak.get("started_at") or "",
+                "source": bak.get("source") or "resume",
+                "total": len(ids) + len(completed),
+                # Genuinely NEW backups (dedup-skipped games must not inflate
+                # the completion message: 21 checked ≠ 21 created).
+                "created_ids": [],
+            }
+            get_library().begin_bulk()
+            first = get_library().get_by_id(ids[0])
+            self._backup_batch_notice.begin(
+                t("batch.backup_label"),
+                self._backup_batch["total"],
+                first.name if first else "")
+            self._backup_batch_notice.update_progress(
+                len(completed), self._backup_batch["total"],
+                first.name if first else "")
+            for gid in ids:
+                self._enqueue_backup(
+                    gid, force_full=bool(bak.get("force")),
+                    silent=True, part_of_batch=True)
+            self._pump_backup_queue()
+
+        syn = _pbj.get_job(_pbj.KEY_SYNC_ALL)
+        if syn and syn.get("pending_ids"):
+            orch = get_orchestrator()
+            if orch.is_online():
+                pending_set = set(syn["pending_ids"])
+                jobs = [j for j in (syn.get("jobs") or [])
+                        if j.get("game_id") in pending_set]
+                if not jobs:
+                    # Rebuild minimal jobs from library
+                    for gid in syn["pending_ids"]:
+                        e = get_library().get_by_id(gid)
+                        if e and e.save_paths:
+                            jobs.append({
+                                "game_id": e.id,
+                                "game_name": e.name,
+                                "save_paths": list(e.save_paths),
+                                "exe_path": e.exe_path or "",
+                                "computed_folder_name": e.computed_folder_name or "",
+                                "name_history": list(e.name_history or []),
+                            })
+                if jobs:
+                    logger.info(f"Resuming Sync Tutti: {len(jobs)} remaining")
+                    # Preserve completed tally in notice via enqueue rebuild
+                    orch._sync_max_inflight = sync_max_inflight()
+                    orch.enqueue_sync_batch(jobs, source="resume")
+            else:
+                logger.info("Pending Sync Tutti kept on disk — provider offline")
+
+        man = _pbj.get_job(_pbj.KEY_MANUAL_BATCH)
+        if man:
+            self._show_manual_path_dialog(resume_state=man)
+
+        sea = _pbj.get_job(_pbj.KEY_SEARCH_BATCH)
+        if sea and sea.get("pending_ids"):
+            pending = list(sea["pending_ids"])
+            completed = list(sea.get("completed_ids") or [])
+            logger.info(
+                f"Resuming batch web search: {len(pending)} remaining "
+                f"({len(completed)} already done)")
+            self._start_batch_game_search(
+                pending,
+                prior_done=len(completed),
+                prior_matched=int(sea.get("matched") or 0),
+                prior_completed_ids=completed,
+            )
+
+    def _show_manual_path_dialog(self, resume_state: dict | None = None):
+        """Open Aggiunta multipla with show() so ✕ can shelve to the sidebar."""
+        from ui.dialogs.manual_path_dialog import ManualPathDialog
+        existing = self._manual_path_dlg
+        if existing is not None:
+            try:
+                existing.unshelve()
+                return
+            except RuntimeError:
+                self._manual_path_dlg = None
+        dlg = ManualPathDialog(self)
+        self._manual_path_dlg = dlg
+        dlg.shelved.connect(lambda: self._on_manual_path_shelved(dlg))
+        dlg.shelve_status.connect(lambda: self._refresh_manual_path_shelf(dlg))
+        dlg.finished.connect(lambda _r: self._on_manual_path_finished(dlg))
+        if resume_state:
+            dlg.restore_persisted_state(resume_state)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _refresh_manual_path_shelf(self, dlg):
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is not dlg:
+                continue
+            btn = e.get("btn")
+            if btn is None:
+                return
+            try:
+                btn.set_status("running" if dlg.has_shelvable_work() else "done")
+                btn.update_label(dlg.shelve_nav_label())
+                btn.setToolTip(dlg.shelve_nav_tooltip())
+            except RuntimeError:
+                pass
+            return
+
+    def _on_manual_path_shelved(self, dlg):
+        entry = None
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is dlg:
+                entry = e
+                break
+        if entry is None:
+            btn = NavButton(t("manual_path.shelved_nav"), "📁")
+            btn.clicked.connect(lambda _=False, d=dlg: self._resurrect_manual_path(d))
+            self._shelved_adds_layout.addWidget(btn)
+            entry = {"dlg": dlg, "btn": btn, "kind": "manual_path"}
+            self._shelved_add_entries.append(entry)
+            self._shelved_adds_host.setVisible(True)
+        self._refresh_manual_path_shelf(dlg)
+        QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
+
+    def _resurrect_manual_path(self, dlg):
+        try:
+            dlg.unshelve()
+        except RuntimeError:
+            pass
+
+    def _on_manual_path_finished(self, dlg):
+        if getattr(dlg, "added_entries", None):
+            try:
+                self._backups_page._load_games()
+                self._backups_page._refresh_list()
+            except Exception:
+                pass
+            try:
+                self._library_page.refresh_styles()
+            except Exception:
+                pass
+        if self._manual_path_dlg is dlg:
+            self._manual_path_dlg = None
+        # Remove sidebar entry
+        keep = []
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is dlg:
+                btn = e.get("btn")
+                if btn is not None:
+                    self._shelved_adds_layout.removeWidget(btn)
+                    btn.deleteLater()
+            else:
+                keep.append(e)
+        self._shelved_add_entries = keep
+        self._shelved_adds_host.setVisible(bool(keep))
 
     # ── Tray ──────────────────────────────────────────────────────────────────
 
@@ -549,6 +1111,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._really_quit = True
         QApplication.quit()
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                from ui.helpers import trim_process_memory
+                QTimer.singleShot(150, trim_process_memory)
+
     def closeEvent(self, event):
         config = get_config()
 
@@ -570,6 +1139,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if config.get("minimize_to_tray", True):
             event.ignore()
             self.hide()
+            from ui.helpers import trim_process_memory
+            trim_process_memory()
         else:
             event.accept()
             # Mark before quit(): its own close-all-windows pass re-enters
@@ -602,7 +1173,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         config.save()
 
     def _restore_window_state(self):
-        """Restore window geometry from config, falling back to defaults."""
+        """Restore window geometry from config, falling back to defaults.
+        
+        Also performs emergency safety check: if saved geometry is unusable
+        (window too large for screen or completely off-screen), resets to safe scale.
+        """
         config = get_config()
         geo = config.get("window_geometry", None)
         if geo and isinstance(geo, dict):
@@ -610,31 +1185,149 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 from PySide6.QtWidgets import QApplication as _QApp
                 screen = _QApp.primaryScreen()
                 available = screen.availableGeometry() if screen else None
+                # Only floor absurd values (corrupt config) — do NOT inflate a
+                # legitimately saved size: max(900, w) would trip the emergency
+                # reset below on small screens (e.g. a real 800x600 window).
                 x = int(geo.get("x", 100))
                 y = int(geo.get("y", 100))
-                w = max(900, int(geo.get("w", 1100)))
-                h = max(600, int(geo.get("h", 720)))
-                # Clamp to available screen so window doesn't appear off-screen
+                w = max(200, int(geo.get("w", 1100)))
+                h = max(200, int(geo.get("h", 720)))
+
+                # Emergency safety check: if window is too large for screen
                 if available:
-                    x = max(available.x(), min(x, available.right()  - w))
-                    y = max(available.y(), min(y, available.bottom() - h))
+                    screen_w = available.width()
+                    screen_h = available.height()
+                    if w > screen_w * 0.9 or h > screen_h * 0.9:
+                        # Emergency reset: window too large, clamp to a safe
+                        # size. This used to ALSO disable auto-scale
+                        # (ui_scale_auto=False + factor 1.0) — but the saved
+                        # geometry can be oversized for a totally benign
+                        # reason (a monitor swap since the last run), and
+                        # silently turning the user's auto-scale off on every
+                        # such boot is what made "auto scale randomly
+                        # disabled" reports: the scale itself is fine, only
+                        # the saved window no longer fits this screen.
+                        logger.warning(
+                            f"Emergency: Saved window size ({w}x{h}) too large for screen "
+                            f"({screen_w}x{screen_h}). Clamping to safe size."
+                        )
+                        # Use safe default geometry
+                        w = min(1100, int(screen_w * 0.8))
+                        h = min(720, int(screen_h * 0.8))
+                        x = available.x() + (screen_w - w) // 2
+                        y = available.y() + (screen_h - h) // 2
+
+                        # Show emergency toast after window is shown
+                        from PySide6.QtCore import QTimer
+                        QTimer.singleShot(100, self._show_dpi_emergency_toast)
+                    else:
+                        # Clamp position so window stays on-screen. When the
+                        # saved size fits the screen (≤90%), clamping x/y is
+                        # safe in both dimensions.
+                        x = max(available.x(), min(x, available.right() - w))
+                        y = max(available.y(), min(y, available.bottom() - h))
+
                 self.setGeometry(x, y, w, h)
             except Exception:
                 pass
         if config.get("window_maximized", False):
             self.showMaximized()
 
+    def _ensure_cheats_page(self):
+        """Create the Cheats page on first use (replaces the stack placeholder)."""
+        if self._cheats_page is not None:
+            return self._cheats_page
+        from ui.pages.cheats_page import CheatsPage
+        page = CheatsPage()
+        page.set_load_notice(self._cheats_load_notice)
+        old = self._stack.widget(5)
+        self._stack.removeWidget(old)
+        old.deleteLater()
+        self._stack.insertWidget(5, page)
+        self._cheats_page = page
+        return page
+
+    def _reopen_shelved_load(self):
+        """Sidebar notice clicked: back to the Cheats page, restore progress or open loaded editor."""
+        page = self._ensure_cheats_page()
+        self._switch_page(5)
+        page.on_sidebar_notice_clicked()
+
+
+    def _show_dpi_emergency_toast(self):
+        """Show emergency DPI reset toast notification."""
+        try:
+            from PySide6.QtWidgets import QLabel, QWidget
+            from PySide6.QtCore import Qt, QTimer
+            from ui.styles.theme import palette
+            from i18n import t
+            from ui.helpers import scaled
+            
+            # Create toast widget
+            toast = QWidget()
+            toast.setObjectName("dpi_emergency_toast")
+            
+            # Use scaled dimensions for styling
+            pad = scaled(12, self)
+            border_radius = scaled(8, self)
+            toast.setStyleSheet(f"""
+                #dpi_emergency_toast {{
+                    background: {palette('bg_card')};
+                    border: 1px solid {palette('warning')};
+                    border-radius: {border_radius}px;
+                    padding: {pad}px;
+                }}
+            """)
+            
+            layout = QVBoxLayout(toast)
+            layout.setContentsMargins(scaled(16, self), scaled(12, self), scaled(16, self), scaled(12, self))
+            layout.setSpacing(scaled(4, self))
+            
+            title = QLabel(t("dpi.emergency_title"))
+            title.setStyleSheet(f"color: {palette('warning')}; font-weight: bold; font-size: {scaled(13, self)}px;")
+            layout.addWidget(title)
+            
+            msg = QLabel(t("dpi.emergency_message_auto"))
+            msg.setStyleSheet(f"color: {palette('text')}; font-size: {scaled(11, self)}px;")
+            msg.setWordWrap(True)
+            layout.addWidget(msg)
+            
+            # Position toast at top center of main window with scaled dimensions
+            geo = self.geometry()
+            toast_w = min(scaled(400, self), geo.width() - scaled(40, self))
+            toast_h = toast.sizeHint().height()
+            x = geo.x() + (geo.width() - toast_w) // 2
+            y = geo.y() + scaled(20, self)
+            toast.setGeometry(x, y, toast_w, toast_h + scaled(40, self))
+            toast.setParent(self)
+            toast.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+            toast.show()
+            
+            # Auto-hide after 5 seconds
+            QTimer.singleShot(5000, toast.hide)
+        except Exception:
+            pass
+
     def _open_cheats_for(self, game_id: str):
         """The library's "Cheats" entry: open the editor already on that
         game, so the search step is skipped."""
-        if self._cheats_page.open_for_game(game_id):
+        if self._ensure_cheats_page().open_for_game(game_id):
             self._switch_page(5)
 
     def _switch_page(self, idx: int):
-        # If leaving settings page, auto-cancel unsaved changes
-        if self._active_nav_idx == 4 and idx != 4:
-            if hasattr(self._settings_page, 'on_page_leave'):
-                self._settings_page.on_page_leave()
+        # If leaving previous page, invoke on_page_leave hook to cancel workers/pumps
+        if self._active_nav_idx is not None and self._active_nav_idx != idx:
+            old_page = self._stack.widget(self._active_nav_idx)
+            if old_page is not None and hasattr(old_page, 'on_page_leave') and callable(old_page.on_page_leave):
+                try:
+                    old_page.on_page_leave()
+                except Exception:
+                    logger.debug("on_page_leave failed", exc_info=True)
+            # Automatic memory trim when leaving previous page
+            from ui.helpers import trim_process_memory
+            QTimer.singleShot(350, trim_process_memory)
+        if idx == 5:
+            self._ensure_cheats_page()
         for i, btn in enumerate(self._nav_buttons):
             btn.set_active(i == idx)
         self._stack.setCurrentIndex(idx)
@@ -645,14 +1338,50 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         page = self._stack.widget(idx)
         if getattr(page, "_styles_stale", False):
             self._refresh_page_styles(page)
-        # Refresh overview when navigating to it
-        if idx == 0:
-            self._overview_page.refresh()
-        # Refresh per-game suppression list when navigating to settings
-        elif idx == 4 and hasattr(self._settings_page, '_load_suppression_list'):
-            self._settings_page._load_suppression_list()
+        # Overview / Library / Backups / Sync load after the page paints.
+        if idx == 1:
+            self._library_page.on_page_enter()
+        elif idx == 2:
+            self._sync_page.ensure_loaded()
+        elif idx == 3:
+            self._backups_page.ensure_loaded()
+        elif idx == 4:
+            if hasattr(self._settings_page, 'ensure_loaded'):
+                self._settings_page.ensure_loaded()
+            if hasattr(self._settings_page, '_load_suppression_list'):
+                self._settings_page._load_suppression_list()
         elif idx == 5:
             self._cheats_page.on_page_enter()
+
+    def _on_refresh_all_pages(self):
+        """Overview refresh button: wipe every open page so the next visit
+        re-runs its async chunk pump (fresh reveal, fresh data)."""
+        try:
+            if get_monitor().currently_playing():
+                return  # in-game: wiping pages would fight live file writes
+        except Exception:
+            pass
+        for page in (self._library_page, self._sync_page, self._backups_page,
+                     self._settings_page):
+            wipe = getattr(page, "wipe_and_reload", None)
+            if callable(wipe):
+                try:
+                    wipe()
+                except Exception:
+                    logger.debug(
+                        f"wipe_and_reload failed for {type(page).__name__}",
+                        exc_info=True)
+        if self._cheats_page is not None:
+            try:
+                self._cheats_page.wipe_and_reload()
+            except Exception:
+                logger.debug("wipe_and_reload failed for CheatsPage",
+                             exc_info=True)
+        try:
+            from ui.helpers import trim_process_memory
+            trim_process_memory()
+        except Exception:
+            pass
 
     # ── Overlay ───────────────────────────────────────────────────────────────
 
@@ -803,6 +1532,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             entry = get_library().get_by_exe(context)
             if entry:
                 self._pending_cloud_notification.pop(entry.id, None)
+                # Hand-added orphan archive: same accept action, restore from
+                # local index (path + name already recorded) instead of cloud.
+                if self._apply_orphan_backup_to_game(entry):
+                    self._show_tracking_toast_if_playing(entry.id)
+                    try:
+                        self._backups_page._load_games()
+                        self._backups_page._refresh_list()
+                    except Exception:
+                        pass
+                    return
                 orch = get_orchestrator()
 
                 def _on_no_local_sync_done(game_id: str, result):
@@ -835,6 +1574,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             entry = get_library().get_by_exe(context)
             if entry:
                 self._pending_cloud_notification.pop(entry.id, None)
+                getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
                 # Persist the "use local saves" choice so the download prompt is
                 # not re-shown on every restart (reversible from Settings →
                 # suppressed-games list).
@@ -863,6 +1603,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             entry = get_library().get_by_exe(context)
             if entry:
                 self._pending_cloud_notification.pop(entry.id, None)
+                getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
                 self._persist_cloud_no_local_decline(entry.id, entry.name)
                 self._show_tracking_toast_if_playing(entry.id)
 
@@ -909,9 +1650,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         elif action == "open_app":
             self._show_modal_app(from_user_action=True)
         elif action == "backup_all":
-            for g in get_library().all_games():
-                if g.save_paths:
-                    self._backup_game(g.id)
+            ids = [g.id for g in get_library().all_games() if g.save_paths]
+            self._start_backup_all(ids, source="overlay")
         elif action == "backup_current":
             # In-game overlay "Backup": only the game(s) currently running
             for g in get_monitor().currently_playing():
@@ -1669,8 +2409,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         list below), so Credits kept the previous theme until the next tab
         switch.
         """
-        for page in (self._overview_page, self._library_page,
-                     self._sync_page, self._backups_page):
+        pages = [self._overview_page, self._library_page,
+                 self._sync_page, self._backups_page]
+        if self._cheats_page is not None:
+            pages.append(self._cheats_page)
+        for page in pages:
             if not callable(getattr(page, "refresh_styles", None)):
                 continue
             if page is not self._stack.currentWidget():
@@ -1692,14 +2435,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """Restyle sidebar pieces that use inline palette() or need a re-polish.
 
         Called on every theme switch (and not deferred to the next tab change).
+        Also refreshes DPI/accessibility width when UI scale changes.
         """
+        from ui.helpers import scaled
+        if getattr(self, "_sidebar", None) is not None:
+            self._sidebar.setFixedWidth(scaled(220, self, min_px=210))
+
         self._update_sidebar_status()
 
         for btn in self._nav_buttons:
             btn.style().unpolish(btn)
             btn.style().polish(btn)
             btn.update()
-        for btn in (self._search_nav_btn, self._cheats_nav_btn):
+        for btn in (self._cheats_nav_btn,):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
             btn.update()
@@ -1709,13 +2457,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 btn.style().unpolish(btn)
                 btn.style().polish(btn)
                 btn.update()
+        for notice in (
+            getattr(self, "_backup_batch_notice", None),
+            getattr(self, "_sync_batch_notice", None),
+            getattr(self, "_search_batch_notice", None),
+        ):
+            if notice is not None:
+                try:
+                    notice.refresh_styles()
+                except RuntimeError:
+                    pass
         self._style_credits_btn()
         # Force Qt to drop any cached :hover painting from the previous theme.
         self._credits_btn.style().unpolish(self._credits_btn)
         self._credits_btn.style().polish(self._credits_btn)
         self._credits_btn.update()
-        self._machine_lbl.setStyleSheet(
-            f"color: {palette('text_hint')}; font-size: 10px; padding: 0 16px 12px;")
         if self._overlay:
             self._overlay.refresh_styles()
 
@@ -1849,6 +2605,114 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # somebody goes back to.
         QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._prune_save_edit_copies)
 
+    def _setup_startup_self_checks(self):
+        """In-app regression guards (no shipped ``tests/`` suite).
+
+        Same delay pattern as backup verify: a few minutes after launch, off
+        the GUI thread; failures use status bar + tray.
+        """
+        self.self_check_failed.connect(self._on_self_check_failed)
+        self.self_check_progress.connect(self._on_self_check_progress)
+        self.self_check_done.connect(self._on_self_check_done)
+        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._run_startup_self_checks)
+
+    def _run_startup_self_checks(self):
+        # Only run self-checks if enabled in settings
+        if not get_config().get("self_checks", True):
+            logger.info("Self-checks disabled in settings, skipping")
+            return
+        
+        # Check if configuration history exists before running self-checks.
+        # The real checkpoint history lives under CONFIG_HISTORY_DIR — NOT a
+        # "config_dir/history" folder (that path never exists, so this gate
+        # silently skipped the checks even when snapshots were present).
+        from core.constants import CONFIG_HISTORY_DIR
+        if not CONFIG_HISTORY_DIR.exists() or not any(CONFIG_HISTORY_DIR.iterdir()):
+            logger.info("No configuration history found, skipping self-checks")
+            return
+        
+        # Check if enough time has passed since last check based on frequency
+        frequency_days = get_config().get("self_checks_frequency", 7)
+        last_check = get_config().get("last_self_check", 0)
+        current_time = int(time.time())
+        seconds_per_day = 86400
+        min_seconds = frequency_days * seconds_per_day
+        
+        if current_time - last_check < min_seconds:
+            days_until_next = (min_seconds - (current_time - last_check)) // seconds_per_day
+            logger.info(f"Self-checks already run recently, next check in {days_until_next} days")
+            return
+            
+        # Run self-checks and update last check time
+        from core.self_checks import run_startup_self_checks
+
+        # Surface the sweep in the sidebar like Backup/Sync Tutti. The
+        # callbacks run on the worker thread — the Qt signals marshal them
+        # back to the GUI thread.
+        self._verify_batch_notice.begin(t("batch.verify_label"), 2)
+
+        def _progress(check_id: str, index: int, total: int):
+            self.self_check_progress.emit(check_id, index, total)
+
+        def _fail(check_id: str, detail: str):
+            self.self_check_failed.emit(check_id, detail)
+
+        def _on_complete():
+            # Update last check time on successful completion
+            try:
+                get_config().set("last_self_check", int(time.time()))
+                logger.info("Self-checks completed, updated last check time")
+            except Exception as e:
+                logger.warning(f"Failed to update last self-check time: {e}")
+            self.self_check_done.emit()
+
+        # Run checks and record completion once the worker thread is done.
+        run_startup_self_checks(on_failure=_fail, on_done=_on_complete,
+                                on_progress=_progress)
+
+    @Slot(str, int, int)
+    def _on_self_check_progress(self, check_id: str, index: int, total: int):
+        names = {
+            "config_history_restore": t("batch.verify_snapshot"),
+            "backup_index": t("batch.verify_index"),
+        }
+        self._verify_batch_notice.update_progress(
+            index, max(total, 1), names.get(check_id, check_id))
+
+    @Slot()
+    def _on_self_check_done(self):
+        self._verify_batch_notice.finish(t("batch.verify_done"), hide_after_ms=4000)
+
+    @Slot(int)
+    def _on_verify_batch_started(self, total: int):
+        self._verify_batch_notice.begin(t("batch.verify_label"), total)
+
+    @Slot(int, int, str)
+    def _on_verify_batch_progress(self, done: int, total: int, name: str):
+        self._verify_batch_notice.update_progress(done, total, name)
+
+    @Slot(str)
+    def _on_verify_batch_finished(self, msg: str):
+        self._verify_batch_notice.finish(msg, hide_after_ms=4000)
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(400, trim_process_memory)
+
+    @Slot(str, str)
+    def _on_self_check_failed(self, check_id: str, detail: str):
+        msg = t("self_checks.failed", check=check_id)
+        if detail:
+            msg = f"{msg} ({detail[:80]})"
+        self._status_bar.showMessage(msg, 20000)
+        try:
+            if self._tray is not None:
+                self._tray.showMessage(
+                    t("app.name"),
+                    t("self_checks.failed", check=check_id),
+                    self._tray.icon(), 10000)
+        except Exception:
+            logger.debug("Could not raise a tray notice for self-check",
+                         exc_info=True)
+
     def _setup_auto_export_config(self):
         """Schedule encrypted config uploads to the sync provider."""
         self._auto_export_timer = QTimer(self)
@@ -1861,7 +2725,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _maybe_run_auto_export_config(self):
         """Upload config to the sync provider if enabled and due."""
-        from core.config_manager import get_config
         cfg = get_config()
         if not cfg.get("auto_export_config_enabled", False):
             return
@@ -1934,7 +2797,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _maybe_check_for_updates(self):
         """Poll GitHub Releases when enabled and the jittered interval is due."""
-        from core.config_manager import get_config
         from core.update_check import (
             fetch_latest_release, is_check_due, mark_check_attempted,
             should_notify,
@@ -1973,7 +2835,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_update_available(self, info):
         if self._update_dialog_open or info is None:
             return
-        from core.config_manager import get_config
         from core.update_check import mark_notified
         from ui.dialogs.update_dialog import UpdateAvailableDialog
 
@@ -2002,7 +2863,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         competes for disk with the in-game backups, and nothing is lost by
         waiting an hour.
         """
-        from core.config_manager import get_config
         cfg = get_config()
         if not cfg.get("backup_verify_enabled", True):
             return
@@ -2031,18 +2891,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             ids = [b.backup_id for b in mgr.get_all_backups()]
             if not ids:
                 return
-            bad = 0
-            for bid in ids:
-                try:
-                    state, _detail = mgr.verify_backup(bid, deep=False)
-                    if state != "ok":
-                        bad += 1
-                except Exception as e:
-                    logger.debug(f"Scheduled verify failed for {bid}: {e}")
+            try:
+                # Throttled + batched index writes; skip archives still "ok"
+                # within the last half-day so a weekly schedule does not
+                # re-read every zip on a library of hundreds.
+                results = mgr.verify_backups(ids, deep=False)
+            except Exception as e:
+                logger.debug(f"Scheduled verify failed: {e}")
+                return
+            bad = sum(1 for state, _ in results.values() if state != "ok")
             get_config().set("backup_verify_last", datetime.utcnow().isoformat())
-            logger.info(f"Scheduled backup verification: {len(ids) - bad}/{len(ids)} intact")
+            logger.info(
+                f"Scheduled backup verification: {len(results) - bad}/{len(results)} intact"
+            )
             if bad:
-                self.backup_verify_problems.emit(bad, len(ids))
+                self.backup_verify_problems.emit(bad, len(results))
 
         self._verify_thread = threading.Thread(target=_run, daemon=True)
         self._verify_thread.start()
@@ -2060,6 +2923,28 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.debug("Could not raise a tray notice for the verify result",
                          exc_info=True)
 
+    @Slot(str)
+    def _on_index_validation_failed(self, detail: str):
+        """Startup index check could not finish — same surface as verify problems."""
+        msg = t("backups.index_validate_failed")
+        if detail:
+            msg = f"{msg} ({detail[:80]})"
+        self._status_bar.showMessage(msg, 20000)
+        try:
+            if self._tray is not None:
+                self._tray.showMessage(
+                    t("app.name"),
+                    t("backups.index_validate_failed"),
+                    self._tray.icon(), 10000)
+        except Exception:
+            logger.debug("Could not raise a tray notice for index validation",
+                         exc_info=True)
+
+    @Slot()
+    def _on_index_validation_recovered(self):
+        msg = t("backups.index_validate_recovered")
+        self._status_bar.showMessage(msg, 8000)
+
     # ── Monitor ───────────────────────────────────────────────────────────────
 
     def _setup_monitors(self):
@@ -2075,7 +2960,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # A hand-registered destination waiting for its game is picked up the
         # moment that game appears — no periodic re-check, just this one
         # event, matched on the name coincidence.
-        get_library().game_added.connect(self._adopt_manual_entries_for)
+        get_library().game_added.connect(self._on_library_game_added_refresh)
 
         from core.watcher import get_save_watcher
         self._watcher = get_save_watcher()
@@ -2087,6 +2972,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Watcher is started lazily: watch_game is called in _on_game_launched
         # and unwatch_game in _on_game_exited, so no paths are watched at startup.
         lib.game_added.connect(lambda _: get_monitor().refresh_tracked())
+        lib.bulk_finished.connect(lambda: get_monitor().refresh_tracked())
         self._last_known_paths: dict[str, list] = {
             e.id: list(e.save_paths) for e in lib.all_games()
         }
@@ -2215,21 +3101,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.debug(f"Could not restore this game's pins: {e}")
 
         # Launching is the one moment a game is GUARANTEED to have its
-        # executable — that is what makes a save destination registered by
-        # hand ("www/save under the game") placeable at all. So any such
-        # destination still waiting for this game is taken over here, before
-        # the cloud check reads save_paths: a game added without an exe and
-        # given one later never emits game_added again, and would otherwise
-        # keep waiting forever.
-        try:
-            from core.manual_paths import adopt_manual_entries_for
-            if adopt_manual_entries_for(entry):
-                refreshed = get_library().get_by_id(entry.id)
-                if refreshed is not None:
-                    entry = refreshed
-        except Exception:
-            logger.debug("Manual-entry adoption at launch failed", exc_info=True)
-
+        # executable. Orphan hand-added archives (and cloud saves) are offered
+        # through _check_cloud_on_launch — same notification, no silent adopt.
         self._update_sidebar_status()
 
         # Minimise SaveSync to the tray for the duration of play (restored on
@@ -2710,6 +3583,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._backup_game(entry.id, force_full=False)
         # Trigger auto scan confirmation for this specific game if needed
         self._check_auto_scan_for_game(entry)
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(1000, trim_process_memory)
 
     def _on_unknown_game_exited(self, exe_path: str):
         """An unregistered process exited. We track and scan ONLY games the user
@@ -3106,15 +3981,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         playing = get_monitor().currently_playing()
         if playing:
             self._sidebar_status.setText(f"🎮 {playing[0].name}")
-            self._sidebar_status.setStyleSheet(f"color: {palette('accent')}; font-size: 10px; padding: 8px 16px;")
+            fs = scaled(10, self)
+            pad_v = scaled(8, self)
+            pad_h = scaled(16, self)
+            self._sidebar_status.setStyleSheet(f"color: {palette('accent')}; font-size: {fs}px; padding: {pad_v}px {pad_h}px;")
         else:
             orch = get_orchestrator()
+            fs = scaled(10, self)
+            pad_v = scaled(8, self)
+            pad_h = scaled(16, self)
             if orch.is_online():
                 self._sidebar_status.setText(t('main.online'))
-                self._sidebar_status.setStyleSheet(f"color: {palette('info')}; font-size: 10px; padding: 8px 16px;")
+                self._sidebar_status.setStyleSheet(f"color: {palette('info')}; font-size: {fs}px; padding: {pad_v}px {pad_h}px;")
             else:
                 self._sidebar_status.setText(t('main.offline'))
-                self._sidebar_status.setStyleSheet(f"color: {palette('text_muted')}; font-size: 10px; padding: 8px 16px;")
+                self._sidebar_status.setStyleSheet(f"color: {palette('text_muted')}; font-size: {fs}px; padding: {pad_v}px {pad_h}px;")
 
     # ── Orchestrator ──────────────────────────────────────────────────────────
 
@@ -3172,7 +4053,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_sync_finished(self, game_id: str, result):
         from datetime import datetime
         entry = get_library().get_by_id(game_id)
-        name  = entry.name if entry else game_id
+        name = entry.name if entry else ""
+        if not name:
+            try:
+                from core.backup import get_backup_manager
+                backs = get_backup_manager().get_backups_for_game(game_id)
+                if backs:
+                    name = (backs[0].game_name
+                            or get_backup_manager()._game_folder_for_entry(backs[0])
+                            or "")
+            except Exception:
+                name = ""
+        if not name:
+            name = game_id
+
+        in_batch = bool(getattr(get_orchestrator(), "_sync_batch", None))
 
         # Chain the upload half of a "both" conflict resolution.
         # The download has just finished — now upload local saves.
@@ -3211,135 +4106,285 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         sync_status="synced",
                         cloud_metadata={**((entry.cloud_metadata or {})), "last_synced_hash": synced_hash},
                     )
-            if result.conflicts:
-                self._status_bar.showMessage(
-                    t("sync.sync_conflicts", game=name, count=len(result.conflicts)), 8000)
-            elif no_changes:
-                self._status_bar.showMessage(
-                    t("sync.sync_unchanged", game=name), 4000)
-                # No overlay/toast spam for unchanged — keep it quiet
-            else:
-                self._status_bar.showMessage(t("sync.sync_success", game=name), 5000)
-                if self._overlay:
-                    self._overlay.show_sync_done(name)
+            # During Sync Tutti the sidebar notice is the only live UI —
+            # per-item status/overlay spam freezes the app on large batches.
+            if not in_batch:
+                if result.conflicts:
+                    self._status_bar.showMessage(
+                        t("sync.sync_conflicts", game=name, count=len(result.conflicts)), 8000)
+                elif no_changes:
+                    self._status_bar.showMessage(
+                        t("sync.sync_unchanged", game=name), 4000)
+                else:
+                    self._status_bar.showMessage(t("sync.sync_success", game=name), 5000)
+                    if self._overlay:
+                        self._overlay.show_sync_done(name)
+                self._update_sidebar_status()
         else:
             if entry:
                 get_library().update_game_fields(game_id, sync_status="pending")
-            self._status_bar.showMessage(t("sync.sync_error", error=result.message), 8000)
-        self._update_sidebar_status()
+            if not in_batch:
+                self._status_bar.showMessage(t("sync.sync_error", error=result.message), 8000)
+                self._update_sidebar_status()
 
     # ── Game actions ──────────────────────────────────────────────────────────
 
-    def _adopt_manual_entries_for(self, entry):
-        """A game just appeared: give it any save destination registered for
-        it by hand. One name comparison — nothing is scanned or polled."""
+    def _on_library_game_added_refresh(self, entry):
+        """Library gained a real game — orphan archives wait for launch notify."""
         if entry is None:
             return
+        # No silent adopt: matching orphans are offered via the cloud-saves
+        # notification on first launch (_check_cloud_on_launch).
         try:
-            from core.manual_paths import adopt_manual_entries_for
-            absorbed = adopt_manual_entries_for(entry)
+            self._library_page.refresh_styles()
         except Exception:
-            logger.debug("Manual-entry adoption failed", exc_info=True)
+            pass
+
+    def _show_scan_folder(self):
+        """🔍 — scan a folder for installed games, confirm, add.
+
+        Uses show() (not exec) so ✕ can shelve during scan/insert/store —
+        same pattern as Aggiunta multipla.
+        """
+        from ui.dialogs.exe_scan_dialog import ExeScanDialog
+        existing = getattr(self, "_exe_scan_dlg", None)
+        if existing is not None:
+            try:
+                existing.unshelve()
+                return
+            except RuntimeError:
+                self._exe_scan_dlg = None
+        dlg = ExeScanDialog(self)
+        self._exe_scan_dlg = dlg
+        dlg.search_requested.connect(self._start_batch_game_search)
+        dlg.shelved.connect(lambda: self._on_exe_scan_shelved(dlg))
+        dlg.shelve_status.connect(lambda: self._refresh_exe_scan_shelf(dlg))
+        dlg.finished.connect(lambda _r: self._on_exe_scan_finished(dlg))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _show_scan_folder_at(self, folder_path: str):
+        """A whole folder was dropped on the library — same flow as 🔍,
+        with the scan started on the dropped folder immediately."""
+        from ui.dialogs.exe_scan_dialog import ExeScanDialog
+        existing = getattr(self, "_exe_scan_dlg", None)
+        if existing is not None:
+            try:
+                existing.unshelve()
+                return
+            except RuntimeError:
+                self._exe_scan_dlg = None
+        dlg = ExeScanDialog(self)
+        self._exe_scan_dlg = dlg
+        dlg.search_requested.connect(self._start_batch_game_search)
+        dlg.shelved.connect(lambda: self._on_exe_scan_shelved(dlg))
+        dlg.shelve_status.connect(lambda: self._refresh_exe_scan_shelf(dlg))
+        dlg.finished.connect(lambda _r: self._on_exe_scan_finished(dlg))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.start_folder(folder_path)
+
+    def _refresh_exe_scan_shelf(self, dlg):
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is not dlg:
+                continue
+            btn = e.get("btn")
+            if btn is None:
+                return
+            try:
+                btn.set_status("running" if dlg.has_shelvable_work() else "done")
+                btn.update_label(dlg.shelve_nav_label())
+                btn.setToolTip(dlg.shelve_nav_tooltip())
+            except RuntimeError:
+                pass
             return
-        if absorbed:
-            logger.info(f"{entry.name}: absorbed {absorbed} hand-registered destination(s)")
+
+    def _on_exe_scan_shelved(self, dlg):
+        entry = None
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is dlg:
+                entry = e
+                break
+        if entry is None:
+            btn = NavButton(t("exe_scan.shelved_nav"), "🔍")
+            btn.clicked.connect(lambda _=False, d=dlg: self._resurrect_exe_scan(d))
+            self._shelved_adds_layout.addWidget(btn)
+            entry = {"dlg": dlg, "btn": btn, "kind": "exe_scan"}
+            self._shelved_add_entries.append(entry)
+            self._shelved_adds_host.setVisible(True)
+        self._refresh_exe_scan_shelf(dlg)
+        QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
+
+    def _resurrect_exe_scan(self, dlg):
+        try:
+            dlg.unshelve()
+        except RuntimeError:
+            pass
+
+    def _on_exe_scan_finished(self, dlg):
+        if getattr(self, "_exe_scan_dlg", None) is dlg:
+            self._exe_scan_dlg = None
+        if getattr(dlg, "added_entries", None):
             try:
                 self._library_page._load_library()
             except Exception:
                 pass
+            try:
+                self._backups_page._load_games()
+                self._backups_page._refresh_list()
+            except Exception:
+                pass
+        keep = []
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is dlg:
+                btn = e.get("btn")
+                if btn is not None:
+                    self._shelved_adds_layout.removeWidget(btn)
+                    btn.deleteLater()
+            else:
+                keep.append(e)
+        self._shelved_add_entries = keep
+        self._shelved_adds_host.setVisible(bool(keep))
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(300, trim_process_memory)
 
-    def _show_scan_folder(self):
-        """🔍 — scan a folder for installed games, confirm, add."""
-        from ui.dialogs.exe_scan_dialog import ExeScanDialog
-        dlg = ExeScanDialog(self)
-        dlg.search_requested.connect(self._start_batch_game_search)
-        dlg.exec()
-
-    def _start_batch_game_search(self, game_ids):
+    def _start_batch_game_search(
+        self,
+        game_ids,
+        *,
+        prior_done: int = 0,
+        prior_matched: int = 0,
+        prior_completed_ids: list | None = None,
+    ):
         """Kick off the opt-in web-search pass over freshly added games.
 
-        The runner outlives this call and the panel: the user can put the
-        window away and pick it up again from the sidebar entry.
+        Opens the detail panel by default (same expectation as before). The
+        sidebar bar tracks progress in parallel; the panel only stays hidden
+        if the user already minimised it during this run.
         """
         if not game_ids:
             return
         runner = self._game_search_runner()
         if runner.running:
-            self._show_game_search_panel()
+            # Already going — reopen only if the user has not minimised.
+            self._ensure_game_search_panel(
+                show=not getattr(self, "_search_user_minimized", False))
             return
-        if runner.start(list(game_ids)):
-            self._search_nav_btn.setVisible(True)
-            self._search_nav_btn.set_status("running")
-            self._search_nav_btn.setToolTip(t("game_search.minimize_tooltip"))
-            self._show_game_search_panel()
+        if runner.start(
+            list(game_ids),
+            prior_done=prior_done,
+            prior_matched=prior_matched,
+            prior_total=len(game_ids) + max(0, int(prior_done)),
+            prior_completed_ids=prior_completed_ids,
+        ):
+            self._search_user_minimized = False
+            self._search_batch_notice.begin(
+                t("batch.search_label"), runner.total)
+            if prior_done:
+                self._search_batch_notice.update_progress(
+                    prior_done, runner.total, "")
+            self._search_batch_notice.setToolTip(
+                t("game_search.sidebar_tooltip_running"))
+            self._ensure_game_search_panel(show=True)
 
     def _game_search_runner(self):
         runner = getattr(self, "_search_runner", None)
         if runner is None:
             from ui.game_search_runner import GameSearchRunner
             runner = GameSearchRunner(self)
+            runner.progress.connect(self._on_search_batch_progress)
             runner.finished.connect(self._on_batch_search_finished)
             self._search_runner = runner
         return runner
 
-    def _show_game_search_panel(self):
-        """Open (or re-show) the batch-search panel."""
+    def _on_search_batch_progress(self, done: int, total: int, name: str):
+        self._search_batch_notice.update_progress(done, total, name or "")
+
+    def _on_search_panel_minimized(self):
+        self._search_user_minimized = True
+
+    def _ensure_game_search_panel(self, *, show: bool):
         runner = self._game_search_runner()
         if not runner.has_run:
             return
         panel = getattr(self, "_search_panel", None)
         if panel is not None:
             try:
-                panel.show()
-                panel.raise_()
-                panel.activateWindow()
+                if show:
+                    self._search_user_minimized = False
+                    panel.show()
+                    panel.raise_()
+                    panel.activateWindow()
                 return
             except RuntimeError:
                 self._search_panel = None
         from ui.dialogs.game_search_panel import GameSearchPanel
         panel = GameSearchPanel(runner, self)
         panel.dismissed.connect(self._on_batch_search_dismissed)
+        panel.minimized.connect(self._on_search_panel_minimized)
         self._search_panel = panel
-        panel.show()
+        if show:
+            self._search_user_minimized = False
+            panel.show()
+        else:
+            panel.hide()
 
-    def _on_batch_search_finished(self, _matched: int, _total: int, _cancelled: bool):
+    def _show_game_search_panel(self):
+        """Open (or re-show) the batch-search panel from the sidebar notice."""
+        self._search_batch_notice.stop_auto_hide()
+        self._search_user_minimized = False
+        self._ensure_game_search_panel(show=True)
+
+    def _on_batch_search_finished(self, matched: int, total: int, cancelled: bool):
         # Refresh the library so newly fetched covers and metadata show up.
         try:
             self._library_page._load_library()
         except Exception:
             logger.debug("Library refresh after batch search failed", exc_info=True)
-        if self._search_nav_btn.isVisible():
-            self._search_nav_btn.set_status("failed" if _cancelled else "done")
-            self._search_nav_btn.setToolTip(
-                t("game_search.nav_tooltip_failed" if _cancelled
-                  else "game_search.nav_tooltip_done"))
+        msg = t(
+            "batch.search_done_cancelled" if cancelled else "batch.search_done",
+            matched=matched, total=total,
+        )
+        # Stay a bit so the user can open the log; auto-hide if ignored.
+        self._search_batch_notice.finish(msg, hide_after_ms=12000)
+        self._search_batch_notice.setToolTip(
+            t("game_search.nav_tooltip_failed" if cancelled
+              else "game_search.nav_tooltip_done"))
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(400, trim_process_memory)
 
     def _on_batch_search_dismissed(self):
         """The user closed a finished run: retire it, so the sidebar entry
         doesn't linger pointing at a search nobody is waiting on any more."""
         self._search_panel = None
-        self._search_nav_btn.setVisible(False)
-        self._search_nav_btn.set_status("")
+        self._search_batch_notice.stop_auto_hide()
+        self._search_batch_notice.hide()
         runner = getattr(self, "_search_runner", None)
         if runner is not None and not runner.running:
             self._search_runner = None
 
     def _show_add_game(self, name: str = "", exe_path: str = ""):
         # Never steal focus back to a different shelved card — open a new one.
+        # Construct shell on the next tick; sections fill async inside the dialog.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self._open_add_game_dialog(name, exe_path))
+
+    def _open_add_game_dialog(self, name: str = "", exe_path: str = ""):
         dlg = AddGameDialog(name=name, exe_path=exe_path, parent=self)
+
         def _on_added(entry):
-            # Clean up all tracking for this exe when game is added
             self._session_shown_exes.discard(entry.exe_path)
             self._overlay_shown_exes.discard(entry.exe_path)
             self._exit_dialog_shown_exes.discard(entry.exe_path)
-            # Also remove from pending unknown
             self._pending_unknown.pop(entry.exe_path, None)
+
         dlg.game_added.connect(_on_added)
         self._wire_add_game_shelve(dlg)
-        # show() — not exec()/open(): exec nests a loop; open() forces
-        # WindowModal with bookkeeping that fights shelving. WindowModal is
-        # already set on the dialog; show() keeps the parent usable after ✕.
-        dlg.show()
+        # show_and_build — shell immediately, form sections + populate in chunks
+        # (not exec()/open(): exec nests a loop; open() fights shelving).
+        dlg.show_and_build()
 
     def _wire_add_game_shelve(self, dlg: AddGameDialog):
         """Keep a shelved Add/Edit dialog alive and reachable from the sidebar."""
@@ -3460,8 +4505,90 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _on_add_game_dialog_finished(self, dlg):
         self._remove_shelved_add_entry(dlg)
+        # Accept/reject tear the dialog down for real; without this the
+        # Add/Edit dialog (and every pixmap it decoded) stays alive as a
+        # hidden child of the main window — one stack of RAM per card opened.
+        dlg.deleteLater()
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(250, trim_process_memory)
 
-    def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False):
+    def _start_backup_all(self, game_ids=None, force_full: bool = False,
+                          source: str = "overview"):
+        """Enqueue Backup Tutti with sidebar progress and disk resume state."""
+        from datetime import datetime, timezone
+        from core.concurrency import backup_max_inflight, log_limits
+        from core import pending_batch_jobs as _pbj
+
+        if game_ids is None:
+            game_ids = [g.id for g in get_library().all_games() if g.save_paths]
+        ids = [gid for gid in game_ids if gid]
+        if not ids:
+            return
+        log_limits()
+        self._backup_max_inflight = backup_max_inflight()
+        completed: list[str] = []
+        self._backup_batch = {
+            "pending_ids": list(ids),
+            "completed_ids": completed,
+            "force": bool(force_full),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "source": source or "overview",
+            "total": len(ids),
+            # Genuinely NEW backups (dedup-skipped games must not inflate the
+            # completion message: 21 checked ≠ 21 created).
+            "created_ids": [],
+        }
+        # Suppress per-game library/overview rebuilds until the batch ends.
+        get_library().begin_bulk()
+        _pbj.set_job(_pbj.KEY_BACKUP_ALL, {
+            "pending_ids": list(ids),
+            "completed_ids": [],
+            "force": bool(force_full),
+            "started_at": self._backup_batch["started_at"],
+            "source": source or "overview",
+        })
+        first = get_library().get_by_id(ids[0])
+        self._backup_batch_notice.begin(
+            t("batch.backup_label"), len(ids),
+            first.name if first else "")
+        for gid in ids:
+            self._enqueue_backup(gid, force_full=force_full, silent=True,
+                                part_of_batch=True)
+        self._pump_backup_queue()
+
+    def _enqueue_backup(self, game_id: str, force_full: bool = False,
+                        silent: bool = False, part_of_batch: bool = False):
+        if not game_id:
+            return
+        with self._backup_lock:
+            if game_id in self._backup_inflight or game_id in self._backup_queued:
+                return
+            self._backup_queued.add(game_id)
+            self._backup_job_queue.append({
+                "game_id": game_id,
+                "force": bool(force_full),
+                "silent": bool(silent),
+                "batch": bool(part_of_batch),
+            })
+
+    def _pump_backup_queue(self):
+        from core.concurrency import backup_max_inflight
+        cap = self._backup_max_inflight or backup_max_inflight()
+        while True:
+            with self._backup_lock:
+                if len(self._backup_inflight) >= cap:
+                    return
+                if not self._backup_job_queue:
+                    return
+                job = self._backup_job_queue.popleft()
+                gid = job["game_id"]
+                self._backup_queued.discard(gid)
+                if gid in self._backup_inflight:
+                    continue
+                self._backup_inflight.add(gid)
+            self._run_backup_job(job)
+
+    def _run_backup_job(self, job: dict):
         """Create a backup for a game in a background thread to avoid UI freeze.
 
         Always uses entry.save_paths — the user's own confirmed paths — and
@@ -3474,32 +4601,39 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         live-tracking-driven callers (the in-game timer, a save-changed
         event) — and only for as long as this game has NO confirmed path
         at all; normal and provisional backups are never mixed.
-
-        Args:
-            force_full: Force backup even if content hash unchanged (used for exit backups).
-            silent:     Suppress toast notifications and overlay (used for automatic
-                        periodic backups that would spam the user).
         """
+        game_id = job["game_id"]
+        force_full = job.get("force", False)
+        silent = job.get("silent", False)
         entry = get_library().get_by_id(game_id)
         if not entry:
+            self._finish_backup_job(game_id, batch=job.get("batch", False))
             return
+        if self._backup_batch and job.get("batch"):
+            done = len(self._backup_batch.get("completed_ids") or [])
+            total = int(self._backup_batch.get("total") or 0)
+            self._backup_batch_notice.update_progress(done, total, entry.name)
         config = get_config()
         max_mb = config.get("max_backup_size_mb", 512)
+        name = entry.name
+        save_paths = list(entry.save_paths or [])
+        exe_path = entry.exe_path
+        computed = entry.computed_folder_name
+        excluded = entry.excluded_save_paths
 
-        import threading
         def _do_backup():
             backup, created = get_backup_manager().create_backup(
-                game_id, entry.name, entry.save_paths,
-                exe_path=entry.exe_path,
+                game_id, name, save_paths,
+                exe_path=exe_path,
                 max_size_mb=max_mb,
                 force=force_full,
-                computed_folder_name=entry.computed_folder_name,
-                excluded_paths=entry.excluded_save_paths,
+                computed_folder_name=computed,
+                excluded_paths=excluded,
                 return_status=True,
             )
-            # Thread-safe append with lock (created = genuinely new vs dedup-skip)
             with self._backup_lock:
-                self._backup_results.append((game_id, backup, silent, created))
+                self._backup_results.append(
+                    (game_id, backup, silent, created, job.get("batch", False)))
             from PySide6.QtCore import QMetaObject, Qt
             try:
                 QMetaObject.invokeMethod(
@@ -3510,6 +4644,99 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 logger.debug("Backup: MainWindow destroyed before result delivery")
 
         threading.Thread(target=_do_backup, daemon=True).start()
+
+    def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False):
+        """Enqueue a single-game backup under the adaptive concurrency cap."""
+        from core.concurrency import backup_max_inflight
+        self._backup_max_inflight = backup_max_inflight()
+        self._enqueue_backup(game_id, force_full=force_full, silent=silent,
+                             part_of_batch=False)
+        self._pump_backup_queue()
+
+    def _finish_backup_job(self, game_id: str, batch: bool = False,
+                           created: bool = False):
+        from core import pending_batch_jobs as _pbj
+        with self._backup_lock:
+            self._backup_inflight.discard(game_id)
+        if batch and self._backup_batch:
+            pending = [g for g in (self._backup_batch.get("pending_ids") or [])
+                       if g != game_id]
+            completed = list(self._backup_batch.get("completed_ids") or [])
+            if game_id and game_id not in completed:
+                completed.append(game_id)
+            self._backup_batch["pending_ids"] = pending
+            self._backup_batch["completed_ids"] = completed
+            # Count only genuinely NEW backups. The completion message must
+            # say how many backups were actually created — not how many
+            # games were checked (dedup skips inflate that number).
+            if created and game_id and game_id not in self._backup_batch["created_ids"]:
+                self._backup_batch["created_ids"].append(game_id)
+            total = int(self._backup_batch.get("total") or 0)
+            done = len(completed)
+            entry = get_library().get_by_id(pending[0]) if pending else None
+            name = entry.name if entry else ""
+            self._backup_batch_notice.update_progress(done, total, name)
+            persist = (not pending) or (done % 8 == 0)
+            _pbj.mark_game_done(_pbj.KEY_BACKUP_ALL, game_id, persist=persist)
+            if not pending:
+                try:
+                    _pbj.flush()
+                except Exception:
+                    pass
+                created_ids = list(self._backup_batch.get("created_ids") or [])
+                self._backup_batch = None
+                try:
+                    get_library().end_bulk()
+                except Exception:
+                    logger.debug("end_bulk after Backup Tutti failed", exc_info=True)
+                done_msg = self._backup_batch_done_message(created_ids)
+                self._backup_batch_notice.finish(done_msg)
+                # One aggregated toast at the end (the queue is already built;
+                # a plain append, no per-game rebuilds). Respect the same
+                # setting that gates single-backup toasts. A single created
+                # backup reports the game's name, not just the number.
+                try:
+                    if (get_config().get("show_overlay_on_backup", True)
+                            and self._overlay):
+                        _bname = ""
+                        if len(created_ids) == 1:
+                            _bentry = get_library().get_by_id(created_ids[0])
+                            _bname = _bentry.name if _bentry else ""
+                        self._overlay.show_batch_done(
+                            "backup", len(created_ids), _bname)
+                except Exception:
+                    logger.debug("batch toast after Backup Tutti failed", exc_info=True)
+                self._update_sidebar_status()
+                try:
+                    self._overview_page.refresh()
+                except Exception:
+                    pass
+                try:
+                    self._backups_page._load_games()
+                    self._backups_page._refresh_list()
+                except Exception:
+                    pass
+                from ui.helpers import trim_process_memory
+                QTimer.singleShot(400, trim_process_memory)
+        self._pump_backup_queue()
+
+    def _backup_batch_done_message(self, created_ids: list) -> str:
+        """Completion notice for Backup Tutti.
+
+        The progress bar counts every game CHECKED (21/21), but the completion
+        message must only count the backups that were actually CREATED — the
+        rest were dedup-skipped (content unchanged). One game → show its name;
+        more than one → just the number; zero → nothing new to say.
+        """
+        n = len(created_ids)
+        if n == 0:
+            return t("batch.backup_done_none")
+        if n == 1:
+            entry = get_library().get_by_id(created_ids[0])
+            name = entry.name if entry else ""
+            return (t("batch.backup_done_one", name=name) if name
+                    else t("batch.backup_done", done=1))
+        return t("batch.backup_done", done=n)
 
     def _backup_provisional_paths(self, game_id: str, silent: bool = True):
         """Back up whatever live tracking has found so far for a game that
@@ -3620,89 +4847,105 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     @Slot()
     def _on_backup_done(self):
         """Handle backup completion on the GUI thread."""
+        batch = False
         with self._backup_lock:
             if not self._backup_results:
                 return
             try:
-                game_id, backup, silent, created = self._backup_results.popleft()
+                item = self._backup_results.popleft()
+                if len(item) == 5:
+                    game_id, backup, silent, created, batch = item
+                else:
+                    game_id, backup, silent, created = item
             except IndexError:
                 return
-        if backup:
-            entry = get_library().get_by_id(game_id)
-            if not entry:
-                return
+        try:
+            if backup:
+                entry = get_library().get_by_id(game_id)
+                if not entry:
+                    return
 
-            # `created` (from create_backup's return_status) says precisely
-            # whether this was a genuinely new backup or a dedup-skip that
-            # returned the existing latest entry — no timestamp guessing, so a
-            # backup made seconds after the previous one is no longer
-            # misclassified as new (the spurious "unchanged but synced" bug).
-            from datetime import datetime
+                # `created` (from create_backup's return_status) says precisely
+                # whether this was a genuinely new backup or a dedup-skip that
+                # returned the existing latest entry — no timestamp guessing, so a
+                # backup made seconds after the previous one is no longer
+                # misclassified as new (the spurious "unchanged but synced" bug).
+                from datetime import datetime
 
-            # Always mark pending watcher files as backed up — whether the
-            # backup is genuinely new or a dedup skip (content unchanged).
-            # Without this, dedup-skipped files stay pending forever and
-            # re-trigger the backup flow on every filesystem event.
-            try:
-                from core.watcher import mark_game_files_backed_up
-                mark_game_files_backed_up(game_id)
-            except Exception:
-                pass
+                # Always mark pending watcher files as backed up — whether the
+                # backup is genuinely new or a dedup skip (content unchanged).
+                # Without this, dedup-skipped files stay pending forever and
+                # re-trigger the backup flow on every filesystem event.
+                try:
+                    from core.watcher import mark_game_files_backed_up
+                    mark_game_files_backed_up(game_id)
+                except Exception:
+                    pass
 
-            if created:
-                # Use atomic field update to avoid clobbering concurrent
-                # playtime changes from the monitor's exit handler.
-                from datetime import timezone as _tz
-                lib = get_library()
-                lib.update_game_fields(
-                    game_id,
-                    last_backed_up=datetime.now(_tz.utc).isoformat(),
-                    machine_id=get_machine_id(),
-                )
+                if created:
+                    # Use atomic field update to avoid clobbering concurrent
+                    # playtime changes from the monitor's exit handler.
+                    from datetime import timezone as _tz
+                    lib = get_library()
+                    lib.update_game_fields(
+                        game_id,
+                        last_backed_up=datetime.now(_tz.utc).isoformat(),
+                        machine_id=get_machine_id(),
+                    )
 
-                config = get_config()
-                if config.get("auto_sync_after_backup", False) and entry.save_paths:
-                    orch = get_orchestrator()
-                    if orch.is_online():
-                        logger.info(f"Auto-syncing after backup for {entry.name}")
-                        orch.sync_game(entry.id, entry.name, entry.save_paths, exe_path=entry.exe_path, computed_folder_name=entry.computed_folder_name, name_history=list(entry.name_history))
+                    config = get_config()
+                    # Never auto-sync mid Backup Tutti — would stampede Sync Tutti
+                    # and freeze the UI the same way toast spam did.
+                    if (not batch
+                            and config.get("auto_sync_after_backup", False)
+                            and entry.save_paths):
+                        orch = get_orchestrator()
+                        if orch.is_online():
+                            logger.info(f"Auto-syncing after backup for {entry.name}")
+                            orch.sync_game(
+                                entry.id, entry.name, entry.save_paths,
+                                exe_path=entry.exe_path,
+                                computed_folder_name=entry.computed_folder_name,
+                                name_history=list(entry.name_history))
 
-                if silent:
-                    logger.info(f"Auto-backup created silently for {entry.name}")
-                elif config.get("show_overlay_on_backup", True):
-                    self._status_bar.showMessage(t("notifications.backup_created", game=entry.name), 5000)
-                    if self._overlay:
-                        self._overlay.show_backup_done(entry.name)
+                    if silent or batch:
+                        logger.info(f"Auto-backup created silently for {entry.name}")
+                    elif config.get("show_overlay_on_backup", True):
+                        self._status_bar.showMessage(
+                            t("notifications.backup_created", game=entry.name), 5000)
+                        if self._overlay:
+                            self._overlay.show_backup_done(entry.name)
+                    else:
+                        logger.info(
+                            f"Backup created for {entry.name} (notifications disabled)")
                 else:
-                    logger.info(f"Backup created for {entry.name} (notifications disabled)")
-            else:
-                # Dedup skip — content unchanged since the previous backup.
-                # If the game is still flagged "pending" (e.g. from an old
-                # failed sync, a restore, or keep-local waiting to upload),
-                # reconcile it now instead of leaving it stuck: the sync
-                # itself will report "unchanged" / upload and flip status.
-                # pending_local_wins alone is enough: keep-local sets pending
-                # but an empty prior sync must not leave the upload stranded.
-                config = get_config()
-                _needs_reconcile = (
-                    entry.sync_status == "pending"
-                    or getattr(entry, "pending_local_wins", False)
-                )
-                if (_needs_reconcile
-                        and config.get("auto_sync_after_backup", False)
-                        and entry.save_paths):
-                    orch = get_orchestrator()
-                    if orch.is_online():
-                        logger.info(f"Reconciling pending sync status for {entry.name} (backup unchanged)")
-                        orch.sync_game(entry.id, entry.name, entry.save_paths,
-                                       exe_path=entry.exe_path,
-                                       computed_folder_name=entry.computed_folder_name,
-                                       name_history=list(entry.name_history))
-                if not silent:
-                    msg = t("notifications.backup_unchanged", game=entry.name)
-                    self._status_bar.showMessage(msg, 4000)
-                    if self._overlay:
-                        self._overlay.show_backup_done(entry.name, skipped=True)
+                    # Dedup skip — content unchanged since the previous backup.
+                    config = get_config()
+                    _needs_reconcile = (
+                        entry.sync_status == "pending"
+                        or getattr(entry, "pending_local_wins", False)
+                    )
+                    if (not batch
+                            and _needs_reconcile
+                            and config.get("auto_sync_after_backup", False)
+                            and entry.save_paths):
+                        orch = get_orchestrator()
+                        if orch.is_online():
+                            logger.info(
+                                f"Reconciling pending sync status for {entry.name} "
+                                f"(backup unchanged)")
+                            orch.sync_game(
+                                entry.id, entry.name, entry.save_paths,
+                                exe_path=entry.exe_path,
+                                computed_folder_name=entry.computed_folder_name,
+                                name_history=list(entry.name_history))
+                    if not silent and not batch:
+                        msg = t("notifications.backup_unchanged", game=entry.name)
+                        self._status_bar.showMessage(msg, 4000)
+                        if self._overlay:
+                            self._overlay.show_backup_done(entry.name, skipped=True)
+        finally:
+            self._finish_backup_job(game_id, batch=batch, created=bool(created))
 
     def _restore_game_latest(self, game_id: str):
         """Open backup picker — RestoreDialog handles its own confirmation."""
@@ -3715,9 +4958,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         dlg.exec()
 
     def _restore_game_by_id(self, game_id: str, backup_id: str, confirmed: bool = False):
-        """Restore backup_id for game_id.  If confirmed=False, ask the user first."""
-        if not confirmed:
-            bk = get_backup_manager().get_backup(backup_id)
+        """Restore backup_id for game_id.  If confirmed=False, ask the user first.
+        For orphan backups (no game in library), prompts user with custom file picker."""
+        lib_entry = get_library().get_by_id(game_id)
+        bk = get_backup_manager().get_backup(backup_id)
+        target_dir = ""
+        is_orphan = lib_entry is None or not bk or not bk.save_paths
+
+        if is_orphan:
+            # Orphan backup (archivio senza gioco in libreria): apri il browse file custom per selezionare dove salvarlo
+            from ui.widgets.file_pickers import pick_folder
+            target_dir = pick_folder(self, t("backup.select_restore_destination"))
+            if not target_dir:
+                return
+
+        if not confirmed and not is_orphan:
             if bk:
                 from core import to_local_dt
                 _dt = to_local_dt(bk.created_at)
@@ -3741,12 +4996,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         import threading
 
         def _do_restore():
-            result = get_backup_manager().restore_backup(backup_id)
+            result = get_backup_manager().restore_backup(backup_id, target_dir=target_dir)
             # Remember what WE put there: landing on that exact state is
             # the intended outcome, and must not read as a regression.
             self._last_restored[game_id] = backup_id
             with self._restore_lock:
-                self._restore_results.append(("step1", game_id, backup_id, result))
+                self._restore_results.append(("step1", game_id, backup_id, result, target_dir))
             from PySide6.QtCore import QMetaObject, Qt
             try:
                 QMetaObject.invokeMethod(
@@ -3765,17 +5020,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # Find the step1 result
             pending = None
             for i, item in enumerate(self._restore_results):
-                if isinstance(item, tuple) and len(item) == 4 and item[0] == "step1":
+                if isinstance(item, tuple) and len(item) == 5 and item[0] == "step1":
                     pending = item
                     del self._restore_results[i]
                     break
         if pending is None:
             return
-        _, game_id, backup_id, result = pending
+        _, game_id, backup_id, result, target_dir = pending
         self._status_bar.clearMessage()
 
         if result.success:
-            if result.used_fallback_dir:
+            if target_dir:
+                self._status_bar.showMessage(
+                    t("backup.restore_orphan_success", path=target_dir), 4000)
+            elif result.used_fallback_dir:
                 # Files were written, but NOT to the game's real save
                 # location — every save_path was still a foreign-user path
                 # after resolution (see restore_backup's hard safety gate).
@@ -4039,9 +5297,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         entry = get_library().get_by_id(game_id)
         if entry:
-            dlg = AddGameDialog(entry=entry, parent=self)
-            self._wire_add_game_shelve(dlg)
-            dlg.show()
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda e=entry: self._open_edit_game_dialog(e))
+
+    def _open_edit_game_dialog(self, entry):
+        dlg = AddGameDialog(entry=entry, parent=self)
+        self._wire_add_game_shelve(dlg)
+        dlg.show_and_build()
 
     def _sync_game(self, game_id: str):
         entry = get_library().get_by_id(game_id)
@@ -4064,10 +5326,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # GUI thread long enough to look hung — same "please wait" sheet as
         # a theme swap.
         from ui.widgets.busy_overlay import busy_over
-        with busy_over(self):
-            self._on_language_changed_inner(locale)
+        # Relabel blocks the GUI thread with no mid-work ticks — show at once.
+        with busy_over(self, delay_ms=0) as overlay:
+            self._on_language_changed_inner(locale, overlay=overlay)
 
-    def _on_language_changed_inner(self, locale: str):
+    def _on_language_changed_inner(self, locale: str, overlay=None):
+        if overlay is not None:
+            overlay.set_base_text(t("common.please_wait"))
         self.setWindowTitle(t("app.name"))
         # Pins are top-level windows of their own: nothing else in the tree
         # walk below reaches them.
@@ -4084,15 +5349,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # repainted on the next provider/monitor event, so it would stay in
         # the previous language until then — refresh it here explicitly.
         self._update_sidebar_status()
+        if overlay is not None:
+            overlay.pump()
         # Nav buttons
         for i, (key, icon) in enumerate(self._nav_defs):
             self._nav_buttons[i].update_label(t(key))
         # Not in _nav_defs — it sits under Credits, not with the others.
         self._cheats_nav_btn.update_label(t('cheats.nav'))
-        self._search_nav_btn.update_label(t("game_search.nav"))
         self._sync_add_dlg_nav_tip()
-        if hasattr(self._cheats_page, 'update_locale'):
+        if self._cheats_page is not None and hasattr(self._cheats_page, 'update_locale'):
             self._cheats_page.update_locale()
+        if overlay is not None:
+            overlay.pump()
         # Tray menu — rebuild with translated strings
         if hasattr(self, '_tray') and self._tray:
             self._tray.setToolTip(t("app.name"))
@@ -4110,12 +5378,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         action.setText(label)
         # Status bar
         self._status_bar.showMessage(t("status.ready"), 1000)
-        # All pages
-        for page in (self._overview_page, self._library_page,
-                     self._sync_page, self._backups_page, self._settings_page,
-                     self._cheats_page):
+        # All pages (cheats may still be a lazy placeholder)
+        pages = [self._overview_page, self._library_page,
+                 self._sync_page, self._backups_page, self._settings_page]
+        if self._cheats_page is not None:
+            pages.append(self._cheats_page)
+        for page in pages:
             if hasattr(page, "update_locale"):
                 page.update_locale()
+            if overlay is not None:
+                overlay.pump()
         name = t(f"languages.{locale}")
         self._status_bar.showMessage(f"🌐 {name}", 3000)
 

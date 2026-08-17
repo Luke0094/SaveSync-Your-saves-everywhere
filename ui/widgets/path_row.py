@@ -14,13 +14,13 @@ from typing import Optional
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QToolButton,
+    QSizePolicy,
 )
 
 from i18n import t
 from core import fmt_size as _fmt_size
-from ui.helpers import open_in_file_manager
+from ui.helpers import lock_min_size, open_in_file_manager, scaled
 from ui.modal_helpers import information_window_modal
-from ui.styles.theme import palette
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +97,7 @@ class PathRow(QFrame):
         self._excluded_subdirs: set = set()  # child paths to exclude from size
         self.file_list = None  # FileListWidget (lazy)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setStyleSheet(f"""
-            QFrame {{ background:{palette('bg_card')}; border:1px solid {palette('border')}; border-radius:6px; }}
-            QFrame:hover {{ border-color:{palette('border_hover')}; }}
-        """)
+        self.setObjectName("path_row")
         self._build()
 
     def set_excluded_subdirs(self, excluded: set):
@@ -139,7 +136,7 @@ class PathRow(QFrame):
         self.checkbox = QCheckBox()
         self.checkbox.setChecked(True)  # Default to checked
         self.checkbox.setToolTip(t('add_game.include_path'))
-        self.checkbox.setStyleSheet("QCheckBox { spacing: 4px; }")
+        self.checkbox.setObjectName("path_row_cb")
 
         # Truncated path label (registry entries show 🗝 + key, no scheme)
         from core.registry_saves import is_registry_path as _is_reg
@@ -147,31 +144,38 @@ class PathRow(QFrame):
         _disp = (f"🗝 {_reg_disp(self._path)}" if _is_reg(self._path)
                  else self._path)
         path_lbl = QLabel(_disp)
-        path_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:11px;")
+        path_lbl.setObjectName("path_row_path")
         path_lbl.setToolTip(_disp if not _is_reg(self._path)
                             else t('auto_scan.registry_key_tooltip'))
-        path_lbl.setMinimumWidth(60)
+        path_lbl.setMinimumWidth(scaled(60, self))
         path_lbl.setWordWrap(False)
 
         # Size info — computed asynchronously to avoid blocking the GUI
         # thread with rglob on large save directories.
         info_lbl = QLabel("...")
-        info_lbl.setStyleSheet(f"color:{palette('text_faint')};font-size:10px;min-width:110px;")
+        info_lbl.setObjectName("path_row_info")
         self._info_lbl = info_lbl
         # Trigger initial size computation (no exclusions yet; updated by set_excluded_subdirs)
         self._refresh_size()
 
-        # Buttons
+        # Buttons — locked chrome so narrow dialogs scroll H instead of clipping
+        _btn = scaled(24, self, min_px=22)
         open_btn = QToolButton()
         open_btn.setText("\U0001f4c2")
         open_btn.setToolTip(t('add_game.open_folder'))
-        open_btn.setFixedSize(24, 24)
+        open_btn.setFixedSize(_btn, _btn)
+        lock_min_size(open_btn, _btn, _btn,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         open_btn.clicked.connect(self._open_folder)
 
         rm_btn = QToolButton()
         rm_btn.setText("\u2715")
         rm_btn.setToolTip(t('add_game.remove_path'))
-        rm_btn.setFixedSize(24, 24)
+        rm_btn.setFixedSize(_btn, _btn)
+        lock_min_size(rm_btn, _btn, _btn,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         rm_btn.clicked.connect(lambda: self.remove_requested.emit(self._path))
 
         row.addWidget(self.checkbox)
@@ -179,11 +183,14 @@ class PathRow(QFrame):
         row.addWidget(info_lbl)
         row.addWidget(open_btn)
         row.addWidget(rm_btn)
+        # Floor so checkbox + truncated path + size + open/✕ stay reachable.
+        self.setMinimumWidth(scaled(280, self, min_px=240))
         outer.addLayout(row)
 
         # File browser (collapsible) — shows individual files for exclusion
         from ui.widgets.file_list_widget import FileListWidget
-        self.file_list = FileListWidget(self._path)
+        self.file_list = FileListWidget(self._path, game_id=self._game_id)
+
         # Restore any previously saved file exclusions for this path
         if self._game_id:
             try:

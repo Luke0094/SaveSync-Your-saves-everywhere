@@ -198,10 +198,15 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
                 # (a hyphenated title keeps its hyphen; a folder like
                 # "Game v1.2 - Win" derives as just "Game").
                 try:
-                    from core.game_sources.common import _RELEASE_NOISE
+                    from core.game_sources.common import (
+                        _RELEASE_NOISE, _TRAILING_MARKERS,
+                    )
                     while True:
                         m = re.search(r'[\s._\-–—]+([A-Za-z0-9]+)\s*$', cleaned)
-                        if not m or m.group(1).lower() not in _RELEASE_NOISE:
+                        if not m:
+                            break
+                        token = m.group(1).lower()
+                        if token not in _RELEASE_NOISE and token not in _TRAILING_MARKERS:
                             break
                         cleaned = cleaned[:m.start()].rstrip(' ._-–—')
                 except Exception:
@@ -1917,8 +1922,22 @@ def detect_save_paths(
         engine_hits = sorted(_engine_paths(exe_path, game_name, appid, extra_terms=extra), key=lambda x: -x[0])
         logger.info(f"_engine_paths returned {len(engine_hits)} hits: {[(s, p) for s, p in engine_hits]}")
         for score, p in engine_hits:
-            if score >= 50:
+            # Only the engine's OWN paths (Ren'Py container 92, RPG Maker
+            # 90/82/92, Unity LocalLow 88/85, Godot 86, AliceSoft 90, Bakin
+            # 92, Tyrano 92 — the declared per-engine exceptions, including
+            # engines that save inside a "data" folder like Bakin) are
+            # trusted enough to skip the save-indicator string check. The
+            # generic ones (saves 72, save/SaveData 70, data 55, user 50,
+            # keyword 68, appid 75) stay candidates but must pass
+            # _is_valid_save_context, so a game's asset "data" folder is
+            # not offered as a save location unless it has game context.
+            # Direct save-file drops (drag & drop of a .sav into the cheat
+            # editor) never go through this filter at all — they open via
+            # open_save() regardless of the library.
+            if score >= 82:
                 _add(p, engine_detected=True)
+            else:
+                _add(p, engine_detected=False)
 
     # Strategy 3: Registry (Windows). The game linkage was already
     # established by the STRICT key-name match inside _registry_save_paths

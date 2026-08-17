@@ -19,7 +19,7 @@ from core.monitor import get_monitor
 from core.config_manager import get_config
 from i18n import t
 from ui.styles.theme import palette
-from ui.helpers import ElidedCheckBox, TopmostPinMixin, apply_game_friendly_flags
+from ui.helpers import ElidedCheckBox, TopmostPinMixin, apply_game_friendly_flags, finalize_adaptive_dialog_size, lock_min_size, scaled
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,7 @@ class ScanWorkerThread(QThread):
         # exactly the case the plain "already has paths, skip it" rule
         # (meant for broad library-wide sweeps) would otherwise discard.
         self.force = force
+        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._should_stop = True
@@ -268,7 +269,7 @@ class SavePathItem(QWidget):
 
         # Game name header
         header = QLabel(f"\U0001f3ae {self.game_name}")
-        header.setStyleSheet(f"font-weight: bold; color: {palette('accent')}; font-size: 12px;")
+        header.setObjectName("auto_scan_game_header")
         layout.addWidget(header)
 
         # Path checkboxes with delete buttons + file browser
@@ -292,10 +293,13 @@ class SavePathItem(QWidget):
         ignored_row = QHBoxLayout()
         ignored_row.setContentsMargins(20, 0, 2, 0)
         self._ignored_count_lbl = QLabel()
-        self._ignored_count_lbl.setStyleSheet(
-            f"color:{palette('text_hint')};font-size:10px;")
+        self._ignored_count_lbl.setObjectName("auto_scan_muted")
         manage_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
-        manage_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
+        lock_min_size(
+            manage_btn, scaled(88, self, min_px=72), scaled(24, self, min_px=22),
+            policy_h=QSizePolicy.Policy.Minimum,
+            policy_v=QSizePolicy.Policy.Fixed)
+        manage_btn.setObjectName("auto_scan_sm_btn")
         manage_btn.clicked.connect(self._open_ignored_dialog)
         ignored_row.addWidget(self._ignored_count_lbl, 1)
         ignored_row.addWidget(manage_btn)
@@ -365,7 +369,7 @@ class SavePathItem(QWidget):
         # off the label.
         from core.registry_saves import is_registry_path, registry_display
         checkbox = ElidedCheckBox()
-        checkbox.setStyleSheet("QCheckBox { font-size: 11px; }")
+        checkbox.setObjectName("list_cb_sm")
         if is_registry_path(path):
             checkbox.setTooltipSuffix(t('auto_scan.registry_key_tooltip'))
             checkbox.setFullText(f"\U0001f5dd {registry_display(path)}")
@@ -380,8 +384,8 @@ class SavePathItem(QWidget):
         # in front of you than from the path string alone. Bound to the path,
         # not to a row index, so deletions never need it rebound.
         open_btn = QPushButton("\U0001f4c2")
-        open_btn.setFixedSize(24, 24)
-        open_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 0px; }")
+        open_btn.setFixedSize(scaled(24, self), scaled(24, self))
+        open_btn.setObjectName("auto_scan_icon_btn")
         open_btn.setToolTip(t('add_game.open_folder'))
         open_btn.clicked.connect(partial(self._open_path, path))
         self.open_buttons.append(open_btn)
@@ -389,8 +393,8 @@ class SavePathItem(QWidget):
 
         # Delete button
         delete_btn = QPushButton("\U0001f5d1")
-        delete_btn.setFixedSize(24, 24)
-        delete_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 0px; }")
+        delete_btn.setFixedSize(scaled(24, self), scaled(24, self))
+        delete_btn.setObjectName("auto_scan_icon_btn")
         delete_btn.setToolTip(t('auto_scan.remove_path'))
         delete_btn.clicked.connect(partial(self._on_delete_clicked, len(self.delete_buttons)))
         self.delete_buttons.append(delete_btn)
@@ -573,8 +577,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         super().__init__(parent)
         self.setWindowTitle(t('auto_scan.window_title'))
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.resize(700, 500)
-        
+
         self.scan_thread = None
         self.path_items: List[SavePathItem] = []
         self.games_without_saves: List[GameEntry] = []
@@ -602,12 +605,12 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         
         # Header
         header = QLabel(t('auto_scan.header'))
-        header.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        header.setObjectName("dialog_title")
         layout.addWidget(header)
         
         description = QLabel(t('auto_scan.description'))
         description.setWordWrap(True)
-        description.setStyleSheet(f"color: {palette('text_muted')}; margin-bottom: 15px;")
+        description.setObjectName("dialog_desc")
         layout.addWidget(description)
         
         # Progress section
@@ -617,7 +620,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.progress_label = QLabel(t('auto_scan.preparing_scan'))
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
-        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setFixedHeight(scaled(4, self))
         self.progress_bar.setVisible(False)
         
         # Extended scan button — disabled while a scan is running
@@ -645,7 +648,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.results_layout = QVBoxLayout(self.results_widget)
         self.results_area.setWidget(self.results_widget)
         
-        layout.addWidget(self.results_area)
+        layout.addWidget(self.results_area, 1)
         
         # Action buttons
         button_layout = QHBoxLayout()
@@ -678,6 +681,10 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         
         layout.addLayout(button_layout)
         layout.addLayout(dont_show_layout)
+
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=560, min_h=420, scroll=self.results_area,
+            list_content=True)
 
     def start_scan(self, general_scan: bool = False):
         """Start the automatic scan process.  Opens immediately; scanning runs live."""
@@ -1524,6 +1531,8 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             if not self.scan_thread.wait(2000):
                 logger.warning("Scan thread did not stop within 2s — detaching (it will exit on its own)")
         self.reject()
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(250, trim_process_memory)
 
 
 def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = None,

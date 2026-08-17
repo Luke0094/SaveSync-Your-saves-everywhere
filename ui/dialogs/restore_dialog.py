@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.styles.theme import palette
 from ui.backup_labels import ORIGIN_LABELS, origin_badge
+from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.modal_helpers import question_window_modal, warning_window_modal
 from core import fmt_size as _fmt_size
 from core.backup import get_backup_manager, BackupEntry
@@ -45,8 +45,6 @@ class RestoreDialog(QDialog):
         entry = get_library().get_by_id(game_id)
         game_name = entry.name if entry else game_id
         self.setWindowTitle(t('restore.window_title', game=game_name))
-        self.setMinimumWidth(480)
-        self.setMinimumHeight(340)
         # WindowModal come AddGameDialog: l’overlay resta utilizzabile
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self._build(game_name)
@@ -58,11 +56,11 @@ class RestoreDialog(QDialog):
 
         from i18n import t
         title = QLabel(f"<b>{t('backup.restore_confirm_title')}</b>")
-        title.setStyleSheet(f"font-size:15px;color:{palette('text_secondary')};")
+        title.setObjectName("dialog_title")
         root.addWidget(title)
 
         sub = QLabel(game_name)
-        sub.setStyleSheet(f"color:{palette('text_hint')};font-size:12px;")
+        sub.setObjectName("dialog_desc")
         root.addWidget(sub)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -72,7 +70,7 @@ class RestoreDialog(QDialog):
         from PySide6.QtWidgets import QComboBox
         filter_row = QHBoxLayout()
         self._origin_combo = QComboBox()
-        self._origin_combo.setFixedWidth(160)
+        self._origin_combo.setFixedWidth(scaled(160, self))
         self._origin_combo.addItem(t("backups.filter_all"), "all")
         self._origin_combo.addItem(t("backups.source_local"), "local")
         try:
@@ -109,10 +107,13 @@ class RestoreDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton(t("common.cancel"))
-        cancel_btn.setFixedHeight(32)
+        cancel_btn.setFixedHeight(scaled(32, self))
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
         root.addLayout(btn_row)
+
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=480, min_h=340, scroll=scroll, list_content=True)
 
     def _load_backups(self):
         """Load local and cloud backups for the game."""
@@ -174,7 +175,7 @@ class RestoreDialog(QDialog):
 
         if not filtered:
             empty = QLabel(t("backup.no_backups"))
-            empty.setStyleSheet(f"color:{palette('text_muted')};font-size:13px;padding:16px;")
+            empty.setObjectName("backup_empty")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._list_layout.addWidget(empty)
         else:
@@ -184,12 +185,8 @@ class RestoreDialog(QDialog):
 
     def _make_row(self, bk: BackupEntry, cloud_only: bool = False) -> QWidget:
         row_w = QFrame()
-        row_w.setObjectName("restore_row")
+        row_w.setObjectName("backup_row")
         row_w.setFrameShape(QFrame.Shape.NoFrame)
-        row_w.setStyleSheet(f"""
-            QFrame#restore_row {{ background:{palette('bg_card')}; border:1px solid {palette('border')}; border-radius:6px; }}
-            QFrame#restore_row:hover {{ border-color:{palette('border_hover')}; background:{palette('bg_hover')}; }}
-        """)
         row = QHBoxLayout(row_w)
         row.setContentsMargins(12, 8, 12, 8)
         row.setSpacing(10)
@@ -197,14 +194,14 @@ class RestoreDialog(QDialog):
         # Info column — use text_muted instead of text_hint/text_faint
         # so metadata is readable on dark backgrounds
         date_lbl = QLabel(_fmt_dt(bk.created_at))
-        date_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;font-weight:600;")
+        date_lbl.setObjectName("backup_row_date")
 
         origin_lbl = QLabel(origin_badge(bk))
-        origin_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        origin_lbl.setObjectName("backup_row_meta")
         size_lbl = QLabel(_fmt_size(bk.size_bytes))
-        size_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        size_lbl.setObjectName("backup_row_meta")
         mid_lbl = QLabel(f"🖥 {bk.machine_id[:8]}" if bk.machine_id else "")
-        mid_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:10px;")
+        mid_lbl.setObjectName("backup_row_meta_sm")
 
         info_col = QVBoxLayout()
         info_col.setSpacing(2)
@@ -215,7 +212,7 @@ class RestoreDialog(QDialog):
         sub_row.addWidget(mid_lbl)
         if bk.note:
             note_lbl = QLabel(bk.note)
-            note_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:10px;font-style:italic;")
+            note_lbl.setObjectName("backup_row_note")
             sub_row.addWidget(note_lbl)
         sub_row.addStretch()
         info_col.addLayout(sub_row)
@@ -223,13 +220,9 @@ class RestoreDialog(QDialog):
         row.addLayout(info_col, 1)
 
         restore_btn = QPushButton(t("buttons.restore"))
-        restore_btn.setFixedHeight(28)
-        restore_btn.setFixedWidth(80)
-        restore_btn.setStyleSheet(
-            f"QPushButton {{ background:{palette('accent')}; color:{palette('accent_text')};"
-            f"border:none; border-radius:4px; font-size:10px; font-weight:600; }}"
-            f"QPushButton:hover {{ background:{palette('accent_hover')}; }}"
-        )
+        restore_btn.setObjectName("primary_btn")
+        restore_btn.setFixedHeight(scaled(28, self))
+        restore_btn.setFixedWidth(scaled(80, self))
         if cloud_only:
             restore_btn.clicked.connect(lambda _, bid=bk.backup_id: self._download_and_restore(bid))
         else:

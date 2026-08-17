@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG_TRANSFER_VERSION = 2
 CLOUD_CONFIG_PATH = "SaveSync/savesync_config"
-MAX_CONFIG_HISTORY = 10
+# Local snapshots created on export / upload / pre-import / pre-restore.
+MAX_CONFIG_HISTORY = 5
 
 # Keys that are machine-specific and should NOT be exported
 _MACHINE_SPECIFIC_KEYS = frozenset({
@@ -468,11 +469,21 @@ def save_config_snapshot(label: str = "") -> Optional[Path]:
 
 
 def list_config_snapshots() -> list[dict]:
-    """Return list of saved snapshots, newest first."""
-    if not CONFIG_HISTORY_DIR.exists():
+    """Return list of saved snapshots, newest first (no deletions)."""
+    return _list_config_snapshots()
+
+
+def prune_config_history() -> None:
+    """Drop snapshots beyond ``MAX_CONFIG_HISTORY`` (e.g. after a limit change)."""
+    _enforce_history_limit()
+
+
+def _list_config_snapshots(history_dir: Path | None = None) -> list[dict]:
+    root = Path(history_dir) if history_dir is not None else CONFIG_HISTORY_DIR
+    if not root.exists():
         return []
     snapshots = []
-    for d in CONFIG_HISTORY_DIR.iterdir():
+    for d in root.iterdir():
         if not d.is_dir():
             continue
         meta_file = d / "metadata.json"
@@ -492,19 +503,50 @@ def list_config_snapshots() -> list[dict]:
     return snapshots
 
 
+def _read_snapshot_payload(snapshot_path: Path) -> tuple[Optional[bytes], Optional[bytes]]:
+    """Load config/library bytes from a snapshot folder into memory.
+
+    Must run *before* any history mutation (``pre_restore`` / prune): with a
+    full 5-slot history, creating a new snapshot can delete the oldest folder
+    on disk — including the one being restored.
+    """
+    snapshot_path = Path(snapshot_path)
+    src_config = snapshot_path / "config.json"
+    src_library = snapshot_path / "library.json"
+    config_bytes = src_config.read_bytes() if src_config.exists() else None
+    library_bytes = src_library.read_bytes() if src_library.exists() else None
+    return config_bytes, library_bytes
+
+
 def restore_config_snapshot(snapshot_path: Path) -> bool:
-    """Restore config + library from a snapshot. Saves current state first."""
+    """Restore config + library from a snapshot. Saves current state first.
+
+    Bytes are read into memory *before* ``pre_restore`` is written: with a
+    history cap of five, creating that safety snapshot can delete the oldest
+    folder — which may be the one the user just asked to restore.
+    """
     try:
-        # Safety net: snapshot current config before restoring
+        config_bytes, library_bytes = _read_snapshot_payload(snapshot_path)
+        if config_bytes is None and library_bytes is None:
+            logger.error(f"Config restore: empty snapshot {snapshot_path}")
+            return False
+
+        # Safety net: snapshot current config before overwriting live files.
         save_config_snapshot("pre_restore")
 
-        src_config = snapshot_path / "config.json"
-        src_library = snapshot_path / "library.json"
-
-        if src_config.exists():
-            shutil.copy2(src_config, CONFIG_FILE)
-        if src_library.exists():
-            shutil.copy2(src_library, LIBRARY_FILE)
+        # Same-dir tmp + replace: crash mid-write must not leave truncated
+        # config/library (important on Unix where there is no AV retry path).
+        from core import atomic_replace as _atomic_replace
+        if config_bytes is not None:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CONFIG_FILE.with_suffix(".tmp")
+            tmp.write_bytes(config_bytes)
+            _atomic_replace(tmp, CONFIG_FILE)
+        if library_bytes is not None:
+            LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = LIBRARY_FILE.with_suffix(".tmp")
+            tmp.write_bytes(library_bytes)
+            _atomic_replace(tmp, LIBRARY_FILE)
 
         # Reload singletons.  Acquire their internal locks to avoid racing
         # with concurrent get()/set() calls from other threads.
@@ -528,10 +570,130 @@ def restore_config_snapshot(snapshot_path: Path) -> bool:
         return False
 
 
-def delete_config_snapshot(snapshot_path: Path) -> bool:
-    """Delete a snapshot folder."""
+def self_check_config_history_restore() -> tuple[bool, str]:
+    """In-app regression guard (no ``tests/`` folder required).
+
+    Two parts:
+    1. Health check of the REAL ``config_history`` checkpoints (read-only):
+       every snapshot folder present on disk must be findable and readable —
+       metadata parses, at least config/library payload exists and is valid
+       JSON. Nothing is deleted or modified here.
+    2. Sandbox restore test: builds an isolated history with a full slot
+       count, reads the oldest snapshot the same way restore does, then
+       deletes that folder (as prune would) and checks the in-memory payload
+       is still the expected config. Never touches the user's real
+       ``config_history`` or live config files.
+    """
+    import tempfile
+
     try:
-        if snapshot_path.exists() and snapshot_path.parent == CONFIG_HISTORY_DIR:
+        # ── Part 1: health of the real checkpoints ────────────────────────
+        real_snaps = _list_config_snapshots()
+        for s in real_snaps:
+            p = s["path"]
+            meta_file = p / "metadata.json"
+            if not meta_file.exists():
+                return False, f"checkpoint {p.name}: metadata.json missing"
+            try:
+                meta_file.read_text(encoding="utf-8")
+            except Exception as e:
+                return False, f"checkpoint {p.name}: metadata unreadable: {e}"
+            config_file = p / "config.json"
+            library_file = p / "library.json"
+            if not config_file.exists() and not library_file.exists():
+                return False, (
+                    f"checkpoint {p.name}: neither config.json nor library.json"
+                )
+            for payload in (config_file, library_file):
+                if not payload.exists():
+                    continue
+                try:
+                    json.loads(payload.read_text(encoding="utf-8"))
+                except Exception as e:
+                    return False, f"checkpoint {p.name}: {payload.name} corrupt: {e}"
+
+        # ── Part 2: sandbox restore vs full-slot rotation ──────────────────
+        with tempfile.TemporaryDirectory(prefix="savesync_hist_check_") as td:
+            root = Path(td)
+            hist = root / "hist"
+            hist.mkdir()
+            oldest: Path | None = None
+            for i in range(MAX_CONFIG_HISTORY):
+                d = hist / f"2020-01-{i + 1:02d}T00-00-00"
+                d.mkdir()
+                (d / "config.json").write_text(
+                    json.dumps({"snap": i}), encoding="utf-8")
+                (d / "library.json").write_text("[]", encoding="utf-8")
+                (d / "metadata.json").write_text(
+                    json.dumps({"timestamp": f"2020-01-{i + 1:02d}T00:00:00"}),
+                    encoding="utf-8",
+                )
+                if i == 0:
+                    oldest = d
+            assert oldest is not None
+            config_bytes, library_bytes = _read_snapshot_payload(oldest)
+            if not config_bytes:
+                return False, "oldest snapshot config missing after read"
+            # Simulate prune removing the folder that was just read.
+            shutil.rmtree(oldest)
+            if oldest.exists():
+                return False, "sandbox oldest snapshot still on disk after prune"
+            data = json.loads(config_bytes.decode("utf-8"))
+            if data.get("snap") != 0:
+                return False, f"payload snap={data.get('snap')!r}, expected 0"
+            if library_bytes is None:
+                return False, "oldest snapshot library missing after read"
+            # Separate sandbox: enforce must drop extras beyond the cap.
+            # Pass the dir explicitly — never rebind CONFIG_HISTORY_DIR (that
+            # raced with live save_config_snapshot / auto-export).
+            hist2 = root / "hist2"
+            hist2.mkdir()
+            for i in range(MAX_CONFIG_HISTORY + 1):
+                d = hist2 / f"2020-03-{i + 1:02d}T00-00-00"
+                d.mkdir()
+                (d / "config.json").write_text(
+                    json.dumps({"snap": i}), encoding="utf-8")
+                (d / "library.json").write_text("[]", encoding="utf-8")
+                (d / "metadata.json").write_text(
+                    json.dumps({"timestamp": f"2020-03-{i + 1:02d}T00:00:00"}),
+                    encoding="utf-8",
+                )
+            _enforce_history_limit(history_dir=hist2)
+            left = [p for p in hist2.iterdir() if p.is_dir()]
+            if len(left) > MAX_CONFIG_HISTORY:
+                return False, (
+                    f"history prune left {len(left)} dirs "
+                    f"(max {MAX_CONFIG_HISTORY})"
+                )
+        return True, ""
+    except Exception as e:
+        logger.warning(f"Config history self-check failed: {e}")
+        return False, str(e)[:200]
+
+
+def _history_paths_match(a: Path, b: Path) -> bool:
+    """True if *a* and *b* name the same directory (symlink-safe on Unix)."""
+    try:
+        if a.exists() and b.exists():
+            return a.samefile(b)
+    except OSError:
+        pass
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
+def delete_config_snapshot(
+    snapshot_path: Path, *, history_dir: Path | None = None,
+) -> bool:
+    """Delete a snapshot folder under the active (or sandbox) history root."""
+    try:
+        snapshot_path = Path(snapshot_path)
+        root = Path(history_dir) if history_dir is not None else CONFIG_HISTORY_DIR
+        if snapshot_path.exists() and _history_paths_match(
+            snapshot_path.parent, root,
+        ):
             shutil.rmtree(snapshot_path)
             return True
     except Exception as e:
@@ -539,12 +701,51 @@ def delete_config_snapshot(snapshot_path: Path) -> bool:
     return False
 
 
-def _enforce_history_limit():
-    """Keep at most MAX_CONFIG_HISTORY snapshots."""
-    snaps = list_config_snapshots()
+def _enforce_history_limit(
+    *, protect: Path | None = None, history_dir: Path | None = None,
+):
+    """Keep at most MAX_CONFIG_HISTORY snapshots.
+
+    *protect* is never deleted (used if a caller still holds a path open).
+    *history_dir* scopes list/delete (sandbox self-check); default is the
+    real ``CONFIG_HISTORY_DIR``.
+    """
+    snaps = _list_config_snapshots(history_dir)
+    protect_res = None
+    if protect is not None:
+        try:
+            protect_res = Path(protect).resolve()
+        except OSError:
+            protect_res = Path(protect)
+
+    def _resolved(p: Path) -> Path:
+        try:
+            return Path(p).resolve()
+        except OSError:
+            return Path(p)
+
     while len(snaps) > MAX_CONFIG_HISTORY:
-        oldest = snaps.pop()
-        delete_config_snapshot(oldest["path"])
+        # Newest-first list: walk from the end for the oldest deletable entry.
+        removed = False
+        for idx in range(len(snaps) - 1, -1, -1):
+            candidate = snaps[idx]
+            if protect_res is not None and _resolved(candidate["path"]) == protect_res:
+                continue
+            if not delete_config_snapshot(
+                candidate["path"], history_dir=history_dir,
+            ):
+                # Do not pretend the slot was freed — stop rather than
+                # spinning on a path we cannot remove (perms / busy file).
+                logger.warning(
+                    "Config history prune could not delete %s",
+                    candidate["path"],
+                )
+                return
+            del snaps[idx]
+            removed = True
+            break
+        if not removed:
+            break
 
 
 # ── Cloud Config Sync ───────────────────────────────────────────────────────

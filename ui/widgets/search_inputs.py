@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.styles.theme import palette, ThemedMixin
+from ui.helpers import scaled
+from ui.styles.theme import palette
 
 
 class ClearableLineEdit(QLineEdit):
@@ -38,12 +39,12 @@ class ClearableLineEdit(QLineEdit):
         self._clear_btn.setText("×")
         self._clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._clear_btn.setToolTip(t("common.clear"))
-        self._clear_btn.setFixedSize(15, 15)
+        self._clear_btn.setFixedSize(scaled(15, self), scaled(15, self))
         self._clear_btn.setStyleSheet(
-            "QToolButton{background:transparent;color:#d16565;"
-            "border:1px solid #d16565;border-radius:7px;"
-            "font-size:10px;font-weight:bold;padding:0px;}"
-            "QToolButton:hover{background:#d16565;color:#ffffff;}"
+            f"QToolButton{{background:transparent;color:#d16565;"
+            f"border:1px solid #d16565;border-radius:7px;"
+            f"font-size:{scaled(10, self)}px;font-weight:bold;padding:0px;}}"
+            f"QToolButton:hover{{background:#d16565;color:#ffffff;}}"
         )
         self._clear_btn.setVisible(False)
         self._clear_btn.clicked.connect(self.clear)
@@ -195,7 +196,7 @@ class _SearchCombo(QComboBox):
         event.accept()
 
 
-class _SuggestPopup(QFrame, ThemedMixin):
+class _SuggestPopup(QFrame):
     """Lightweight suggestions dropdown shown while typing in the search
     field. It is a plain child widget (not a top-level window), takes no
     focus, and is fully driven by the page: the line edit keeps keyboard
@@ -208,22 +209,11 @@ class _SuggestPopup(QFrame, ThemedMixin):
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setObjectName("backup_suggest_popup")
-        self._sty(self, lambda: (
-            f"QFrame#backup_suggest_popup{{background:{palette('bg_card')};"
-            f"border:1px solid {palette('border_hover')};border-radius:6px;}}"
-        ))
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         self._list = QListWidget()
         self._list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._sty(self._list, lambda: (
-            f"QListWidget{{background:transparent;border:none;font-size:12px;"
-            f"color:{palette('text_secondary')};}}"
-            f"QListWidget::item{{padding:5px 8px;border-radius:4px;}}"
-            f"QListWidget::item:selected{{background:{palette('accent')};"
-            f"color:{palette('accent_text')};}}"
-        ))
         self._list.itemClicked.connect(
             lambda item: self.item_activated.emit(self._list.row(item)))
         lay.addWidget(self._list)
@@ -259,6 +249,22 @@ class _SuggestPopup(QFrame, ThemedMixin):
         row_h = self._list.sizeHintForRow(0) if labels else 0
         visible = min(len(labels), self.MAX_VISIBLE_ROWS)
         self.setFixedHeight(max(1, visible * max(row_h, 20) + 10))
+
+    def refresh_styles(self):
+        """Re-apply the theme in place after a light/dark or DPI change.
+
+        The popup's colours come from the QSS #backup_suggest_popup
+        selectors (ui.styles.dark/light), so a polish + repaint picks up
+        the new palette; the fixed height is recomputed because row sizes
+        change with the scale."""
+        for w in (self, self._list):
+            w.style().unpolish(w)
+            w.style().polish(w)
+        if self._list.count():
+            row_h = self._list.sizeHintForRow(0)
+            visible = min(self._list.count(), self.MAX_VISIBLE_ROWS)
+            self.setFixedHeight(max(1, visible * max(row_h, 20) + 10))
+        self.update()
 
     def clear_selection(self):
         """Back to the NULL selection (no highlighted row)."""

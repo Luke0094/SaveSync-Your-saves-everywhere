@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from i18n import t
 from core.config_manager import get_config
 from core.library import get_library
+from ui.helpers import lock_min_size, scaled
 from ui.modal_helpers import input_text_window_modal, question_window_modal
 from ui.styles.theme import palette, ThemedMixin
 from ui.widgets.library_drag import _active_drag, DragProxy
@@ -199,20 +200,14 @@ class TagFilterPanel(QFrame, ThemedMixin):
         layout.setSpacing(4)
 
         header = QLabel(t(self._header_key))
-        self._sty(header, lambda: (
-            f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
-            f"letter-spacing:0.5px;background:transparent;"
-        ))
+        header.setObjectName("folder_filter_header")
         layout.addWidget(header)
         self._header = header
 
         self._search = GhostClearableLineEdit()
+        self._search.setObjectName("folder_filter_search")
         self._search.setPlaceholderText(t(self._search_key))
-        self._search.setFixedHeight(24)
-        self._sty(self._search, lambda: (
-            f"QLineEdit{{background:{palette('bg_input')};border:1px solid {palette('border')};"
-            f"border-radius:4px;padding:0 6px;font-size:11px;color:{palette('text')};}}"
-        ))
+        self._search.setFixedHeight(scaled(24, self))
         self._search.textChanged.connect(self._filter)
         # Backups-search-style suggestions: typing opens a popup list of
         # matching tags (first row highlighted, ghost mirrors it); ↓/↑
@@ -235,7 +230,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         # No fixed cap — the panel now lives in a draggable splitter pane
         # (see FolderTree), so this should grow/shrink with whatever space
         # the user gives it. A floor keeps it from disappearing entirely.
-        self._scroll.setMinimumHeight(40)
+        self._scroll.setMinimumHeight(scaled(40, self))
         self._scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._scroll_content = QWidget()
         # Named, not styled: an own stylesheet here would outrank the theme
@@ -258,10 +253,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         # so a large selection can never push the tag list out of view.
         # Hidden entirely at zero selections. Clicking an entry removes it.
         self._selected_lbl = QLabel(t(self._active_key))
-        self._sty(self._selected_lbl, lambda: (
-            f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
-            f"letter-spacing:0.5px;background:transparent;margin-top:2px;"
-        ))
+        self._selected_lbl.setObjectName("folder_filter_active")
         self._selected_lbl.setVisible(False)
         layout.addWidget(self._selected_lbl)
         self._selected_scroll = QScrollArea()
@@ -282,11 +274,7 @@ class TagFilterPanel(QFrame, ThemedMixin):
         self._selected_buttons: dict[str, QPushButton] = {}
 
         self._clear_btn = QPushButton(t(self._clear_key))
-        self._sty(self._clear_btn, lambda: (
-            f"QPushButton{{color:{palette('text_muted')};font-size:10px;background:transparent;"
-            f"border:none;padding:2px;}}"
-            f"QPushButton:hover{{color:{palette('accent')};}}"
-        ))
+        self._clear_btn.setObjectName("folder_filter_clear")
         self._clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._clear_btn.clicked.connect(self._clear_all)
         layout.addWidget(self._clear_btn)
@@ -574,7 +562,7 @@ class FolderRow(QFrame, ThemedMixin):
         self._depth = depth
         self._selected = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(30)
+        self.setFixedHeight(scaled(30, self))
         # Scoped selector target: the row style must NOT cascade to child
         # QFrames (the 3px color bar) — an unscoped QFrame{...} rule gave
         # the bar the selection border too, squeezing the folder icon.
@@ -583,19 +571,19 @@ class FolderRow(QFrame, ThemedMixin):
 
     def _build(self):
         layout = QHBoxLayout(self)
-        indent = 8 + self._depth * 14
+        indent = scaled(8, self) + self._depth * scaled(14, self)
         layout.setContentsMargins(indent, 2, 4, 2)
         layout.setSpacing(5)
 
         # Folder icon with color
         icon_lbl = QLabel("📁")
-        icon_lbl.setFixedWidth(18)
-        icon_lbl.setStyleSheet("font-size:12px;background:transparent;")
+        icon_lbl.setFixedWidth(scaled(18, self))
+        icon_lbl.setObjectName("folder_row_icon")
         layout.addWidget(icon_lbl)
 
         # Color bar (colour re-read from self._color_key on refresh)
         bar = QFrame()
-        bar.setFixedSize(3, 16)
+        bar.setFixedSize(scaled(3, self), scaled(16, self))
         self._sty(bar, lambda: f"background:{palette(self._color_key)};border-radius:1px;")
         layout.addWidget(bar)
 
@@ -607,17 +595,13 @@ class FolderRow(QFrame, ThemedMixin):
 
         # "+" button for sub-folder (visible on hover via stylesheet)
         self._add_btn = QPushButton("+")
-        self._add_btn.setFixedSize(18, 18)
+        self._add_btn.setObjectName("folder_row_add")
+        self._add_btn.setFixedSize(scaled(18, self), scaled(18, self))
         self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # On "Tutti i giochi" the + creates a ROOT folder (same convenience
         # as the bottom "new folder" button); on folders, a subfolder.
         self._add_btn.setToolTip(t("library.new_folder") if self._path == "__all__"
                                  else t("library.add_subfolder"))
-        self._sty(self._add_btn, lambda: (
-            f"QPushButton{{color:{palette('text_muted')};font-size:12px;font-weight:700;"
-            f"background:transparent;border:1px solid {palette('border')};border-radius:9px;padding:0;}}"
-            f"QPushButton:hover{{color:{palette('accent')};border-color:{palette('accent')};}}"
-        ))
         self._add_btn.clicked.connect(lambda: self.add_sub.emit(self._path))
         layout.addWidget(self._add_btn)
         # Hide by default, show on hover
@@ -637,7 +621,34 @@ class FolderRow(QFrame, ThemedMixin):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start = event.pos()
             self._folder_dragging = False
+            if not getattr(self, "_drag_cleanup_armed", False):
+                self._drag_cleanup_armed = True
+                self.destroyed.connect(self._cancel_folder_drag)
         super().mousePressEvent(event)
+
+    def _cancel_folder_drag(self, *_):
+        """Abort a folder drag whose source row died mid-drag — same rule as
+        the game cards: a rebuild while the mouse is held would otherwise
+        leave the ghost on screen (burn-in) and the hover target lit."""
+        proxy = _active_drag.pop("proxy", None)
+        if proxy is not None:
+            try:
+                proxy.hide()
+                proxy.deleteLater()
+            except RuntimeError:
+                pass
+        src = _active_drag.pop("source", None)
+        if src is not None:
+            try:
+                src.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        _active_drag.clear()
+        tree = self.parentWidget()
+        while tree and not isinstance(tree, FolderTree):
+            tree = tree.parentWidget()
+        if tree:
+            tree.clear_drag_hover()
 
     def mouseMoveEvent(self, event):
         if self._path == "__all__":
@@ -648,6 +659,16 @@ class FolderRow(QFrame, ThemedMixin):
             if (event.pos() - self._drag_start).manhattanLength() < 15:
                 return
             self._folder_dragging = True
+            # Stale-proxy sweep before the new ghost: the previous drag's
+            # source may have died mid-drag (rebuild), leaving its ghost
+            # visible — never show two at once.
+            stale = _active_drag.get("proxy")
+            if stale is not None:
+                try:
+                    stale.hide()
+                    stale.deleteLater()
+                except RuntimeError:
+                    pass
             px = self.grab()
             eff = QGraphicsOpacityEffect(self)
             eff.setOpacity(0.3)
@@ -779,10 +800,10 @@ class FolderRow(QFrame, ThemedMixin):
 
     def _label_style(self) -> str:
         if getattr(self, '_drag_hover', False):
-            return f"color:{palette(self._color_key)};font-size:11px;font-weight:700;background:transparent;"
+            return f"color:{palette(self._color_key)};font-size:{scaled(11, self)}px;font-weight:700;background:transparent;"
         elif self._selected:
-            return f"color:{palette('text')};font-size:11px;font-weight:600;background:transparent;"
-        return f"color:{palette('text_secondary')};font-size:11px;background:transparent;"
+            return f"color:{palette('text')};font-size:{scaled(11, self)}px;font-weight:600;background:transparent;"
+        return f"color:{palette('text_secondary')};font-size:{scaled(11, self)}px;background:transparent;"
 
     def _apply_style(self):
         # State-dependent (drag/selected) AND palette-dependent — recomputed
@@ -808,13 +829,19 @@ class FolderTree(QFrame, ThemedMixin):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setFixedWidth(170)
-        self._sty(self, lambda: f"background:{palette('bg_card')};border-right:1px solid {palette('border')};")
+        # Classic narrow-but-readable folder rail (~168).
+        _sw = scaled(168, self, min_px=150)
+        self.setFixedWidth(_sw)
+        lock_min_size(self, w=_sw, policy_h=QSizePolicy.Policy.Fixed)
+        self.setObjectName("folder_tree")
         self._rows: list[FolderRow] = []
         self._new_folder_btn = None
         self._selected_path = "__all__"
+        self._splitter = None   # created below; guards early resizeEvent
+        self._applying_split = False
 
         # Outer layout just hosts the splitter below.
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -823,12 +850,9 @@ class FolderTree(QFrame, ThemedMixin):
         # either section can take more or less of the sidebar's height —
         # replaces the old fixed static separator + hard height cap.
         self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.setObjectName("folder_tree_splitter")
         self._splitter.setChildrenCollapsible(False)
         self._splitter.setHandleWidth(7)
-        self._sty(self._splitter, lambda: (
-            f"QSplitter::handle{{background:{palette('separator')};}}"
-            f"QSplitter::handle:hover{{background:{palette('accent')};}}"
-        ))
         outer.addWidget(self._splitter)
 
         # ── Top pane: "All games" row + folder tree + "+ new folder" ────
@@ -836,7 +860,7 @@ class FolderTree(QFrame, ThemedMixin):
         self._layout = QVBoxLayout(self._folders_pane)
         self._layout.setContentsMargins(4, 8, 4, 4)
         self._layout.setSpacing(2)
-        self._folders_pane.setMinimumHeight(90)
+        self._folders_pane.setMinimumHeight(scaled(90, self))
         self._splitter.addWidget(self._folders_pane)
 
         # ── Bottom pane: "filter by" tabs — tags | engine ─────────────────
@@ -849,9 +873,7 @@ class FolderTree(QFrame, ThemedMixin):
         filters_col.setSpacing(2)
 
         self._filter_by_lbl = QLabel(t("library.filter_by"))
-        self._sty(self._filter_by_lbl, lambda: (
-            f"color:{palette('text_muted')};font-size:10px;font-weight:700;"
-            f"letter-spacing:0.5px;background:transparent;"))
+        self._filter_by_lbl.setObjectName("folder_filter_by")
         filters_col.addWidget(self._filter_by_lbl)
 
         tabs_row = QHBoxLayout()
@@ -865,7 +887,7 @@ class FolderTree(QFrame, ThemedMixin):
         for i, btn in enumerate(self._filter_tab_btns):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setFixedHeight(24)
+            btn.setFixedHeight(scaled(24, self))
             btn.setSizePolicy(QSizePolicy.Policy.Expanding,
                               QSizePolicy.Policy.Fixed)
             btn.setMinimumWidth(0)
@@ -895,7 +917,7 @@ class FolderTree(QFrame, ThemedMixin):
         # however far the user drags the handle up. TagFilterPanel's own
         # tag-list scroll area grows to fill whatever extra height the
         # splitter gives this pane (see TagFilterPanel._build).
-        self._filters_pane.setMinimumHeight(160)
+        self._filters_pane.setMinimumHeight(scaled(160, self))
         self._splitter.addWidget(self._filters_pane)
         self._show_filter_tab(0)
 
@@ -906,21 +928,93 @@ class FolderTree(QFrame, ThemedMixin):
 
         self.rebuild()
 
-    def _restore_splitter_sizes(self) -> None:
-        """Re-apply the user's folder/filter split (or the default)."""
-        raw = get_config().get("library_filter_splitter", [260, 215]) or [260, 215]
+    def _split_scale(self) -> float:
         try:
-            sizes = [max(1, int(raw[0])), max(1, int(raw[1]))]
+            from ui.helpers import ui_scale
+            return max(0.5, ui_scale(self))
+        except Exception:
+            return 1.0
+
+    def _restore_splitter_sizes(self) -> None:
+        """Place the folder/filter split line from the saved sizes.
+
+        Stored in DESIGN units (scale-1 pixels), so a DPI/UI-scale change
+        keeps the same number of tag rows visible.  The split is DYNAMIC,
+        not a fixed ratio: on window resize the tag pane keeps its saved
+        height (same number of tags), and the folder pane absorbs the
+        extra space or the shrink — down to its own minimum — before the
+        tag pane finally gives up height.  Resizing never rewrites the
+        saved split: the line moves again only when the user drags the
+        handle.
+        """
+        raw = get_config().get("library_filter_splitter", None)
+        try:
+            a, b = float(raw[0]), float(raw[1])
+            if 0.0 < a <= 1.0 and 0.0 < b <= 1.0:
+                # Legacy ratio (fraction of the sidebar) → nominal
+                # 500-unit sidebar.
+                folders_design = 500.0 * a
+                tags_design = 500.0 * b
+            else:
+                # Design units (scale-1 pixels).  Values > 1.0 can also
+                # come from very old builds that stored raw pixels — the
+                # one-time drift at non-100% UI scale is negligible.
+                folders_design = float(a)
+                tags_design = float(b)
         except (TypeError, ValueError, IndexError, KeyError):
-            sizes = [260, 215]
-        self._splitter.setSizes(sizes)
+            folders_design, tags_design = 200.0, 380.0
+        self._apply_split(folders_design, tags_design)
+
+    def _apply_split(self, folders_design: float, tags_design: float) -> None:
+        """Set the split so the TAG pane gets its saved height.
+
+        The folder pane (stretch 1) takes whatever is left: it absorbs
+        the extra space when the sidebar grows and gives it back when it
+        shrinks, clamped at its own minimum — only then does the tag
+        pane lose height.  Programmatic applies are flagged so they never
+        overwrite the user's saved split.
+        """
+        splitter = self._splitter
+        total = splitter.height()
+        if total <= 0:
+            return
+        scale = self._split_scale()
+        tags_px = max(1, int(round(tags_design * scale)))
+        want = [max(1, int(total - tags_px)), tags_px]
+        if splitter.sizes() == want:
+            return
+        self._applying_split = True
+        try:
+            splitter.setSizes(want)
+        finally:
+            self._applying_split = False
 
     def _save_splitter_sizes(self, *_args) -> None:
+        if getattr(self, "_applying_split", False):
+            return
         sizes = self._splitter.sizes()
         if len(sizes) < 2 or sizes[0] <= 0 or sizes[1] <= 0:
             return
+        scale = self._split_scale()
         get_config().set("library_filter_splitter",
-                         [int(sizes[0]), int(sizes[1])])
+                         [round(sizes[0] / scale, 4),
+                          round(sizes[1] / scale, 4)])
+
+    def showEvent(self, event):
+        """Re-apply the saved split once the sidebar has its real height."""
+        super().showEvent(event)
+        if self._splitter is not None:
+            self._restore_splitter_sizes()
+
+    def resizeEvent(self, event):
+        """Keep the tag pane at its saved height when the window resizes."""
+        super().resizeEvent(event)
+        if self._splitter is None or not self.isVisible():
+            return
+        self._restore_splitter_sizes()
+
+
+
 
     def rebuild(self):
         # Clear the folder-list pane (top splitter pane only — the tag
@@ -966,7 +1060,7 @@ class FolderTree(QFrame, ThemedMixin):
 
     def _new_folder_btn_style(self) -> str:
         return (
-            f"QPushButton{{color:{palette('text_muted')};font-size:11px;background:transparent;"
+            f"QPushButton{{color:{palette('text_muted')};font-size:{scaled(11, self)}px;background:transparent;"
             f"border:1px dashed {palette('border')};border-radius:4px;padding:4px;}}"
             f"QPushButton:hover{{color:{palette('accent')};border-color:{palette('accent')};}}"
         )
@@ -974,6 +1068,9 @@ class FolderTree(QFrame, ThemedMixin):
     def refresh_styles(self):
         # Page chrome of the tree (self bg + splitter handle) is registered…
         super().refresh_styles()
+        _sw = scaled(168, self, min_px=150)
+        self.setFixedWidth(_sw)
+        lock_min_size(self, w=_sw, policy_h=QSizePolicy.Policy.Fixed)
         # …the folder rows, the "+ new folder" button and the tag panel are
         # re-styled in place so NO row/panel is recreated on a theme switch.
         for row in list(self._rows):
@@ -1044,14 +1141,14 @@ class FolderTree(QFrame, ThemedMixin):
                     f"QPushButton#filter_tab{{background:{palette('accent')};"
                     f"color:{palette('accent_text')};"
                     f"border:1px solid {palette('accent')};"
-                    f"border-radius:3px;font-size:10px;font-weight:700;"
+                    f"border-radius:3px;font-size:{scaled(10, self)}px;font-weight:700;"
                     f"padding:2px 6px;}}")
             else:
                 btn.setStyleSheet(
                     f"QPushButton#filter_tab{{background:{palette('bg_elevated')};"
                     f"color:{palette('text_secondary')};"
                     f"border:1px solid {palette('border_hover')};"
-                    f"border-radius:3px;font-size:10px;font-weight:600;"
+                    f"border-radius:3px;font-size:{scaled(10, self)}px;font-weight:600;"
                     f"padding:2px 6px;}}"
                     f"QPushButton#filter_tab:hover{{color:{palette('text')};"
                     f"border-color:{palette('accent')};}}")
@@ -1122,7 +1219,7 @@ class FolderTree(QFrame, ThemedMixin):
         dlg = QDialog(self)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.setWindowTitle(t("library.new_folder"))
-        dlg.setMinimumWidth(320)
+        dlg.setMinimumWidth(scaled(320, dlg))
         lay = QVBoxLayout(dlg)
         lay.setSpacing(12)
         lay.setContentsMargins(16, 16, 16, 16)
@@ -1130,7 +1227,7 @@ class FolderTree(QFrame, ThemedMixin):
         # Transient application-modal dialog: it cannot be open across a theme
         # switch, so its palette-derived styles are read once at creation
         # (built into style vars to keep the setStyleSheet calls palette-free).
-        _dlg_lbl_style = f"color:{palette('text_muted')};font-size:11px;font-weight:600;"
+        _dlg_lbl_style = f"color:{palette('text_muted')};font-size:{scaled(11, self)}px;font-weight:600;"
 
         # Name input
         name_lbl = QLabel(t("library.folder_name"))
@@ -1150,7 +1247,7 @@ class FolderTree(QFrame, ThemedMixin):
         color_buttons: list[tuple[QPushButton, str]] = []  # (btn, color_key)
         for ck in FOLDER_COLOR_KEYS:
             btn = QPushButton()
-            btn.setFixedSize(28, 28)
+            btn.setFixedSize(scaled(28, dlg), scaled(28, dlg))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             hex_c = palette(ck)
             btn.setStyleSheet(_swatch_style(hex_c, False))
@@ -1198,7 +1295,7 @@ class FolderTree(QFrame, ThemedMixin):
                     menu.setStyleSheet(
                         f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
                         f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-                        f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+                        f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
                         f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
                     )
                     menu.addAction(f"+ {t('library.new_folder')}",
@@ -1213,7 +1310,7 @@ class FolderTree(QFrame, ThemedMixin):
         menu.setStyleSheet(
             f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
             f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
             f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
         menu.addAction(t("library.add_subfolder"), lambda: self._add_folder(path))
@@ -1223,7 +1320,7 @@ class FolderTree(QFrame, ThemedMixin):
         color_menu.setStyleSheet(
             f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
             f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
             f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
         menu.addMenu(color_menu)

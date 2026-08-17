@@ -198,6 +198,23 @@ def ensure_data_directory() -> Path:
     return data_dir
 
 
+def sync_launch_on_startup_registration() -> None:
+    """Ensure system boot registration matches the saved config.
+
+    On first run or if the executable moved, registers SaveSync in the OS
+    startup mechanism (Windows registry, Linux autostart, macOS LaunchAgent).
+    """
+    try:
+        from core.config_manager import get_config
+        config = get_config()
+        want = bool(config.get("launch_on_startup", True))
+        actual = get_launch_on_startup()
+        if want and not actual:
+            set_launch_on_startup(True)
+    except Exception as e:
+        logger.debug(f"Could not sync launch on startup registration: {e}")
+
+
 def setup_default_config() -> None:
     """Setup default configuration if it doesn't exist.
     ConfigManager already loads defaults on init, so just trigger a load."""
@@ -208,6 +225,7 @@ def setup_default_config() -> None:
         # Loading the config is sufficient — ConfigManager merges _DEFAULTS
         # with any existing config.json, so all keys are always present.
         get_config()
+        sync_launch_on_startup_registration()
     except Exception as e:
         logger.error(f"Failed to setup default config: {e}")
         # Create basic config file manually as fallback
@@ -225,6 +243,7 @@ def setup_default_config() -> None:
 
         except Exception as fallback_error:
             logger.error(f"Failed to create fallback config: {fallback_error}")
+
 
 
 def migrate_old_settings() -> None:

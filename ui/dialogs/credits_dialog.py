@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from i18n import t
 from core.constants import APP_NAME, APP_VERSION, GITHUB_URL
+from ui.helpers import scaled
 from ui.styles.theme import palette
 
 _WALLETS = [
@@ -127,11 +128,7 @@ class _CopyOnClickField(QLineEdit):
         toast = QLabel(t("credits.copied"), self,
                        Qt.WindowType.ToolTip
                        | Qt.WindowType.FramelessWindowHint)
-        toast.setStyleSheet(
-            f"QLabel{{color:{palette('accent_text')};background:{palette('accent')};"
-            f"border:none;border-radius:4px;padding:4px 10px;"
-            f"font-size:11px;font-weight:600;}}"
-        )
+        toast.setObjectName("credits_toast")
         toast.adjustSize()
         anchor = self.mapToGlobal(QPoint(self.width() // 2, 0))
         toast.move(anchor.x() - toast.width() // 2,
@@ -148,9 +145,9 @@ class _CopyOnClickField(QLineEdit):
 
 def _hsep() -> QFrame:
     sep = QFrame()
+    sep.setObjectName("credits_sep")
     sep.setFrameShape(QFrame.Shape.HLine)
-    sep.setFixedHeight(1)
-    sep.setStyleSheet(f"background:{palette('border')};border:none;")
+    sep.setFixedHeight(scaled(1, sep))
     return sep
 
 
@@ -158,10 +155,9 @@ class CreditsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("credits.title"))
-        self.setFixedSize(440, 480)
+        self.setFixedSize(scaled(440, self), scaled(480, self))
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        self.setStyleSheet(f"QDialog{{background:{palette('bg')};}}")
         self._build_ui()
 
     def _build_ui(self):
@@ -179,8 +175,6 @@ class CreditsDialog(QDialog):
         logo.setFixedSize(_LOGO_PX + 4, _LOGO_PX + 4)
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        logo.setStyleSheet(
-            "QLabel#credits_logo{background:transparent;border:none;padding:0;}")
         if not logo_px.isNull():
             logo.setPixmap(logo_px)
         logo_row = QHBoxLayout()
@@ -191,30 +185,29 @@ class CreditsDialog(QDialog):
         root.addLayout(logo_row)
 
         brand = QLabel(APP_NAME)
+        brand.setObjectName("credits_heading")
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand_font = QFont()
         brand_font.setPointSize(16)
         brand_font.setBold(True)
         brand.setFont(brand_font)
-        brand.setStyleSheet(f"color:{palette('text')};")
         root.addWidget(brand)
 
         ver = QLabel(t("credits.version", version=APP_VERSION))
+        ver.setObjectName("credits_muted")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ver.setStyleSheet(
-            f"color:{palette('text_secondary')};font-size:12px;")
         root.addWidget(ver)
 
         root.addWidget(_hsep())
 
         # ── Developer ─────────────────────────────────────────────────────────
         dev_lbl = QLabel(t("credits.developer"))
+        dev_lbl.setObjectName("credits_heading")
         dev_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         dev_font = QFont()
         dev_font.setPointSize(13)
         dev_font.setBold(True)
         dev_lbl.setFont(dev_font)
-        dev_lbl.setStyleSheet(f"color:{palette('text')};")
         root.addWidget(dev_lbl)
 
         dev_row = QHBoxLayout()
@@ -222,15 +215,15 @@ class CreditsDialog(QDialog):
         dev_row.addStretch()
 
         name_lbl = QLabel("Luke0094")
+        name_lbl.setObjectName("credits_muted")
         name_font = QFont()
         name_font.setPointSize(11)
         name_lbl.setFont(name_font)
-        name_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
         dev_row.addWidget(name_lbl)
 
         github_btn = QPushButton("GitHub")
         github_btn.setObjectName("credits_github_btn")
-        github_btn.setFixedWidth(100)
+        github_btn.setFixedWidth(scaled(100, self))
         github_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         github_btn.setToolTip(t("credits.github_tooltip"))
         # Colours live in the theme (#credits_github_btn) so light/dark hover
@@ -245,12 +238,12 @@ class CreditsDialog(QDialog):
 
         # ── Donations ─────────────────────────────────────────────────────────
         don_lbl = QLabel(t("credits.donations"))
+        don_lbl.setObjectName("credits_heading")
         don_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         don_font = QFont()
         don_font.setPointSize(12)
         don_font.setBold(True)
         don_lbl.setFont(don_font)
-        don_lbl.setStyleSheet(f"color:{palette('text')};")
         root.addWidget(don_lbl)
 
         for coin, address in _WALLETS:
@@ -261,7 +254,7 @@ class CreditsDialog(QDialog):
 
         close_btn = QPushButton(t("common.close"))
         close_btn.setObjectName("primary_btn")
-        close_btn.setFixedWidth(120)
+        close_btn.setFixedWidth(scaled(120, self))
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.accept)
 
@@ -276,19 +269,15 @@ class CreditsDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(8)
         lbl = QLabel(f"{coin}:")
-        lbl.setFixedWidth(64)
+        lbl.setObjectName("credits_coin")
+        lbl.setFixedWidth(scaled(64, lbl))
         lbl_font = QFont()
         lbl_font.setBold(True)
         lbl.setFont(lbl_font)
-        lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:11px;")
         row.addWidget(lbl)
         entry = _CopyOnClickField(address)
+        entry.setObjectName("credits_wallet_field")
         entry.setAlignment(Qt.AlignmentFlag.AlignCenter)
         entry.setCursorPosition(0)
-        entry.setStyleSheet(
-            f"QLineEdit{{color:{palette('text_secondary')};background:{palette('bg_input')};"
-            f"border:1px solid {palette('border')};border-radius:4px;"
-            f"padding:4px 6px;font-size:10px;}}"
-        )
         row.addWidget(entry)
         return row

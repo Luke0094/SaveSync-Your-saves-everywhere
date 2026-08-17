@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
 
 from i18n import t
 from ui.styles.theme import palette
-from ui.helpers import TopmostPinMixin, apply_game_friendly_flags
+from ui.helpers import (TopmostPinMixin, finalize_adaptive_dialog_size,
+                        apply_game_friendly_flags, scaled)
 
 
 class ConflictDialog(TopmostPinMixin, QDialog):
@@ -36,12 +37,13 @@ class ConflictDialog(TopmostPinMixin, QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(t("sync.conflict_title"))
-        self.setMinimumWidth(440)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._topmost_timer = None
         apply_game_friendly_flags(self)
         self._choice: str = "local"
         self._build(game_name, local_mtime, cloud_mtime)
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=440, min_h=320)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -63,13 +65,12 @@ class ConflictDialog(TopmostPinMixin, QDialog):
         layout.setContentsMargins(24, 24, 24, 24)
 
         title = QLabel(t("sync.conflict_title"))
-        title.setObjectName("page_header")
-        title.setStyleSheet("font-size: 18px;")
+        title.setObjectName("dialog_heading")
         layout.addWidget(title)
 
         desc = QLabel(f"<b>{game_name}</b><br>{t('sync.conflict_desc')}")
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {palette('text_secondary')}; line-height: 1.5;")
+        desc.setObjectName("dialog_desc")
         layout.addWidget(desc)
 
         sep = QFrame()
@@ -135,10 +136,11 @@ class ConflictDialog(TopmostPinMixin, QDialog):
         """)
         card_layout = QVBoxLayout(card)
         icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet(f"font-size: 24px; color: {color};")
+        fs = scaled(24, self)
+        icon_lbl.setStyleSheet(f"font-size: {fs}px; color: {color};")
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         text_lbl = QLabel(text)
-        text_lbl.setStyleSheet(f"color: {palette('text_secondary')}; font-size: 12px;")
+        text_lbl.setObjectName("dialog_desc")
         text_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         text_lbl.setWordWrap(True)
         card_layout.addWidget(icon_lbl)

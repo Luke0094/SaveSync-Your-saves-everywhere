@@ -75,6 +75,7 @@ class SyncWorker(QThread):
                  save_paths: list, direction: str = "auto", exe_path: str = "",
                  computed_folder_name: str = "", name_history: list[str] | None = None,
                  excluded_paths: list[str] | None = None,
+                 orphan: bool = False,
                  parent=None):
         super().__init__(parent)
         self._providers = providers  # snapshot of connected providers
@@ -86,6 +87,7 @@ class SyncWorker(QThread):
         self._computed_folder_name = computed_folder_name
         self._name_history = name_history or []
         self._excluded_paths = excluded_paths or []
+        self._orphan = bool(orphan)
 
     def _migrate_remote_folders(self, providers: list, current_folder: str) -> None:
         """Move remote backup files from old-name folders into *current_folder*.
@@ -244,16 +246,29 @@ class SyncWorker(QThread):
                 self.finished.emit(SyncResult(success=False, message="Sync cancelled"))
                 return
 
-            # Ensure a fresh backup exists before uploading
+            # Ensure a fresh backup exists before uploading. Prefer a single
+            # mtime preflight here; if already current, skip create_backup
+            # entirely (avoids a second identical walk inside create_backup).
             if self._direction in ("auto", "up"):
                 save_paths = [str(p) for p in self._save_paths]
-                bm.create_backup(
-                    self._game_id, self._game_name, save_paths,
-                    exe_path=self._exe_path,
-                    computed_folder_name=self._computed_folder_name,
-                    name_history=self._name_history,
+                if bm.is_backup_current(
+                    self._game_id, save_paths,
                     excluded_paths=self._excluded_paths,
-                )
+                ):
+                    logger.debug(
+                        "Sync skip local backup for %r — mtime already current",
+                        self._game_name,
+                    )
+                else:
+                    bm.create_backup(
+                        self._game_id, self._game_name, save_paths,
+                        exe_path=self._exe_path,
+                        computed_folder_name=self._computed_folder_name,
+                        name_history=self._name_history,
+                        excluded_paths=self._excluded_paths,
+                        skip_mtime_preflight=True,
+                        orphan=self._orphan,
+                    )
 
             # Migrate remote folders for old names before sync
             if self._name_history:
@@ -345,6 +360,8 @@ class SyncOrchestrator(QObject):
     conflict_detected = Signal(str, object)  # game_id, conflict_info dict
     provider_changed  = Signal(str)          # provider_id or "" (backward compat)
     providers_updated = Signal()             # emitted after any provider connect/disconnect
+    batch_progress    = Signal(int, int, str)  # done, total, current name
+    batch_finished    = Signal(int, str)       # done count, last synced name
 
     def __init__(self):
         super().__init__()
@@ -358,6 +375,10 @@ class SyncOrchestrator(QObject):
         # History is persisted so the sync page keeps its entries across
         # app restarts (one entry per sync run, never aggregated).
         self._sync_history: list[dict] = self._load_history()
+        from collections import deque
+        self._sync_job_queue: deque = deque()
+        self._sync_batch: dict | None = None
+        self._sync_max_inflight: int = 1
 
     @staticmethod
     def _history_path():
@@ -562,9 +583,51 @@ class SyncOrchestrator(QObject):
 
     # ── Sync ─────────────────────────────────────────────────────────────────
 
+    def enqueue_sync_batch(self, jobs: list[dict], source: str = "sync_page"):
+        """Queue Sync Tutti with adaptive concurrency + resume persistence."""
+        from datetime import datetime, timezone
+        from core.concurrency import sync_max_inflight, log_limits
+        from core import pending_batch_jobs as _pbj
+        if not jobs:
+            return
+        log_limits()
+        self._sync_max_inflight = sync_max_inflight()
+        ids = [j["game_id"] for j in jobs if j.get("game_id")]
+        self._sync_batch = {
+            "pending_ids": list(ids),
+            "completed_ids": [],
+            "total": len(ids),
+            "source": source or "sync_page",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _pbj.set_job(_pbj.KEY_SYNC_ALL, {
+            "pending_ids": list(ids),
+            "completed_ids": [],
+            "jobs": list(jobs),
+            "started_at": self._sync_batch["started_at"],
+            "source": source or "sync_page",
+        })
+        first_name = (jobs[0].get("game_name") or "") if jobs else ""
+        self.batch_progress.emit(0, len(ids), first_name)
+        self._orphan_synced_pending: set[str] = set()
+        for j in jobs:
+            self.sync_game(
+                j["game_id"], j.get("game_name") or "",
+                j.get("save_paths") or [],
+                direction=j.get("direction") or "auto",
+                exe_path=j.get("exe_path") or "",
+                computed_folder_name=j.get("computed_folder_name"),
+                name_history=j.get("name_history"),
+                excluded_paths=j.get("excluded_paths"),
+                orphan=bool(j.get("orphan")),
+                _batch=True,
+            )
+
     def sync_game(self, game_id: str, game_name: str, save_paths: list,
                   direction: str = "auto", exe_path: str = "", computed_folder_name: str | None = None,
-                  name_history: list[str] | None = None, excluded_paths: list[str] | None = None):
+                  name_history: list[str] | None = None, excluded_paths: list[str] | None = None,
+                  orphan: bool = False,
+                  _batch: bool = False):
         # Fill excluded_paths from the library when the caller didn't pass
         # them: the pre-sync backup hashes save_paths WITHOUT exclusions
         # otherwise, sees a "different" content hash than the last real
@@ -592,36 +655,81 @@ class SyncOrchestrator(QObject):
                     logger.info(f"'{game_name}': keep-local → forcing upload (local wins)")
             except Exception:
                 pass
+        job = {
+            "game_id": game_id,
+            "game_name": game_name,
+            "save_paths": list(save_paths or []),
+            "direction": direction,
+            "exe_path": exe_path or "",
+            "computed_folder_name": computed_folder_name or "",
+            "name_history": list(name_history or []),
+            "excluded_paths": list(excluded_paths or []) if excluded_paths is not None else None,
+            "orphan": bool(orphan),
+            "batch": bool(_batch),
+        }
         with self._sync_lock:
             if game_id in self._syncing_games:
                 logger.warning(f"Sync already in progress for {game_name}, skipping")
                 return
-            self._syncing_games.add(game_id)
+            # Also skip if already queued
+            if any(j.get("game_id") == game_id for j in self._sync_job_queue):
+                logger.warning(f"Sync already queued for {game_name}, skipping")
+                return
+            self._sync_job_queue.append(job)
+        self._pump_sync_queue()
 
+    def _pump_sync_queue(self):
+        from core.concurrency import sync_max_inflight
+        cap = self._sync_max_inflight or sync_max_inflight()
+        while True:
+            with self._sync_lock:
+                inflight = len(self._syncing_games)
+                if inflight >= cap or not self._sync_job_queue:
+                    return
+                job = self._sync_job_queue.popleft()
+                gid = job["game_id"]
+                if gid in self._syncing_games:
+                    continue
+                self._syncing_games.add(gid)
+            self._start_sync_worker(job)
+
+    def _start_sync_worker(self, job: dict):
+        game_id = job["game_id"]
+        game_name = job.get("game_name") or ""
         connected = self.get_connected_providers()
         if not connected:
             logger.warning("Sync requested but no provider connected")
             with self._sync_lock:
                 self._syncing_games.discard(game_id)
+            self._mark_sync_batch_done(game_id, game_name)
+            self._pump_sync_queue()
             return
+
+        if self._sync_batch and job.get("batch"):
+            done = len(self._sync_batch.get("completed_ids") or [])
+            total = int(self._sync_batch.get("total") or 0)
+            self.batch_progress.emit(done, total, game_name)
 
         self._cleanup_workers()
         self.sync_started.emit(game_id)
         worker = SyncWorker(
-            connected, game_id, game_name, save_paths, direction,
-            exe_path=exe_path,
-            computed_folder_name=computed_folder_name or "",
-            name_history=name_history or [],
-            excluded_paths=excluded_paths or [],
+            connected, game_id, game_name, job.get("save_paths") or [],
+            job.get("direction") or "auto",
+            exe_path=job.get("exe_path") or "",
+            computed_folder_name=job.get("computed_folder_name") or "",
+            name_history=job.get("name_history") or [],
+            excluded_paths=job.get("excluded_paths") or [],
+            orphan=bool(job.get("orphan")),
         )
 
-        def _on_done(result, _worker=worker, _gid=game_id):
+        def _on_done(result, _worker=worker, _gid=game_id, _batch=job.get("batch"),
+                     _name=game_name):
             try:
                 _worker.finished.disconnect()
                 _worker.progress.disconnect()
             except (RuntimeError, TypeError):
                 pass
-            self._on_sync_done(_gid, result)
+            self._on_sync_done(_gid, result, batch=_batch, game_name=_name)
 
         from PySide6.QtCore import Qt
         worker.finished.connect(_on_done, Qt.ConnectionType.QueuedConnection)
@@ -632,6 +740,69 @@ class SyncOrchestrator(QObject):
         with self._sync_lock:
             self._workers.append(worker)
         worker.start()
+
+    def _mark_sync_batch_done(self, game_id: str, game_name: str = ""):
+        from core import pending_batch_jobs as _pbj
+        if not self._sync_batch:
+            return
+        pending = [g for g in (self._sync_batch.get("pending_ids") or []) if g != game_id]
+        completed = list(self._sync_batch.get("completed_ids") or [])
+        if game_id and game_id not in completed:
+            completed.append(game_id)
+        self._sync_batch["pending_ids"] = pending
+        self._sync_batch["completed_ids"] = completed
+        # The completion notice needs the name when exactly ONE game was
+        # actually synced (like Backup Tutti shows the name for one backup).
+        if game_name:
+            self._sync_batch["last_synced_name"] = game_name
+        total = int(self._sync_batch.get("total") or 0)
+        done = len(completed)
+        last_synced_name = self._sync_batch.get("last_synced_name") or ""
+        next_name = ""
+        if pending:
+            # Prefer the queued job's game_name (orphans have no library row).
+            want = pending[0]
+            with self._sync_lock:
+                for j in self._sync_job_queue:
+                    if j.get("game_id") == want:
+                        next_name = j.get("game_name") or ""
+                        break
+            if not next_name:
+                try:
+                    from core.library import get_library as _gl
+                    e = _gl().get_by_id(want)
+                    next_name = e.name if e else ""
+                except Exception:
+                    next_name = ""
+            if not next_name:
+                try:
+                    from core.backup import get_backup_manager
+                    backs = get_backup_manager().get_backups_for_game(want)
+                    if backs:
+                        next_name = backs[0].game_name or ""
+                except Exception:
+                    pass
+        self.batch_progress.emit(done, total, next_name)
+        # Throttle disk: persist every 8 completions, always on batch end.
+        persist = (not pending) or (done % 8 == 0)
+        job = _pbj.mark_game_done(_pbj.KEY_SYNC_ALL, game_id, persist=persist)
+        if not pending:
+            # Flush deferred orphan index stamps + pending-jobs file.
+            try:
+                from core.backup import get_backup_manager
+                pending_ids = list(getattr(self, "_orphan_synced_pending", set()) or [])
+                self._orphan_synced_pending = set()
+                if pending_ids:
+                    get_backup_manager().flush_orphan_indexes(pending_ids)
+            except Exception:
+                logger.debug("orphan index flush failed", exc_info=True)
+            try:
+                _pbj.flush()
+            except Exception:
+                pass
+            self._sync_batch = None
+            self.batch_finished.emit(done, last_synced_name or "")
+            return
 
     def _cleanup_workers(self):
         """Remove finished workers from the list."""
@@ -644,16 +815,25 @@ class SyncOrchestrator(QObject):
                     w.deleteLater()
             self._workers = alive
 
-    def _on_sync_done(self, game_id: str, result: SyncResult):
+    def _on_sync_done(self, game_id: str, result: SyncResult,
+                      batch: bool = False, game_name: str = ""):
         # Resolve the display name now so history rows survive a game being
         # renamed/removed later.
-        game_name = ""
-        try:
-            from core.library import get_library as _gl
-            _e = _gl().get_by_id(game_id)
-            game_name = _e.name if _e else ""
-        except Exception:
-            pass
+        if not game_name:
+            try:
+                from core.library import get_library as _gl
+                _e = _gl().get_by_id(game_id)
+                game_name = _e.name if _e else ""
+            except Exception:
+                pass
+        if not game_name:
+            try:
+                from core.backup import get_backup_manager
+                _backs = get_backup_manager().get_backups_for_game(game_id)
+                if _backs:
+                    game_name = _backs[0].game_name or ""
+            except Exception:
+                pass
         with self._sync_lock:
             self._syncing_games.discard(game_id)
             from datetime import datetime, timezone
@@ -685,17 +865,36 @@ class SyncOrchestrator(QObject):
             except Exception:
                 pass
         # Stamp the machine_id on cloud_metadata so other machines can detect cross-machine syncs
-        if result.success and result.files_uploaded > 0:
+        if result.success:
             try:
                 from core.library import get_library as _gl
                 from core.machine import get_machine_id as _mid
                 entry = _gl().get_by_id(game_id)
-                if entry:
-                    cloud_meta = dict(entry.cloud_metadata or {})
-                    cloud_meta["last_sync_machine"] = _mid()
-                    # Reset download confirmations since the cloud data changed
-                    cloud_meta["download_confirmed_machines"] = [_mid()]
-                    _gl().update_game_fields(game_id, cloud_metadata=cloud_meta)
+                if entry is not None:
+                    if result.files_uploaded > 0:
+                        cloud_meta = dict(entry.cloud_metadata or {})
+                        cloud_meta["last_sync_machine"] = _mid()
+                        # Reset download confirmations since the cloud data changed
+                        cloud_meta["download_confirmed_machines"] = [_mid()]
+                        _gl().update_game_fields(game_id, cloud_metadata=cloud_meta)
+                else:
+                    # Orphan archive (Aggiungi percorso): no library row — stamp
+                    # synced_to / hash on the backup index instead.
+                    from core.backup import get_backup_manager
+                    pids = [p.PROVIDER_ID for p in self.get_connected_providers()]
+                    backs = get_backup_manager().get_backups_for_game(game_id)
+                    h = ""
+                    if backs:
+                        h = (backs[0].cloud_metadata or {}).get("save_hash") or ""
+                    # During Sync Tutti defer index.json writes to batch end.
+                    in_batch = bool(batch or self._sync_batch)
+                    get_backup_manager().mark_orphan_synced(
+                        game_id, provider_ids=pids, save_hash=h,
+                        persist=not in_batch)
+                    if in_batch:
+                        if not hasattr(self, "_orphan_synced_pending"):
+                            self._orphan_synced_pending = set()
+                        self._orphan_synced_pending.add(game_id)
             except Exception as _e:
                 logger.debug(f"Failed to stamp sync machine: {_e}")
         # Detect connection loss and trigger per-provider auto-reconnect
@@ -708,6 +907,9 @@ class SyncOrchestrator(QObject):
                     self._schedule_reconnect(pid)
         self.sync_finished.emit(game_id, result)
         self._cleanup_workers()
+        if batch or self._sync_batch:
+            self._mark_sync_batch_done(game_id, game_name)
+        self._pump_sync_queue()
 
     # ── Per-provider reconnect ───────────────────────────────────────────────
 

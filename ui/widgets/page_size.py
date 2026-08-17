@@ -7,13 +7,15 @@ custom value is the one way a user can ask for more work than their machine
 can do — a guard that puts a list back to the default when rendering it took
 the app down.
 
-The guard is deliberately crude: the scope is written to disk BEFORE a risky
-render and removed after it, both flushed synchronously. A scope still marked
-at startup means the render never returned, so its size is not trusted again.
+The guard is deliberately crude: the scope is written to a tiny sidecar
+BEFORE a risky render and removed after it. A scope still marked at startup
+means the render never returned, so its size is not trusted again.
 Only sizes above the largest preset are guarded — the presets cannot be the
-cause, and an fsync per page change is not worth paying for them.
+cause. The sidecar avoids rewriting the whole config.json twice per oversized
+page rebuild (previously an immediate config.save() on enter and exit).
 """
 
+import json
 import logging
 from contextlib import contextmanager
 
@@ -21,7 +23,9 @@ from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QComboBox
 
 from core.config_manager import get_config
+from core.constants import USER_DATA_DIR
 from i18n import t
+from ui.helpers import scaled
 
 # Closed width: enough for a 2-digit size + arrow. The popup is sized
 # separately so "Personalizzato…" / "Custom…" is never clipped there.
@@ -37,7 +41,8 @@ PAGE_SIZE_PRESETS = (10, 20, 50)
 PAGE_SIZE_MAX = 500
 
 _SIZES_KEY = "page_sizes"
-_GUARD_KEY = "page_size_render_guard"
+_GUARD_KEY = "page_size_render_guard"  # legacy key inside config.json
+_GUARD_FILE = USER_DATA_DIR / "page_size_render_guard.json"
 
 # Every scope that has a selector, so recovery can name them.
 SCOPE_LIBRARY = "library"
@@ -101,46 +106,98 @@ def is_risky(value: int) -> bool:
     return value > max(PAGE_SIZE_PRESETS)
 
 
+def _read_guard_file() -> dict:
+    try:
+        if _GUARD_FILE.exists():
+            with open(_GUARD_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                out = {}
+                for k, v in data.items():
+                    try:
+                        out[str(k)] = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                return out
+    except Exception as e:
+        logger.debug(f"Could not read page-size guard: {e}")
+    return {}
+
+
+def _write_guard_file(data: dict) -> None:
+    try:
+        _GUARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _GUARD_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        from core import atomic_replace
+        atomic_replace(tmp, _GUARD_FILE)
+    except Exception as e:
+        logger.warning(f"Could not write page-size guard: {e}")
+
+
+def _clear_guard_scope(scope: str) -> None:
+    data = _read_guard_file()
+    if scope not in data:
+        return
+    data.pop(scope, None)
+    if not data:
+        try:
+            _GUARD_FILE.unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug(f"Could not remove page-size guard: {e}")
+        return
+    _write_guard_file(data)
+
+
 @contextmanager
 def guarded_render(scope: str):
     """Mark a risky render in progress, so a crash inside it is survivable.
 
     A no-op for a preset size, which keeps the common path free of disk I/O.
+    Uses a tiny sidecar file — not config.json — so a custom page size does
+    not flush the whole settings document twice per rebuild.
     """
     size = page_size(scope)
     if not is_risky(size):
         yield
         return
-    config = get_config()
-    guard = dict(config.get(_GUARD_KEY, {}) or {})
-    guard[scope] = size
-    config.set(_GUARD_KEY, guard)
-    config.save()          # must be on disk BEFORE the render is attempted
+    data = _read_guard_file()
+    data[scope] = size
+    _write_guard_file(data)
     try:
         yield
     finally:
-        guard = dict(config.get(_GUARD_KEY, {}) or {})
-        if guard.pop(scope, None) is not None:
-            config.set(_GUARD_KEY, guard)
-            config.save()
+        _clear_guard_scope(scope)
 
 
 def recover_page_sizes() -> dict:
     """Reset any page size whose render never finished. Call once at startup.
 
     Returns {scope: size_that_failed} for what was reset, so the caller can
-    say something about it.
+    say something about it. Also migrates a legacy guard left in config.json.
     """
     config = get_config()
-    guard = dict(config.get(_GUARD_KEY, {}) or {})
+    guard = _read_guard_file()
+    legacy = dict(config.get(_GUARD_KEY, {}) or {})
+    if legacy:
+        for scope, size in legacy.items():
+            try:
+                guard[str(scope)] = int(size)
+            except (TypeError, ValueError):
+                pass
+        config.set(_GUARD_KEY, {})
     if not guard:
         return {}
     sizes = dict(config.get(_SIZES_KEY, {}) or {})
     for scope in guard:
         sizes[scope] = PAGE_SIZE_DEFAULT
     config.set(_SIZES_KEY, sizes)
-    config.set(_GUARD_KEY, {})
     config.save()
+    try:
+        _GUARD_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
     logger.warning(
         "Page size reset to %d for %s: the previous render did not finish "
         "(sizes were %s)", PAGE_SIZE_DEFAULT, ", ".join(guard), guard)
@@ -161,7 +218,7 @@ class PageSizeCombo(QComboBox):
         self._scope = scope
         self._on_change = on_change
         self.setObjectName("page_size_combo")
-        self.setFixedHeight(26)
+        self.setFixedHeight(scaled(26, self))
         self.setFixedWidth(_COMBO_WIDTH)
         self.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)

@@ -26,6 +26,7 @@ from core.game_sources.common import source_label
 from core.library import (quantize_rating, review_rating, review_vote_count,
                           reviews_display_count)
 from i18n import t
+from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
 from ui.widgets.page_size import SCOPE_REVIEWS, PageSizeCombo, page_size
@@ -66,7 +67,7 @@ class _CountedTextEdit(QTextEdit):
         self.setStyleSheet(
             f"QTextEdit{{background:{palette('bg_input')};color:{palette('text')};"
             f"border:1px solid {palette('border')};border-radius:4px;"
-            f"padding:4px;font-size:12px;}}")
+            f"padding:4px;font-size:{scaled(12, self)}px;}}")
         self.counter = QLabel()
         self.counter.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.textChanged.connect(self._enforce)
@@ -89,7 +90,7 @@ class _CountedTextEdit(QTextEdit):
         full = used >= self._limit
         self.counter.setText(f"{used}/{self._limit}")
         self.counter.setStyleSheet(
-            f"color:{palette('warning' if full else 'text_hint')};font-size:10px;")
+            f"color:{palette('warning' if full else 'text_hint')};font-size:{scaled(10, self)}px;")
 
 
 class _ReviewCard(QFrame):
@@ -98,9 +99,6 @@ class _ReviewCard(QFrame):
     def __init__(self, review: dict, on_edit, on_delete, parent=None):
         super().__init__(parent)
         self.setObjectName("review_card")
-        self.setStyleSheet(
-            f"#review_card{{background:{palette('bg_elevated')};"
-            f"border:1px solid {palette('border')};border-radius:6px;}}")
         col = QVBoxLayout(self)
         col.setContentsMargins(10, 8, 10, 8)
         col.setSpacing(4)
@@ -111,14 +109,12 @@ class _ReviewCard(QFrame):
                                   font_size=11))
         who = (review.get("reviewer") or "").strip() or t("reviews.you")
         who_lbl = QLabel(who)
-        who_lbl.setStyleSheet(
-            f"color:{palette('text_secondary')};font-size:12px;font-weight:600;")
+        who_lbl.setObjectName("review_who")
         head.addWidget(who_lbl)
         when = _when_text(review.get("at", ""))
         if when:
             when_lbl = QLabel(when)
-            when_lbl.setStyleSheet(
-                f"color:{palette('text_hint')};font-size:10px;")
+            when_lbl.setObjectName("review_when")
             head.addWidget(when_lbl)
         # Where a score came from decides how much it is worth, so a review
         # that isn't the user's own says which site gave it — the reviewer
@@ -128,17 +124,13 @@ class _ReviewCard(QFrame):
         if src and src != "user":
             src_lbl = QLabel(source_label(src) or src)
             src_lbl.setToolTip(t("reviews.from_source", source=src))
-            src_lbl.setStyleSheet(
-                f"color:{palette('text_hint')};font-size:10px;"
-                f"border:1px solid {palette('border')};border-radius:6px;"
-                f"padding:0px 5px;")
+            src_lbl.setObjectName("review_meta_sm")
             head.addWidget(src_lbl)
         votes = review_vote_count(review)
         # Aggregates only — an ordinary user/DLsite review is one opinion.
         if votes > 1:
             votes_lbl = QLabel(t("reviews.votes_n", count=votes))
-            votes_lbl.setStyleSheet(
-                f"color:{palette('text_hint')};font-size:10px;")
+            votes_lbl.setObjectName("review_meta_sm")
             head.addWidget(votes_lbl)
         head.addStretch()
 
@@ -147,7 +139,7 @@ class _ReviewCard(QFrame):
         for btn, tip, cb in ((edit_btn, t("reviews.edit"), on_edit),
                              (del_btn, t("reviews.delete"), on_delete)):
             btn.setObjectName("icon_btn")
-            btn.setFixedSize(24, 24)
+            btn.setFixedSize(scaled(24, btn), scaled(24, btn))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(tip)
             btn.clicked.connect(cb)
@@ -167,11 +159,11 @@ class _ReviewCard(QFrame):
             body.setWordWrap(True)
             body.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse)
-            body.setStyleSheet(f"color:{palette('text')};font-size:12px;")
+            body.setObjectName("review_body")
             body_row.addWidget(body, 1)
             copy_btn = QPushButton("⧉")
             copy_btn.setObjectName("icon_btn")
-            copy_btn.setFixedSize(24, 24)
+            copy_btn.setFixedSize(scaled(24, copy_btn), scaled(24, copy_btn))
             copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             copy_btn.setToolTip(t("reviews.copy_tooltip"))
             copy_btn.clicked.connect(
@@ -184,9 +176,7 @@ class _ReviewCard(QFrame):
         if notes:
             notes_lbl = QLabel(f"{t('reviews.notes')}: {notes}")
             notes_lbl.setWordWrap(True)
-            notes_lbl.setStyleSheet(
-                f"color:{palette('text_muted')};font-size:11px;"
-                f"font-style:italic;")
+            notes_lbl.setObjectName("review_notes")
             col.addWidget(notes_lbl)
 
     @staticmethod
@@ -212,15 +202,93 @@ class ReviewsDialog(QDialog):
         self._reviews = [dict(r) for r in (reviews or [])]
         self._editing_index = -1        # -1 = the form is composing a new one
         self._page = 1
+        self._review_gen = 0            # stale-pump guard for card insertion
+        self._pending_reviews: list = []
+        self._review_busy = None
 
         self.setWindowTitle(t("reviews.title_for", name=game_name)
                             if game_name else t("reviews.title"))
-        self.setMinimumSize(560, 620)
+        # Native HWND paints COLOR_WINDOW (often white) before QSS — seed the
+        # palette so the first mapped frame matches the theme background
+        # (same construction as the add/edit dialog that opens this one).
+        self._apply_window_chrome()
+        # Form fields keep fixed heights; the review list scrolls. Size from
+        # host/screen so short displays get a scrollbar instead of crush.
         # WindowModal like the add/edit dialog that opens it: the overlay and
         # the rest of the app stay usable.
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self._build()
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=620, min_h=780, scroll=self._scroll, list_content=True)
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
         self._refresh()
+
+    def _apply_window_chrome(self):
+        """Theme-coloured native window fill before the first paint.
+
+        Without this, Windows maps a white client area for one frame while
+        Qt resolves stylesheets — the white flash seen on every open.
+        """
+        from PySide6.QtGui import QColor, QPalette
+        bg = QColor(palette("bg"))
+        fg = QColor(palette("text"))
+        card = QColor(palette("bg_card"))
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, bg)
+        pal.setColor(QPalette.ColorRole.Base, card)
+        pal.setColor(QPalette.ColorRole.AlternateBase, bg)
+        pal.setColor(QPalette.ColorRole.Button, bg)
+        pal.setColor(QPalette.ColorRole.WindowText, fg)
+        pal.setColor(QPalette.ColorRole.Text, fg)
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {palette('bg')}; color: {palette('text')}; }}"
+            f"QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}"
+        )
+        try:
+            from ui.helpers import set_dark_title_bar
+            set_dark_title_bar(self)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        self._apply_window_chrome()
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
+        super().showEvent(event)
+
+    def show_settled(self):
+        """Map the window at its already-chosen size with zero white flash (identical to AddGameDialog)."""
+        self._apply_window_chrome()
+        self.setWindowOpacity(0.0)
+        self.setUpdatesEnabled(False)
+        try:
+            QDialog.show(self)
+            self.ensurePolished()
+        finally:
+            self.setUpdatesEnabled(True)
+        self.repaint()
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self.setWindowOpacity(1.0)
+        self.raise_()
+        self.activateWindow()
+
+    def exec(self) -> int:
+        self.show_settled()
+        return super().exec()
+
+
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -231,13 +299,11 @@ class ReviewsDialog(QDialog):
 
         head = QHBoxLayout()
         title = QLabel(t("reviews.title"))
-        title.setStyleSheet(
-            f"color:{palette('text')};font-size:16px;font-weight:700;")
+        title.setObjectName("dialog_title")
         head.addWidget(title)
         head.addStretch()
         self._avg_caption = QLabel(t("reviews.average"))
-        self._avg_caption.setStyleSheet(
-            f"color:{palette('text_muted')};font-size:11px;")
+        self._avg_caption.setObjectName("review_when")
         head.addWidget(self._avg_caption)
         self._avg = StarRating(0.0, star_size=13, font_size=12)
         head.addWidget(self._avg)
@@ -261,16 +327,12 @@ class ReviewsDialog(QDialog):
     def _build_form(self) -> QWidget:
         box = QFrame()
         box.setObjectName("review_form")
-        box.setStyleSheet(
-            f"#review_form{{background:{palette('bg_card')};"
-            f"border:1px solid {palette('border')};border-radius:6px;}}")
         col = QVBoxLayout(box)
         col.setContentsMargins(12, 10, 12, 10)
         col.setSpacing(6)
 
         self._form_title = QLabel(t("reviews.new"))
-        self._form_title.setStyleSheet(
-            f"color:{palette('text_secondary')};font-size:12px;font-weight:600;")
+        self._form_title.setObjectName("review_form_title")
         col.addWidget(self._form_title)
 
         # Rating and who wrote it on one line: both are short, and the stars
@@ -280,17 +342,12 @@ class ReviewsDialog(QDialog):
         self._stars = StarRatingInput()
         line.addWidget(self._stars)
         self._score = QLabel()
-        self._score.setStyleSheet(
-            f"color:{palette('text_secondary')};font-size:12px;"
-            f"font-weight:600;min-width:34px;")
+        self._score.setObjectName("review_score")
         self._stars.value_changed.connect(self._on_stars)
         line.addWidget(self._score)
         self._reviewer = QLineEdit()
         self._reviewer.setPlaceholderText(t("reviews.reviewer_placeholder"))
-        self._reviewer.setStyleSheet(
-            f"QLineEdit{{background:{palette('bg_input')};color:{palette('text')};"
-            f"border:1px solid {palette('border')};border-radius:4px;"
-            f"padding:4px 6px;font-size:12px;}}")
+        self._reviewer.setObjectName("review_reviewer")
         line.addWidget(self._reviewer, 1)
         col.addLayout(line)
 
@@ -307,8 +364,7 @@ class ReviewsDialog(QDialog):
 
         actions = QHBoxLayout()
         self._form_hint = QLabel("")
-        self._form_hint.setStyleSheet(
-            f"color:{palette('warning')};font-size:11px;")
+        self._form_hint.setObjectName("review_form_hint")
         actions.addWidget(self._form_hint)
         actions.addStretch()
         self._cancel_edit_btn = QPushButton(t("reviews.cancel_edit"))
@@ -332,6 +388,9 @@ class ReviewsDialog(QDialog):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setStyleSheet("background: transparent; border: none;")
+        self._scroll.viewport().setStyleSheet("background: transparent;")
+        self._scroll.viewport().setAutoFillBackground(False)
         # A page of reviews is taller than the panel whatever its size, so the
         # vertical bar is expected; a horizontal one would only mean the text
         # failed to wrap.
@@ -341,6 +400,8 @@ class ReviewsDialog(QDialog):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list_host = QWidget()
         self._list_host.setObjectName("transparent_bg")
+        self._list_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._list_host.setStyleSheet("background: transparent;")
         self._list = QVBoxLayout(self._list_host)
         self._list.setContentsMargins(0, 0, 0, 0)
         self._list.setSpacing(6)
@@ -350,8 +411,7 @@ class ReviewsDialog(QDialog):
 
         self._empty = QLabel(t("reviews.empty"))
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty.setStyleSheet(
-            f"color:{palette('text_disabled')};font-size:12px;padding:20px;")
+        self._empty.setObjectName("dialog_empty")
         col.addWidget(self._empty)
 
         # Page size on the pager row, as everywhere else in the app.
@@ -480,18 +540,46 @@ class ReviewsDialog(QDialog):
         total_pages = max(1, -(-len(self._reviews) // per_page))
         self._page = max(1, min(self._page, total_pages))
         start = (self._page - 1) * per_page
+        page_items = list(enumerate(
+            self._reviews[start:start + per_page], start=start))
 
-        for offset, review in enumerate(
-                self._reviews[start:start + per_page]):
-            index = start + offset
+        self._empty.setVisible(not self._reviews)
+        self._scroll.setVisible(bool(self._reviews))
+        self._render_pager(total_pages)
+
+        # Cards insert in QTimer chunks so a page of reviews never freezes the dialog;
+        # generation token prevents stale callbacks from accumulating RAM or writing to destroyed trees.
+        self._review_gen += 1
+        gen = self._review_gen
+        self._stop_review_busy()
+        if self.isVisible():
+            from ui.widgets.busy_overlay import DeferredBusy
+            self._review_busy = DeferredBusy(self, t("common.please_wait"))
+        self._pending_reviews = page_items
+        QTimer.singleShot(0, lambda g=gen: self._insert_review_step(g))
+
+    def _insert_review_step(self, gen: int):
+        if gen != self._review_gen:
+            return  # stale pump — a newer _refresh or close took over
+        for _ in range(3):  # three cards per tick
+            if not self._pending_reviews:
+                break
+            index, review = self._pending_reviews.pop(0)
             self._list.addWidget(_ReviewCard(
                 review,
                 on_edit=lambda _=False, i=index: self._load_into_form(i),
                 on_delete=lambda _=False, i=index: self._delete(i)))
-        self._list.addStretch()
-        self._empty.setVisible(not self._reviews)
-        self._scroll.setVisible(bool(self._reviews))
-        self._render_pager(total_pages)
+        if self._pending_reviews:
+            QTimer.singleShot(0, lambda g=gen: self._insert_review_step(g))
+        else:
+            self._stop_review_busy()
+            self._list.addStretch()
+
+    def _stop_review_busy(self):
+        busy = self._review_busy
+        if busy is not None:
+            busy.close()
+            self._review_busy = None
 
     def _render_pager(self, total_pages: int):
         # The combo is reparented before the row is wiped: it belongs to the
@@ -512,7 +600,21 @@ class ReviewsDialog(QDialog):
             build_pager(self._page, total_pages, _go,
                         size_combo=self._size_combo))
 
-    # ── Result ───────────────────────────────────────────────────────────────
+    # ── Result & Cleanup ─────────────────────────────────────────────────────
+
+    def _cleanup_pump(self):
+        """Invalidate in-flight card insertion and release pending queue."""
+        self._review_gen += 1
+        self._pending_reviews.clear()
+        self._stop_review_busy()
+
+    def reject(self):
+        self._cleanup_pump()
+        super().reject()
+
+    def done(self, result: int):
+        self._cleanup_pump()
+        super().done(result)
 
     def _on_accept(self):
         # Text still sitting in the form would otherwise be lost without a
@@ -520,6 +622,7 @@ class ReviewsDialog(QDialog):
         if (self._text.toPlainText().strip()
                 or quantize_rating(self._stars.value())):
             self._commit()
+        self._cleanup_pump()
         self.accept()
 
     def reviews(self) -> list:

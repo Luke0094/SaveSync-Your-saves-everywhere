@@ -6,7 +6,10 @@ class TadsRecFormat(_Format):
     """TAD-kit ``system.rec`` slots. See ``core.engines.tads``."""
     name = "TADS record"
     engine = "TADS"
-    verify_exact = True
+    # dump() re-joins tokens with single spaces, so a record that held
+    # multiple spaces is NOT byte-exact. The guarantee is only known per
+    # instance, once the file is seen (load flips it on when it holds).
+    verify_exact = False
 
     def __init__(self):
         self._rec = None
@@ -17,6 +20,7 @@ class TadsRecFormat(_Format):
             self._rec = loads(data)
         except TadsError as e:
             raise SaveEditorError(str(e)) from e
+        self.verify_exact = (self.dump() == data)
 
     def dump(self) -> bytes:
         return self._rec.dump()

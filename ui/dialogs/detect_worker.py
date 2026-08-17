@@ -25,6 +25,7 @@ class DetectWorker(QThread):
         self._tracked_snapshot = tracked_snapshot or {}
         self._appid = appid
         self._should_stop = False
+        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._should_stop = True

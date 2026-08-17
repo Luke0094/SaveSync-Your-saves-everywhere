@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
+from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
 
@@ -20,7 +21,6 @@ def _styled_title(text: str) -> QLabel:
     """Create a dialog title label matching the app's dialog style."""
     lbl = QLabel(text)
     lbl.setObjectName("page_header")
-    lbl.setStyleSheet("font-size: 18px;")
     return lbl
 
 
@@ -34,46 +34,28 @@ def _separator() -> QFrame:
 def _accent_btn(text: str) -> QPushButton:
     """Primary action button styled with the accent palette."""
     btn = QPushButton(text)
-    btn.setStyleSheet(
-        f"QPushButton {{ background:{palette('accent')}; color:{palette('accent_text')}; "
-        f"border:1px solid {palette('accent')}; border-radius:6px; padding:7px 16px; "
-        f"font-size:12px; font-weight:600; }} "
-        f"QPushButton:hover {{ background:{palette('accent_hover')}; }}"
-    )
+    btn.setObjectName("form_primary_btn")
     return btn
 
 
 def _secondary_btn(text: str) -> QPushButton:
     """Secondary action button with subtle border."""
     btn = QPushButton(text)
-    btn.setStyleSheet(
-        f"QPushButton {{ background:{palette('bg')}; color:{palette('text_secondary')}; "
-        f"border:1px solid {palette('border')}; border-radius:6px; padding:7px 16px; "
-        f"font-size:12px; }} "
-        f"QPushButton:hover {{ border-color:{palette('accent')}; color:{palette('accent')}; }}"
-    )
+    btn.setObjectName("form_secondary_btn")
     return btn
 
 
 def _danger_btn(text: str) -> QPushButton:
     """Destructive action button (delete, etc.)."""
     btn = QPushButton(text)
-    btn.setStyleSheet(
-        f"QPushButton {{ color:{palette('error')}; border:1px solid {palette('error')}; "
-        f"background:transparent; border-radius:6px; padding:7px 16px; font-size:12px; }} "
-        f"QPushButton:hover {{ background:{palette('error')}; color:{palette('accent_text')}; }}"
-    )
+    btn.setObjectName("danger_btn")
     return btn
 
 
 def _muted_btn(text: str) -> QPushButton:
     """Very subtle button for low-priority actions."""
     btn = QPushButton(text)
-    btn.setStyleSheet(
-        f"QPushButton {{ color:{palette('text_muted')}; border:1px solid {palette('border_subtle')}; "
-        f"background:transparent; border-radius:6px; padding:7px 16px; font-size:11px; }} "
-        f"QPushButton:hover {{ border-color:{palette('text_muted')}; color:{palette('text_secondary')}; }}"
-    )
+    btn.setObjectName("form_muted_btn")
     return btn
 
 
@@ -85,10 +67,11 @@ class ConfigImportPreviewDialog(QDialog):
     def __init__(self, preview: dict, has_credentials: bool, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("config_transfer.preview_title"))
-        self.setMinimumWidth(480)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._preview = preview
         self._build(preview, has_credentials)
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=480, min_h=400)
 
     def _build(self, preview: dict, has_credentials: bool):
         layout = QVBoxLayout(self)
@@ -103,7 +86,7 @@ class ConfigImportPreviewDialog(QDialog):
             f"{t('config_transfer.exported_at', date=preview['exported_at'][:19].replace('T', ' '))}"
         )
         info = QLabel(info_text)
-        info.setStyleSheet(f"color: {palette('text_secondary')}; font-size: 12px;")
+        info.setObjectName("dialog_desc")
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -127,13 +110,14 @@ class ConfigImportPreviewDialog(QDialog):
 
         if summary_parts:
             summary = QLabel("\n".join(summary_parts))
-            summary.setStyleSheet(f"color: {palette('text')}; font-size: 12px; line-height: 1.6;")
+            summary.setObjectName("dialog_desc")
             summary.setWordWrap(True)
             layout.addWidget(summary)
 
         if n_invalid:
             note = QLabel(t("config_transfer.invalid_paths_note"))
-            note.setStyleSheet(f"color: {palette('warning')}; font-size: 11px;")
+            fs = scaled(11, self)
+            note.setStyleSheet(f"color: {palette('warning')}; font-size: {fs}px;")
             note.setWordWrap(True)
             layout.addWidget(note)
 
@@ -158,7 +142,7 @@ class ConfigImportPreviewDialog(QDialog):
             layout.addWidget(_separator())
 
             merge_label = QLabel(t("config_transfer.merge_strategy_label"))
-            merge_label.setStyleSheet(f"font-weight: bold; font-size: 12px; color: {palette('text')};")
+            merge_label.setObjectName("settings_section_lbl")
             layout.addWidget(merge_label)
 
             self._strategy_group = QButtonGroup(self)
@@ -214,11 +198,11 @@ class ConfigHistoryDialog(QDialog):
     def __init__(self, snapshots: list[dict], parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("config_transfer.history_title"))
-        self.setMinimumWidth(420)
-        self.setMinimumHeight(320)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._snapshots = snapshots
         self._build()
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=420, min_h=320)
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -231,7 +215,7 @@ class ConfigHistoryDialog(QDialog):
         self._list.setStyleSheet(
             f"QListWidget {{ background:{palette('bg_card')}; border:1px solid {palette('border')}; "
             f"border-radius:6px; }} "
-            f"QListWidget::item {{ padding:6px 10px; color:{palette('text_secondary')}; font-size:12px; }} "
+            f"QListWidget::item {{ padding:6px 10px; color:{palette('text_secondary')}; font-size:{scaled(12, self)}px; }} "
             f"QListWidget::item:selected {{ background:{palette('bg_elevated')}; color:{palette('accent')}; }}"
         )
         if not self._snapshots:
@@ -307,9 +291,10 @@ class CloudConfigPromptDialog(QDialog):
     def __init__(self, cloud_info: dict, provider_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("config_transfer.cloud_config_found"))
-        self.setMinimumWidth(420)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._build(cloud_info, provider_name)
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=420, min_h=280)
 
     def _build(self, cloud_info: dict, provider_name: str):
         layout = QVBoxLayout(self)
@@ -330,7 +315,7 @@ class CloudConfigPromptDialog(QDialog):
         desc = QLabel(t("config_transfer.cloud_config_prompt",
                         name=provider_name or "cloud", date=mod_str))
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {palette('text_secondary')}; line-height: 1.5;")
+        desc.setObjectName("dialog_desc")
         layout.addWidget(desc)
 
         layout.addWidget(_separator())

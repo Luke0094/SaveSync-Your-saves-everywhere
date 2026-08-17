@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from core.constants import APP_VERSION
 from core.update_check import ReleaseInfo
 from i18n import t
+from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.styles.theme import palette
 
 
@@ -31,10 +32,11 @@ class UpdateAvailableDialog(QDialog):
         self.setWindowTitle(t("update.title"))
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        self.setMinimumSize(480, 420)
-        self.resize(520, 480)
-        self.setStyleSheet(f"QDialog{{background:{palette('bg')};}}")
         self._build()
+        from ui.helpers import set_dark_title_bar
+        set_dark_title_bar(self)
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=480, min_h=400)
 
     def _build(self):
         # Outer sheet reuses the busy-overlay dim; the card inside is the
@@ -50,57 +52,44 @@ class UpdateAvailableDialog(QDialog):
 
         card = QFrame()
         card.setObjectName("busy_toast")
-        card.setMaximumWidth(460)
+        card.setMaximumWidth(scaled(460, self))
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(22, 18, 22, 18)
         card_lay.setSpacing(12)
 
         title = QLabel(t("update.title"))
+        title.setObjectName("update_title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(
-            f"color:{palette('text')};font-size:15px;font-weight:700;"
-            f"background:transparent;border:none;")
         card_lay.addWidget(title)
 
         summary = QLabel(t("update.available",
                            version=self._info.version,
                            current=APP_VERSION))
+        summary.setObjectName("update_summary")
         summary.setWordWrap(True)
         summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        summary.setStyleSheet(
-            f"color:{palette('text_secondary')};font-size:12px;"
-            f"font-weight:500;background:transparent;border:none;")
         card_lay.addWidget(summary)
 
         note = QLabel(t("update.manual_note"))
+        note.setObjectName("update_note")
         note.setWordWrap(True)
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        note.setStyleSheet(
-            f"color:{palette('text_muted')};font-size:11px;"
-            f"background:transparent;border:none;")
         card_lay.addWidget(note)
 
         body = (self._info.body or "").strip() or t("update.no_notes")
         notes = QTextEdit()
+        notes.setObjectName("update_notes")
         notes.setReadOnly(True)
         notes.setPlainText(body)
-        notes.setMinimumHeight(160)
-        notes.setStyleSheet(
-            f"QTextEdit{{background:{palette('bg')};color:{palette('text')};"
-            f"border:1px solid {palette('border')};border-radius:6px;"
-            f"padding:8px;font-size:12px;font-weight:400;}}")
+        notes.setMinimumHeight(scaled(160, self))
         card_lay.addWidget(notes, 1)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
 
         later = QPushButton(t("update.later"))
+        later.setObjectName("update_later_btn")
         later.setCursor(Qt.CursorShape.PointingHandCursor)
-        later.setStyleSheet(
-            f"QPushButton{{color:{palette('text')};background:{palette('bg_elevated')};"
-            f"border:1px solid {palette('border')};border-radius:4px;"
-            f"padding:7px 16px;font-size:12px;font-weight:600;}}"
-            f"QPushButton:hover{{border-color:{palette('border_hover')};}}")
         later.clicked.connect(self.reject)
         btn_row.addWidget(later)
 
@@ -124,10 +113,11 @@ class _DimSheet(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._dim = QColor(palette("bg"))
-        self._dim.setAlpha(190)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), self._dim)
+        dim = QColor(palette("bg"))
+        dim.setAlpha(190)
+        painter.fillRect(self.rect(), dim)
         painter.end()

@@ -256,6 +256,59 @@ def _ping_running_instance() -> bool:
         return False
 
 
+# On Windows a QLocalServer does NOT see a raw CreateFileW client (Qt's
+# QLocalSocket protocol needs an exchange the ctypes ping never performs), so
+# the listener is a plain Win32 named pipe served from a thread. The ping
+# above connects, we get the connection, the callback brings the window up.
+def _start_show_pipe(callback) -> None:
+    """Serve ``\\\\.\\pipe\\<show-name>`` on a daemon thread (Windows only)."""
+    import threading
+    import time
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateNamedPipeW.restype = ctypes.c_void_p
+    k32.CreateNamedPipeW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                     ctypes.c_uint32, ctypes.c_uint32,
+                                     ctypes.c_uint32, ctypes.c_uint32,
+                                     ctypes.c_uint32, ctypes.c_void_p]
+    k32.ConnectNamedPipe.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    PIPE_ACCESS_DUPLEX = 0x00000003
+    PIPE_TYPE_BYTE = 0x00000000
+    PIPE_READMODE_BYTE = 0x00000000
+    PIPE_WAIT = 0x00000000
+    NMPWAIT_USE_DEFAULT_WAIT = 0x00000000
+    INVALID = ctypes.c_void_p(-1).value
+    ERROR_PIPE_CONNECTED = 535
+    path = "\\\\.\\pipe\\" + _instance_show_name()
+
+    def _serve():
+        while True:
+            try:
+                handle = k32.CreateNamedPipeW(
+                    path, PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1, 0, 0, NMPWAIT_USE_DEFAULT_WAIT, None)
+            except Exception:
+                time.sleep(0.5)
+                continue
+            if handle in (None, INVALID):
+                time.sleep(0.5)
+                continue
+            try:
+                ok = k32.ConnectNamedPipe(handle, None)
+                if not ok and ctypes.get_last_error() == ERROR_PIPE_CONNECTED:
+                    ok = True   # client connected between Create and Connect
+                if ok:
+                    callback()
+            finally:
+                k32.CloseHandle(handle)
+
+    t = threading.Thread(target=_serve, name="show-pipe", daemon=True)
+    t.start()
+
+
 def _show_native_msgbox(title: str, message: str):
     """Show a native Windows MessageBox without requiring Qt."""
     if sys.platform == "win32":
@@ -308,6 +361,74 @@ def main():
     # which would see the mutex we already own and incorrectly exit with
     # "already running".
     sys._savesync_instance_checked = True
+
+    # ── Second-launch focus listener, as early as possible ──────────────
+    # A new instance pings a local pipe/socket and exits; we answer by
+    # bringing the existing window to the foreground. Started BEFORE the
+    # heavy imports so a relaunch during startup already finds the pipe.
+    # The callback resolves `window` lazily: the pipe may receive a ping
+    # before MainWindow exists, so the raise happens on the first call that
+    # follows window creation.
+    if sys.platform == "win32":
+        from PySide6.QtCore import QObject, Signal
+        _window_ref = {}
+
+        class _ShowSignal(QObject):
+            requested = Signal()
+
+        _show_signal = _ShowSignal()
+
+        def _raise_window():
+            w = _window_ref.get("w")
+            if w is not None:
+                try:
+                    w.show_and_raise()
+                except Exception:
+                    pass
+
+        # The pipe runs on a daemon thread: emit is queued into the main
+        # thread's event loop (receiver lives there), so Qt widget calls
+        # always happen on the GUI thread.
+        _show_signal.requested.connect(_raise_window)
+        _start_show_pipe(_show_signal.requested.emit)
+        _window_ref["w"] = None  # filled in below once MainWindow is created
+    else:
+        # QLocalServer serves AF_UNIX sockets on Linux/macOS; the plain
+        # socket client matches here. newConnection fires on the GUI thread,
+        # so a direct call is safe. The client (main._ping_running_instance
+        # and runtime_splash_hook._ping_primary_instance) connects to
+        # tempfile.gettempdir()/name, so the server must listen on that same
+        # absolute path: QLocalServer's own temp path would not always be
+        # the same directory tempfile picks.
+        import tempfile
+        from PySide6.QtNetwork import QLocalServer
+        _window_ref = {}
+        _show_name = os.path.join(tempfile.gettempdir(), _instance_show_name())
+
+        def _on_second_instance():
+            w = _window_ref.get("w")
+            if w is not None:
+                try:
+                    w.show_and_raise()
+                except Exception:
+                    pass
+
+        QLocalServer.removeServer(_show_name)
+        _show_server = QLocalServer()
+
+        def _on_qt_second_instance():
+            while _show_server.hasPendingConnections():
+                conn = _show_server.nextPendingConnection()
+                if conn is not None:
+                    conn.close()
+                    conn.deleteLater()
+            _on_second_instance()
+
+        _show_server.newConnection.connect(_on_qt_second_instance)
+        if not _show_server.listen(_show_name):
+            logging.warning(
+                f"Second-instance listener unavailable: {_show_server.errorString()}"
+            )
 
     # Phase 1: filesystem-only startup (native splash already visible)
     from core.startup import ensure_data_directory, validate_directories, cleanup_temp_files, check_dependencies
@@ -464,27 +585,8 @@ def main():
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.setUrlHandler("savesync", window, "handleSavesyncUrl")
 
-        # ── Second-launch focus ──────────────────────────────────────────
-        # A new instance pings this local socket and exits; we answer by
-        # bringing the existing window to the foreground.
-        from PySide6.QtNetwork import QLocalServer
-        _show_name = _instance_show_name()
-        QLocalServer.removeServer(_show_name)   # clear a stale socket/pipe
-        _show_server = QLocalServer(window)
-
-        def _on_second_instance():
-            while _show_server.hasPendingConnections():
-                conn = _show_server.nextPendingConnection()
-                if conn is not None:
-                    conn.close()
-                    conn.deleteLater()
-            window.show_and_raise()
-
-        _show_server.newConnection.connect(_on_second_instance)
-        if not _show_server.listen(_show_name):
-            logging.warning(
-                f"Second-instance listener unavailable: {_show_server.errorString()}"
-            )
+        # Hand the created window to the early second-launch listener.
+        _window_ref["w"] = window
 
         sys.exit(app.exec())
     except Exception:

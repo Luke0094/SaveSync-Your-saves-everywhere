@@ -23,16 +23,25 @@ def _svg(body: str, fill: str) -> str:
     )
 
 
-def ensure_arrow_icons(theme: str) -> dict[str, str]:
-    """Return QSS-ready ``url("…")`` values for up/down/left/right chevrons."""
+def ensure_arrow_icons(theme: str, suffix: str = "") -> dict[str, str]:
+    """Return QSS-ready ``url("…")`` values for up/down/left/right chevrons.
+
+    *suffix* picks an alternate fill: ``""`` = theme fill, ``"_muted"`` =
+    the muted text colour (used for disabled arrows, so a chevron visibly
+    dims when there is nothing to scroll).
+    """
     from core.constants import USER_DATA_DIR
 
-    fill = "#c0c0cc" if theme == "dark" else "#4a4a5a"
+    if suffix:
+        from ui.styles.theme import palette
+        fill = palette("text_muted")
+    else:
+        fill = "#c0c0cc" if theme == "dark" else "#4a4a5a"
     out_dir = Path(USER_DATA_DIR) / "ui_icons" / theme
     out_dir.mkdir(parents=True, exist_ok=True)
     urls = {}
     for name, body in _SVGS.items():
-        path = out_dir / f"{name}.svg"
+        path = out_dir / f"{name}{suffix}.svg"
         text = _svg(body, fill)
         try:
             if not path.is_file() or path.read_text(encoding="utf-8") != text:
@@ -56,7 +65,9 @@ def chevron_button_style(
 
     *direction* is one of ``left`` / ``right`` / ``up`` / ``down``. Unicode
     glyphs (◀ ▶) vanish on some Windows fonts/DPI scales — these icons are
-    the same assets the global theme injects into scrollbars.
+    the same assets the global theme injects into scrollbars. The disabled
+    state paints the chevron in the muted text colour, so an arrow with
+    nothing left to scroll dims instead of staying full-strength.
     """
     if theme is None:
         try:
@@ -66,6 +77,8 @@ def chevron_button_style(
             theme = "dark"
     urls = ensure_arrow_icons(theme)
     icon = urls.get(direction) or urls.get("right")
+    muted = ensure_arrow_icons(theme, suffix="_muted")
+    muted_icon = muted.get(direction) or muted.get("right")
     from ui.styles.theme import palette
     return (
         f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
@@ -74,5 +87,5 @@ def chevron_button_style(
         f"QPushButton:hover{{background:{palette('accent')};"
         f"border-color:{palette('accent')};}}"
         f"QPushButton:disabled{{background:{palette('bg')};"
-        f"border-color:{palette('border')};}}"
+        f"border-color:{palette('border')};image:{muted_icon};}}"
     )

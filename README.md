@@ -41,9 +41,17 @@ choice — with an always-on-top overlay so you never have to leave the game.
 ### Backups & sync
 - **Versioned local backups** with retention (max count, days, minimum kept,
   size cap) and content-dedup (unchanged saves are skipped)
+- **Mtime preflight** — Backup All / Sync skip games whose saves clearly have
+  not changed (newest mtime + file count vs the last backup), before rebuilding
+  content hashes
+- **Adaptive batch queues** — Backup All / Sync All run with a concurrency
+  limit derived from CPU and RAM, with sidebar progress (`N/M — name`) and
+  resume after an app restart
 - **Pre-restore safety backups** — automatic backup before any restore
 - **Integrity checks** — each backup is opened and confirmed readable, on
-  demand or on a schedule, so a damaged archive is found before you need it
+  demand or on a schedule, so a damaged archive is found before you need it;
+  sweeps throttle only on weaker machines, skip archives still marked OK
+  recently, and flush index files once per game
 - **Interference alerts** — when something outside SaveSync puts an older save
   state back (a launcher's automatic sync, say), it says so, and can force the
   restore with the game frozen
@@ -63,6 +71,9 @@ choice — with an always-on-top overlay so you never have to leave the game.
 - **Card and list views** with search (by title or developer), folder tree with
   colors, star ratings from reviews, and three-state filters for tags and
   engines (include / exclude)
+- **Paged lists** — only the current page of cards/rows is built; on capable
+  machines the page is filled in one go, on weaker ones in small chunks so the
+  UI stays responsive
 - **Smart tag merging** — case- and separator-insensitive ("2D Game", "2d-game"
   and "2DCG"/"2dcg" converge to one canonical tag, self-healing on startup)
 - **Web metadata search** — name, description, cover, developer, release date,
@@ -434,6 +445,9 @@ Two rules it is built around:
 | TADS record (`system.rec`) — whitespace tokens, NUL-padded | Classic MJR TADS 3 VM state (`.t3v`) — a snapshot, not a named value list |
 | SQLite (`.db`, `.sqlite`) — Room / Compose Desktop Java progress | |
 
+<summary><strong>Some Info about Saves system</strong></summary>
+<details>
+
 Two notes on Ren'Py, because they are unusual. Its saves are Python pickles,
 and unpickling one runs code from the file — so SaveSync reads the pickle
 opcode by opcode and never builds anything out of it. And Ren'Py 8 refuses a
@@ -657,6 +671,8 @@ untouched open/close is byte-for-byte.
 It edits files at rest. Nothing is injected into a running game and nothing
 attaches to one.
 
+</details>
+
 ## Hotkeys
 
 | Key | Action |
@@ -671,7 +687,44 @@ Hotkeys are registered with **pynput**: on Linux they work as a regular user
 ## Configuration
 
 Settings live in `%APPDATA%/SaveSync/config.json` (Linux/macOS:
-`~/.local/share/SaveSync/`) with debounced writes and validation.
+`~/.local/share/SaveSync/`) with debounced writes and validation. Most of what
+you tune is in **Settings**; a few behaviours scale automatically from the
+machine so capable PCs are not artificially slowed and weaker ones stay usable.
+
+### How adaptive limits work
+
+At runtime SaveSync classifies the host into a coarse tier from **logical CPU
+count** and **total RAM** (via `psutil` when present). That tier is **cached
+~45 s** so a brief free-RAM dip (game launch, antivirus) does not flip library
+chunking / verify pacing on and off. **Currently available RAM** is still read
+live for Backup All / Sync All: under ~1.5 GB free, those queues drop to one
+job so they do not fight the game for memory.
+
+| Tier | Rough signal | What changes |
+|------|--------------|--------------|
+| **high** | ≥ 8 logical CPUs and ≥ ~12 GB total RAM | No pause between integrity checks; library page built in one shot; short config/library write debounce (~0.5 s); Backup All / Sync All may run more jobs in parallel (up to 8 / 4) |
+| **mid** | typical desktop (≥ 4 CPUs, comfortable total RAM) | Light verify pause (~20 ms); library inserts in chunks of ~16; debounce ~1 s; moderate batch concurrency |
+| **low** | few CPUs, or ≤ ~8 GB total RAM | Stronger verify pause (~80 ms); smaller library chunks (~6); debounce ~2 s; Backup All / Sync All capped tightly (often 1–2) |
+
+These are **not** Settings toggles. Batch jobs (Backup All, Sync All,
+multiple-add) also **persist progress** and resume after a restart; the sidebar
+shows `N/M — name` while they run.
+
+Other automatic I/O habits worth knowing:
+
+- **Filesystem watcher** coalesces save bursts (~5 s, ~8 s when many files are
+  pending) before triggering a backup
+- **Backup / sync “already current”** uses an mtime + entry-count preflight so
+  unchanged games are skipped without rebuilding zip content hashes
+- **Config export history** (snapshots created on export, cloud upload,
+  pre-import / pre-restore) keeps at most **5** local folders under
+  `config_history/`; older ones are rotated out. A sandbox self-check after
+  startup verifies that restore still works when the history is full (same
+  notification path as backup integrity failures)
+- **Page-size crash guard** for oversized custom page sizes uses a tiny sidecar
+  file (`page_size_render_guard.json`), not a full rewrite of `config.json`
+
+### Settings reference
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -683,12 +736,24 @@ Settings live in `%APPDATA%/SaveSync/config.json` (Linux/macOS:
 | `save_edit_copy_days` | 7 | Days before those copies are dropped. The newest is never dropped for age, and the rule also runs at startup, so it reaches saves nobody has opened since |
 | `process_poll_interval` | 1s | Base scan interval (auto-slows in game / when idle) |
 | `backup_on_exit` | true | Auto-backup when a game closes |
+| `backup_during_game` | false | Periodic in-game backups while playing (interval in Settings) |
 | `auto_scan_on_exit` | true | Scan for save paths when a game exits |
 | `auto_sync_after_backup` | false | Sync to cloud after each backup |
 | `save_correlation_enabled` | false | Claim saves by write-time correlation (see above) |
 | `save_correlation_window_ms` | 1000 | How far apart the two writes may be. Weaker candidates get 40% of it |
 | `backup_verify_enabled` | true | Check backup archives on a schedule |
 | `backup_verify_interval_days` | 7 | How often that check runs |
+| `auto_export_config_enabled` | false | Periodically upload an encrypted config pack to the connected sync provider |
+| `auto_export_config_interval_days` | 7 | How often that cloud config export runs |
+| `page_sizes` | per list | Items per page for library, backups, save editor, reviews (presets 10 / 20 / 50, or custom) |
+
+### Config export & history
+
+From **Settings → Transfer** you can export / import an encrypted
+`.savesync` pack (settings, library, optional credentials) and browse
+**Configuration History**. Each successful export or cloud upload also writes a
+local snapshot; at most five are kept. Restoring or importing first snapshots
+the current state (`pre_restore` / `pre_import`) so you can undo.
 
 ### Diagnostics
 

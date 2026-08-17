@@ -15,7 +15,8 @@ import logging
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from typing import Optional
+from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QScrollArea, QSizePolicy, QSpinBox,
@@ -26,7 +27,7 @@ from core.save_editor import (SaveEditorError, describe, explain,
                               list_backups, open_save, prune_backups,
                               restore_backup)
 from i18n import t
-from ui.helpers import ElidedLabel
+from ui.helpers import ElidedLabel, PageScrollMixin, scaled
 from ui.modal_helpers import warning_window_modal
 from ui.styles.theme import palette, ThemedMixin
 from ui.widgets.search_inputs import ClearableLineEdit, GhostClearableLineEdit
@@ -319,7 +320,7 @@ class _DropZone(QFrame, ThemedMixin):
         self.setObjectName("cheats_drop")
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(58)
+        self.setFixedHeight(scaled(58, self))
         self._hot = False
         row = QHBoxLayout(self)
         row.setContentsMargins(14, 8, 14, 8)
@@ -336,7 +337,7 @@ class _DropZone(QFrame, ThemedMixin):
         return (f"QFrame#cheats_drop{{border:1px dashed {edge};border-radius:6px;"
                 f"background:{fill};}}"
                 f"QLabel#cheats_drop_label{{color:{palette('text_muted')};"
-                f"font-size:11px;background:transparent;border:none;}}")
+                f"font-size:{scaled(11, self)}px;background:transparent;border:none;}}")
 
     def retranslate(self):
         self._label.setText(t("cheats.drop_hint"))
@@ -376,19 +377,53 @@ class _DropZone(QFrame, ThemedMixin):
         else:
             event.ignore()
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.browse.emit()
-        super().mouseReleaseEvent(event)
+class _SaveLoadWorker(QThread):
+    finished = Signal(object, object)  # (doc, exception)
+    progress = Signal(float)
+
+    def __init__(self, path: Path, game_dir: Optional[Path], parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._game_dir = game_dir
+        self._is_cancelled = False
+        self.setPriority(QThread.Priority.IdlePriority)
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        from time import monotonic
+        start_mono = monotonic()
+        last_emit = 0.0
+
+        def _prog_tick(elapsed=0.0):
+            nonlocal last_emit
+            now = monotonic()
+            # Throttle progress events to max 2Hz (every 500ms) to prevent event-loop saturation and UI lag during scrolling
+            if now - last_emit >= 0.5:
+                last_emit = now
+                self.progress.emit(now - start_mono)
+            return not self._is_cancelled
+
+        try:
+            doc = open_save(self._path, game_dir=self._game_dir, progress=_prog_tick)
+            if self._is_cancelled:
+                self.finished.emit(None, SaveEditorError(t("cheats.loading_cancelled")))
+            else:
+                self.finished.emit(doc, None)
+        except Exception as exc:
+            self.finished.emit(None, exc)
 
 
-class CheatsPage(QWidget, ThemedMixin):
+
+class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     """Pick a game, pick a save, edit what is inside it."""
 
     STEP_PICK, STEP_SAVES, STEP_EDIT = 0, 1, 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
         self._entry = None
         self._doc = None
         self._editors = {}          # field path -> widget, for the page shown
@@ -403,11 +438,29 @@ class CheatsPage(QWidget, ThemedMixin):
         self._files = []            # the save list, newest first
         self._file_page = 0
         self._games_page = 0        # the library list has its own page number
+        # Async row insert (same idea as library cards): gen invalidates
+        # in-flight pumps when a newer list starts.
+        self._row_insert_gen = 0
+        self._row_insert_queue: list = []
+        self._row_insert_chunk = 16
+        self._row_insert_on_done = None
+        self._deferred_busy = None
+        self._save_load_worker = None
+        self._save_load_busy = None
+        self._save_load_gen = 0
+        self._loaded_path = None
+        self._load_notice = None
         self._hold_watch = QTimer(self)
         self._hold_watch.setInterval(1000)
+
+
         self._hold_watch.timeout.connect(self._watch_hold_game)
         self._build()
-        self.show_step(self.STEP_PICK)
+        # Shell only — game rows fill on first on_page_enter (async chunks).
+        # Like the library: once filled, keep the UI for the whole session
+        # (switching to Settings and back must not rebuild).
+        self._pending_initial_load = True
+        self.show_step(self.STEP_PICK, refresh_pick=False)
 
     # ── Construction ─────────────────────────────────────────────────────────
 
@@ -420,7 +473,7 @@ class CheatsPage(QWidget, ThemedMixin):
         head.setSpacing(10)
         self._back_btn = QPushButton("←")
         self._back_btn.setObjectName("cheats_back")
-        self._back_btn.setFixedSize(28, 28)
+        self._back_btn.setFixedSize(scaled(28, self), scaled(28, self))
         self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._back_btn.clicked.connect(self._go_back)
         head.addWidget(self._back_btn)
@@ -453,6 +506,7 @@ class CheatsPage(QWidget, ThemedMixin):
         col.setSpacing(4)
         col.addStretch(1)
         area.setWidget(body)
+        self._register_page_scroll(area, list_content=True)
         return area, col
 
     def _build_pick(self) -> QWidget:
@@ -462,7 +516,7 @@ class CheatsPage(QWidget, ThemedMixin):
         col.setSpacing(10)
         self._search = GhostClearableLineEdit()
         self._search.setPlaceholderText(t("cheats.search_placeholder"))
-        self._search.setFixedHeight(32)
+        self._search.setFixedHeight(scaled(32, self))
         self._search.setObjectName("list_search")
         self._search.textChanged.connect(self._on_game_search_changed)
         # ↓ or a click on the hint takes the game it is pointing at, the same
@@ -498,7 +552,7 @@ class CheatsPage(QWidget, ThemedMixin):
         self._kept_lbl.setObjectName("section_header")
         col.addWidget(self._kept_lbl)
         self._kept_area, self._kept_col = self._scroller()
-        self._kept_area.setMaximumHeight(150)
+        self._kept_area.setMaximumHeight(scaled(150, self))
         col.addWidget(self._kept_area)
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -512,7 +566,7 @@ class CheatsPage(QWidget, ThemedMixin):
         # untouched QComboBox as the editor's, for the same reason: the theme
         # already dresses it in both light and dark.
         self._folder_combo = QComboBox()
-        self._folder_combo.setMaximumWidth(320)
+        self._folder_combo.setMaximumWidth(scaled(320, self))
         self._folder_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._folder_combo.currentIndexChanged.connect(self._apply_folder)
         head.addWidget(self._folder_combo)
@@ -545,7 +599,7 @@ class CheatsPage(QWidget, ThemedMixin):
         prev, nxt = QPushButton("←"), QPushButton("→")
         for btn in (prev, nxt):
             btn.setObjectName("cheats_pager")
-            btn.setFixedSize(28, 24)
+            btn.setFixedSize(scaled(28, btn), scaled(24, btn))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
         lbl = QLabel("")
         lbl.setObjectName("cheats_page_lbl")
@@ -577,14 +631,14 @@ class CheatsPage(QWidget, ThemedMixin):
         # out with the wrong padding and radius and no room for its arrow.
         # Letting the theme have it keeps the two in step for good.
         self._group_combo = QComboBox()
-        self._group_combo.setMaximumWidth(190)
+        self._group_combo.setMaximumWidth(scaled(190, self))
         self._group_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._group_combo.currentIndexChanged.connect(self._apply_group)
         bar.addWidget(self._group_combo)
         self._field_filter = ClearableLineEdit()
         self._field_filter.setObjectName("list_search")
         self._field_filter.setPlaceholderText(t("cheats.filter_values"))
-        self._field_filter.setFixedHeight(30)
+        self._field_filter.setFixedHeight(scaled(30, self))
         self._field_filter.textChanged.connect(self._apply_field_filter)
         bar.addWidget(self._field_filter, 1)
         self._save_btn = QPushButton(t("cheats.apply"))
@@ -615,12 +669,13 @@ class CheatsPage(QWidget, ThemedMixin):
 
     # ── Steps ────────────────────────────────────────────────────────────────
 
-    def show_step(self, step: int):
+    def show_step(self, step: int, *, refresh_pick: bool = True):
         self._stack.setCurrentIndex(step)
         self._back_btn.setVisible(step != self.STEP_PICK)
         if step == self.STEP_PICK:
             self._subtitle.setText(t("cheats.subtitle"))
-            self._refresh_games()
+            if refresh_pick:
+                self._refresh_games()
         self._sync_title()
 
     def _sync_title(self):
@@ -720,16 +775,23 @@ class CheatsPage(QWidget, ThemedMixin):
         self._games_prev.setEnabled(self._games_page > 0)
         self._games_next.setEnabled(self._games_page < pages - 1)
         if not found:
+            self._cancel_row_insert()
             self._add_note(self._games_col, t("cheats.no_games"))
             return
-        from core.engines.game_engine import engine_display, engine_for_game
+        from core.engines.game_engine import engine_display
+        jobs = []
         for g in found[start:start + per_page]:
-            n = len(g.save_paths or [])
-            eng = engine_display(engine_for_game(g))
-            row = _Row(g.name, t("cheats.n_paths", count=n) if n else
-                       t("cheats.no_paths"), engine=eng)
-            row.clicked.connect(lambda e=g: self._open_game(e))
-            self._insert(self._games_col, row)
+            def _build(g=g):
+                n = len(g.save_paths or [])
+                stored_eng = getattr(g, "engine", "") or ""
+                eng = engine_display(stored_eng) if stored_eng else ""
+                row = _Row(g.name, t("cheats.n_paths", count=n) if n else
+                           t("cheats.no_paths"), engine=eng)
+                row.clicked.connect(lambda e=g: self._open_game(e))
+                return self._games_col, row
+            jobs.append(_build)
+        self._begin_async_rows(jobs)
+
 
     def _accept_ghost(self):
         found = self._matches()
@@ -747,12 +809,90 @@ class CheatsPage(QWidget, ThemedMixin):
         self._open_game(entry)
         return True
 
+    def ensure_loaded(self):
+        """Kick initial load when user navigates to CheatsPage."""
+        self.on_page_enter()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_pending_initial_load", False):
+            self.on_page_enter()
+
     def on_page_enter(self):
-        """Opening this while a game is running goes straight to that game:
-        it is the one you are almost certainly here about, and the search
-        step would only be something to click past."""
+        """First visit fills the pick list; later visits keep the last step."""
         if self._entry is not None or self._stack.currentIndex() != self.STEP_PICK:
             return
+        QTimer.singleShot(0, self._enter_after_paint)
+
+    def on_page_leave(self):
+        """Clean up in-flight pumps and active holds when user switches to another tab.
+        Shelved save-loads in the sidebar continue running uninterrupted."""
+        self._cancel_row_insert()
+        self._stop_hold()
+        self._hold_watch.stop()
+        busy = getattr(self, "_save_load_busy", None)
+        is_shelved = busy is not None and getattr(busy, "_shelved", False)
+        if not is_shelved:
+            worker = getattr(self, "_save_load_worker", None)
+            if worker is not None:
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+                self._save_load_worker = None
+            self._stop_deferred_busy()
+
+    def wipe_and_reload(self):
+        """Wipe save editor state and prune old save structures from memory."""
+        self._cancel_row_insert()
+        self._stop_hold()
+        self._hold_watch.stop()
+        self._doc = None
+        self._loaded_path = None
+        self._loaded_mtime = 0
+        self._pending.clear()
+        self._held.clear()
+        self._editors.clear()
+        self._all_files.clear()
+        self._files.clear()
+        self._entry = None
+        self._loose = None
+        worker = getattr(self, "_save_load_worker", None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+            self._save_load_worker = None
+        busy = getattr(self, "_save_load_busy", None)
+        if busy is not None:
+            try:
+                busy.close_overlay()
+            except Exception:
+                pass
+            self._save_load_busy = None
+        self._close_load_notice()
+        if hasattr(self, "_folder_combo"):
+            self._folder_combo.blockSignals(True)
+            self._folder_combo.clear()
+            self._folder_combo.blockSignals(False)
+        if hasattr(self, "_group_combo"):
+            self._group_combo.blockSignals(True)
+            self._group_combo.clear()
+            self._group_combo.blockSignals(False)
+        self._clear(self._games_col)
+        self._clear(self._kept_col)
+        self._clear(self._files_col)
+        self._clear(self._fields_col)
+        self._pending_initial_load = True
+        self.show_step(self.STEP_PICK, refresh_pick=False)
+        if self.isVisible():
+            self.on_page_enter()
+
+    def _enter_after_paint(self):
+        if self._entry is not None or self._stack.currentIndex() != self.STEP_PICK:
+            return
+        self._pending_initial_load = False
         try:
             from core.monitor import get_monitor
             playing = get_monitor().currently_playing()
@@ -763,6 +903,7 @@ class CheatsPage(QWidget, ThemedMixin):
             self._open_game(playing[0])
         else:
             self._refresh_games()
+
 
     def _open_game(self, entry):
         self._entry = entry
@@ -849,6 +990,9 @@ class CheatsPage(QWidget, ThemedMixin):
         means a look in the folder per save, and a game with several save
         paths has a few hundred. What anyone is here to undo is the save they
         just edited, which — being the newest — is on the first page.
+
+        File/kept rows insert in QTimer chunks (library-style) so switching
+        into this step never freezes on a long page.
         """
         self._clear(self._kept_col)
         self._clear(self._files_col)
@@ -859,35 +1003,37 @@ class CheatsPage(QWidget, ThemedMixin):
         start = self._file_page * per_page
         shown = files[start:start + per_page]
 
-        if not files:
-            # Two different nothings, and only one of them is the player's to
-            # fix. A game with no save folder registered at all needs one
-            # added before there is anything here to edit; a game whose
-            # folders are known but empty has simply not been played yet.
-            # Saying "no save file found" to both hides the step that would
-            # actually get somewhere.
-            no_paths = self._entry is not None and not (self._entry.save_paths
-                                                        or [])
-            self._add_note(self._files_col,
-                           t("cheats.no_paths_yet" if no_paths
-                             else "cheats.no_saves"))
-        # Where a file is only worth saying when it tells two rows apart. One
-        # folder, and it is the same line under every row.
-        show_where = len({f.parent for f in files}) > 1
-        for f in shown:
-            known = describe(f)
-            detail = known or f.suffix.lower().lstrip(".") or ""
-            row = _Row(f.name, detail, str(f.parent) if show_where else "")
-            # Name first (elided in the row), then full path — the default
-            # row tip is only the title, which is not enough for saves.
-            row.setToolTip(f"{f.name}\n{f}")
-            row.clicked.connect(lambda p=f: self._open_editor(p))
-            self._insert(self._files_col, row)
         self._file_page_lbl.setText(t("cheats.page_of_saves",
                                       page=self._file_page + 1,
                                       pages=pages, total=len(files)))
         self._file_prev.setEnabled(self._file_page > 0)
         self._file_next.setEnabled(self._file_page < pages - 1)
+
+        jobs = []
+        if not files:
+            no_paths = self._entry is not None and not (self._entry.save_paths
+                                                        or [])
+            note = t("cheats.no_paths_yet" if no_paths else "cheats.no_saves")
+
+            def _empty_files(note=note):
+                lbl = QLabel(note)
+                lbl.setObjectName("empty_hint")
+                lbl.setWordWrap(True)
+                return self._files_col, lbl
+
+            jobs.append(_empty_files)
+        else:
+            show_where = len({f.parent for f in files}) > 1
+            for f in shown:
+                def _file_row(f=f, show_where=show_where):
+                    known = describe(f)
+                    detail = known or f.suffix.lower().lstrip(".") or ""
+                    row = _Row(f.name, detail,
+                               str(f.parent) if show_where else "")
+                    row.setToolTip(f"{f.name}\n{f}")
+                    row.clicked.connect(lambda p=f: self._open_editor(p))
+                    return self._files_col, row
+                jobs.append(_file_row)
 
         kept = []
         for f in shown:
@@ -895,13 +1041,24 @@ class CheatsPage(QWidget, ThemedMixin):
                 kept.append((when, copy, f))
         kept.sort(reverse=True, key=lambda t_: t_[0])
         if not kept:
-            self._add_note(self._kept_col, t("cheats.no_kept"))
-        for when, copy, target in kept[:20]:
-            row = _Row(target.name, when.strftime("%d/%m/%Y %H:%M"))
-            row.setToolTip(str(copy))
-            row.add_button(t("cheats.restore"),
-                           lambda _=False, c=copy, tg=target: self._restore(c, tg))
-            self._insert(self._kept_col, row)
+            def _empty_kept():
+                lbl = QLabel(t("cheats.no_kept"))
+                lbl.setObjectName("empty_hint")
+                lbl.setWordWrap(True)
+                return self._kept_col, lbl
+            jobs.append(_empty_kept)
+        else:
+            for when, copy, target in kept[:20]:
+                def _kept_row(when=when, copy=copy, target=target):
+                    row = _Row(target.name, when.strftime("%d/%m/%Y %H:%M"))
+                    row.setToolTip(str(copy))
+                    row.add_button(
+                        t("cheats.restore"),
+                        lambda _=False, c=copy, tg=target: self._restore(c, tg))
+                    return self._kept_col, row
+                jobs.append(_kept_row)
+
+        self._begin_async_rows(jobs)
 
     def _step_saves(self, delta: int):
         self._file_page += delta
@@ -971,25 +1128,149 @@ class CheatsPage(QWidget, ThemedMixin):
         return ""
 
     def _open_editor(self, path: Path):
-        from ui.widgets.busy_overlay import busy_over
+        resolved_path = Path(path).resolve()
+        # Fast path: if the document for this exact save file is already in memory
+        # and has not been modified externally, display it immediately without reloading!
         try:
-            # Most saves open in a blink, but a big one — a 64 MB RAGS graph,
-            # say — takes seconds, and a window that simply stops responding
-            # reads as a crash.
-            with busy_over(self, t("common.please_wait")) as busy:
-                self._doc = open_save(
-                    path, game_dir=self._game_dir(),
-                    progress=busy.tick if busy is not None else None)
-        except SaveEditorError as e:
-            warning_window_modal(self, t("cheats.title"), explain(e))
+            mtime = resolved_path.stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        if (self._doc is not None
+                and getattr(self, "_loaded_path", None) == resolved_path
+                and getattr(self, "_loaded_mtime", 0) == mtime):
+            self._close_load_notice()
+            self.show_step(self.STEP_EDIT)
             return
+
+        # If a DIFFERENT save file was open previously, purge old structures/AST from memory
+        if getattr(self, "_loaded_path", None) != resolved_path:
+            self._doc = None
+            self._loaded_path = None
+            self._loaded_mtime = 0
+            try:
+                from core.save_editor import prune_all
+                prune_all()
+            except Exception:
+                pass
+
+        # Cancel any previous in-flight worker
+        prev_worker = getattr(self, "_save_load_worker", None)
+        if prev_worker is not None:
+            try:
+                prev_worker.cancel()
+            except Exception:
+                pass
+            self._save_load_worker = None
+
+        prev_busy = getattr(self, "_save_load_busy", None)
+        if prev_busy is not None:
+            try:
+                prev_busy.close_overlay()
+            except Exception:
+                pass
+            self._save_load_busy = None
+
+        self._save_load_gen = getattr(self, "_save_load_gen", 0) + 1
+        gen = self._save_load_gen
+
+        # Enter the edit step immediately so the page never feels frozen,
+        # then open the save on the next event-loop turn.
+        self._cancel_row_insert()
         self._stop_hold()
         self._hold_watch.stop()
         self._pending = {}
         self._held = {}
         self._hold_armed = False
         self._page = 0
+        self._doc = None
+        self._loaded_path = None
+        self._loaded_mtime = 0
+        # A previous shelved load may still be showing its "Loaded" notice —
+        # a fresh open starts clean.
+        self._close_load_notice()
+        self._subtitle.setText(t("common.please_wait"))
+        self._edit_hint.setText("")
+        self._save_btn.setEnabled(False)
+        self._field_filter.clear()
+        self._group_combo.blockSignals(True)
+        self._group_combo.clear()
+        self._group_combo.blockSignals(False)
         self.show_step(self.STEP_EDIT)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda p=resolved_path, g=gen: self._open_editor_body(p, g))
+
+    def _open_editor_body(self, path: Path, gen: int = 0):
+        if gen != getattr(self, "_save_load_gen", 0):
+            return
+
+        from ui.widgets.busy_overlay import BusyOverlay
+        overlay = BusyOverlay(self, t("common.please_wait"), shelvable=True)
+        overlay._reveal_after_s = 0
+        overlay.reveal()
+        self._save_load_busy = overlay
+
+        worker = _SaveLoadWorker(path, self._game_dir(), self)
+        self._save_load_worker = worker
+
+        overlay.on_shelve = lambda: self._shelved_load_start(overlay, worker)
+        overlay._cancel_btn.clicked.connect(worker.cancel)
+        worker.progress.connect(lambda el: self._on_save_load_progress(el, overlay))
+        worker.finished.connect(lambda doc, err, p=path, ov=overlay, wk=worker, g=gen: (
+            self._on_save_load_finished(doc, err, p, ov, wk, g)
+        ))
+        worker.start()
+
+    def _on_save_load_progress(self, elapsed: float, overlay):
+        if overlay is not None and not getattr(overlay, "_shelved", False):
+            overlay.tick(elapsed)
+        elif overlay is not None and getattr(overlay, "_shelved", False):
+            self._shelved_load_tick(elapsed)
+
+    def _on_save_load_finished(self, doc, err, path: Path, overlay, worker, gen: int = 0):
+        if gen != getattr(self, "_save_load_gen", 0):
+            try:
+                overlay.close_overlay()
+            except Exception:
+                pass
+            return
+
+        shelved = getattr(overlay, "_shelved", False)
+        cancelled = getattr(overlay, "_cancelled", False) or getattr(worker, "_is_cancelled", False)
+        try:
+            overlay.close_overlay()
+        except Exception:
+            pass
+        self._save_load_busy = None
+        self._save_load_worker = None
+        notice = getattr(self, "_load_notice", None)
+
+        if err is not None or doc is None:
+            self._doc = None
+            self._loaded_path = None
+            self._loaded_mtime = 0
+            if notice is not None:
+                notice.hide_cancel()
+                notice.finish(
+                    t("cheats.loading_cancelled")
+                    if cancelled
+                    else t("cheats.loading_failed"),
+                    hide_after_ms=4000)
+            if err is not None and not cancelled and not shelved:
+                warning_window_modal(self, t("cheats.title"), explain(err))
+            self.show_step(self.STEP_SAVES)
+            return
+
+        self._doc = doc
+        self._loaded_path = path
+        try:
+            self._loaded_mtime = path.stat().st_mtime_ns
+        except OSError:
+            self._loaded_mtime = 0
+        if notice is not None and shelved:
+            notice.hide_cancel()
+            notice.finish(t("cheats.loading_done", name=path.name),
+                          hide_after_ms=0)
+            notice.set_activatable(True)
         ro = bool(getattr(self._doc, "read_only", False))
         if ro:
             self._subtitle.setText(t("cheats.editing_read_only",
@@ -1006,6 +1287,79 @@ class CheatsPage(QWidget, ThemedMixin):
         self._field_filter.clear()
         self._fill_groups()
         self._render_page()
+        if not shelved:
+            self.show_step(self.STEP_EDIT)
+
+
+    # ── shelved load: report in the sidebar notice instead of the sheet ────
+
+    def set_load_notice(self, notice):
+        """The sidebar BatchProgressNotice that reports shelved loads."""
+        self._load_notice = notice
+
+    def on_sidebar_notice_clicked(self):
+        """Clicked sidebar notice: restore please-wait if still loading, or open editor if done."""
+        worker = getattr(self, "_save_load_worker", None)
+        busy = getattr(self, "_save_load_busy", None)
+        if (worker is not None and worker.isRunning()) or (busy is not None and getattr(busy, "_shelved", False) and self._doc is None):
+            self._unshelve_load()
+        elif self._doc is not None:
+            self.show_step(self.STEP_EDIT)
+            self._close_load_notice()
+
+
+    def reopen_loaded_save(self):
+        self.on_sidebar_notice_clicked()
+
+    def _unshelve_load(self):
+        """Bring the Please Wait overlay back onto the screen."""
+        self.show_step(self.STEP_EDIT)
+        if self._save_load_busy is not None:
+            self._save_load_busy.unshelve()
+        notice = getattr(self, "_load_notice", None)
+        if notice is not None:
+            notice.hide()
+
+    def _shelved_load_start(self, busy, worker=None):
+        """The sheet was put away — return to saves list and hand reporting to the sidebar notice."""
+        if self._entry is not None:
+            self.show_step(self.STEP_SAVES)
+        elif self._loose is not None:
+            self._show_loose(self._loose)
+        else:
+            self.show_step(self.STEP_PICK)
+
+        notice = getattr(self, "_load_notice", None)
+        if notice is None:
+            return
+        notice.show_indeterminate(t("cheats.loading_side"))
+        notice.set_activatable(True)
+        def _cancel_and_abort():
+            if worker is not None:
+                worker.cancel()
+            busy._on_cancel()
+        notice.set_cancel(t("common.cancel_search"), _cancel_and_abort, min_seconds=30)
+
+    def _shelved_load_tick(self, elapsed):
+        notice = getattr(self, "_load_notice", None)
+        if notice is None:
+            return
+        notice.check_cancel_elapsed(elapsed)
+        sec = int(elapsed)
+        if sec != getattr(self, "_last_shelved_sec", -1):
+            self._last_shelved_sec = sec
+            notice.set_indeterminate_text(
+                f"{t('cheats.loading_side')} ({sec}s)")
+
+
+    def _close_load_notice(self):
+        notice = getattr(self, "_load_notice", None)
+        if notice is not None:
+            notice.hide_cancel()
+            notice.finish(hide_after_ms=0)
+            notice.hide()
+
+
 
     # ── the value list, a page at a time ─────────────────────────────────────
 
@@ -1085,15 +1439,21 @@ class CheatsPage(QWidget, ThemedMixin):
         pages = max(1, (len(fields) + _PAGE_SIZE - 1) // _PAGE_SIZE)
         self._page = max(0, min(self._page, pages - 1))
         start = self._page * _PAGE_SIZE
-        for f in fields[start:start + _PAGE_SIZE]:
-            self._insert(self._fields_col, self._field_row(f))
-        if not fields:
-            self._add_note(self._fields_col, t("cheats.no_values"))
         self._page_lbl.setText(t("cheats.page_of", page=self._page + 1,
                                  pages=pages, total=len(fields)))
         self._prev_btn.setEnabled(self._page > 0)
         self._next_btn.setEnabled(self._page < pages - 1)
-        self._sync_hold_label()
+        if not fields:
+            self._cancel_row_insert()
+            self._add_note(self._fields_col, t("cheats.no_values"))
+            self._sync_hold_label()
+            return
+        jobs = []
+        for f in fields[start:start + _PAGE_SIZE]:
+            def _field(f=f):
+                return self._fields_col, self._field_row(f)
+            jobs.append(_field)
+        self._begin_async_rows(jobs, on_done=self._sync_hold_label)
 
     def _field_row(self, f) -> QWidget:
         row = QFrame()
@@ -1121,7 +1481,7 @@ class CheatsPage(QWidget, ThemedMixin):
         hold = QPushButton("🔒" if marked else "🔓")
         hold.setObjectName("cheats_hold_btn")
         hold.setCheckable(True)
-        hold.setFixedSize(24, 24)
+        hold.setFixedSize(scaled(24, self), scaled(24, self))
         hold.setChecked(marked)
         if getattr(self._doc, "read_only", False):
             hold.setEnabled(False)
@@ -1161,7 +1521,7 @@ class CheatsPage(QWidget, ThemedMixin):
             w.valueChanged.connect(lambda v, p=f.path: self._remember(p, float(v)))
         else:
             w = QLineEdit(str(current))
-            w.setMinimumWidth(180)
+            w.setMinimumWidth(scaled(180, self))
             w.textChanged.connect(lambda v, p=f.path: self._remember(p, v))
         w.setObjectName("cheats_value")
         if getattr(self._doc, "read_only", False):
@@ -1318,6 +1678,122 @@ class CheatsPage(QWidget, ThemedMixin):
 
     # ── Small helpers ────────────────────────────────────────────────────────
 
+    def _stop_deferred_busy(self):
+        busy = getattr(self, "_deferred_busy", None)
+        if busy is not None:
+            busy.close()
+            self._deferred_busy = None
+
+    def _cancel_row_insert(self):
+        """Invalidate any in-flight chunk pump and drop the please-wait."""
+        self._row_insert_gen = getattr(self, "_row_insert_gen", 0) + 1
+        self._row_insert_queue = []
+        self._row_insert_on_done = None
+        self._stop_deferred_busy()
+
+    def wipe_and_reload(self):
+        """Wipe cached save docs and game pick list; called by the overview refresh button."""
+        self._cancel_row_insert()
+        self._clear(self._games_col)
+        self._clear(self._files_col)
+        self._clear(self._kept_col)
+        worker = getattr(self, "_save_load_worker", None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+            self._save_load_worker = None
+        busy = getattr(self, "_save_load_busy", None)
+        if busy is not None:
+            try:
+                busy.close_overlay()
+            except Exception:
+                pass
+            self._save_load_busy = None
+        self._doc = None
+        self._loaded_path = None
+        self._save_load_gen = getattr(self, "_save_load_gen", 0) + 1
+        self._editors.clear()
+        self._pending.clear()
+        self._held.clear()
+        self._stop_hold()
+        self._close_load_notice()
+        self._pending_initial_load = True
+        self.show_step(self.STEP_PICK, refresh_pick=False)
+        if self.isVisible():
+            QTimer.singleShot(0, self._enter_after_paint)
+
+
+    def _begin_async_rows(self, jobs: list, on_done=None):
+        """Insert list rows in QTimer chunks (same pattern as library cards).
+
+        Each *job* is a zero-arg callable returning ``(column, widget)``.
+        Please-wait covers the pump when the page is visible (delay 0).
+        """
+        self._cancel_row_insert()
+        gen = self._row_insert_gen
+        self._row_insert_queue = list(jobs)
+        self._row_insert_on_done = on_done
+        from core.concurrency import library_insert_chunk_size
+        cs = library_insert_chunk_size()
+        # Match library: never one blocking pump for the whole page.
+        self._row_insert_chunk = cs if cs > 0 else 16
+        if not self._row_insert_queue:
+            if callable(on_done):
+                on_done()
+            return
+        if self.isVisible():
+            from ui.widgets.busy_overlay import DeferredBusy
+            self._deferred_busy = DeferredBusy(
+                self, t("common.please_wait"), delay_ms=200)
+        QTimer.singleShot(0, lambda g=gen: self._async_row_step(g))
+
+
+    def _async_row_step(self, gen: int):
+        if gen != getattr(self, "_row_insert_gen", 0):
+            return
+        queue = getattr(self, "_row_insert_queue", None) or []
+        if not queue:
+            self._finish_row_insert(gen)
+            return
+        chunk_n = getattr(self, "_row_insert_chunk", 0) or len(queue)
+        chunk = queue[:chunk_n]
+        del queue[:chunk_n]
+        self._row_insert_queue = queue
+        for build in chunk:
+            if gen != getattr(self, "_row_insert_gen", 0):
+                return
+            try:
+                col, widget = build()
+            except Exception as e:
+                logger.debug(f"Save-editor row build failed: {e}")
+                continue
+            if col is None or widget is None:
+                continue
+            try:
+                self._insert(col, widget)
+            except RuntimeError:
+                return
+        if gen != getattr(self, "_row_insert_gen", 0):
+            return
+        if self._row_insert_queue:
+            QTimer.singleShot(0, lambda g=gen: self._async_row_step(g))
+            return
+        self._finish_row_insert(gen)
+
+    def _finish_row_insert(self, gen: int):
+        if gen != getattr(self, "_row_insert_gen", 0):
+            return
+        done = self._row_insert_on_done
+        self._row_insert_on_done = None
+        self._stop_deferred_busy()
+        if callable(done):
+            try:
+                done()
+            except Exception as e:
+                logger.debug(f"Save-editor row on_done failed: {e}")
+
     def _insert(self, col: QVBoxLayout, widget: QWidget):
         col.insertWidget(col.count() - 1, widget)
 
@@ -1332,12 +1808,24 @@ class CheatsPage(QWidget, ThemedMixin):
         leaves the parent as it was: the layout gives a hidden widget no
         room, so the list empties just the same.
         """
+        if col is None:
+            return
         while col.count() > 1:
             item = col.takeAt(0)
+            if item is None:
+                continue
             w = item.widget()
             if w is not None:
                 w.hide()
                 w.deleteLater()
+            sub = item.layout()
+            if sub is not None:
+                while sub.count() > 0:
+                    sitem = sub.takeAt(0)
+                    sw = sitem.widget() if sitem else None
+                    if sw is not None:
+                        sw.hide()
+                        sw.deleteLater()
 
     def _add_note(self, col: QVBoxLayout, text: str):
         lbl = QLabel(text)

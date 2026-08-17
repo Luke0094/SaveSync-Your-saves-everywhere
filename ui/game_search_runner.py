@@ -27,6 +27,7 @@ class _SearchWorker(QThread):
         super().__init__(parent)
         self._game_ids = list(game_ids)
         self._cancel = cancel_event
+        self.setPriority(QThread.Priority.IdlePriority)
 
     def run(self):
         from core.library import get_library
@@ -35,51 +36,55 @@ class _SearchWorker(QThread):
         from pathlib import Path
 
         lib = get_library()
-        for game_id in self._game_ids:
-            if self._cancel.is_set():
-                logger.info("Batch search cancelled")
-                break
-            entry = lib.get_by_id(game_id)
-            if entry is None:
-                continue
-            name = entry.name
-            try:
-                folder = ""
-                if entry.exe_path:
-                    try:
-                        folder = Path(entry.exe_path).parent.name
-                    except Exception:
-                        folder = ""
-                results = search_game_info_multi(
-                    name,
-                    appid=entry.appid or None,
-                    enable_web_fallback=True,
-                    exe_path=entry.exe_path or "",
-                    folder_name=folder,
-                )
-            except Exception as e:
-                logger.debug(f"Search failed for {name}: {e}")
-                self.one_done.emit(game_id, name, False, str(e)[:80])
-                continue
+        lib.begin_bulk()
+        try:
+            for game_id in self._game_ids:
+                if self._cancel.is_set():
+                    logger.info("Batch search cancelled")
+                    break
+                entry = lib.get_by_id(game_id)
+                if entry is None:
+                    continue
+                name = entry.name
+                try:
+                    folder = ""
+                    if entry.exe_path:
+                        try:
+                            folder = Path(entry.exe_path).parent.name
+                        except Exception:
+                            folder = ""
+                    results = search_game_info_multi(
+                        name,
+                        appid=entry.appid or None,
+                        enable_web_fallback=True,
+                        exe_path=entry.exe_path or "",
+                        folder_name=folder,
+                    )
+                except Exception as e:
+                    logger.debug(f"Search failed for {name}: {e}")
+                    self.one_done.emit(game_id, name, False, str(e)[:80])
+                    continue
 
-            if self._cancel.is_set():
-                break
-            if not results:
-                self.one_done.emit(game_id, name, False, "")
-                continue
+                if self._cancel.is_set():
+                    break
+                if not results:
+                    self.one_done.emit(game_id, name, False, "")
+                    continue
 
-            # "Auto-accept the first valid result": the list is already
-            # scored best-first and thresholded by the search layer.
-            best = results[0]
-            try:
-                changed = apply_game_info(entry, best)
-                if changed:
-                    lib.update_game(entry)
-                self.one_done.emit(game_id, name, bool(changed),
-                                   best.name if best else "")
-            except Exception as e:
-                logger.warning(f"Could not apply search result for {name}: {e}")
-                self.one_done.emit(game_id, name, False, str(e)[:80])
+                # "Auto-accept the first valid result": the list is already
+                # scored best-first and thresholded by the search layer.
+                best = results[0]
+                try:
+                    changed = apply_game_info(entry, best)
+                    if changed:
+                        lib.update_game(entry)
+                    self.one_done.emit(game_id, name, bool(changed),
+                                       best.name if best else "")
+                except Exception as e:
+                    logger.warning(f"Could not apply search result for {name}: {e}")
+                    self.one_done.emit(game_id, name, False, str(e)[:80])
+        finally:
+            lib.end_bulk()
         self.all_done.emit()
 
 
@@ -103,20 +108,45 @@ class GameSearchRunner(QObject):
 
     # ── Control ──────────────────────────────────────────────────────────────
 
-    def start(self, game_ids: list) -> bool:
+    def start(
+        self,
+        game_ids: list,
+        *,
+        prior_done: int = 0,
+        prior_matched: int = 0,
+        prior_total: int | None = None,
+        prior_completed_ids: list | None = None,
+    ) -> bool:
         if self.running or not game_ids:
             return False
         self._cancel = threading.Event()
-        self.total = len(game_ids)
-        self.done = self.matched = 0
+        prior_done = max(0, int(prior_done))
+        prior_matched = max(0, int(prior_matched))
+        self.total = max(len(game_ids) + prior_done, int(prior_total or 0))
+        self.done = prior_done
+        self.matched = prior_matched
         self.lines = []
         self.cancelled = False
         self.running = True
+        try:
+            from core import pending_batch_jobs as _pbj
+            from datetime import datetime, timezone
+            _pbj.set_job(_pbj.KEY_SEARCH_BATCH, {
+                "pending_ids": list(game_ids),
+                "completed_ids": list(prior_completed_ids or []),
+                "matched": self.matched,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            logger.debug("Could not persist search-batch start", exc_info=True)
         self._worker = _SearchWorker(game_ids, self._cancel)
         self._worker.one_done.connect(self._on_one)
         self._worker.all_done.connect(self._on_all)
         self._worker.start()
-        logger.info(f"Batch web search started for {self.total} title(s)")
+        logger.info(
+            f"Batch web search started for {len(game_ids)} title(s)"
+            + (f" (resuming, {prior_done} already done)" if prior_done else "")
+        )
         return True
 
     def cancel(self):
@@ -148,9 +178,23 @@ class GameSearchRunner(QObject):
         self.lines.append((line, matched))
         self.progress.emit(self.done, self.total, name)
         self.log_line.emit(line, matched)
+        try:
+            from core import pending_batch_jobs as _pbj
+            job = _pbj.mark_game_done(_pbj.KEY_SEARCH_BATCH, _game_id)
+            if job is not None:
+                _pbj.update_job(_pbj.KEY_SEARCH_BATCH, matched=self.matched)
+        except Exception:
+            logger.debug("Could not persist search-batch progress", exc_info=True)
 
     def _on_all(self):
         self.running = False
+        try:
+            from core import pending_batch_jobs as _pbj
+            # Crash never reaches here (pending stays on disk). Cancel or a
+            # clean finish both clear — cancel is intentional stop.
+            _pbj.clear_job(_pbj.KEY_SEARCH_BATCH)
+        except Exception:
+            logger.debug("Could not clear search-batch job", exc_info=True)
         logger.info(f"Batch web search finished: {self.matched}/{self.total} matched"
                     + (" (cancelled)" if self.cancelled else ""))
         self.finished.emit(self.matched, self.total, self.cancelled)

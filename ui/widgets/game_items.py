@@ -13,7 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize, QRectF
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize, QRectF, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QImageReader, QRegion
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -24,7 +24,8 @@ from core.library import GameEntry, get_library
 from core.config_manager import get_config
 from i18n import t
 from ui.helpers import (display_scale, load_pixmap_any as _load_pixmap_any,
-                        open_in_file_manager, scaled_for_screen)
+                        lock_min_size, open_in_file_manager, scaled,
+                        scaled_for_screen)
 from ui.styles.theme import palette, ThemedMixin
 from ui.widgets.library_drag import _active_drag, DragProxy
 from ui.widgets.library_folders import (FolderRow, _clean_tag_display,
@@ -35,6 +36,14 @@ from ui.widgets.library_folders import (FolderRow, _clean_tag_display,
 from ui.widgets.rating import StarRating
 
 logger = logging.getLogger(__name__)
+
+# Design footprint at 96 DPI — ``library_card_size`` scales with logical DPI.
+_CARD_W0, _CARD_H0 = 186, 240
+
+
+def library_card_size(host=None) -> tuple[int, int]:
+    """Library grid card size for the current screen DPI."""
+    return scaled(_CARD_W0, host), scaled(_CARD_H0, host)
 
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".ico", ".avif"}
@@ -333,6 +342,17 @@ def _cover_cache_max(dpr: float) -> int:
     scale = max(1.0, float(dpr or 1.0)) ** 2
     return max(_COVER_CACHE_MIN, int(_COVER_CACHE_MAX / scale))
 
+
+def trim_cover_cache() -> None:
+    """Release the rendered-cover cache when the library is not in view.
+
+    A page of covers is tens of MB held for the whole session once rendered;
+    the cache only earns its keep while the library is on screen (rebuilds,
+    view toggles, search typing). Leaving the page frees it — the next visit
+    re-renders from the on-disk cover in the same chunked, covered pass that
+    the first visit always used."""
+    _COVER_CACHE.clear()
+
 # Above this many source pixels, decoding the file at full resolution costs
 # more than asking the decoder for a smaller image. BELOW it the reverse is
 # true — the reader's own overhead (header parse, non-native scaling) makes
@@ -518,10 +538,16 @@ def _web_search_game_dialog(item: QWidget, game_id: str):
             item.refresh(refreshed)
 
     dialog.finished.connect(_refresh_after_close)
-    # Start search after dialog is shown
-    QTimer.singleShot(200, dialog._web_search)
-    # show() — not exec()/open(): shelving must release WindowModal cleanly.
-    dialog.show()
+
+    def _start_search_when_ready():
+        if getattr(dialog, "_ui_ready", False):
+            dialog._web_search()
+        else:
+            QTimer.singleShot(50, _start_search_when_ready)
+
+    # show_and_build — shell immediately; search after sections+populate.
+    dialog.show_and_build()
+    QTimer.singleShot(200, _start_search_when_ready)
 
 
 # ── Game Card (grid view) ─────────────────────────────────────────────────────
@@ -611,7 +637,7 @@ class _PlayRatingStrip(QWidget):
 
     def __init__(self, entry: GameEntry, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(16)
+        self.setFixedHeight(scaled(16, self))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._playtime = _PlaytimeLabel(self)
         self._playtime.setAlignment(
@@ -728,7 +754,33 @@ class _GameItemMixin:
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start = event.pos()
             self._dragging = False
+            if not getattr(self, "_drag_cleanup_armed", False):
+                self._drag_cleanup_armed = True
+                self.destroyed.connect(self._cancel_drag)
         super().mousePressEvent(event)
+
+    def _cancel_drag(self, *_):
+        """Abort a drag whose source widget died mid-drag (a library refresh
+        or rebuild can delete the card while the mouse is held). Without this
+        the floating ghost stayed on screen forever — the burn-in report —
+        and the folder hover highlight stayed lit."""
+        proxy = _active_drag.pop("proxy", None)
+        if proxy is not None:
+            try:
+                proxy.hide()
+                proxy.deleteLater()
+            except RuntimeError:
+                pass
+        src = _active_drag.pop("source", None)
+        if src is not None:
+            try:
+                src.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        _active_drag.clear()
+        tree = self._find_folder_tree()
+        if tree is not None:
+            tree.clear_drag_hover()
 
     def mouseMoveEvent(self, event):
         if not (event.buttons() & Qt.MouseButton.LeftButton) or not getattr(self, '_drag_start', None):
@@ -737,6 +789,16 @@ class _GameItemMixin:
             if (event.pos() - self._drag_start).manhattanLength() < 15:
                 return
             self._dragging = True
+            # A proxy already in _active_drag is ALWAYS stale here: a dead
+            # source card (refresh mid-drag) could not run its own cleanup,
+            # so the old ghost must not be left floating next to the new one.
+            stale = _active_drag.get("proxy")
+            if stale is not None:
+                try:
+                    stale.hide()
+                    stale.deleteLater()
+                except RuntimeError:
+                    pass
             # Grab pixmap BEFORE dimming
             px = self.grab()
             # Dim original
@@ -818,7 +880,7 @@ class _GameItemMixin:
         menu.setStyleSheet(
             f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
             f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
             f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
         menu.addAction(t('library.details'),         lambda: self.detail_requested.emit(self._entry.id))
@@ -849,7 +911,7 @@ class _GameItemMixin:
             sub.setStyleSheet(
                 f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
                 f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-                f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+                f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
                 f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
             )
             _populate_save_folder_menu(sub, _targets)
@@ -880,7 +942,7 @@ class _GameItemMixin:
         sub.setStyleSheet(
             f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
             f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
             f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
         )
         menu.addMenu(sub)
@@ -911,7 +973,7 @@ class _GameItemMixin:
         
         dialog = QDialog(self)
         dialog.setWindowTitle(t("library.adjust_cover_focus"))
-        dialog.setFixedSize(320, 380)
+        dialog.setFixedSize(scaled(320, dialog), scaled(380, dialog))
         
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -920,7 +982,7 @@ class _GameItemMixin:
         # Instructions
         info = QLabel(t("library.cover_focus_instruction"))
         info.setWordWrap(True)
-        info.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        info.setObjectName("dialog_intro")
         layout.addWidget(info)
         
         # Load the original image once for all previews
@@ -944,9 +1006,9 @@ class _GameItemMixin:
         current_focus = getattr(self._entry, 'cover_focus', 'center')
         
         # Use same aspect ratio as actual card (186x240) but half resolution for performance
-        card_w, card_h = 186, 240
+        card_w, card_h = library_card_size(self)
         preview_w, preview_h = card_w // 2, card_h // 2  # 93x120
-        button_w, button_h = 100, 125  # Slightly larger than preview for visible borders
+        button_w, button_h = scaled(100, self), scaled(125, self)
         
         scaled_px = None
         if original_px and not original_px.isNull():
@@ -1034,7 +1096,7 @@ class _GameItemMixin:
         custom_btn = QPushButton(t("library.cover_focus_custom"))
         custom_btn.setStyleSheet(
             f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
-            f"border:1px solid {palette('border')};border-radius:6px;padding:7px;font-size:12px;}}"
+            f"border:1px solid {palette('border')};border-radius:6px;padding:7px;font-size:{scaled(12, self)}px;}}"
             f"QPushButton:hover{{border-color:{palette('accent')};}}"
         )
         _current_is_custom = str(current_focus).lower().startswith("custom:")
@@ -1043,11 +1105,6 @@ class _GameItemMixin:
         custom_btn.clicked.connect(lambda: self._show_cover_custom_editor(dialog, original_px))
         layout.addWidget(custom_btn)
         layout.addStretch()
-
-        # Apply theme styling
-        dialog.setStyleSheet(
-            f"QDialog{{background:{palette('bg_card')};}}"
-        )
 
         dialog.exec()
 
@@ -1064,7 +1121,6 @@ class _GameItemMixin:
 
         dlg = QDialog(self)
         dlg.setWindowTitle(t("library.cover_focus_custom"))
-        dlg.setStyleSheet(f"QDialog{{background:{palette('bg_card')};}}")
         vbox = QVBoxLayout(dlg)
         vbox.setContentsMargins(16, 16, 16, 16)
         vbox.setSpacing(12)
@@ -1080,11 +1136,6 @@ class _GameItemMixin:
         cancel_btn.clicked.connect(dlg.reject)
         save_btn = QPushButton(t("common.save_changes"))
         save_btn.setObjectName("primary_btn")
-        save_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('accent')};color:{palette('accent_text')};"
-            f"border:none;border-radius:6px;padding:7px 14px;font-weight:600;}}"
-            f"QPushButton:hover{{background:{palette('accent_hover')};}}"
-        )
         save_btn.clicked.connect(dlg.accept)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(save_btn)
@@ -1204,8 +1255,11 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         slots = min(n, self._DOTS_VISIBLE)
         for _ in range(slots):
             dot = QWidget()
-            dot.setFixedSize(6, 6)
-            dot.setStyleSheet("background:rgba(255,255,255,0.5);border-radius:3px;")
+            _d = scaled(6, self, min_px=5)
+            dot.setFixedSize(_d, _d)
+            r = max(2, _d // 2)
+            dot.setStyleSheet(
+                f"background:rgba(255,255,255,0.5);border-radius:{r}px;")
             self._dots_layout.addWidget(dot)
 
         self._total_images = n          # remember total for window calc
@@ -1214,8 +1268,10 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         # Centre horizontally
         self._dots_bar.adjustSize()
         bar_w = self._dots_bar.width()
-        x = max(0, (186 - bar_w) // 2)
-        self._dots_bar.move(x, 106)
+        cw = getattr(self, "_cw", _CARD_W0)
+        x = max(0, (cw - bar_w) // 2)
+        dots_y = getattr(self, "_dots_y", scaled(106, self))
+        self._dots_bar.move(x, dots_y)
 
     def _update_dot_highlight(self):
         """Repaint the dot strip for the current _slideshow_idx.
@@ -1271,7 +1327,8 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._slideshow_idx = (self._slideshow_idx + 1) % len(self._all_images)
         path = self._all_images[self._slideshow_idx]
         focus = getattr(self._entry, 'cover_focus', 'center')
-        px = _make_pixmap(path, 186, 240, focus)
+        px = _make_pixmap(path, getattr(self, "_cw", _CARD_W0),
+                          getattr(self, "_ch", _CARD_H0), focus)
         if px and not px.isNull():
             # Blend two freshly rendered cache frames (same path as the
             # clean loop-back to image 0). Using cover.pixmap() as the
@@ -1308,8 +1365,10 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         cover framing identical to the static _make_pixmap path.
         """
         dpr = max(1.0, float(display_scale() or 1.0))
-        tw = int(round(186 * dpr))
-        th = int(round(240 * dpr))
+        cw = getattr(self, "_cw", _CARD_W0)
+        ch = getattr(self, "_ch", _CARD_H0)
+        tw = int(round(cw * dpr))
+        th = int(round(ch * dpr))
         if (px.width() == tw and px.height() == th
                 and abs(float(px.devicePixelRatio() or 1.0) - dpr) < 0.01):
             return px
@@ -1318,7 +1377,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         out.fill(Qt.GlobalColor.transparent)
         p = QPainter(out)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        p.drawPixmap(QRectF(0.0, 0.0, 186.0, 240.0), px, QRectF(px.rect()))
+        p.drawPixmap(QRectF(0.0, 0.0, float(cw), float(ch)), px, QRectF(px.rect()))
         p.end()
         return out
 
@@ -1332,7 +1391,9 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             from_px = None
             if from_path:
                 focus = getattr(self._entry, 'cover_focus', 'center')
-                from_px = _make_pixmap(from_path, 186, 240, focus)
+                from_px = _make_pixmap(
+                    from_path, getattr(self, "_cw", _CARD_W0),
+                    getattr(self, "_ch", _CARD_H0), focus)
             if from_px is None or from_px.isNull():
                 cur = self._cover.pixmap()
                 if cur is None or cur.isNull():
@@ -1356,7 +1417,9 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
                 path = (self._all_images[self._slideshow_idx]
                         if self._all_images else None)
                 focus = getattr(self._entry, 'cover_focus', 'center')
-                settled = _make_pixmap(path, 186, 240, focus) if path else None
+                settled = _make_pixmap(
+                    path, getattr(self, "_cw", _CARD_W0),
+                    getattr(self, "_ch", _CARD_H0), focus) if path else None
                 self._cover.setPixmap(
                     settled if settled and not settled.isNull() else final)
             return
@@ -1392,7 +1455,9 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._fade_t = 0.0
 
     def _build(self):
-        self.setFixedSize(186, 240)
+        self._cw, self._ch = library_card_size(self)
+        cw, ch = self._cw, self._ch
+        self.setFixedSize(cw, ch)
         # Frame: QSS when the card has no folder colour, inline when it does.
         # NOT registered with _sty — refresh_styles() calls this directly, so
         # the objectName and the sheet always move together.
@@ -1405,7 +1470,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         # about 3x more to re-polish when the theme changes.
         self._cover = QLabel(self)
         self._cover.setObjectName("game_card_cover")
-        self._cover.setFixedSize(186, 240)
+        self._cover.setFixedSize(cw, ch)
         self._cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._update_cover()
 
@@ -1413,32 +1478,36 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._playing_badge = QLabel(f"▶ {t('library.playing').upper()}", self)
         self._playing_badge.setObjectName("playing_badge")
         self._playing_badge.setVisible(False)
-        self._playing_badge.move(8, 8)
+        self._playing_badge.move(scaled(8, self), scaled(8, self))
         self._playing_badge.adjustSize()
 
         # Slideshow dot indicators (bottom-center, visible only on hover)
         self._dots_bar = QWidget(self)
         self._dots_bar.setObjectName("game_card_dots")
         self._dots_layout = QHBoxLayout(self._dots_bar)
-        self._dots_layout.setContentsMargins(12, 6, 12, 6)
-        self._dots_layout.setSpacing(5)
+        self._dots_layout.setContentsMargins(
+            scaled(12, self), scaled(6, self), scaled(12, self), scaled(6, self))
+        self._dots_layout.setSpacing(scaled(5, self))
         self._dots_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._dots_slots = 0
         self._total_images = 0
-        self._dots_bar.setFixedHeight(20)
-        self._dots_bar.setMinimumWidth(40)
+        self._dots_bar.setFixedHeight(scaled(20, self))
+        self._dots_bar.setMinimumWidth(scaled(40, self))
         self._dots_bar.setVisible(False)
-        # Position: bottom-center of the cover image (above the info panel at y=130)
-        self._dots_bar.move(0, 104)   # centred above the info panel
+        bottom_y = int(round(ch * 130 / 240))
+        bottom_h = max(scaled(90, self), ch - bottom_y)
+        self._dots_y = max(scaled(8, self), bottom_y - scaled(26, self))
+        self._dots_bar.move(0, self._dots_y)
         self._dots_bar.adjustSize()
 
         # ── Bottom info overlay (absolute positioned, full width) ─────────────
         # Translucent tint over the cover; the per-theme rgba lives in the QSS.
         self._bottom = QWidget(self)
         self._bottom.setObjectName("game_card_bottom")
-        self._bottom.setGeometry(0, 130, 186, 110)
+        self._bottom.setGeometry(0, bottom_y, cw, bottom_h)
         bl = QVBoxLayout(self._bottom)
-        bl.setContentsMargins(10, 6, 10, 6)
+        bl.setContentsMargins(
+            scaled(10, self), scaled(6, self), scaled(10, self), scaled(6, self))
         bl.setSpacing(2)
 
         # _clean_tag_display heals a name still stored with HTML entities
@@ -1448,7 +1517,8 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._name_lbl.setObjectName("game_card_name")
         self._name_lbl.setWordWrap(False)
         fm = self._name_lbl.fontMetrics()
-        elided = fm.elidedText(_disp_name, Qt.TextElideMode.ElideRight, 162)
+        elided = fm.elidedText(
+            _disp_name, Qt.TextElideMode.ElideRight, max(40, cw - scaled(24, self)))
         self._name_lbl.setText(elided)
         self._name_lbl.setToolTip(_disp_name)
 
@@ -1470,7 +1540,11 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         # because the bottom overlay propagates its rgba fill to children and
         # painted this button as a darker rectangle.
         self._sync_card_btn.setObjectName("card_flat_btn")
-        self._sync_card_btn.setFixedSize(22, 18)
+        _sw, _sh = scaled(22, self), scaled(18, self)
+        self._sync_card_btn.setFixedSize(_sw, _sh)
+        lock_min_size(self._sync_card_btn, _sw, _sh,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._sync_card_btn.setToolTip(t("sync.sync_now"))
         self._sync_card_btn.clicked.connect(lambda: self.sync_requested.emit(self._entry.id))
         _status_row.addWidget(self._sync_card_btn)
@@ -1484,19 +1558,25 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
 
         # Action bar
         bar = QHBoxLayout()
-        bar.setContentsMargins(0, 4, 0, 0)
-        bar.setSpacing(4)
+        bar.setContentsMargins(0, scaled(4, self), 0, 0)
+        bar.setSpacing(scaled(4, self))
 
         self._launch_btn = QPushButton(t("buttons.play"))
         # card_play_btn: the shared primary_btn look, tightened for the card.
         self._launch_btn.setObjectName("card_play_btn")
-        self._launch_btn.setFixedHeight(26)
+        self._launch_btn.setFixedHeight(scaled(26, self))
+        lock_min_size(self._launch_btn, h=scaled(26, self),
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._launch_btn.clicked.connect(lambda: self.launch_requested.emit(self._entry.id))
 
         self._backup_btn = QPushButton(t("buttons.backup"))
         # Same transparency treatment as the ⟳ sync button above, one size up.
         self._backup_btn.setObjectName("card_flat_btn_lg")
-        self._backup_btn.setFixedSize(26, 26)
+        _bw = scaled(26, self)
+        self._backup_btn.setFixedSize(_bw, _bw)
+        lock_min_size(self._backup_btn, _bw, _bw,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._backup_btn.setToolTip(t("library.backup_now"))
         self._backup_btn.clicked.connect(lambda: self.backup_requested.emit(self._entry.id))
 
@@ -1504,7 +1584,10 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         # card_more_btn, not the shared icon_btn: it keeps a solid backdrop so
         # the small ⋯ glyph stays readable over the cover art (see the QSS).
         more_btn.setObjectName("card_more_btn")
-        more_btn.setFixedSize(26, 26)
+        more_btn.setFixedSize(_bw, _bw)
+        lock_min_size(more_btn, _bw, _bw,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         more_btn.clicked.connect(lambda: self._show_context_menu(more_btn))
 
         bar.addWidget(self._launch_btn, 1)
@@ -1558,7 +1641,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         _st_hover, _st_hover_style = _sync_hover(self._entry, "10px")
         self._status_lbl.set_texts(
             f"{STATUS_ICONS.get(status,'?')}  {t(f'library.status_{status}')}",
-            f"color:{_status_color(status)};font-size:10px;font-weight:500;background:transparent;",
+            f"color:{_status_color(status)};font-size:{scaled(10, self)}px;font-weight:500;background:transparent;",
             _st_hover, _st_hover_style,
         )
 
@@ -1584,7 +1667,9 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
 
     def _update_cover(self):
         focus = getattr(self._entry, 'cover_focus', 'center')
-        px = _make_pixmap(self._img_path, 186, 240, focus)
+        px = _make_pixmap(
+            self._img_path, getattr(self, "_cw", _CARD_W0),
+            getattr(self, "_ch", _CARD_H0), focus)
         if px:
             self._cover.setPixmap(px)
             self._cover.setText("")
@@ -1652,10 +1737,11 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         # see the note in GameCard._build.
         self._thumb = QLabel()
         self._thumb.setObjectName("game_row_thumb")
-        self._thumb.setFixedSize(48, 48)
+        _th = scaled(48, self)
+        self._thumb.setFixedSize(_th, _th)
         self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         focus = getattr(self._entry, 'cover_focus', 'center')
-        px = _make_pixmap(self._img_path, 48, 48, focus)
+        px = _make_pixmap(self._img_path, _th, _th, focus)
         if px:
             self._thumb.setPixmap(px)
         else:
@@ -1664,7 +1750,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
 
         # Folder color dot
         self._folder_dot = QLabel("●")
-        self._folder_dot.setFixedWidth(14)
+        self._folder_dot.setFixedWidth(scaled(14, self))
         self._folder_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._update_folder_dot()
         row.addWidget(self._folder_dot)
@@ -1679,6 +1765,11 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         name_row.setContentsMargins(0, 0, 0, 0)
         self._name_lbl = QLabel(_clean_tag_display(self._entry.name))
         self._name_lbl.setObjectName("game_name")
+        # A bare QLabel compresses to a sliver at narrow widths, so list rows
+        # became a wall of buttons with the title gone — the "list view cut
+        # off" report. Keep a readable floor: the page then H-scrolls instead
+        # of crushing the row.
+        lock_min_size(self._name_lbl, w=scaled(220, self, min_px=180))
         name_row.addWidget(self._name_lbl, 0)
         self._rating = StarRating(self._entry.average_rating(),
                                   star_size=10, font_size=11)
@@ -1725,25 +1816,38 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         # row_play_btn, not the shared primary_btn: the zero padding this
         # needs (and the cancelled :pressed) live with the rule in the theme.
         self._launch_btn.setObjectName("row_play_btn")
-        self._launch_btn.setFixedSize(28, 28)
+        _rw = scaled(28, self)
+        self._launch_btn.setFixedSize(_rw, _rw)
+        lock_min_size(self._launch_btn, _rw, _rw,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._launch_btn.setToolTip(t("buttons.play").lstrip("▶").strip())
         self._launch_btn.clicked.connect(lambda: self.launch_requested.emit(self._entry.id))
 
         self._backup_btn = QPushButton(t("buttons.backup"))
         self._backup_btn.setObjectName("icon_btn")
-        self._backup_btn.setFixedSize(28, 28)
+        self._backup_btn.setFixedSize(_rw, _rw)
+        lock_min_size(self._backup_btn, _rw, _rw,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._backup_btn.setToolTip(t("library.backup_now"))
         self._backup_btn.clicked.connect(lambda: self.backup_requested.emit(self._entry.id))
 
         self._sync_btn = QPushButton(t("buttons.sync"))
         self._sync_btn.setObjectName("icon_btn")
-        self._sync_btn.setFixedSize(28, 28)
+        self._sync_btn.setFixedSize(_rw, _rw)
+        lock_min_size(self._sync_btn, _rw, _rw,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._sync_btn.setToolTip(t("sync.sync_now"))
         self._sync_btn.clicked.connect(lambda: self.sync_requested.emit(self._entry.id))
 
         more_btn = QPushButton(t("buttons.more"))
         more_btn.setObjectName("icon_btn")
-        more_btn.setFixedSize(28, 28)
+        more_btn.setFixedSize(_rw, _rw)
+        lock_min_size(more_btn, _rw, _rw,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         more_btn.clicked.connect(lambda: self._show_context_menu(more_btn))
 
         for b in (self._launch_btn, self._backup_btn, self._sync_btn, more_btn):
@@ -1758,7 +1862,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         _ensure_children_field(folders)
         color_key = _get_folder_color_by_path(folders, cat)
         if color_key:
-            style = f"color:{palette(color_key)};font-size:14px;background:transparent;"
+            style = f"color:{palette(color_key)};font-size:{scaled(14, self)}px;background:transparent;"
             self._folder_dot.setStyleSheet(style)
             self._folder_dot.setVisible(True)
         else:
@@ -1769,7 +1873,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         the current entry (state + theme dependent)."""
         status = _display_sync_status(self._entry)
         self._status_lbl.setText(f"{STATUS_ICONS.get(status,'?')} {t(f'library.status_{status}')}")
-        style = f"color:{_status_color(status)};font-size:11px;font-weight:600;min-width:90px;background:transparent;"
+        style = f"color:{_status_color(status)};font-size:{scaled(11, self)}px;font-weight:600;min-width:90px;background:transparent;"
         self._status_lbl.setStyleSheet(style)
 
     def _apply_playtime(self):
@@ -1778,7 +1882,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         _pt_hover, _pt_hover_style = _session_hover(self._entry, "11px")
         self._playtime_lbl.set_texts(
             f"🕐 {pt}" if self._entry.playtime_seconds > 0 else "",
-            f"color:{palette('text_muted')};font-size:11px;",
+            f"color:{palette('text_muted')};font-size:{scaled(11, self)}px;",
             _pt_hover, _pt_hover_style,
         )
 

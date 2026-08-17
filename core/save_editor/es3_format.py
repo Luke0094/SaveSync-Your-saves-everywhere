@@ -30,14 +30,17 @@ class Es3Format(JsonFormat):
         if not is_encrypted(data):
             # Encryption is optional, and most games leave it off.
             return super().load(data)
-        self._password = find_password(data, self.source_path, self.game_dir,
-                                       progress=self.progress)
+        # Probe round-trips may already carry the password the first reader
+        # found — skip a second archive hunt.
+        if not self._password:
+            self._password = find_password(
+                data, self.source_path, self.game_dir, progress=self.progress)
         if not self._password:
             raise SaveEditorError(
                 "this Easy Save 3 file is encrypted and its password is not "
                 "in the game's files — put the key in an es3.key file beside "
                 "the save")
-        self._iv = data[:16]
+        self._iv = self._iv or data[:16]
         try:
             super().load(decrypt(data, self._password))
         except Es3Error as e:

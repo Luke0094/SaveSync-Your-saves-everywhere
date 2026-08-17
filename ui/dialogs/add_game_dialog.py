@@ -13,18 +13,22 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint
-from PySide6.QtGui import QPixmap, QColor, QIcon, QFont
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QEventLoop
+from PySide6.QtGui import QPixmap, QColor, QIcon, QFont, QPalette
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QFileDialog, QProgressBar, QFrame,
     QWidget, QScrollArea, QSizePolicy, QMessageBox,
     QSpinBox, QCheckBox, QComboBox, QTextEdit,
 )
 
 from i18n import t
-from ui.helpers import (ElidedCheckBox, display_scale, load_pixmap_any,
-                        open_in_file_manager, scaled_for_screen,
+from ui.helpers import (ElidedCheckBox, apply_adaptive_dialog_size,
+                        display_scale, finalize_adaptive_dialog_size,
+                        hook_dialog_geometry_save, load_pixmap_any, lock_min_size,
+                        mediate_panel_scroll, mediate_page_scroll,
+                        open_in_file_manager, restore_dialog_geometry,
+                        save_dialog_geometry, scaled, scaled_for_screen,
                         thumbnail_pixmap, viewer_pixmap)
 from ui.modal_helpers import question_window_modal
 from ui.styles.theme import palette
@@ -78,9 +82,10 @@ class IgnoredPathsDialog(QDialog):
         self._session_only = session_only
         self.restored_paths: list = []
         self.setWindowTitle(t("add_game.ignored_paths_dialog_title"))
-        self.setMinimumWidth(480)
         self._checkboxes: list[tuple[QCheckBox, str]] = []  # (cb, path)
         self._build()
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=480, min_h=320, scroll=self._scroll, list_content=True)
 
     def _build(self):
         from core.config_manager import get_config
@@ -90,13 +95,15 @@ class IgnoredPathsDialog(QDialog):
                         if self._session_only
                         else "add_game.ignored_paths_dialog_desc"))
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        desc.setObjectName("dialog_desc")
         layout.addWidget(desc)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll = scroll
         inner = QWidget()
+        inner.setObjectName("transparent_bg")
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(0, 8, 0, 8)
 
@@ -112,7 +119,7 @@ class IgnoredPathsDialog(QDialog):
         if not deleted:
             empty_lbl = QLabel(t("add_game.session_ignored_none" if self._session_only
                                  else "add_game.ignored_paths_none"))
-            empty_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:12px;")
+            empty_lbl.setObjectName("dialog_empty")
             inner_layout.addWidget(empty_lbl)
         else:
             for path in deleted:
@@ -142,13 +149,10 @@ class IgnoredPathsDialog(QDialog):
         # fell off the right edge. Full path stays in the tooltip, and the
         # restore logic reads it from self._checkboxes, not from the label.
         cb = ElidedCheckBox()
-        cb.setStyleSheet("QCheckBox { font-size: 11px; }")
+        cb.setObjectName("list_cb_sm")
         cb.setFullText(path)
         tag = QLabel(t("add_game.ignored_paths_deleted_label"))
-        tag.setStyleSheet(
-            f"color:{palette('text_hint')};font-size:10px;"
-            f"border:1px solid {palette('border')};border-radius:3px;padding:1px 5px;"
-        )
+        tag.setObjectName("deleted_tag")
         row.addWidget(cb, 1)
         row.addWidget(tag)
         self._checkboxes.append((cb, path))
@@ -217,6 +221,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._web_search_active = False
         self._pending_search_payload = None  # (result, error) while shelved
         self._force_close = False  # True for Accept / Cancel — never shelve those
+        self._i18n_hooked = False  # language_changed connection made (guards disconnect)
         self._bg_notice_status = ""  # running | done | failed
         self._bg_work_kind = ""  # exe | search | detect — sidebar label while shelved
         self._save_paths: list[str] = []   # current path list
@@ -246,7 +251,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                                      (getattr(entry, "reviews", None) or [])]
 
         self.setWindowTitle(t("add_game.title") if not entry else t("library.edit"))
-        self.setMinimumWidth(540)
+        # Native HWND paints COLOR_WINDOW (often white) before QSS — seed the
+        # palette so the first mapped frame matches the theme background.
+        self._apply_window_chrome()
         # WindowModal, NOT ApplicationModal: the dialog must block only the
         # main window. ApplicationModal froze input on EVERY app window —
         # including the in-game overlay, so an unknown-game notification
@@ -254,199 +261,401 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # same rule in ui/modal_helpers.py).
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setAcceptDrops(True)
-        
-        self._build()
-        self._update_reviews_btn()
-        # Live locale: placeholder "Unknown"/"Sconosciuto" changes width.
-        from i18n import get_engine as _get_i18n
-        _get_i18n().language_changed.connect(self._on_language_changed)
 
-        if entry:
-            # Block signals during init population to prevent auto-detect firing
-            self._exe_edit.blockSignals(True)
-            # _clean_tag (html.unescape) heals name/developer/description saved
-            # with HTML entities by earlier versions ("N&amp;R", "you&#039;re"),
-            # exactly as it already does for tags — so the dialog shows clean
-            # text and re-saving persists it clean.
-            self._name_edit.setText(self._clean_tag(entry.name))
-            from core.resolvers import is_launcher_url as _is_lurl_edit
-            _exe_load = entry.exe_path or ""
-            if _exe_load and _is_lurl_edit(_exe_load):
-                # Legacy: URL was wrongly stored as exe_path — show it as launch id.
-                if not entry.appid:
-                    self._appid_edit.setText(_exe_load)
-                self._exe_edit.setText("")
-            else:
-                self._exe_edit.setText(_exe_load)
-            self._exe_edit.blockSignals(False)
-            # Load appid if present
-            if entry.appid:
-                self._appid_edit.setText(entry.appid)
-            # Load backup interval (convert seconds to minutes)
-            backup_interval_min = round(entry.backup_interval_sec / 60)
-            self._backup_interval_spin.setValue(max(1, backup_interval_min))
-            # Load auto backup enabled setting
-            self._auto_backup_cb.setChecked(entry.auto_backup_enabled)
-            for p in entry.save_paths:
-                self._add_path(p, detected=False)
-            # Compress any legacy uncompressed images in the cache folder
-            # (must happen before icon_path check so stale refs are resolved)
-            if entry.exe_path:
-                _gf = get_install_folder_name(entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
-                _ensure_cache_compressed(_ICON_CACHE_DIR / _gf)
-            # Resolve icon_path: if original was compressed, update to the .jpg
-            _icon = entry.icon_path
-            if _icon and not Path(_icon).exists():
-                _jpg_alt = Path(_icon).with_suffix(".jpg")
-                if _jpg_alt.exists():
-                    _icon = str(_jpg_alt)
-            if _icon and Path(_icon).exists():
-                self._image_path = _icon
-                self._update_image_preview(_icon)
-            # Detect all available images for navigation (including current)
-            all_imgs = []
-            # Always detect from exe path - _find_all_game_images handles icon_path properly
-            if entry.exe_path:
-                from ui.widgets.game_items import _find_all_game_images
-                all_imgs = _find_all_game_images(entry)
-            # Remove duplicates while preserving order
-            seen = set()
-            all_imgs = [x for x in all_imgs if not (x in seen or seen.add(x))]
-            if all_imgs:
-                self._detected_images = all_imgs
-                # Always show the saved icon_path as current (only if it exists)
-                # Use the resolved _icon (may have been updated to .jpg above)
-                if _icon and Path(_icon).exists():
-                    self._image_path = _icon
-                    self._current_image_idx = 0
-                elif self._image_path and self._image_path in all_imgs:
-                    self._current_image_idx = all_imgs.index(self._image_path)
-                else:
-                    self._current_image_idx = 0
-                    self._image_path = all_imgs[0]
-                if self._image_path:
-                    self._update_image_preview(self._image_path)
-                    self._update_nav_buttons()
-        
-            # Pre-fill description and category
-            if entry.description:
-                self._desc_edit.setPlainText(self._clean_tag(entry.description))
-            if entry.category:
-                for i in range(self._category_combo.count()):
-                    if self._category_combo.itemData(i) == entry.category:
-                        self._category_combo.setCurrentIndex(i)
-                        break
-            if entry.tags:
-                # _split_tag_text heals tags saved with HTML entities
-                # (&#039; …) AND comma-joined tags stored as one ("avventura
-                # , azione") by earlier versions/web sources; the healed
-                # list is what gets saved.
-                self._tags = self._split_tag_text(entry.tags)
-                # Render the tag chips immediately. This MUST NOT be nested in
-                # the store_url branch below (the old bug) — editing a game
-                # with tags but no store URL would then open with an empty
-                # chip strip while add mode rendered fine, which read as the
-                # add/edit tag-area inconsistency.
-                self._rebuild_tag_chips()
-            # A stored engine is the answer even when it came from detection:
-            # re-detecting here would need the install folder, which may be
-            # gone, and would overwrite a hand-typed value.
-            _stored_engine = (getattr(entry, "engine", "") or "").strip()
-            if _stored_engine:
-                self._set_engine(_stored_engine, from_user=True)
-            elif entry.exe_path:
-                self._detect_engine_from_exe(entry.exe_path)
-            # New metadata fields
-            if hasattr(entry, 'developer') and entry.developer:
-                self._developer_edit.setText(self._clean_tag(entry.developer))
-            if hasattr(entry, 'release_year') and entry.release_year:
-                self._year_edit.setText(entry.release_year)
-            if hasattr(entry, 'store_url') and entry.store_url:
-                # store_url may be a single URL or comma-separated list
-                urls = [u.strip() for u in entry.store_url.split(',') if u.strip()]
-                self._store_urls = urls
-                self._rebuild_url_chips()
-            # Seed source fingerprint so already-applied sources are not
-            # re-offered without material news, and so a dead primary can be
-            # soft-promoted without wiping saved fields.
-            _saved_src = getattr(entry, 'info_source', '') or ''
-            _applied: list[str] = []
-            _base = (_saved_src or '').split('+')[0]
-            if _base:
-                _applied.append(_base)
-            for _r in (getattr(entry, 'reviews', None) or []):
-                if not isinstance(_r, dict):
-                    continue
-                _rs = (_r.get('source') or '').split('+')[0]
-                if _rs and _rs not in ('user', 'web') and _rs not in _applied:
-                    _applied.append(_rs)
-            for _u in (getattr(self, '_store_urls', None) or []):
-                _us = self._source_from_url(_u) if hasattr(self, '_source_from_url') else ''
-                if _us and _us not in _applied:
-                    _applied.append(_us)
-            if _saved_src or _applied:
-                self._enrichment_source_fingerprint = {
-                    'source': _saved_src,
-                    'content': (
-                        (entry.description or '') + ' ' +
-                        (getattr(entry, 'developer', '') or '') + ' ' +
-                        (getattr(entry, 'release_year', '') or '')
-                    ).strip(),
-                    'applied': _applied,
-                }
-            self._add_btn.setText(t("common.save_changes"))
+        # Shell only (title + chrome). Form sections + populate run as
+        # QTimer chunks after show — same idea as library / save-editor rows.
+        self._ui_ready = False
+        self._build_gen = 0
+        self._deferred_busy = None
+        self._pending_init_name = name
+        self._pending_init_exe = exe_path
+        self._populate_queue: list = []
+        self._build_shell()
+
+    def _build_shell(self):
+        """Title chrome only — enough to show the window immediately."""
+        self._root_layout = QVBoxLayout(self)
+        self._root_layout.setSpacing(8)
+        self._root_layout.setContentsMargins(16, 12, 16, 12)
+        self._title_lbl = QLabel(self.windowTitle())
+        self._title_lbl.setObjectName("add_dialog_title")
+        self._root_layout.addWidget(self._title_lbl)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        self._root_layout.addWidget(sep)
+        # Body scroll: off when resize fits; H/V AsNeeded only when capped
+        # (low-res). Path list keeps its own list scroll for many rows.
+        self._body_scroll = QScrollArea()
+        self._body_scroll.setWidgetResizable(True)
+        self._body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._body_host = QWidget()
+        self._body_host.setObjectName("transparent_bg")
+        self._body_layout = QVBoxLayout(self._body_host)
+        self._body_layout.setSpacing(8)
+        self._body_layout.setContentsMargins(0, 0, 0, 0)
+        self._body_scroll.setWidget(self._body_host)
+        self._root_layout.addWidget(self._body_scroll, 1)
+        # Soft shell floor until async sections exist; _fit_to_content grows
+        # to the real footprint. Keep scroll bars off until then.
+        self.setMinimumHeight(860)
+        self._panel_size = apply_adaptive_dialog_size(self, min_w=680, min_h=860, prefer_w=680, prefer_h=860)
+        mediate_panel_scroll(self._body_scroll, capped_w=False, capped_h=False)
+
+
+    def show_and_build(self):
+        """Show the shell at content-min size, then build sections."""
+        self._apply_window_chrome()
+        self.setMinimumHeight(860)
+        self.resize(max(self.width(), 680), max(self.height(), 860))
+        self._panel_size = apply_adaptive_dialog_size(self, min_w=680, min_h=860, prefer_w=680, prefer_h=860)
+        if hasattr(self, "_body_scroll"):
+            mediate_panel_scroll(self._body_scroll, capped_w=False, capped_h=False)
+        self._center_on_parent()
+        self.show_settled()
+        self._start_async_build()
+
+
+    def _fit_to_content(self):
+        """Resize-first; re-mediate scroll from live viewport vs content."""
+        self._body_layout.activate()
+        paths_h = getattr(self, "_PATHS_FLOOR", 100)
+        if hasattr(self, "_paths_scroll"):
+            self._paths_scroll.setMinimumHeight(paths_h)
+
+        body_hint = self._body_layout.sizeHint()
+        body_min = self._body_layout.minimumSize()
+        body_w = max(body_hint.width(), body_min.width(), 640)
+        body_h = max(body_hint.height(), body_min.height())
+
+        m = self._root_layout.contentsMargins()
+        spacing = self._root_layout.spacing()
+        title_h = max(22, self._title_lbl.sizeHint().height())
+        footer_h = scaled(44, self, min_px=40)
+        chrome_h = m.top() + m.bottom() + title_h + footer_h + spacing * 3 + 10
+        prefer_w = max(680, body_w + m.left() + m.right() + 8)
+        # Vertical slack: ensure full visibility of backup settings and all form sections
+        prefer_h = max(body_h + chrome_h + scaled(80, self, min_px=64), 860)
+
+        self._panel_size = apply_adaptive_dialog_size(
+            self, min_w=680, min_h=prefer_h,
+            prefer_w=prefer_w, prefer_h=prefer_h,
+            max_width_frac=0.94, max_height_frac=0.96)
+
+        # Prefer remembered manual size when it still fits the host and is at least prefer_h
+        if restore_dialog_geometry(self):
+            if self.height() < prefer_h:
+                self.resize(self.width(), prefer_h)
+            from ui.helpers import dialog_host_geometry, DialogSizeResult
+            host = dialog_host_geometry(self)
+            if host is not None:
+                max_w = int(host.width() * 0.94)
+                max_h = int(host.height() * 0.96)
+                self._panel_size = DialogSizeResult(
+                    self.width(), self.height(),
+                    self.width() >= max_w - 2, self.height() >= max_h - 2,
+                    prefer_w, prefer_h)
+        hook_dialog_geometry_save(self)
+        self.setMinimumHeight(min(prefer_h, 860))
+        self.resize(max(self.width(), prefer_w), max(self.height(), prefer_h))
+        self._center_on_parent()
+
+        # Prefer live viewport caps so narrowing the window later still
+        # enables H scroll instead of clipping icon/chrome buttons. The V
+        # policy is ALWAYS AsNeeded: minimumSizeHint is optimistic (sections
+        # like the tags/URL strips report small minima), so a capped dialog
+        # could clip the last rows with no scrollbar to reach them — the
+        # "dialog cut off" report. AsNeeded shows a bar only when the content
+        # really overflows, so a fitting dialog still gets none.
+        from ui.helpers import page_scroll_caps, mediate_panel_scroll
+        cw, _ch = page_scroll_caps(self._body_scroll)
+        mediate_panel_scroll(self._body_scroll, capped_w=cw, capped_h=True)
+        if hasattr(self, "_paths_scroll"):
+            mediate_page_scroll(self._paths_scroll, list_content=True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "_ui_ready", False):
+            QTimer.singleShot(0, self._remediate_add_scrolls)
+
+    def _remediate_add_scrolls(self):
+        if hasattr(self, "_body_scroll"):
+            # Same rule as _fit_to_content: H follows the live viewport caps,
+            # V is always AsNeeded so a shrunken dialog can never cut off
+            # its last rows without a scrollbar.
+            from ui.helpers import page_scroll_caps, mediate_panel_scroll
+            cw, _ch = page_scroll_caps(self._body_scroll)
+            mediate_panel_scroll(self._body_scroll, capped_w=cw, capped_h=True)
+        if hasattr(self, "_paths_scroll"):
+            mediate_page_scroll(self._paths_scroll, list_content=True)
+
+    def _center_on_parent(self):
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
         else:
-            if name:
-                # A caller may hand us a generic exe stem ("nw", "game"…) as the
-                # name; with a real exe path, walk up to the install-folder name
-                # instead so the game is never proposed as "nw".
-                if exe_path:
-                    try:
-                        from core.save_detector import derive_display_name, GENERIC_EXE_STEMS
-                        from core.resolvers import is_launcher_url as _is_lurl
-                        if name.strip().lower() in GENERIC_EXE_STEMS and not _is_lurl(exe_path):
-                            _better = derive_display_name(exe_path)
-                            if _better:
-                                name = _better
-                    except Exception:
-                        pass
-                self._name_edit.setText(name)
-            if exe_path:
-                from core.resolvers import is_launcher_url
-                if is_launcher_url(exe_path):
-                    # Store the full launcher URL in appid field
-                    self._appid_edit.setText(exe_path)
-                    if name:
-                        self._shortcut_name = name
-                    # Defer exe resolution to after the dialog is shown so the UI
-                    # never freezes on drag-and-drop (the sync scan ran before exec()).
-                    # _resolve_exe_from_url_async already runs in a background thread.
-                    QTimer.singleShot(0, lambda _url=exe_path: self._resolve_exe_from_url_async(_url))
-                    if name:
-                        self._detect_btn.setEnabled(True)
-                else:
-                    self._exe_edit.setText(exe_path)
-                    self._detect_btn.setEnabled(True)
-                    self._auto_detect_image(exe_path)
+            from PySide6.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                geo = self.frameGeometry()
+                geo.moveCenter(screen.availableGeometry().center())
+                self.move(geo.topLeft())
 
+
+    def _stop_deferred_busy(self):
+        busy = getattr(self, "_deferred_busy", None)
+        if busy is not None:
+            try:
+                busy.close()
+            except Exception:
+                pass
+            self._deferred_busy = None
+
+    def _start_async_build(self):
+        self._build_gen += 1
+        gen = self._build_gen
+        self._ui_ready = False
+        self._stop_deferred_busy()
+        if self.isVisible():
+            from ui.widgets.busy_overlay import DeferredBusy
+            self._deferred_busy = DeferredBusy(
+                self, t("common.please_wait"), delay_ms=0)
+        self._build_iter = self._build_sections()
+        QTimer.singleShot(0, lambda g=gen: self._async_build_step(g))
+
+    def _async_build_step(self, gen: int):
+        if gen != self._build_gen:
+            return
+        try:
+            next(self._build_iter)
+        except StopIteration:
+            self._on_ui_sections_done(gen)
+            return
+        except Exception as e:
+            logger.exception(f"Add-game section build failed: {e}")
+            self._stop_deferred_busy()
+            return
+        QTimer.singleShot(0, lambda g=gen: self._async_build_step(g))
+
+    def _on_ui_sections_done(self, gen: int):
+        if gen != self._build_gen:
+            return
+        self._update_reviews_btn()
+        from i18n import get_engine as _get_i18n
+        try:
+            _get_i18n().language_changed.connect(self._on_language_changed)
+            self._i18n_hooked = True
+        except Exception:
+            pass
         self._placeholder_signal.connect(self._exe_edit.setPlaceholderText)
         self.search_finished.connect(self._on_search_finished)
         self.primary_reachability_done.connect(self._on_primary_reachability_done)
+        self._queue_initial_populate()
+        if not self._populate_queue:
+            self._finish_async_open(gen)
+            return
+        QTimer.singleShot(0, lambda g=gen: self._async_populate_step(g))
 
-    def _build(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
-        layout.setContentsMargins(24, 20, 24, 20)
+    def _queue_initial_populate(self):
+        """Break entry/name seeding into small jobs (path rows especially)."""
+        self._populate_queue = []
+        entry = self._editing_entry
+        name = self._pending_init_name or ""
+        exe_path = self._pending_init_exe or ""
+        if entry:
+            self._populate_queue.append(lambda: self._populate_entry_fields(entry))
+            paths = list(entry.save_paths or [])
+            for p in paths:
+                self._populate_queue.append(
+                    lambda path=p: self._add_path(path, detected=False))
+            self._populate_queue.append(lambda: self._populate_entry_media(entry))
+            self._populate_queue.append(lambda: self._populate_entry_meta(entry))
+        else:
+            self._populate_queue.append(
+                lambda: self._populate_new_game(name, exe_path))
 
-        title = QLabel(self.windowTitle())
-        title.setObjectName("page_header")
-        title.setStyleSheet("font-size:17px;")
-        layout.addWidget(title)
+    def _async_populate_step(self, gen: int):
+        if gen != self._build_gen:
+            return
+        queue = self._populate_queue
+        if not queue:
+            self._finish_async_open(gen)
+            return
+        from core.concurrency import library_insert_chunk_size
+        cs = library_insert_chunk_size()
+        chunk_n = cs if cs > 0 else 16
+        chunk = queue[:chunk_n]
+        del queue[:chunk_n]
+        for job in chunk:
+            if gen != self._build_gen:
+                return
+            try:
+                job()
+            except Exception as e:
+                logger.debug(f"Add-game populate step failed: {e}")
+        if queue:
+            QTimer.singleShot(0, lambda g=gen: self._async_populate_step(g))
+            return
+        self._finish_async_open(gen)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        layout.addWidget(sep)
+    def _finish_async_open(self, gen: int):
+        if gen != self._build_gen:
+            return
+        self._populate_queue = []
+        self._ui_ready = True
+        self._apply_engine_width()
+        if hasattr(self, "_tag_container"):
+            try:
+                self._repin_tag_strip_width()
+            except Exception:
+                pass
+        if hasattr(self, "_url_container"):
+            try:
+                self._repin_url_strip_width()
+            except Exception:
+                pass
+        # Content-min size once fields exist — fit BEFORE hiding busy overlay
+        self._fit_to_content()
+        self._stop_deferred_busy()
+        if hasattr(self, "_add_btn"):
+            self._add_btn.setEnabled(True)
 
-        # ── Image + name/exe row ──────────────────────────────────────────────
+
+    def _populate_entry_fields(self, entry: GameEntry):
+        self._exe_edit.blockSignals(True)
+        self._name_edit.setText(self._clean_tag(entry.name))
+        from core.resolvers import is_launcher_url as _is_lurl_edit
+        _exe_load = entry.exe_path or ""
+        if _exe_load and _is_lurl_edit(_exe_load):
+            if not entry.appid:
+                self._appid_edit.setText(_exe_load)
+            self._exe_edit.setText("")
+        else:
+            self._exe_edit.setText(_exe_load)
+        self._exe_edit.blockSignals(False)
+        if entry.appid:
+            self._appid_edit.setText(entry.appid)
+        backup_interval_min = round(entry.backup_interval_sec / 60)
+        self._backup_interval_spin.setValue(max(1, backup_interval_min))
+        self._auto_backup_cb.setChecked(entry.auto_backup_enabled)
+        self._add_btn.setText(t("common.save_changes"))
+
+    def _populate_entry_media(self, entry: GameEntry):
+        if entry.exe_path:
+            _gf = get_install_folder_name(
+                entry.exe_path or "", entry.name, entry.id,
+                entry.computed_folder_name)
+            _ensure_cache_compressed(_ICON_CACHE_DIR / _gf)
+        _icon = entry.icon_path
+        if _icon and not Path(_icon).exists():
+            _jpg_alt = Path(_icon).with_suffix(".jpg")
+            if _jpg_alt.exists():
+                _icon = str(_jpg_alt)
+        if _icon and Path(_icon).exists():
+            self._image_path = _icon
+            self._update_image_preview(_icon)
+        all_imgs = []
+        if entry.exe_path:
+            from ui.widgets.game_items import _find_all_game_images
+            all_imgs = _find_all_game_images(entry)
+        seen = set()
+        all_imgs = [x for x in all_imgs if not (x in seen or seen.add(x))]
+        if all_imgs:
+            self._detected_images = all_imgs
+            if _icon and Path(_icon).exists():
+                self._image_path = _icon
+                self._current_image_idx = 0
+            elif self._image_path and self._image_path in all_imgs:
+                self._current_image_idx = all_imgs.index(self._image_path)
+            else:
+                self._current_image_idx = 0
+                self._image_path = all_imgs[0]
+            if self._image_path:
+                self._update_image_preview(self._image_path)
+                self._update_nav_buttons()
+
+    def _populate_entry_meta(self, entry: GameEntry):
+        if entry.description:
+            self._desc_edit.setPlainText(self._clean_tag(entry.description))
+        if entry.category:
+            for i in range(self._category_combo.count()):
+                if self._category_combo.itemData(i) == entry.category:
+                    self._category_combo.setCurrentIndex(i)
+                    break
+        if entry.tags:
+            self._tags = self._split_tag_text(entry.tags)
+            self._rebuild_tag_chips()
+        _stored_engine = (getattr(entry, "engine", "") or "").strip()
+        if _stored_engine:
+            self._set_engine(_stored_engine, from_user=True)
+        elif entry.exe_path:
+            self._detect_engine_from_exe(entry.exe_path)
+        if getattr(entry, "developer", None):
+            self._developer_edit.setText(self._clean_tag(entry.developer))
+        if getattr(entry, "release_year", None):
+            self._year_edit.setText(entry.release_year)
+        if getattr(entry, "store_url", None) and entry.store_url:
+            urls = [u.strip() for u in entry.store_url.split(",") if u.strip()]
+            self._store_urls = urls
+            self._rebuild_url_chips()
+        _saved_src = getattr(entry, "info_source", "") or ""
+        _applied: list[str] = []
+        _base = (_saved_src or "").split("+")[0]
+        if _base:
+            _applied.append(_base)
+        for _r in (getattr(entry, "reviews", None) or []):
+            if not isinstance(_r, dict):
+                continue
+            _rs = (_r.get("source") or "").split("+")[0]
+            if _rs and _rs not in ("user", "web") and _rs not in _applied:
+                _applied.append(_rs)
+        for _u in (getattr(self, "_store_urls", None) or []):
+            _us = self._source_from_url(_u) if hasattr(self, "_source_from_url") else ""
+            if _us and _us not in _applied:
+                _applied.append(_us)
+        if _saved_src or _applied:
+            self._enrichment_source_fingerprint = {
+                "source": _saved_src,
+                "content": (
+                    (entry.description or "") + " " +
+                    (getattr(entry, "developer", "") or "") + " " +
+                    (getattr(entry, "release_year", "") or "")
+                ).strip(),
+                "applied": _applied,
+            }
+
+    def _populate_new_game(self, name: str, exe_path: str):
+        if name:
+            if exe_path:
+                try:
+                    from core.save_detector import derive_display_name, GENERIC_EXE_STEMS
+                    from core.resolvers import is_launcher_url as _is_lurl
+                    if name.strip().lower() in GENERIC_EXE_STEMS and not _is_lurl(exe_path):
+                        _better = derive_display_name(exe_path)
+                        if _better:
+                            name = _better
+                except Exception:
+                    pass
+            self._name_edit.setText(name)
+        if exe_path:
+            from core.resolvers import is_launcher_url
+            if is_launcher_url(exe_path):
+                self._appid_edit.setText(exe_path)
+                if name:
+                    self._shortcut_name = name
+                QTimer.singleShot(
+                    0, lambda _url=exe_path: self._resolve_exe_from_url_async(_url))
+                if name:
+                    self._detect_btn.setEnabled(True)
+            else:
+                self._exe_edit.setText(exe_path)
+                self._detect_btn.setEnabled(True)
+                self._auto_detect_image(exe_path)
+
+    def _build_sections(self):
+        """Yield between major form sections so the event loop can paint."""
+        layout = self._body_layout
         top_row = QHBoxLayout()
         top_row.setSpacing(16)
 
@@ -460,7 +669,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         from ui.styles.arrow_icons import chevron_button_style as _chevron_btn
         self._img_prev_btn = QPushButton("")
-        self._img_prev_btn.setFixedSize(22, 56)
+        self._img_prev_btn.setFixedSize(scaled(22, self), scaled(56, self))
         self._img_prev_btn.setToolTip(t('add_game.previous_image'))
         self._img_prev_btn.setStyleSheet(
             _chevron_btn("left", extra=f"border-color:{palette('border_hover')};")
@@ -469,10 +678,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._img_prev_btn.clicked.connect(self._prev_image)
 
         self._img_preview_container = QFrame()
-        self._img_preview_container.setFixedSize(90, 56)
-        self._img_preview_container.setStyleSheet(
-            f"background:{palette('bg_elevated')};border:1px solid {palette('border_hover')};border-radius:6px;"
-        )
+        _pw, _ph = scaled(90, self), scaled(56, self)
+        self._img_preview_container.setFixedSize(_pw, _ph)
+        self._img_preview_container.setObjectName("img_preview_frame")
         # Use a QStackedLayout so the trash icon overlays the preview
         from PySide6.QtWidgets import QStackedLayout
         img_preview_layout = QStackedLayout(self._img_preview_container)
@@ -490,24 +698,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         # Trash overlay — small icon at top-right of preview, cache images only
         self._img_trash_overlay = QPushButton("🗑", self._img_preview_container)
-        self._img_trash_overlay.setFixedSize(20, 20)
-        self._img_trash_overlay.move(68, 2)   # top-right corner of the 90×56 container
+        _tw = scaled(20, self)
+        self._img_trash_overlay.setFixedSize(_tw, _tw)
+        self._img_trash_overlay.move(_pw - _tw - scaled(2, self), scaled(2, self))
         self._img_trash_overlay.setCursor(Qt.CursorShape.PointingHandCursor)
         self._img_trash_overlay.setToolTip(t('add_game.remove_image_tooltip'))
-        self._img_trash_overlay.setStyleSheet(
-            "QPushButton{"
-            "background:rgba(0,0,0,0.45);color:rgba(255,255,255,0.6);"
-            "border:none;border-radius:4px;font-size:11px;padding:0;}"
-            "QPushButton:hover{"
-            "background:#c0392b;color:#fff;}"
-        )
+        self._img_trash_overlay.setObjectName("img_trash_btn")
         self._img_trash_overlay.setVisible(False)
         self._img_trash_overlay.clicked.connect(self._remove_current_image_from_carousel)
         # Keep the preview on top of the stacked widget
         img_preview_layout.setCurrentIndex(1)
 
         self._img_next_btn = QPushButton("")
-        self._img_next_btn.setFixedSize(22, 56)
+        self._img_next_btn.setFixedSize(scaled(22, self), scaled(56, self))
         self._img_next_btn.setToolTip(t('add_game.next_image') if t('add_game.next_image') != 'add_game.next_image' else "Next image")
         self._img_next_btn.setStyleSheet(
             _chevron_btn("right", extra=f"border-color:{palette('border_hover')};")
@@ -521,26 +724,20 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         # Image counter label (e.g. "2 / 5")
         self._img_counter = QLabel()
+        self._img_counter.setObjectName("img_counter")
         self._img_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._img_counter.setStyleSheet(f"color:{palette('text_muted')};font-size:10px;")
 
         img_btn_row = QHBoxLayout()
         img_btn_row.setSpacing(4)
         self._img_add_btn = QPushButton("📷")
-        self._img_add_btn.setFixedSize(40, 26)
+        self._img_add_btn.setObjectName("img_tool_btn")
+        self._img_add_btn.setFixedSize(scaled(40, self), scaled(26, self))
         self._img_add_btn.setToolTip(t('add_game.set_custom_image'))
-        self._img_add_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};border:1px solid {palette('border')};border-radius:4px;font-size:14px;padding:0px;}}"
-            f"QPushButton:hover{{background:{palette('accent')};}}"
-        )
         self._img_add_btn.clicked.connect(self._browse_image)
         self._img_folder_btn = QPushButton("📂")
-        self._img_folder_btn.setFixedSize(40, 26)
+        self._img_folder_btn.setObjectName("img_tool_btn")
+        self._img_folder_btn.setFixedSize(scaled(40, self), scaled(26, self))
         self._img_folder_btn.setToolTip(t('add_game.open_cache_folder'))
-        self._img_folder_btn.setStyleSheet(
-            f"QPushButton{{background:{palette('bg_elevated')};border:1px solid {palette('border')};border-radius:4px;font-size:14px;padding:0px;}}"
-            f"QPushButton:hover{{background:{palette('accent')};}}"
-        )
         self._img_folder_btn.clicked.connect(self._open_image_cache_folder)
         img_btn_row.addWidget(self._img_add_btn)
         img_btn_row.addWidget(self._img_folder_btn)
@@ -553,19 +750,30 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._detected_images: list[str] = []
         self._current_image_idx: int = -1
 
-        # Name + exe
+        # Name + exe + game id — fixed row heights so a short dialog never
+        # stacks/crushes these identity fields on top of each other.
         right_col = QVBoxLayout()
-        right_col.setSpacing(6)
+        right_col.setSpacing(8)
+        _field_h = scaled(30, self, min_px=28)
 
         name_lbl = QLabel(t("add_game.name"))
-        name_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        name_lbl.setObjectName("form_field_lbl")
+        name_lbl.setFixedHeight(scaled(16, self, min_px=14))
         name_row = QHBoxLayout()
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText(t('add_game.name_placeholder'))
+        self._name_edit.setFixedHeight(_field_h)
+        self._name_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._name_edit.setMinimumWidth(scaled(160, self, min_px=120))
         self._name_edit.textChanged.connect(self._on_name_changed)
+        _web_w = scaled(48, self, min_px=40)
         self._web_search_btn = QPushButton("🌐")
         self._web_search_btn.setToolTip(t('add_game.web_search'))
-        self._web_search_btn.setFixedWidth(48)
+        self._web_search_btn.setFixedSize(_web_w, _field_h)
+        lock_min_size(self._web_search_btn, _web_w, _field_h,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._web_search_btn.setEnabled(False)
         self._web_search_btn.clicked.connect(self._web_search)
         name_row.addWidget(self._name_edit, 1)
@@ -584,14 +792,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         exe_col = QVBoxLayout()
         exe_col.setSpacing(3)
         self._exe_lbl = QLabel(t("add_game.exe_path"))
-        self._exe_lbl.setStyleSheet(
-            f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        self._exe_lbl.setObjectName("form_field_lbl")
+        self._exe_lbl.setFixedHeight(scaled(16, self, min_px=14))
         self._engine_user_edited = False
         self._engine_fit_deferred = False
         self._engine_edit = QLineEdit()
         self._engine_edit.setPlaceholderText(t("common.unknown"))
         self._engine_edit.setToolTip(t("add_game.engine_tooltip"))
-        self._engine_edit.setFixedHeight(22)
+        self._engine_edit.setFixedHeight(scaled(22, self, min_px=20))
         self._engine_edit.setSizePolicy(
             QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         # Pixel size (not point size) so metrics match the QSS font-size:11px.
@@ -604,7 +812,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._engine_edit.setStyleSheet(
             f"QLineEdit{{background:{palette('bg_elevated')};color:{palette('text')};"
             f"border:1px solid {palette('border_hover')};border-radius:4px;"
-            f"padding:1px 8px;font-size:11px;font-weight:600;}}"
+            f"padding:1px 8px;font-size:{scaled(11, self)}px;font-weight:600;}}"
             f"QLineEdit:focus{{border-color:{palette('accent')};}}"
         )
         self._engine_edit.textChanged.connect(self._fit_engine_width)
@@ -623,30 +831,43 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._exe_edit = QLineEdit()
         self._exe_edit.setPlaceholderText(
             "C:\\Games\\game.exe" if os.name == 'nt' else "/opt/games/game")
+        self._exe_edit.setFixedHeight(_field_h)
+        self._exe_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._exe_edit.textChanged.connect(self._on_exe_changed)
         exe_row.addWidget(self._exe_edit, 1)
         browse_exe = QPushButton(t("add_game.browse"))
-        browse_exe.setFixedWidth(80)
+        browse_exe.setFixedSize(scaled(80, self, min_px=72), _field_h)
+        lock_min_size(browse_exe, scaled(80, self, min_px=72), _field_h,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         browse_exe.clicked.connect(lambda: self._browse_exe())
         exe_row.addWidget(browse_exe)
         exe_col.addLayout(exe_row)
         right_col.addLayout(exe_col)
-        
+
         # Game ID (appid from launcher URL)
         appid_lbl = QLabel(t("add_game.game_id"))
-        appid_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        appid_lbl.setObjectName("form_field_lbl")
+        appid_lbl.setFixedHeight(scaled(16, self, min_px=14))
         appid_row = QHBoxLayout()
         self._appid_edit = QLineEdit()
         self._appid_edit.setPlaceholderText(t('add_game.appid_placeholder'))
         self._appid_edit.setReadOnly(False)
+        self._appid_edit.setFixedHeight(_field_h)
+        self._appid_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         appid_row.addWidget(self._appid_edit, 1)
         right_col.addWidget(appid_lbl)
         right_col.addLayout(appid_row)
-        
+        # Extra vertical space goes below the identity block, never into it.
+        right_col.addStretch(1)
+
         top_row.addLayout(right_col, 1)
         layout.addLayout(top_row)
+        yield
 
-        # ── Developer · Year · Store URL ─────────────────────────────────────
+        # ── Developer · Year · Store URL (same row) ───────────────────────────
         meta_row = QHBoxLayout()
         meta_row.setSpacing(10)
 
@@ -654,13 +875,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             col = QVBoxLayout()
             col.setSpacing(3)
             lbl = QLabel(t(label_key))
-            lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+            lbl.setObjectName("form_field_lbl")
             ed = QLineEdit()
             ed.setPlaceholderText(t(placeholder_key))
             ed.setStyleSheet(
                 f"QLineEdit{{background:{palette('bg_input')};color:{palette('text')};"
                 f"border:1px solid {palette('border')};border-radius:4px;padding:4px 6px;"
-                f"font-size:12px;}}"
+                f"font-size:{scaled(12, self)}px;}}"
             )
             col.addWidget(lbl)
             col.addWidget(ed)
@@ -669,58 +890,113 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         dev_col,   self._developer_edit  = _meta_col("add_game.developer", "add_game.developer_placeholder")
         year_col,  self._year_edit       = _meta_col("add_game.year",      "add_game.year_placeholder")
 
-        # ── Store URLs as bubbles ─────────────────────────────────────────────
-        store_col = QVBoxLayout()
+        # Store URL column (label on top matching dev/year, url_row below)
+        store_host = QFrame()
+        store_host.setFrameShape(QFrame.Shape.NoFrame)
+        store_col = QVBoxLayout(store_host)
+        store_col.setContentsMargins(0, 0, 0, 0)
         store_col.setSpacing(3)
         store_lbl = QLabel(t("add_game.store_url"))
-        store_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        store_lbl.setObjectName("form_field_lbl")
+        store_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         store_col.addWidget(store_lbl)
 
-        # Bubble row (scrollable)
-        self._url_chips_frame = QFrame()
-        self._url_chips_frame.setFixedHeight(28)
-        self._url_chips_frame.setStyleSheet(
-            f"background:{palette('bg_input')};border:1px solid {palette('border')};"
-            f"border-radius:4px;"
-        )
-        url_chips_outer = QHBoxLayout(self._url_chips_frame)
-        url_chips_outer.setContentsMargins(4, 2, 4, 2)
-        url_chips_outer.setSpacing(4)
-        self._url_chips_layout = QHBoxLayout()
-        self._url_chips_layout.setSpacing(4)
-        self._url_chips_layout.setContentsMargins(0, 0, 0, 0)
+        from ui.styles.arrow_icons import chevron_button_style as _url_chevron
+        url_row = QHBoxLayout()
+        url_row.setContentsMargins(0, 0, 0, 0)
+        url_row.setSpacing(6)
 
-        # Text input for adding new URL
         self._url_input = QLineEdit()
         self._url_input.setPlaceholderText(t("add_game.store_url_placeholder"))
+        self._url_input.setFixedHeight(scaled(26, self, min_px=24))
+        self._url_input.setMinimumWidth(scaled(130, self, min_px=100))
         self._url_input.setStyleSheet(
-            "QLineEdit{background:transparent;border:none;padding:0 2px;font-size:11px;"
-            f"color:{palette('text')};}}"
+            f"QLineEdit{{background:{palette('bg_input')};border:1px solid {palette('border')};"
+            f"border-radius:4px;padding:0 6px;font-size:{scaled(11, self)}px;color:{palette('text')};}}"
         )
-        self._url_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._url_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._url_input.returnPressed.connect(self._add_url_from_input)
 
-        # Fetch-from-link: pull metadata for a pasted store/database URL
-        # (vndb.org / Steam via API, anything else via OpenGraph scrape)
+        _fetch = scaled(26, self, min_px=24)
         self._url_fetch_btn = QPushButton("🔗")
         self._url_fetch_btn.setObjectName("icon_btn")
-        self._url_fetch_btn.setFixedSize(24, 24)
+        self._url_fetch_btn.setFixedSize(_fetch, _fetch)
+        lock_min_size(self._url_fetch_btn, _fetch, _fetch,
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         self._url_fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._url_fetch_btn.setToolTip(t('add_game.fetch_from_url'))
         self._url_fetch_btn.clicked.connect(self._fetch_from_url_input)
 
-        url_chips_outer.addLayout(self._url_chips_layout)
-        url_chips_outer.addWidget(self._url_input, 1)
-        url_chips_outer.addWidget(self._url_fetch_btn)
-        store_col.addWidget(self._url_chips_frame)
+        self._url_left_btn = QPushButton("")
+        self._url_left_btn.setFixedSize(scaled(18, self, min_px=16), scaled(26, self))
+        self._url_left_btn.setStyleSheet(_url_chevron("left"))
+        self._url_left_btn.setVisible(False)
+        self._url_left_btn.clicked.connect(self._scroll_urls_left)
 
-        # Internal list of URL strings
-        self._store_urls: list[str] = []
+        self._URL_CHIP_VIEW_W = scaled(240, self, min_px=160)
+        self._url_strip_frame = QFrame()
+        self._url_strip_frame.setObjectName("url_strip")
+        self._url_strip_frame.setFixedHeight(scaled(28, self))
+        self._url_strip_frame.setFixedWidth(self._URL_CHIP_VIEW_W)
+        self._url_strip_frame.setVisible(False)
+        _url_strip_lay = QHBoxLayout(self._url_strip_frame)
+        _url_strip_lay.setContentsMargins(4, 1, 4, 1)
+        _url_strip_lay.setSpacing(0)
 
-        meta_row.addLayout(dev_col,   2)
-        meta_row.addLayout(year_col,  1)
-        meta_row.addLayout(store_col, 2)
+        self._url_scroll = QScrollArea()
+        self._url_scroll.setObjectName("strip_scroll")
+        self._url_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._url_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._url_scroll.setWidgetResizable(True)
+        _url_strip_lay.addWidget(self._url_scroll)
+
+        self._url_container = QFrame()
+        self._url_container.setObjectName("strip_host")
+        self._url_chips_layout = QHBoxLayout(self._url_container)
+        self._url_chips_layout.setContentsMargins(0, 2, 2, 2)
+        self._url_chips_layout.setSpacing(4)
+        self._url_chips_layout.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._url_scroll.setWidget(self._url_container)
+        self._url_scroll.horizontalScrollBar().rangeChanged.connect(
+            lambda _mn, _mx: self._update_url_arrow_states())
+        self._url_scroll.horizontalScrollBar().valueChanged.connect(
+            lambda _v: self._update_url_arrow_states())
+
+        self._url_right_btn = QPushButton("")
+        self._url_right_btn.setFixedSize(scaled(18, self, min_px=16), scaled(26, self))
+        self._url_right_btn.setStyleSheet(_url_chevron("right"))
+        self._url_right_btn.setVisible(False)
+        self._url_right_btn.clicked.connect(self._scroll_urls_right)
+
+        self._url_chip_group = QFrame()
+        self._url_chip_group.setVisible(False)
+        _chip_group_lay = QHBoxLayout(self._url_chip_group)
+        _chip_group_lay.setContentsMargins(0, 0, 0, 0)
+        _chip_group_lay.setSpacing(2)
+        _chip_group_lay.addWidget(self._url_left_btn)
+        _chip_group_lay.addWidget(self._url_strip_frame)
+        _chip_group_lay.addWidget(self._url_right_btn)
+
+        url_row.addWidget(self._url_chip_group)
+        url_row.addWidget(self._url_input, 1)
+        url_row.addWidget(self._url_fetch_btn)
+
+        store_col.addLayout(url_row)
+
+        meta_row.addLayout(dev_col, 1)
+        meta_row.addLayout(year_col, 1)
+        meta_row.addWidget(store_host, 1)
         layout.addLayout(meta_row)
+
+
+
+        self._store_urls: list[str] = []
+        yield
 
         # ── Description + Category ────────────────────────────────────────────
         desc_cat_row = QHBoxLayout()
@@ -730,13 +1006,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         desc_col = QVBoxLayout()
         desc_col.setSpacing(4)
         desc_lbl = QLabel(t("library.description"))
-        desc_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        desc_lbl.setObjectName("form_field_lbl")
         self._desc_edit = QTextEdit()
         self._desc_edit.setPlaceholderText(t("library.description_placeholder"))
-        self._desc_edit.setFixedHeight(60)
+        self._desc_edit.setFixedHeight(scaled(60, self))
         self._desc_edit.setStyleSheet(
             f"QTextEdit{{background:{palette('bg_input')};color:{palette('text')};"
-            f"border:1px solid {palette('border')};border-radius:4px;padding:4px;font-size:12px;}}"
+            f"border:1px solid {palette('border')};border-radius:4px;padding:4px;font-size:{scaled(12, self)}px;}}"
         )
         desc_col.addWidget(desc_lbl)
         desc_col.addWidget(self._desc_edit)
@@ -755,9 +1031,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._reviews_btn = QPushButton()
         self._reviews_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._reviews_btn.setToolTip(t("reviews.button_tooltip"))
-        self._reviews_btn.setFixedHeight(28)
+        self._reviews_btn.setFixedHeight(scaled(28, self, min_px=26))
+        self._reviews_btn.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self._reviews_btn.setStyleSheet(
-            f"QPushButton{{font-size:11px;font-weight:600;padding:3px 10px;"
+            f"QPushButton{{font-size:{scaled(11, self)}px;font-weight:600;padding:3px 10px;"
             f"background:{palette('bg_elevated')};color:{palette('text')};"
             f"border:1px solid {palette('border_hover')};border-radius:4px;}}"
             f"QPushButton:hover{{background:{palette('bg_button')};"
@@ -767,8 +1045,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         cat_col.addWidget(self._reviews_btn)
 
         cat_lbl = QLabel(t("library.category"))
-        cat_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        cat_lbl.setObjectName("form_field_lbl")
         self._category_combo = QComboBox()
+        self._category_combo.setMinimumWidth(scaled(140, self, min_px=120))
+        self._category_combo.setSizePolicy(
+            QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
         self._populate_category_combo()
         cat_col.addWidget(cat_lbl)
         cat_col.addWidget(self._category_combo)
@@ -779,19 +1060,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         # ── Tags ──────────────────────────────────────────────────────────────
         tag_lbl = QLabel(t("library.tags"))
-        tag_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        tag_lbl.setObjectName("form_field_lbl")
         layout.addWidget(tag_lbl)
 
         tag_widget = QWidget()
         tag_layout = QHBoxLayout(tag_widget)
         tag_layout.setContentsMargins(0, 0, 0, 0)
-        tag_layout.setSpacing(4)
+        tag_layout.setSpacing(2)
 
         # SVG chevrons from arrow_icons (same assets as theme scrollbars) —
         # Unicode ◀/▶ vanish on some Windows fonts / DPI scales.
         from ui.styles.arrow_icons import chevron_button_style
         self._tag_left_btn = QPushButton("")
-        self._tag_left_btn.setFixedSize(24, 28)
+        self._tag_left_btn.setFixedSize(scaled(24, self), scaled(28, self))
         self._tag_left_btn.setStyleSheet(chevron_button_style("left"))
         self._tag_left_btn.setVisible(False)
         self._tag_left_btn.clicked.connect(self._scroll_tags_left)
@@ -803,28 +1084,21 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # background, never flush under the button.
         self._tag_strip_frame = QFrame()
         self._tag_strip_frame.setObjectName("tag_strip")
-        self._tag_strip_frame.setStyleSheet(
-            f"QFrame#tag_strip{{background:{palette('bg_input')};"
-            f"border:1px solid {palette('border')};border-radius:4px;}}"
-        )
         # FIXED strip: with the horizontal scrollbar AlwaysOff, a QScrollArea's
         # minimumSizeHint grows with the content, so overflowing/long chips
         # were widening the whole dialog (games with many long tags stretched
         # far beyond the others). A fixed viewport keeps the layout identical
         # for every game (~5 typical chips visible); the rest scrolls via the
         # arrow buttons.
-        self._tag_strip_frame.setFixedHeight(32)
-        self._tag_strip_frame.setFixedWidth(340)
+        self._tag_strip_frame.setFixedHeight(scaled(32, self))
+        self._tag_strip_frame.setFixedWidth(scaled(340, self))
         _strip_lay = QHBoxLayout(self._tag_strip_frame)
-        # Clip gaps: chips are cut 10 px inside the LEFT edge and 44 px
-        # inside the RIGHT edge — the cut lands on visible strip
-        # background well BEFORE the > arrow, never flush under it.
-        _strip_lay.setContentsMargins(10, 1, 44, 1)
+        _strip_lay.setContentsMargins(4, 1, 2, 1)
         _strip_lay.setSpacing(0)
 
+
         self._tag_scroll = QScrollArea()
-        self._tag_scroll.setStyleSheet(
-            "QScrollArea{background:transparent;border:none;}")
+        self._tag_scroll.setObjectName("strip_scroll")
         self._tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._tag_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         # setWidgetResizable(True) is REQUIRED so the inner container is always
@@ -846,19 +1120,16 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             lambda _v: self._update_tag_arrow_states())
 
         self._tag_container = QFrame()
-        self._tag_container.setStyleSheet("background:transparent;border:none;")
+        self._tag_container.setObjectName("strip_host")
         self._tag_chips_layout = QHBoxLayout(self._tag_container)
-        # Trailing margin 12: at full scroll the last chip ends 12 px
-        # BEFORE the clip edge, so its ✕ AND its rounded border are fully
-        # inside the strip, never resting on the cut line.
-        self._tag_chips_layout.setContentsMargins(0, 3, 12, 3)
-        self._tag_chips_layout.setSpacing(4)
+        self._tag_chips_layout.setContentsMargins(0, 3, 2, 3)
+        self._tag_chips_layout.setSpacing(3)
         self._tag_chips_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self._tag_scroll.setWidget(self._tag_container)
 
         self._tag_right_btn = QPushButton("")
-        self._tag_right_btn.setFixedSize(24, 28)
+        self._tag_right_btn.setFixedSize(scaled(24, self), scaled(28, self))
         self._tag_right_btn.setStyleSheet(chevron_button_style("right"))
         self._tag_right_btn.setVisible(False)
         self._tag_right_btn.clicked.connect(self._scroll_tags_right)
@@ -871,7 +1142,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._tag_input.setPlaceholderText(t("library.tags_placeholder"))
         self._tag_input.setStyleSheet(
             f"QLineEdit{{border:1px solid {palette('border')};background:{palette('bg_input')};"
-            f"border-radius:4px;color:{palette('text')};font-size:12px;padding:4px 8px;"
+            f"border-radius:4px;color:{palette('text')};font-size:{scaled(12, self)}px;padding:4px 8px;"
             f"min-width:120px;}}"
         )
         self._tag_input.returnPressed.connect(self._add_tag_from_input)
@@ -903,47 +1174,62 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(sep2)
+        yield
 
         # ── Save paths ────────────────────────────────────────────────────────
-        paths_header = QHBoxLayout()
+        # Label left, compact Detect / Extended scan on the right (same row).
+        paths_hdr = QHBoxLayout()
+        paths_hdr.setSpacing(8)
         paths_lbl = QLabel(t("add_game.save_path"))
-        paths_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
-        paths_header.addWidget(paths_lbl, 1)
+        paths_lbl.setObjectName("form_field_lbl")
+        paths_hdr.addWidget(paths_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        paths_hdr.addStretch(1)
 
-        detect_row = QHBoxLayout()
         self._detect_btn = QPushButton(t("add_game.detect"))
-        self._detect_btn.setFixedHeight(28)
+        _dh = scaled(26, self, min_px=24)
+        lock_min_size(
+            self._detect_btn, scaled(64, self, min_px=56), _dh,
+            policy_h=QSizePolicy.Policy.Fixed,
+            policy_v=QSizePolicy.Policy.Fixed)
+        self._detect_btn.setFixedHeight(_dh)
+        self._detect_btn.setStyleSheet(
+            f"QPushButton{{border:1px solid {palette('border')};background:{palette('bg_elevated')};"
+            f"color:{palette('text')};border-radius:4px;font-size:{scaled(11, self)}px;padding:0 8px;}}"
+            f"QPushButton:hover{{background:{palette('bg_card')};border-color:{palette('accent')};}}"
+        )
         self._detect_btn.clicked.connect(self._start_detect)
-        self._detect_progress = QProgressBar()
-        self._detect_progress.setRange(0, 0)
-        self._detect_progress.setFixedHeight(4)
-        self._detect_progress.setVisible(False)
 
-        # Extended scan button — re-runs detection with broad filesystem scan
         self._extended_scan_btn = QPushButton(t("auto_scan.extended_scan_btn"))
-        self._extended_scan_btn.setFixedHeight(28)
+        lock_min_size(
+            self._extended_scan_btn, scaled(96, self, min_px=84), _dh,
+            policy_h=QSizePolicy.Policy.Fixed,
+            policy_v=QSizePolicy.Policy.Fixed)
+        self._extended_scan_btn.setFixedHeight(_dh)
         self._extended_scan_btn.setToolTip(t("auto_scan.general_scan_hint"))
-        self._extended_scan_btn.setEnabled(False)  # enabled after normal scan completes
+        self._extended_scan_btn.setEnabled(False)
         self._extended_scan_btn.clicked.connect(self._start_extended_detect)
         self._extended_scan_btn.setStyleSheet(
             f"QPushButton{{border:1px solid {palette('border')};background:{palette('bg_elevated')};"
-            f"color:{palette('text_muted')};border-radius:4px;font-size:11px;padding:0 8px;}}"
+            f"color:{palette('text_muted')};border-radius:4px;font-size:{scaled(11, self)}px;padding:0 8px;}}"
             f"QPushButton:enabled{{color:{palette('text')};border-color:{palette('accent')};}}"
             f"QPushButton:hover:enabled{{background:{palette('bg_card')};}}"
         )
+        paths_hdr.addWidget(self._detect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        paths_hdr.addWidget(self._extended_scan_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(paths_hdr)
 
-        detect_row.addWidget(self._detect_btn)
-        detect_row.addWidget(self._detect_progress, 1)
-        detect_row.addWidget(self._extended_scan_btn)
-        paths_header.addLayout(detect_row)
-        layout.addLayout(paths_header)
-
-        # Path rows container (scroll)
+        # Path list: only vertical scroll when many rows; keep floor small so
+        # the dialog fits without a body scrollbar on normal heights.
+        self._PATHS_FLOOR = 120
+        self._PATHS_MIN_H = self._PATHS_FLOOR
         self._paths_scroll = QScrollArea()
         self._paths_scroll.setWidgetResizable(True)
         self._paths_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._paths_scroll.setMinimumHeight(120)
-        self._paths_scroll.setMaximumHeight(200)
+        self._paths_scroll.setMinimumHeight(self._PATHS_MIN_H)
+        # Preferred height = content floor; stretch still absorbs extra dialog
+        # height when the user enlarges the window.
+        self._paths_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._paths_container = QWidget()
         self._paths_container.setObjectName("transparent_bg")
         self._paths_layout = QVBoxLayout(self._paths_container)
@@ -951,34 +1237,46 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._paths_layout.setSpacing(4)
         # Section: "Your paths" (always above detected)
         self._manual_section_lbl = QLabel(t('add_game.your_save_folders'))
-        self._manual_section_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:10px;font-weight:700;padding:2px 0;")
+        self._manual_section_lbl.setObjectName("form_section_lbl")
         self._paths_layout.addWidget(self._manual_section_lbl)
         self._paths_empty_lbl = QLabel(t('add_game.no_paths_added'))
-        self._paths_empty_lbl.setStyleSheet(f"color:{palette('text_disabled')};font-size:11px;padding:8px;")
+        self._paths_empty_lbl.setObjectName("form_empty_lbl")
         self._paths_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._paths_layout.addWidget(self._paths_empty_lbl)
         # Separator and "Detected" section header — hidden until detection runs
         self._detected_sep = QFrame(); self._detected_sep.setFrameShape(QFrame.Shape.HLine)
         self._detected_sep.setVisible(False)
         self._detected_section_lbl = QLabel(t('add_game.auto_detected'))
-        self._detected_section_lbl.setStyleSheet(f"color:{palette('text_faint')};font-size:10px;font-weight:700;padding:2px 0;")
+        self._detected_section_lbl.setObjectName("form_section_lbl_faint")
         self._detected_section_lbl.setVisible(False)
         self._paths_layout.addWidget(self._detected_sep)
         self._paths_layout.addWidget(self._detected_section_lbl)
         self._paths_layout.addStretch()
         self._paths_scroll.setWidget(self._paths_container)
-        layout.addWidget(self._paths_scroll)
+        layout.addWidget(self._paths_scroll, 1)
+        mediate_panel_scroll(
+            self._paths_scroll, getattr(self, "_panel_size", None),
+            list_content=True)
 
         # Manual add row
         manual_row = QHBoxLayout()
         self._manual_path = QLineEdit()
         self._manual_path.setPlaceholderText(t('add_game.manual_path_placeholder'))
+        self._manual_path.setMinimumWidth(scaled(160, self, min_px=120))
         add_path_btn = QPushButton("+")
-        add_path_btn.setFixedWidth(36)
+        _add_w = scaled(36, self, min_px=32)
+        add_path_btn.setFixedWidth(_add_w)
+        lock_min_size(add_path_btn, _add_w, scaled(28, self, min_px=26),
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         add_path_btn.setToolTip(t('add_game.add_path_manually'))
         add_path_btn.clicked.connect(self._add_manual_path)
         browse_save = QPushButton(t("add_game.browse"))
-        browse_save.setFixedWidth(80)
+        _br_w = scaled(80, self, min_px=72)
+        browse_save.setFixedWidth(_br_w)
+        lock_min_size(browse_save, _br_w, scaled(28, self, min_px=26),
+                      policy_h=QSizePolicy.Policy.Fixed,
+                      policy_v=QSizePolicy.Policy.Fixed)
         browse_save.clicked.connect(self._browse_save)
         manual_row.addWidget(self._manual_path, 1)
         manual_row.addWidget(add_path_btn)
@@ -1000,13 +1298,17 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         _ig_vbox.setSpacing(2)
 
         ignored_lbl = QLabel(t("add_game.ignored_paths_section"))
-        ignored_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        ignored_lbl.setObjectName("form_field_lbl")
         _ig_vbox.addWidget(ignored_lbl)
 
         ignored_row = QHBoxLayout()
         self._ignored_paths_count_lbl = QLabel()
-        self._ignored_paths_count_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        self._ignored_paths_count_lbl.setObjectName("form_muted_sm")
         manage_ignored_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
+        lock_min_size(
+            manage_ignored_btn, scaled(88, self, min_px=72), scaled(28, self, min_px=26),
+            policy_h=QSizePolicy.Policy.Minimum,
+            policy_v=QSizePolicy.Policy.Fixed)
         manage_ignored_btn.clicked.connect(self._open_ignored_paths_dialog)
         ignored_row.addWidget(self._ignored_paths_count_lbl, 1)
         ignored_row.addWidget(manage_ignored_btn)
@@ -1017,16 +1319,18 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._refresh_ignored_paths_count()
 
         self._status_lbl = QLabel()
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
         self._search_progress = QProgressBar()
         self._search_progress.setRange(0, 0)
-        self._search_progress.setFixedHeight(4)
-        self._search_progress.setFixedWidth(120)
+        self._search_progress.setFixedHeight(scaled(4, self))
+        self._search_progress.setFixedWidth(scaled(120, self))
         self._search_progress.setVisible(False)
         status_row = QHBoxLayout()
         status_row.addWidget(self._status_lbl, 1)
         status_row.addWidget(self._search_progress)
         layout.addLayout(status_row)
+        yield
 
         sep3 = QFrame(); sep3.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(sep3)
@@ -1034,7 +1338,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # ── Backup settings ───────────────────────────────────────────────────
         backup_header = QHBoxLayout()
         backup_lbl = QLabel(t("add_game.backup_settings"))
-        backup_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        backup_lbl.setObjectName("form_field_lbl")
         backup_header.addWidget(backup_lbl)
         layout.addLayout(backup_header)
 
@@ -1042,7 +1346,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         switch_row = QHBoxLayout()
         self._auto_backup_cb = QCheckBox(t("add_game.auto_backup_enabled"))
         self._auto_backup_cb.setChecked(True)  # Default enabled
-        self._auto_backup_cb.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        self._auto_backup_cb.setObjectName("form_secondary_lbl")
         switch_row.addWidget(self._auto_backup_cb)
         switch_row.addStretch()
         layout.addLayout(switch_row)
@@ -1054,7 +1358,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._backup_interval_spin.setValue(10)  # Default 10 minutes
         self._backup_interval_spin.setToolTip(t("add_game.backup_interval_tooltip"))
         backup_interval_lbl = QLabel(t("add_game.backup_interval_tooltip"))
-        backup_interval_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        backup_interval_lbl.setObjectName("form_muted_sm")
         backup_row.addWidget(backup_interval_lbl)
         backup_row.addWidget(self._backup_interval_spin)
         backup_row.addStretch()
@@ -1067,10 +1371,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         cancel_btn.clicked.connect(self.reject)
         self._add_btn = QPushButton(t("add_game.add"))
         self._add_btn.setObjectName("primary_btn")
+        self._add_btn.setEnabled(False)  # until populate finishes
         self._add_btn.clicked.connect(self._add_game)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(self._add_btn)
-        layout.addLayout(btn_row)
+        # Footer always reachable under the form (no outer body scroll).
+        self._root_layout.addLayout(btn_row)
+        # Last section — StopIteration ends the async pump.
 
     def _pending_removed_paths(self) -> list[str]:
         """This session's trashed rows that are still gone from the list —
@@ -1148,7 +1455,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         dlg.setStyleSheet("QDialog{background:transparent;}")
 
         outer = QWidget(dlg)
-        outer.setStyleSheet("background:rgba(0,0,0,0.85);border-radius:12px;")
+        br = scaled(12, dlg)
+        outer.setStyleSheet(f"background:rgba(0,0,0,0.85);border-radius:{br}px;")
         outer_layout = QVBoxLayout(dlg)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.addWidget(outer)
@@ -1169,39 +1477,46 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._modal_idx = self._current_image_idx
         img_lbl = QLabel()
         img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        img_lbl.setMinimumSize(400, 240)
+        img_lbl.setMinimumSize(scaled(400, self), scaled(240, self))
         img_lbl.setObjectName("transparent_bg")
         v.addWidget(img_lbl, 1)
 
-        # ── Top bar: X button — floats over the top edge of the viewer ───────
+        # ── Top bar: ⛶ fullscreen toggle (left) + ✕ close (right) ──────────
         top_bar = QWidget(outer)
         top_bar.setObjectName("transparent_bg")
         top_row = QHBoxLayout(top_bar)
         top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.addStretch()
-        close_btn = QPushButton(t('add_game.close_modal'))
-        close_btn.setFixedHeight(28)
-        close_btn.setStyleSheet(
-            "QPushButton{background:rgba(0,0,0,0.55);color:#fff;border:none;"
-            "border-radius:5px;font-size:12px;font-weight:700;padding:0 14px;}"
-            "QPushButton:hover{background:#c0392b;color:#fff;}"
-        )
-        close_btn.clicked.connect(dlg.accept)
-        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        top_row.addWidget(close_btn)
+        top_row.setSpacing(8)
 
-        # ⛶ fullscreen toggle — floats over the image's top-right corner
-        fs_btn = QPushButton("⛶", img_lbl)
-        fs_btn.setFixedSize(32, 32)
+        # ⛶ fullscreen toggle — placed in the top bar (left side) so tall/
+        # portrait images can never obscure it. Previously anchored to the
+        # image's top-right pixel corner, which for portrait images sits
+        # mid-screen and was hidden behind the image content.
+        fs_btn = QPushButton("⛶")
+        fs_btn.setFixedSize(scaled(32, dlg), scaled(28, dlg))
         fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         fs_btn.setToolTip(t('add_game.fullscreen_enter'))
         fs_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         fs_btn.setStyleSheet(
-            "QPushButton{background:rgba(0,0,0,0.55);color:rgba(255,255,255,0.85);"
-            "border:1px solid rgba(255,255,255,0.25);border-radius:6px;"
-            "font-size:16px;padding:0;}"
-            "QPushButton:hover{background:rgba(255,255,255,0.2);color:#fff;}"
+            f"QPushButton{{background:rgba(0,0,0,0.55);color:rgba(255,255,255,0.85);"
+            f"border:1px solid rgba(255,255,255,0.25);border-radius:6px;"
+            f"font-size:{scaled(16, dlg)}px;padding:0;}}"
+            f"QPushButton:hover{{background:rgba(255,255,255,0.2);color:#fff;}}"
         )
+        top_row.addWidget(fs_btn)
+
+        top_row.addStretch()
+
+        close_btn = QPushButton(t('add_game.close_modal'))
+        close_btn.setFixedHeight(scaled(28, dlg))
+        close_btn.setStyleSheet(
+            f"QPushButton{{background:rgba(0,0,0,0.55);color:#fff;border:none;"
+            f"border-radius:5px;font-size:{scaled(12, dlg)}px;font-weight:700;padding:0 14px;}}"
+            f"QPushButton:hover{{background:#c0392b;color:#fff;}}"
+        )
+        close_btn.clicked.connect(dlg.accept)
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        top_row.addWidget(close_btn)
 
         def _pixmap_rect_in_label() -> QRect:
             """Rect of the rendered pixmap inside img_lbl (label coords)."""
@@ -1214,16 +1529,21 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                          (img_lbl.height() - ph) // 2, pw, ph)
 
         def _position_fs_btn():
-            r = _pixmap_rect_in_label()
-            fs_btn.move(r.right() - fs_btn.width() - 8, r.top() + 8)
+            # fs_btn is now in the top bar (not anchored to the image),
+            # so no repositioning is needed. Kept as no-op because
+            # _fit_to_label() and resizeEvent callers reference it.
             fs_btn.raise_()
 
         # thumbnail strip + nav (built after img_lbl so _update_thumbs can reference them)
         thumb_labels: list[QLabel] = []
 
         # Source pixmap for the current image, kept unscaled so the view can
-        # be re-fitted to whatever space it actually gets.
+        # be re-fitted to whatever space it actually gets. Both this and the
+        # dialog itself are reachable from self so _shelve() can release them
+        # while the exec() loop is still running.
         _src: dict = {"px": None, "fitted": None}
+        self._modal_src = _src
+        self._modal_viewer_dlg = dlg
 
         def _fit_to_label():
             """Scale the source to the LABEL's real size.
@@ -1296,22 +1616,22 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         _btn_style = (
             f"QPushButton{{background:{palette('accent')};color:{palette('accent_text')};"
-            "border:none;border-radius:5px;padding:6px 14px;font-size:13px;font-weight:700;}"
+            f"border:none;border-radius:5px;padding:6px 14px;font-size:{scaled(13, dlg)}px;font-weight:700;}}"
             f"QPushButton:hover{{background:{palette('accent_hover')};}}"
             "QPushButton:disabled{background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.25);}"
         )
         prev_btn = QPushButton(f"◀  {t('add_game.previous_image')}")
-        prev_btn.setFixedHeight(36)
+        prev_btn.setFixedHeight(scaled(36, dlg))
         prev_btn.setStyleSheet(_btn_style)
         prev_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         next_btn = QPushButton(f"{t('add_game.next_image')}  ▶")
-        next_btn.setFixedHeight(36)
+        next_btn.setFixedHeight(scaled(36, dlg))
         next_btn.setStyleSheet(_btn_style)
         next_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # Thumbnail strip
         thumb_scroll = QScrollArea()
-        thumb_scroll.setFixedHeight(52)
+        thumb_scroll.setFixedHeight(scaled(52, dlg))
         thumb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         thumb_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         thumb_scroll.setFrameShape(thumb_scroll.Shape.NoFrame)
@@ -1325,9 +1645,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         for i, img_path in enumerate(self._detected_images):
             lbl = QLabel()
-            lbl.setFixedSize(60, 40)
+            lbl.setFixedSize(scaled(60, dlg), scaled(40, dlg))
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("border:2px solid rgba(255,255,255,0.25);border-radius:3px;")
+            bw = scaled(2, dlg)
+            br = scaled(3, dlg)
+            lbl.setStyleSheet(f"border:{bw}px solid rgba(255,255,255,0.25);border-radius:{br}px;")
             lbl.setCursor(Qt.CursorShape.PointingHandCursor)
             # Capture index for click
             def _make_click(idx):
@@ -1431,23 +1753,61 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 hide_timer.start()
 
         def _toggle_fs():
-            _fs["on"] = not _fs["on"]
-            if _fs["on"]:
-                fs_btn.setText("🗗")
-                fs_btn.setToolTip(t('add_game.fullscreen_exit'))
-                outer.setStyleSheet("background:rgba(0,0,0,0.97);border-radius:0px;")
-                dlg.showFullScreen()
+            """Cover the screen via setGeometry — never showFullScreen().
+
+            showFullScreen() animates a resize from the window centre on
+            Windows; jumping geometry while opacity is 0 avoids that.
+            """
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import QEventLoop
+
+            entering = not _fs["on"]
+            _fs["on"] = entering
+            dlg.setWindowOpacity(0.0)
+            dlg.setUpdatesEnabled(False)
+            try:
+                if entering:
+                    _fs["restore_geo"] = QRect(dlg.geometry())
+                    screen = dlg.screen() or QApplication.primaryScreen()
+                    if screen is not None:
+                        dlg.setGeometry(screen.geometry())
+                    fs_btn.setText("🗗")
+                    fs_btn.setToolTip(t('add_game.fullscreen_exit'))
+                    outer.setStyleSheet(
+                        "background:rgba(0,0,0,0.97);border-radius:0px;")
+                else:
+                    hide_timer.stop()
+                    fs_btn.setText("⛶")
+                    fs_btn.setToolTip(t('add_game.fullscreen_enter'))
+                    outer.setStyleSheet(
+                        "background:rgba(0,0,0,0.85);border-radius:12px;")
+                    _set_chrome_visible(True)
+                    geo = _fs.get("restore_geo")
+                    if geo is not None and geo.isValid():
+                        dlg.setGeometry(geo)
+                    else:
+                        dlg.resize(self.width(), self.height())
+                        dlg.move(self.mapToGlobal(self.rect().topLeft()))
+                _src["fitted"] = None
+                # Let the layout settle to the NEW geometry BEFORE repainting:
+                # a single processEvents may leave the label at the old size
+                # for one frame, which is the visible resize flicker.
+                _prev = None
+                for _i in range(12):
+                    QApplication.processEvents(
+                        QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                    _cur = (img_lbl.width(), img_lbl.height())
+                    if _cur == _prev:
+                        break
+                    _prev = _cur
+                _fit_to_label()
+                _layout_chrome()
+                _position_fs_btn()
+            finally:
+                dlg.setUpdatesEnabled(True)
+                dlg.setWindowOpacity(1.0)
+            if entering:
                 hide_timer.start()
-            else:
-                hide_timer.stop()
-                fs_btn.setText("⛶")
-                fs_btn.setToolTip(t('add_game.fullscreen_enter'))
-                outer.setStyleSheet("background:rgba(0,0,0,0.85);border-radius:12px;")
-                _set_chrome_visible(True)
-                dlg.showNormal()
-                dlg.resize(self.width(), self.height())
-                dlg.move(self.mapToGlobal(self.rect().topLeft()))
-            QTimer.singleShot(0, _load_modal_img)
 
         fs_btn.clicked.connect(_toggle_fs)
 
@@ -1458,10 +1818,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     _wake_chrome()
                 elif ev.type() == QEvent.Type.Resize:
                     if obj is img_lbl:
-                        # Re-fit HERE, not after showFullScreen()/showNormal():
-                        # this is the first moment the granted geometry is real.
-                        _fit_to_label()
-                        _position_fs_btn()
+                        if not _fs.get("on") or dlg.windowOpacity() > 0.5:
+                            _fit_to_label()
+                            _position_fs_btn()
                     elif obj is outer:
                         _layout_chrome()
                 return False
@@ -1508,6 +1867,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         outer.mousePressEvent = _backdrop_press
 
         dlg.exec()
+
+        # Viewer closed (✕, backdrop click, or shelve's accept()) — release
+        # the references so the full-screen source pixmap can be collected.
+        if getattr(self, "_modal_viewer_dlg", None) is dlg:
+            self._modal_viewer_dlg = None
+        if getattr(self, "_modal_src", None) is _src:
+            self._modal_src = None
 
     def _open_image_cache_folder(self):
         """Open the icon cache folder for this game in the system file manager."""
@@ -1579,10 +1945,23 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         Cache/downloaded images are physically deleted.
         Custom images set via Browse are only removed from the list — the
         file on disk is never deleted because it belongs to the user.
+        Every removal is confirmed via a dialog (even non-cached), so the
+        user cannot accidentally lose track of which cover is shown.
         """
         if not self._image_path:
             return
         is_cache = self._is_downloaded_image(self._image_path)
+        # Confirm ALL removals — previously only cached images got a dialog,
+        # so removing a Browse-added image silently dropped it (bug report).
+        from PySide6.QtWidgets import QMessageBox
+        from ui.modal_helpers import question_window_modal
+        reply = question_window_modal(
+            self, t("add_game.remove_image_title"),
+            t("add_game.remove_image_confirm"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         if is_cache:
             try:
                 Path(self._image_path).unlink(missing_ok=True)
@@ -1603,7 +1982,6 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._img_preview.setText("🎮")
         self._update_nav_buttons()
 
-
     def _update_nav_buttons(self):
         """Update left/right nav buttons, counter, and trash overlay based on current state."""
         n = len(self._detected_images)
@@ -1614,9 +1992,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._img_counter.setText(f"{idx + 1} / {n}")
         elif n == 1:
             self._img_counter.setText("1 / 1")
-        # Show trash overlay only when the current image is a downloaded/cached one
+        # Show trash overlay when there is any image (all images are now removable)
         current_path = self._detected_images[idx] if 0 <= idx < n else ""
-        show_trash = self._is_downloaded_image(current_path)
+        show_trash = bool(current_path)
         if hasattr(self, '_img_trash_overlay'):
             self._img_trash_overlay.setVisible(show_trash)
         else:
@@ -1885,7 +2263,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _report_already_in_library(self, existing) -> None:
         """Tell the user this game is already there and stop the add flow."""
         self._status_lbl.setText(t('add_game.game_exists_with_appid', name=existing.name))
-        self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+        fs = scaled(12, self)
+        self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
         logger.info(f"Launcher target already in library: {existing.name} ({existing.id})")
 
     def _resolve_exe_from_url_async(self, url: str, timeout: int = 30):
@@ -2099,8 +2478,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         Runs once immediately and once deferred so a post-layout / post-locale
         font polish cannot leave the field sized for the previous string.
+        Skip the defer while still hidden — ``show_settled`` polishes before
+        the first visible frame (a deferred tick after show() was a one-frame
+        layout flash of the dialog 'generating').
         """
         self._apply_engine_width()
+        if not self.isVisible():
+            return
         if not self._engine_fit_deferred:
             self._engine_fit_deferred = True
             QTimer.singleShot(0, self._fit_engine_width_deferred)
@@ -2172,6 +2556,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._reviews_btn.setText(
             t("reviews.button_n", count=count) if count
             else t("reviews.button"))
+        # Lock after text so “Recensioni (n)” is never clipped horizontally.
+        hint_w = self._reviews_btn.sizeHint().width()
+        lock_min_size(self._reviews_btn, max(hint_w, scaled(100, self, min_px=88)))
 
     def _open_reviews(self):
         from ui.dialogs.reviews_dialog import ReviewsDialog
@@ -2544,10 +2931,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             logger.debug(f"Auto image detection failed: {e}")
 
     def _browse_save(self):
-        from ui.widgets.file_pickers import pick_folder
-        path = pick_folder(self, t('add_game.select_save_folder'))
+        from ui.widgets.file_pickers import pick_save_path_entry
+        path = pick_save_path_entry(self, t('add_game.select_save_folder'))
         if path:
             self._add_path_with_validation(path)
+
 
     def _add_manual_path(self):
         p = self._manual_path.text().strip()
@@ -2691,7 +3079,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._bg_work_kind = "detect"
         self._emit_bg_status("running")
         self._detect_btn.setText(t("add_game.detecting"))
-        self._detect_progress.setVisible(True)
+        if hasattr(self, "_search_progress"):
+            self._search_progress.setVisible(True)
         self._sync_bg_action_gates()
 
         if self._detect_worker and self._detect_worker.isRunning():
@@ -2725,7 +3114,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _on_detected(self, paths: list[str], is_live_tracking: bool = False):
         self._detection_in_progress = False
         self._detect_btn.setText(t("add_game.detect"))
-        self._detect_progress.setVisible(False)
+        if hasattr(self, "_search_progress") and not self._web_search_active:
+            self._search_progress.setVisible(False)
         self._sync_bg_action_gates()
         # Extended scan is offered after a finished detect, unless another
         # bg op took over the card in the meantime.
@@ -2753,13 +3143,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if added:
             if is_live_tracking:
                 status_msg = t('add_game.paths_detected', count=added)
-                style = f"color:{palette('info')};font-size:11px;"  # Blue for live tracking
+                style = f"color:{palette('info')};font-size:{scaled(11, self)}px;"  # Blue for live tracking
             elif getattr(self._detect_worker, '_general_scan', False):
                 status_msg = t('add_game.paths_found_general', count=added)
-                style = f"color:{palette('warning')};font-size:11px;"  # Orange for general scan
+                style = f"color:{palette('warning')};font-size:{scaled(11, self)}px;"  # Orange for general scan
             else:
                 status_msg = t('add_game.paths_detected', count=added)
-                style = f"color:{palette('success')};font-size:11px;"  # Green for filesystem scan
+                style = f"color:{palette('success')};font-size:{scaled(11, self)}px;"  # Green for filesystem scan
 
             self._status_lbl.setText(status_msg)
             self._status_lbl.setStyleSheet(style)
@@ -2772,11 +3162,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # Detection DID find the save location — it just matches what is
             # already listed. That's a confirmation, not a failure.
             self._status_lbl.setText(t("add_game.paths_already_saved"))
-            self._status_lbl.setStyleSheet(f"color:{palette('success')};font-size:12px;")
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('success')};font-size:{fs}px;")
             self._emit_bg_status("done")
         else:
             self._status_lbl.setText(t("add_game.not_detected"))
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
             self._emit_bg_status("failed")
 
         if not self._exe_resolve_active and not self._web_search_active:
@@ -2885,11 +3277,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._pending_search_payload = None
         self._cancel_detection()
         self._cleanup_session_icon_dirs()
-        try:
-            from i18n import get_engine as _get_i18n
-            _get_i18n().language_changed.disconnect(self._on_language_changed)
-        except (RuntimeError, TypeError):
-            pass
+        if self._i18n_hooked:
+            try:
+                from i18n import get_engine as _get_i18n
+                _get_i18n().language_changed.disconnect(self._on_language_changed)
+            except (RuntimeError, TypeError):
+                pass
+            self._i18n_hooked = False
         super().reject()
 
     def _cancel_detection(self):
@@ -2916,6 +3310,66 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             pass
         # Refresh action gates on the GUI thread (may be called from workers).
         QTimer.singleShot(0, self._sync_bg_action_gates)
+
+    def _apply_window_chrome(self):
+        """Theme-coloured native window fill before the first paint.
+
+        Without this, Windows maps a white client area for one frame while
+        Qt resolves stylesheets — the flash seen on every Add/Edit open.
+        """
+        bg = QColor(palette("bg"))
+        fg = QColor(palette("text"))
+        card = QColor(palette("bg_card"))
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, bg)
+        pal.setColor(QPalette.ColorRole.Base, card)
+        pal.setColor(QPalette.ColorRole.AlternateBase, bg)
+        pal.setColor(QPalette.ColorRole.Button, bg)
+        pal.setColor(QPalette.ColorRole.WindowText, fg)
+        pal.setColor(QPalette.ColorRole.Text, fg)
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {palette('bg')}; color: {palette('text')}; }}"
+            f"QScrollArea {{ background: transparent; }}"
+        )
+        try:
+            from ui.helpers import set_dark_title_bar
+            set_dark_title_bar(self)
+        except Exception:
+            pass
+
+
+
+    def show_settled(self):
+        """Map the window at its already-chosen size with no white flash.
+
+        Geometry is set by ``show_and_build`` before this runs — no
+        ``adjustSize`` / re-center here (that caused the resize-then-move jump).
+        """
+        self._apply_window_chrome()
+        self.setWindowOpacity(0.0)
+        self.setUpdatesEnabled(False)
+        try:
+            QDialog.show(self)
+            self.ensurePolished()
+            if hasattr(self, "_engine_edit"):
+                self._apply_engine_width()
+                self._engine_fit_deferred = False
+            if hasattr(self, "_tag_container"):
+                try:
+                    self._repin_tag_strip_width()
+                except Exception:
+                    pass
+        finally:
+            self.setUpdatesEnabled(True)
+        self.repaint()
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self.setWindowOpacity(1.0)
+        self.raise_()
+        self.activateWindow()
 
     def shelve_nav_label(self) -> str:
         """Sidebar entry text: game hint + which background job is running."""
@@ -2964,6 +3418,26 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         first would skip leaveModal and leave the main window input-blocked
         forever (common after drag-and-drop → URL resolve → ✕).
         """
+        # RAM cleanup on shelve, not just on close: every Add/Edit open makes
+        # a NEW dialog instance, so a hidden-but-alive shelved dialog that
+        # keeps its decoded images stacks a full-screen pixmap (+ the shared
+        # view cache entries) on top of each later open — exactly the growing
+        # peaks that made reopening the panel cost more RAM every time. Close
+        # the modal viewer and drop its source reference; the thumbnail strip
+        # re-decodes on demand if the viewer is opened again.
+        from ui.helpers import clear_view_cache as _clear_view_cache
+        _clear_view_cache()
+        _mdl = getattr(self, "_modal_viewer_dlg", None)
+        if _mdl is not None:
+            try:
+                _mdl.accept()
+            except RuntimeError:
+                pass
+            self._modal_viewer_dlg = None
+        _src = getattr(self, "_modal_src", None)
+        if _src is not None:
+            _src["px"] = None
+            _src["fitted"] = None
         self.hide()
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.shelved.emit()
@@ -2980,6 +3454,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._on_search_finished(*pending)
 
     def closeEvent(self, event):
+        # Cancel any in-flight section/populate pump.
+        self._build_gen = getattr(self, "_build_gen", 0) + 1
+        self._stop_deferred_busy()
         # ✕ while a search runs = put away (like the batch web-search panel).
         # Accept / Cancel set _force_close so they always tear down for real.
         if (not self._force_close
@@ -2995,12 +3472,21 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._pending_search_payload = None
         self._cancel_detection()
         self._cleanup_session_icon_dirs()
-        try:
-            from i18n import get_engine as _get_i18n
-            _get_i18n().language_changed.disconnect(self._on_language_changed)
-        except (RuntimeError, TypeError):
-            pass
+        if self._i18n_hooked:
+            try:
+                from i18n import get_engine as _get_i18n
+                _get_i18n().language_changed.disconnect(self._on_language_changed)
+            except (RuntimeError, TypeError):
+                pass
+            self._i18n_hooked = False
+        save_dialog_geometry(self)
+        # RAM cleanup: the full-screen decoded images shown in the modal
+        # viewer are held by the view cache (up to ~192 MB). The dialog is
+        # closing — nobody will browse them again, so release them now.
+        from ui.helpers import clear_view_cache as _clear_view_cache, trim_process_memory
+        _clear_view_cache()
         super().closeEvent(event)
+        QTimer.singleShot(250, trim_process_memory)
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
@@ -3246,17 +3732,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # "rock & roll" renders as "rock _roll" (and HTML leftovers like
             # "&#039;" show up as "#039;").
             chip = QPushButton(f"{tag.replace('&', '&&')}  ✕")
-            chip.setFixedHeight(22)
+            chip.setFixedHeight(scaled(22, self))
             chip.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             chip.setToolTip(tag)   # full text at a glance even while clipped
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
-            chip.setStyleSheet(
-                f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text_secondary')};"
-                f"border:1px solid {palette('border')};border-radius:10px;padding:0 8px;"
-                f"font-size:11px;}}"
-                f"QPushButton:hover{{background:{palette('error')};color:{palette('accent_text')};"
-                f"border-color:{palette('error')};}}"
-            )
+            chip.setObjectName("add_tag_chip")
             chip.clicked.connect(lambda _, t=tag: self._remove_tag(t))
             self._tag_chips_layout.insertWidget(i, chip)
 
@@ -3283,7 +3763,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # _repin corrects the estimate with REAL geometry: sizeHint-based
         # totals drift a few px under DPI scaling, and a short range means
         # the last chip's rounded end stays clipped even at sb.maximum().
-        QTimer.singleShot(0, self._repin_tag_strip_width)
+        # While hidden, show_settled runs _repin before the first paint.
+        if self.isVisible():
+            QTimer.singleShot(0, self._repin_tag_strip_width)
 
     def _repin_tag_strip_width(self):
         """Post-layout pass: pin the container to the LAYOUT's own minimum
@@ -3360,12 +3842,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # Label part (clickable to open)
             label = url.replace("https://", "").replace("http://", "").split("/")[0]
             chip_frame = QFrame()
-            chip_frame.setFixedHeight(22)
-            chip_frame.setStyleSheet(
-                f"QFrame{{background:{palette('bg_elevated')};border:1px solid {palette('border')};"
-                f"border-radius:10px;}}"
-                f"QFrame:hover{{border-color:{palette('accent')};}}"
-            )
+            chip_frame.setFixedHeight(scaled(22, self))
+            chip_frame.setSizePolicy(
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            chip_frame.setObjectName("url_chip")
             chip_inner = QHBoxLayout(chip_frame)
             chip_inner.setContentsMargins(6, 0, 2, 0)
             chip_inner.setSpacing(2)
@@ -3373,29 +3853,111 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             lbl_btn = QPushButton(label)
             lbl_btn.setFlat(True)
             lbl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            lbl_btn.setStyleSheet(
-                f"QPushButton{{color:{palette('accent')};background:transparent;border:none;"
-                f"font-size:10px;padding:0;text-decoration:underline;}}"
-                f"QPushButton:hover{{color:{palette('accent_hover')};}}"
-            )
+            lbl_btn.setObjectName("url_chip_link")
             lbl_btn.clicked.connect(lambda _, u=url: __import__('webbrowser').open(u))
             lbl_btn.setToolTip(url)
 
             rm_btn = QPushButton("✕")
             rm_btn.setFlat(True)
-            rm_btn.setFixedSize(16, 16)
+            rm_btn.setFixedSize(scaled(16, self), scaled(16, self))
             rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             rm_btn.setToolTip(t('add_game.remove_url_tooltip'))
-            rm_btn.setStyleSheet(
-                f"QPushButton{{color:{palette('text_muted')};background:transparent;border:none;"
-                f"font-size:9px;font-weight:700;border-radius:8px;padding:0;}}"
-                f"QPushButton:hover{{color:{palette('accent_text')};background:{palette('error')};}}"
-            )
+            rm_btn.setObjectName("url_chip_remove")
             rm_btn.clicked.connect(lambda _, u=url: self._remove_url(u))
 
             chip_inner.addWidget(lbl_btn)
             chip_inner.addWidget(rm_btn)
             self._url_chips_layout.insertWidget(i, chip_frame)
+
+        chips = self._url_chip_widgets()
+        has = bool(chips)
+        self._url_chip_group.setVisible(has)
+        self._url_strip_frame.setVisible(has)
+        if not has:
+            self._url_left_btn.setVisible(False)
+            self._url_right_btn.setVisible(False)
+            self._url_container.setMinimumWidth(1)
+            self._update_url_arrow_states()
+            return
+
+        _m = self._url_chips_layout.contentsMargins()
+        _total = _m.left() + _m.right()
+        for _w in chips:
+            _total += max(_w.sizeHint().width(), _w.minimumWidth())
+        if len(chips) > 1:
+            _total += self._url_chips_layout.spacing() * (len(chips) - 1)
+        self._url_container.setMinimumWidth(max(_total, 1))
+        # Viewport fits 2-3 chips comfortably, scrolling if more exist
+        view_w = min(
+            getattr(self, "_URL_CHIP_VIEW_W", 180),
+            max(_total, 80))
+        self._url_strip_frame.setFixedWidth(max(view_w, 80))
+        self._url_scroll.horizontalScrollBar().setValue(0)
+        if self.isVisible():
+            QTimer.singleShot(0, self._repin_url_strip_width)
+        self._update_url_arrow_states()
+
+    def _url_chip_widgets(self) -> list:
+        out = []
+        for i in range(self._url_chips_layout.count()):
+            w = self._url_chips_layout.itemAt(i).widget()
+            if w:
+                out.append(w)
+        return out
+
+    def _repin_url_strip_width(self):
+        try:
+            real = self._url_chips_layout.minimumSize().width()
+            if real > self._url_container.minimumWidth():
+                self._url_container.setMinimumWidth(real)
+            self._update_url_arrow_states()
+        except RuntimeError:
+            pass
+
+    def _update_url_arrow_states(self):
+        try:
+            sb = self._url_scroll.horizontalScrollBar()
+            overflow = sb.maximum() > 0
+            self._url_left_btn.setVisible(overflow)
+            self._url_right_btn.setVisible(overflow)
+            self._url_left_btn.setEnabled(sb.value() > 0)
+            self._url_right_btn.setEnabled(sb.value() < sb.maximum())
+        except RuntimeError:
+            pass
+
+
+    def _scroll_urls_left(self):
+        sb = self._url_scroll.horizontalScrollBar()
+        vw = self._url_scroll.viewport().width()
+        step = max(40, int(vw * 0.85))
+        target = sb.value() - step
+        left_edge = sb.value()
+        for w in reversed(self._url_chip_widgets()):
+            if w.x() < left_edge:
+                start_target = w.x() - 8
+                if start_target >= target:
+                    target = start_target
+                break
+        if target <= self._TAG_SNAP_PX:
+            target = 0
+        sb.setValue(max(target, 0))
+        self._update_url_arrow_states()
+
+    def _scroll_urls_right(self):
+        sb = self._url_scroll.horizontalScrollBar()
+        vw = self._url_scroll.viewport().width()
+        step = max(40, int(vw * 0.85))
+        target = sb.value() + step
+        right_edge = sb.value() + vw
+        for w in self._url_chip_widgets():
+            end = w.x() + w.width()
+            if end > right_edge + 2:
+                end_target = end - vw + 12
+                if end_target <= target:
+                    target = end_target
+                break
+        sb.setValue(min(target, sb.maximum()))
+        self._update_url_arrow_states()
 
     def _scroll_tags_left(self):
         """Step the strip LEFT. Each click moves by a fixed fraction of the
@@ -3459,6 +4021,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._category_combo.addItem(QIcon(px), f"{indent}{name}", path)
 
     def _add_game(self):
+        if not getattr(self, "_ui_ready", False):
+            return
         exe = self._exe_edit.text().strip()
         lib = get_library()
 
@@ -3511,10 +4075,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     existing.appid = appid
                     lib.update_game(existing)
                     self._status_lbl.setText(t('add_game.game_updated_appid', name=existing.name))
-                    self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:12px;")
+                    fs = scaled(12, self)
+                    self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
                 else:
                     self._status_lbl.setText(t('add_game.game_exists_with_appid', name=existing.name))
-                    self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+                    fs = scaled(12, self)
+                    self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
                 self.game_added.emit(existing)
                 self._created_icon_dirs.clear()  # Keep icon folders on successful save
                 self.accept()
@@ -3523,7 +4089,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # Empty exe is fine when a launcher URL is present (launch via appid).
         if exe and not Path(exe).exists():
             self._status_lbl.setText(t('add_game.executable_not_found', exe=exe))
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:12px;")
+            fs = scaled(12, self)
+            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
             return
         if not exe and not _launcher_url and not self._editing_entry:
             # Manual-path games may have no exe; allow only when editing or

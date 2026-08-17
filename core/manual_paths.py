@@ -30,6 +30,14 @@ may type a relative one — three kinds, in the order they are tested:
               user's intent ("this lives next to the game") but has no location
               yet, so it cannot be backed up until it resolves.
 
+When the single path is a *live* game save folder (not a collection copy),
+``live_save_chain`` walks UP like generic exe stems: a user-system folder
+(Roaming, …) yields a profile chain that keeps engine hosts (RenPy under
+Roaming); otherwise the chain is install-relative (www/save). Collection
+adds still use ``save_chain_of`` (walk DOWN inside the copy). Orphan indexes
+record the destination / zip-root label via ``orphan_index_save_path``, never
+the collection parent path.
+
 The game name never comes from an executable here — there isn't one. It comes
 from the folder, through the same generic-stem walk-up that names a game whose
 exe is called "game.exe" (derive_display_name).
@@ -184,9 +192,180 @@ def profile_destination(chain: str):
     if not parts:
         return None
     try:
+        # Ren'Py / engine homes that sit directly under the user profile
+        # (Linux ~/.renpy, macOS ~/Library/RenPy) — not AppData-shaped, but
+        # still a direct per-user destination.
+        head = parts[0].strip().lower()
+        if head in {".renpy", "renpy"}:
+            return _profile_root().joinpath(*parts)
+        if head == "library" and len(parts) >= 2 and parts[1].strip().lower() == "renpy":
+            return _profile_root().joinpath(*_canonical_profile_parts(parts))
         return _expand_user_root(parts)
     except (OSError, ValueError):
         return None
+
+
+# Segments that are pass-through under a game install (relative chain), same
+# spirit as generic exe stems — never the game title itself.
+_RELATIVE_PASS_SEGMENTS = frozenset({
+    "save", "saves", "savedata", "savedata2", "savegame", "savegames",
+    "saved games", "savedgames", "game", "www", "data", "userdata",
+    "user", "users", "slot", "slots", "profile", "profiles",
+    "config", "cfg", "system", "persistent",
+}) | {s.lower() for s in (
+    # Keep in sync with save_detector.GENERIC_EXE_STEMS folder-ish names
+    "bin", "lib", "lib64", "common", "build", "dist", "desktop",
+)}
+
+# Engine host folders under a user profile that MUST stay in a profile chain
+# (Ren'Py: Roaming/RenPy/<Game> — the game folder is descriptive, but without
+# RenPy the chain would not reach the system root correctly).
+_ENGINE_PROFILE_HOSTS = frozenset({
+    "renpy", ".renpy",
+    "unity", "unity3d",
+    "godot",
+})
+
+# Install-library containers: walking up into these means the relative chain
+# has ended (everything below was game-relative).
+_INSTALL_CONTAINERS = frozenset({
+    "games", "giochi", "steamapps", "common", "downloads", "download",
+    "program files", "program files (x86)", "programdata", "public",
+})
+
+
+def live_save_chain(path_str: str) -> str:
+    """Destination chain for a *live* save folder (not a collection copy).
+
+    Walks UP from *path_str* the same way generic stems walk for naming:
+
+      • Hit a user-system folder (AppData / Roaming / Documents / …)
+        → profile chain from that root down, **including** engine hosts
+        like RenPy (``AppData/Roaming/RenPy/<Game>``).
+      • Otherwise → install-relative chain (``www/save``, ``game/save``),
+        stopping before the meaningful game-folder name.
+
+    Empty string: nothing useful could be derived.
+    """
+    if not (path_str or "").strip():
+        return ""
+    try:
+        path = Path(path_str).expanduser().resolve()
+    except (OSError, ValueError):
+        try:
+            path = Path(path_str).expanduser()
+        except (OSError, ValueError):
+            return ""
+
+    parts = list(path.parts)
+    if not parts:
+        return ""
+    # Drop Windows drive / UNC root from the segment list used for chains.
+    start = 0
+    if path.drive or (parts and parts[0] in ("\\", "/", path.anchor)):
+        start = 1
+    segs = parts[start:]
+    if not segs:
+        return ""
+    lower = [s.lower() for s in segs]
+
+    # ── Profile / per-user system root ──────────────────────────────────
+    profile_at = -1
+    for i, n in enumerate(lower):
+        if n in _USER_ROOT_TOKENS or n == "appdata":
+            profile_at = i
+            break
+        if n in ("roaming", "local", "locallow"):
+            profile_at = (i - 1) if i > 0 and lower[i - 1] == "appdata" else i
+            break
+        if n in (".renpy", "renpy"):
+            # Keep AppData/Roaming or Library above RenPy in the chain.
+            if i >= 2 and lower[i - 2] == "appdata" and lower[i - 1] == "roaming":
+                profile_at = i - 2
+            elif i >= 1 and lower[i - 1] == "appdata":
+                profile_at = i - 1
+            elif i >= 1 and lower[i - 1] == "library":
+                profile_at = i - 1
+            else:
+                profile_at = i  # ~/.renpy/…
+            break
+        if n == "library" and i + 1 < len(lower) and lower[i + 1] in (
+                "renpy", "application support"):
+            profile_at = i
+            break
+        if n in _PROFILE_SUBROOTS:
+            profile_at = i
+            break
+
+    if profile_at >= 0:
+        body = segs[profile_at:]
+        # Users/<someone>/AppData/… → drop container + account, keep AppData…
+        if body and body[0].lower() in _USER_CONTAINER_TOKENS:
+            body = body[1:]
+            if body and not _is_profile_subroot(body[0]) and body[0].lower() not in (
+                    "appdata", ".renpy", "renpy", "library"):
+                body = body[1:]  # account name
+        if body and body[0].lower() in _USER_PROFILE_TOKENS:
+            body = body[1:]
+        if not body:
+            return ""
+        # Canonicalize known profile spellings; keep RenPy / game names as-is.
+        return "/".join(_canonical_profile_parts(body))
+
+    # ── Install-relative: collect pass-through segments up to game title ─
+    chain_rev: list[str] = []
+    for s, sl in zip(reversed(segs), reversed(lower)):
+        if sl in _INSTALL_CONTAINERS or sl in _CONTAINER_DIR_NAMES_SAFE:
+            break
+        if sl in _RELATIVE_PASS_SEGMENTS or sl in _ENGINE_PROFILE_HOSTS:
+            # Engine hosts without a profile root above are still pass-through
+            # only when we already have something below (rare); usually RenPy
+            # is handled in the profile branch.
+            if sl in _ENGINE_PROFILE_HOSTS and not chain_rev:
+                break
+            chain_rev.append(s)
+            continue
+        # Meaningful folder = game install name — not part of the chain.
+        break
+    chain_rev.reverse()
+    return "/".join(chain_rev)
+
+
+# Local copy of install/container names used when walking relative chains
+# (avoid importing save_detector's private set at module load).
+_CONTAINER_DIR_NAMES_SAFE = frozenset({
+    "games", "giochi", "steamapps", "downloads", "download", "documents",
+    "program files", "program files (x86)", "programdata", "users", "public",
+    "appdata", "local", "roaming", "locallow", "windows", "system32",
+})
+
+
+def orphan_index_save_path(
+    source: str,
+    chain: str,
+    game_name: str = "",
+    *,
+    from_collection: bool = False,
+) -> str:
+    """Path stored on an orphan index entry (destination / zip-root label).
+
+    Never the collection parent (``D:\\VN Games\\Save\\…``): that is only the
+    zip *source*. Profile chains resolve on this machine; relative collection
+    chains keep the game folder *name* so restore can match zip tops.
+    Live (non-collection) folders record themselves when they are the real
+    destination.
+    """
+    chain = (chain or "").strip()
+    if chain:
+        dest = profile_destination(chain)
+        if dest is not None:
+            return str(dest)
+        if from_collection:
+            return Path(source).name if source else (game_name or "")
+        return source or game_name or ""
+    if from_collection:
+        return Path(source).name if source else (game_name or "")
+    return source or game_name or ""
 
 
 def _is_profile_subroot(segment: str) -> bool:
@@ -707,118 +886,12 @@ def _waiting_for(game, entry) -> bool:
 
 
 def adopt_manual_entries_for(game) -> int:
-    """Hand a newly appeared game the save destinations registered for it.
+    """Deprecated no-op: hand-added saves are orphan backup indexes.
 
-    Event-driven by design — there is NO periodic re-check anywhere. A
-    destination is anchored when it is registered (the game was already
-    known), and otherwise the question is asked again exactly once: here, the
-    moment a game whose name matches turns up. Anchoring is then a single
-    path test under THAT game's folder, not a scan.
-
-    A pending chain like "www/save" is resolved against the game's install
-    folder; an already-absolute destination (a profile path) simply moves
-    across. Either way the paths end up on the entry that HAS the executable,
-    which is what makes the game recognisable at launch — and with it the
-    cloud-saves prompt.
-
-    Returns how many placeholder entries were absorbed.
+    Restore is offered through the cloud-saves notification (also offline),
+    not by silently merging placeholder GameEntry rows into the library.
     """
-    try:
-        from core.library import get_library
-    except Exception:
-        return 0
-    lib = get_library()
-    try:
-        waiting = [g for g in lib.all_games() if _waiting_for(game, g)]
-    except Exception:
-        return 0
-    if not waiting:
-        return 0
-
-    target = lib.get_by_id(game.id)
-    if target is None:
-        return 0
-    try:
-        install = Path(target.exe_path).parent if target.exe_path else None
-    except Exception:
-        install = None
-
-    absorbed = 0
-    for placeholder in waiting:
-        gained: list = []
-        chain = getattr(placeholder, "pending_save_chain", "")
-        if chain:
-            # Profile chains ("AppData/Roaming/…") name a location under THIS
-            # machine's user folder — never under the install directory.
-            try:
-                profile = profile_destination(chain)
-            except Exception:
-                profile = None
-            if profile is not None:
-                try:
-                    if profile.exists():
-                        gained.append(str(profile))
-                except OSError:
-                    pass
-            elif install is not None:
-                candidate = install / Path(*_split(chain))
-                try:
-                    if candidate.exists():
-                        gained.append(str(candidate))
-                except OSError:
-                    pass
-        gained.extend(placeholder.save_paths or [])
-
-        if not gained:
-            # Nothing to hand over — the chain needs an install folder and
-            # this game has no executable yet. Absorbing here would delete the
-            # placeholder and with it the destination, which is the whole
-            # thing being kept. Leave it waiting for a moment that can
-            # actually place it: the launch, where the executable is a
-            # certainty.
-            logger.debug(f"{placeholder.name!r} stays pending: {target.name!r} "
-                         "has nothing to anchor its destination to yet")
-            continue
-
-        for path in gained:
-            if path not in (target.save_paths or []):
-                target.save_paths = list(target.save_paths or []) + [path]
-            # The destination expressed relative to the game travels with the
-            # path it belongs to — one per path, since the placeholder may
-            # have held several folders pointing at different places.
-            moved = ""
-            try:
-                moved = placeholder.chain_for_path(path)
-            except AttributeError:
-                moved = getattr(placeholder, "save_chain", "") or ""
-            if moved:
-                try:
-                    target.record_path_chain(path, moved)
-                except AttributeError:
-                    if not getattr(target, "save_chain", ""):
-                        target.save_chain = moved
-        if gained:
-            target.save_paths_confirmed = True
-        chain_known = chain or getattr(placeholder, "save_chain", "")
-        if chain_known and not getattr(target, "save_chain", ""):
-            target.save_chain = chain_known
-
-        # Order matters: the placeholder goes first so it stops occupying the
-        # game's natural backup/sync folder name, then the game reclaims it,
-        # and only then do the archives move — straight into their final home.
-        lib.remove_game(placeholder.id)
-        _reclaim_folder_name(placeholder, target)
-        # Whatever was backed up while this was only a placeholder becomes
-        # the game's own history: the point of registering saves before the
-        # game exists is that they stop being a loose pile the moment the
-        # game does.
-        _adopt_backups(placeholder, target)
-        logger.info(f"Manual entry {placeholder.name!r} absorbed into {target.name!r}")
-        absorbed += 1
-
-    if absorbed:
-        lib.update_game(target)
-    return absorbed
+    return 0
 
 
 def _reclaim_folder_name(placeholder, target) -> bool:

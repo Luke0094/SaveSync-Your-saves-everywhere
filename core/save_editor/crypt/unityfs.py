@@ -88,10 +88,14 @@ def _lz4_block(src: bytes, out_size: int) -> bytes:
         start = len(out) - offset
         if start < 0:
             raise UnityFsError("a back-reference points before the start")
-        # Copied one byte at a time on purpose: a match may overlap what it
-        # is still producing, which is how the format encodes a run.
-        for k in range(length):
-            out.append(out[start + k])
+        if offset >= length:
+            out.extend(out[start:start + length])
+        else:
+            # Overlapping match (run of bytes): repeat pattern with chunk extension
+            while length > 0:
+                chunk = min(length, offset)
+                out.extend(out[start:start + chunk])
+                length -= chunk
         if len(out) > _MAX_UNPACKED:
             raise UnityFsError("the block unpacks to more than we will hold")
     if out_size and len(out) != out_size:
@@ -208,6 +212,9 @@ def unpack(data: bytes, stop_after: bytes = b"", on_tick=None) -> bytes:
             break                    # the one extra block has now been taken
         if stop_after and stop_after in out:
             seen_marker = True
-        elif on_tick is not None and on_tick() is False:
-            break
+        elif on_tick is not None:
+            import time
+            time.sleep(0.001)        # release GIL to keep GUI thread at 60 FPS
+            if on_tick() is False:
+                break
     return bytes(out)

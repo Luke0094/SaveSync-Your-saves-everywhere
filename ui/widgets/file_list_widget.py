@@ -11,11 +11,11 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QCheckBox,
+    QCheckBox, QToolButton,
 )
 
 from i18n import t
-from ui.styles.theme import palette
+from ui.helpers import scaled
 from core import fmt_size as _fmt_size
 from core.backup import _is_skip_file, _BACKUP_SKIP_DIRS
 
@@ -29,26 +29,26 @@ class FileListWidget(QWidget):
     """Collapsible file list for a save path directory.
 
     Shows a toggle button that expands to reveal all files in the path
-    with individual checkboxes. Files matched by _is_skip_file() (skip
-    extension or skip filename stem, e.g. "log"/"logs") are hidden by
-    default (they won't be backed up anyway).
-
-    Emits ``selection_changed`` whenever the user checks/unchecks a file.
+    with individual checkboxes and delete/restore action buttons so users
+    can exclude specific files from backups or restore them.
     """
 
     selection_changed = Signal()  # emitted when any file checkbox changes
 
-    def __init__(self, path_str: str, parent: Optional[QWidget] = None):
+    def __init__(self, path_str: str, game_id: str = "", parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._path = path_str
+        self._game_id = game_id
         self._expanded = False
         self._file_checkboxes: list[tuple[QCheckBox, str]] = []  # (checkbox, rel_path)
+        self._file_rows: dict[str, tuple[QCheckBox, QToolButton]] = {}
         self._built = False  # lazy build on first expand
         self._excluded_files: set[str] = set()  # relative paths excluded by user
         self._cancel_event = threading.Event()  # thread-safe cancellation flag
         self._bg_thread: Optional[threading.Thread] = None  # track background count thread
 
         self._build_toggle()
+
 
     def cleanup(self):
         """Cancel any running background thread before destruction."""
@@ -73,20 +73,17 @@ class FileListWidget(QWidget):
         toggle_row.setSpacing(6)
 
         self._arrow = QLabel("▶")
-        self._arrow.setStyleSheet(f"color:{palette('text_muted')}; font-size:10px;")
-        self._arrow.setFixedWidth(12)
+        self._arrow.setObjectName("file_list_meta")
+        self._arrow.setFixedWidth(scaled(12, self))
 
         self._toggle_btn = QPushButton(t("file_list.show_files"))
+        self._toggle_btn.setObjectName("file_list_toggle")
         self._toggle_btn.setFlat(True)
         self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._toggle_btn.setStyleSheet(
-            f"QPushButton {{ color:{palette('text_muted')}; font-size:10px; text-align:left; padding:0; border:none; }}"
-            f"QPushButton:hover {{ color:{palette('text_secondary')}; }}"
-        )
         self._toggle_btn.clicked.connect(self._toggle)
 
         self._count_lbl = QLabel("")
-        self._count_lbl.setStyleSheet(f"color:{palette('text_hint')}; font-size:10px;")
+        self._count_lbl.setObjectName("file_list_hint")
 
         toggle_row.addWidget(self._arrow)
         toggle_row.addWidget(self._toggle_btn)
@@ -217,15 +214,15 @@ class FileListWidget(QWidget):
         p = Path(self._path)
         if not p.exists():
             lbl = QLabel(t("file_list.path_not_found"))
-            lbl.setStyleSheet(f"color:{palette('text_muted')}; font-size:10px; font-style:italic;")
+            lbl.setObjectName("file_list_meta_italic")
             self._file_layout.addWidget(lbl)
             return
 
         if p.is_file():
             # Single file — just show it
             cb = QCheckBox(p.name)
+            cb.setObjectName("file_list_cb")
             cb.setChecked(True)
-            cb.setStyleSheet(f"QCheckBox {{ color:{palette('text_secondary')}; font-size:10px; }}")
             cb.toggled.connect(lambda: self.selection_changed.emit())
             self._file_checkboxes.append((cb, p.name))
             self._file_layout.addWidget(cb)
@@ -251,7 +248,7 @@ class FileListWidget(QWidget):
 
                 if files_shown >= _MAX_DISPLAY_FILES:
                     more_lbl = QLabel(f"  ... {t('file_list.and_more')}")
-                    more_lbl.setStyleSheet(f"color:{palette('text_muted')}; font-size:10px; font-style:italic;")
+                    more_lbl.setObjectName("file_list_meta_italic")
                     self._file_layout.addWidget(more_lbl)
                     break
 
@@ -261,30 +258,140 @@ class FileListWidget(QWidget):
                 except OSError:
                     size = "?"
 
-                cb = QCheckBox(f"{rel_path}  ({size})")
-                cb.setChecked(rel_path not in self._excluded_files)
-                cb.setStyleSheet(f"QCheckBox {{ color:{palette('text_secondary')}; font-size:10px; }}")
+                row_w = QWidget()
+                row_lay = QHBoxLayout(row_w)
+                row_lay.setContentsMargins(0, 1, 0, 1)
+                row_lay.setSpacing(6)
+
+                is_excluded = rel_path in self._excluded_files
+
+                cb = QCheckBox(rel_path)
+                cb.setObjectName("file_list_cb")
+                cb.setChecked(not is_excluded)
                 cb.setToolTip(str(f))
-                cb.toggled.connect(lambda checked, rp=rel_path: self._on_file_toggled(rp, checked))
+
+                size_lbl = QLabel(f"({size})")
+                size_lbl.setObjectName("file_list_meta")
+
+                act_btn = QToolButton()
+                act_btn.setObjectName("file_list_action")
+                _btn_sz = scaled(18, self, min_px=16)
+                act_btn.setFixedSize(_btn_sz, _btn_sz)
+                act_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+                def _apply_ui_state(excluded: bool, _c=cb, _b=act_btn):
+                    _c.blockSignals(True)
+                    _c.setChecked(not excluded)
+                    _c.blockSignals(False)
+                    if excluded:
+                        _b.setText("↺")
+                        _b.setToolTip(t("file_list.restore_file"))
+                        _c.setStyleSheet("color: #888888; text-decoration: line-through;")
+                    else:
+                        _b.setText("✕")
+                        _b.setToolTip(t("file_list.exclude_file"))
+                        _c.setStyleSheet("")
+
+                _apply_ui_state(is_excluded)
+
+                act_btn.clicked.connect(lambda _=False, rp=rel_path, c=cb, b=act_btn: (
+                    self._on_action_btn_clicked(rp, c, b)
+                ))
+                cb.toggled.connect(lambda checked, rp=rel_path, c=cb, b=act_btn: (
+                    self._on_cb_toggled(rp, checked, c, b)
+                ))
+
+                row_lay.addWidget(cb, 1)
+                row_lay.addWidget(size_lbl)
+                row_lay.addWidget(act_btn)
+
                 self._file_checkboxes.append((cb, rel_path))
-                self._file_layout.addWidget(cb)
+                self._file_rows[rel_path] = (cb, act_btn)
+                self._file_layout.addWidget(row_w)
                 files_shown += 1
 
         except (PermissionError, OSError) as e:
             err_lbl = QLabel(f"{t('file_list.scan_error')}: {e}")
-            err_lbl.setStyleSheet(f"color:{palette('error')}; font-size:10px;")
+            err_lbl.setObjectName("file_list_error")
             self._file_layout.addWidget(err_lbl)
 
         if files_shown == 0:
             empty_lbl = QLabel(t("file_list.no_save_files"))
-            empty_lbl.setStyleSheet(f"color:{palette('text_muted')}; font-size:10px; font-style:italic;")
+            empty_lbl.setObjectName("file_list_meta_italic")
             self._file_layout.addWidget(empty_lbl)
 
-    def _on_file_toggled(self, rel_path: str, checked: bool):
-        if checked:
-            self._excluded_files.discard(rel_path)
+    def _on_action_btn_clicked(self, rel_path: str, cb: QCheckBox, btn: QToolButton):
+        curr_excl = rel_path in self._excluded_files
+        new_excl = not curr_excl
+        self._set_file_excluded_state(rel_path, new_excl)
+        cb.blockSignals(True)
+        cb.setChecked(not new_excl)
+        cb.blockSignals(False)
+        if new_excl:
+            btn.setText("↺")
+            btn.setToolTip(t("file_list.restore_file"))
+            cb.setStyleSheet("color: #888888; text-decoration: line-through;")
         else:
+            btn.setText("✕")
+            btn.setToolTip(t("file_list.exclude_file"))
+            cb.setStyleSheet("")
+
+    def _on_cb_toggled(self, rel_path: str, checked: bool, cb: QCheckBox, btn: QToolButton):
+        new_excl = not checked
+        self._set_file_excluded_state(rel_path, new_excl)
+        if new_excl:
+            btn.setText("↺")
+            btn.setToolTip(t("file_list.restore_file"))
+            cb.setStyleSheet("color: #888888; text-decoration: line-through;")
+        else:
+            btn.setText("✕")
+            btn.setToolTip(t("file_list.exclude_file"))
+            cb.setStyleSheet("")
+
+    def _set_file_excluded_state(self, rel_path: str, excluded: bool):
+        full_p = str(Path(self._path) / rel_path)
+        if excluded:
             self._excluded_files.add(rel_path)
+        else:
+            self._excluded_files.discard(rel_path)
+
+        if self._game_id:
+            try:
+                from core.config_manager import get_config
+                cfg = get_config()
+                # 1. auto_scan_excluded_files
+                excl_files = dict(cfg.get("auto_scan_excluded_files", {}))
+                game_excl = dict(excl_files.get(self._game_id, {}))
+                path_excl = list(game_excl.get(self._path, []))
+                if excluded and rel_path not in path_excl:
+                    path_excl.append(rel_path)
+                elif not excluded and rel_path in path_excl:
+                    path_excl.remove(rel_path)
+                if path_excl:
+                    game_excl[self._path] = path_excl
+                else:
+                    game_excl.pop(self._path, None)
+                if game_excl:
+                    excl_files[self._game_id] = game_excl
+                else:
+                    excl_files.pop(self._game_id, None)
+                cfg.set("auto_scan_excluded_files", excl_files)
+
+                # 2. auto_scan_deleted_paths (so it appears in Ignored Paths modal)
+                del_paths = dict(cfg.get("auto_scan_deleted_paths", {}))
+                game_del = list(del_paths.get(self._game_id, []))
+                if excluded and full_p not in game_del:
+                    game_del.append(full_p)
+                elif not excluded and full_p in game_del:
+                    game_del.remove(full_p)
+                if game_del:
+                    del_paths[self._game_id] = game_del
+                else:
+                    del_paths.pop(self._game_id, None)
+                cfg.set("auto_scan_deleted_paths", del_paths)
+            except Exception as e:
+                logger.debug(f"Could not persist excluded file state: {e}")
+
         self.selection_changed.emit()
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -296,9 +403,20 @@ class FileListWidget(QWidget):
     def set_excluded_files(self, excluded: set[str]):
         """Set excluded files (e.g., from saved preferences)."""
         self._excluded_files = set(excluded)
-        # Update checkboxes if already built
-        for cb, rel_path in self._file_checkboxes:
-            cb.setChecked(rel_path not in self._excluded_files)
+        for rel_path, (cb, btn) in self._file_rows.items():
+            excl = rel_path in self._excluded_files
+            cb.blockSignals(True)
+            cb.setChecked(not excl)
+            cb.blockSignals(False)
+            if excl:
+                btn.setText("↺")
+                btn.setToolTip(t("file_list.restore_file"))
+                cb.setStyleSheet("color: #888888; text-decoration: line-through;")
+            else:
+                btn.setText("✕")
+                btn.setToolTip(t("file_list.exclude_file"))
+                cb.setStyleSheet("")
 
     def get_path(self) -> str:
         return self._path
+

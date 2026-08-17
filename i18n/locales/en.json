@@ -96,6 +96,7 @@
     "status_pending": "Pending sync",
     "status_conflict": "Conflict",
     "status_local_only": "Local only",
+    "status_archives": "Archives (no game)",
     "status_provisional": "Provisional",
     "status_cloud_only": "Cloud only",
     "status_no_saves": "No saves found",
@@ -321,6 +322,8 @@
     "restore_success": "Saves restored for {game}",
     "restore_success_generic": "Saves restored",
     "restore_fallback_warning": "Could not automatically find the save folder on this PC. Files were exported to:\n{path}\n\nOpen Edit Game and set the correct path manually, then restore again.",
+    "select_restore_destination": "Select destination folder for restore",
+    "restore_orphan_success": "Saves restored to selected folder: {path}",
     "resumed_frozen_game": "A game left frozen by a previous run has been resumed."
   },
   "settings": {
@@ -329,6 +332,14 @@
     "theme": "Theme",
     "theme_dark": "Dark",
     "theme_light": "Light",
+    "ui_scale": "Scale multiplier",
+    "ui_scale_auto": "Automatic scale (same look)",
+    "ui_scale_auto_tooltip": "Same look as manual 100% on 4K @ OS 150%: ideal = Qt_logical_width / 2560. DIPs already include Windows/macOS/Linux scale — changing OS scale keeps the same physical size. All windows grow with the scale.",
+    "self_checks": "Run automatic diagnostic checks (incl. backup integrity)",
+    "self_checks_tooltip": "Periodically runs internal diagnostic checks and opens every backup to confirm it is still readable and complete. This helps spot regressions and damaged archives before they are needed, but can be resource-intensive.",
+    "self_checks_frequency": "Checks frequency",
+    "self_checks_frequency_tooltip": "How often to run diagnostic checks and backup verification (in days).",
+    "ui_scale_quality_clamp": "Ideal ≈{ideal}% → applied ≈{applied}% (readability limit for this resolution; remaining fit uses scrollbars).",
     "hotkey": "Overlay Hotkey",
     "launch_on_startup": "Launch on startup",
     "minimize_to_tray": "Minimize to tray",
@@ -410,6 +421,8 @@
     "search_list": "Search…",
     "language_tooltip": "Interface language. Applies immediately, no restart.",
     "theme_tooltip": "Light or dark. Applies immediately.",
+    "ui_scale_tooltip": "Manual multiplier (50%–150%). Only when automatic scale is off. Does not compensate Windows: 100% = design baseline. Preview applies on slider release or after typing the %.",
+    "ui_scale_effective": "≈{pct}%",
     "launch_on_startup_tooltip": "Start SaveSync with the system, so games are watched from the first launch.",
     "minimize_to_tray_tooltip": "Closing the window leaves SaveSync running in the tray instead of quitting.",
     "auto_sync_after_backup_tooltip": "Upload every new backup to your cloud provider as soon as it is made.",
@@ -430,7 +443,11 @@
     "save_edit_copies": "Copies to keep",
     "save_edit_copies_tooltip": "How many copies of one save file the editor keeps before the oldest is dropped. A copy is taken every time you write to a save, so this is how far back an edit can be undone.",
     "save_edit_copy_days": "Delete after",
-    "save_edit_copy_days_tooltip": "Copies older than this are removed. The newest is always kept, however old it is, so there is always something to undo with."
+    "save_edit_copy_days_tooltip": "Copies older than this are removed. The newest is always kept, however old it is, so there is always something to undo with.",
+    "run_diagnostics": "Run diagnostic checks",
+    "diagnostics_running": "Running diagnostic checks...",
+    "diagnostics_success": "Diagnostic checks completed: no issues found",
+    "diagnostics_issues": "Issues detected"
   },
   "config_transfer": {
     "preview_title": "Import Configuration Preview",
@@ -492,6 +509,7 @@
     "shelved_op_detect": "scan…",
     "shelved_op_done": "ready",
     "shelved_op_failed": "no result",
+    "shelved_nav": "Add/Edit — background work",
     "shelved_nav_add_exe": "Add — resolving exe…",
     "shelved_nav_add_search": "Add — web search…",
     "shelved_nav_add_detect": "Add — detecting saves…",
@@ -519,8 +537,16 @@
     "backup_interval_tooltip": "Automatically create backup every N minutes while game is running",
     "auto_backup_enabled": "Enable automatic backup",
     "select_cover_image": "Select Cover Image",
+    "remove_image_title": "Remove image",
+    "remove_image_confirm": "Remove this image from the carousel? The downloaded cover file will be permanently deleted. You can search again to restore it.",
     "select_executable": "Select Game Executable",
     "select_save_folder": "Select Save Folder",
+    "select_save_file": "Select Save File",
+    "browse_pick_folder": "Folder",
+    "browse_pick_file": "File",
+    "browse_kind_tooltip": "Browse a save folder or a single save file",
+    "pin_to_sidebar": "Add to sidebar",
+    "unpin_from_sidebar": "Remove from sidebar",
     "path_warning": "Path Warning",
     "add_anyway_question": "{warning}\n\nAdd anyway?",
     "paths_found_general": "✓ {count} path(s) found via general scan — review carefully",
@@ -643,6 +669,7 @@
   "main": {
     "auto_in_game": "auto (in-game)",
     "auto_pre_confirm": "auto (paths pending confirmation)",
+    "backup_before_download_note": "pre-download backup",
     "online": "● Online",
     "offline": "● Offline",
     "save_folder_detected": "📂 Save folder detected for {name} — open Library to scan and confirm"
@@ -657,11 +684,16 @@
     "no_save_files": "No save files found",
     "scan_error": "Scan error",
     "and_more": "and more files not shown",
-    "registry_values": "registry values"
+    "registry_values": "registry values",
+    "exclude_file": "Exclude from backups",
+    "restore_file": "Restore to backups"
   },
+
   "notifications": {
     "backup_created": "Backup created for {game}",
-    "backup_unchanged": "No changes detected for {game} — backup skipped"
+    "backup_unchanged": "No changes detected for {game} — backup skipped",
+    "cooldown_active": "This operation has been temporarily disabled, please retry in {seconds}s",
+    "sync_no_changes": "No changes to synchronize"
   },
   "backups": {
     "game_running": "Game running",
@@ -671,6 +703,7 @@
     "filter_all": "All sources",
     "filter_local_only": "Local only",
     "filter_local_sync": "Local + sync",
+    "filter_archive_only": "Archive only",
     "provider_only": "Provider origin only",
     "filter_all_providers": "All sync providers",
     "all_games": "— All titles —",
@@ -692,7 +725,11 @@
     "verify_running": "Checking {done}/{total}…",
     "verify_running_named": "Checking {done}/{total}: {name}…",
     "verify_result_all_ok": "All {total} backups intact",
-    "verify_result_bad": "{bad} of {total} backups have a problem"
+    "verify_result_bad": "{bad} of {total} backups have a problem",
+    "verify_snapshots_ok": "Config snapshots: ok",
+    "verify_snapshots_bad": "Config snapshots: problem — {detail}",
+    "index_validate_failed": "Could not finish checking which backup files are still on disk. Some missing archives may still appear in the list until the next successful check.",
+    "index_validate_recovered": "Backup index check recovered — missing archives were cleaned up."
   },
   "errors": {
     "path_not_found": "Path not found",
@@ -775,7 +812,10 @@
     "clear": "Clear",
     "please_wait": "Please wait…",
     "cancel_search": "Stop searching",
-    "cancelling": "Stopping…"
+    "cancelling": "Stopping…",
+    "to_sidebar": "Minimize",
+    "minimize": "Minimize",
+    "open": "Open"
   },
   "providers": {
     "google_drive": "Google Drive",
@@ -794,6 +834,9 @@
     "offline": "● Offline",
     "no_executable": "No executable set for this game"
   },
+  "self_checks": {
+    "failed": "Internal check failed ({check}). Please report this if it keeps happening."
+  },
   "languages": {
     "en": "English",
     "it": "Italiano"
@@ -804,7 +847,8 @@
     "open_backup_folder": "Open backup folder for selected game",
     "card_view": "Card view",
     "list_view": "List view",
-    "refresh": "Refresh",
+    "refresh": "Rebuild all views (reloads Library, Cheats, Backups and Sync)",
+    "refresh_in_game": "Disabled while a game is running (a full rebuild could interfere with the game's save files)",
     "reset_defaults": "Reset all settings to their default values"
   },
   "dropbox": {
@@ -977,16 +1021,40 @@
     "save": "Save folders",
     "nothing_selected": "No rows selected.",
     "none_resolved": "No path resolved to an existing folder: fix the paths or use Browse.",
-    "result_added": "{count} new entries created.",
+    "result_added": "{count} backups archived (not added to the library).",
     "result_updated": "{count} paths added to existing games.",
-    "result_skipped": "{count} already registered, skipped.",
+    "result_skipped": "{count} already archived, skipped.",
     "result_unresolved": "{count} unresolved and ignored: {names}",
     "reading": "Reading folders…",
     "reading_folder": "Reading {current}/{total} — {name}",
+    "inserting_folder": "Adding {current}/{total} — {name}",
+    "storing": "Saving {current}/{total} — {name}",
+    "cancelled": "Operation cancelled.",
+    "cancelling": "Cancelling…",
+    "shelved_nav": "Multiple add",
+    "shelved_scanning": "Reading folders — click to reopen",
+    "shelved_inserting": "Adding rows — click to reopen",
+    "shelved_storing": "Creating backups — click to reopen",
     "multiple_unresolved": "({count} not located on disk yet.)",
     "from_collection": "Chain read: {chain}  ·  from {source}",
     "collection_hint": "The collection folder can have any name: only one level below it is read. Each subfolder identifies the game and IS the backup source — the saves are right there. The structure inside it is only read and recorded: it is the destination path, the one needed to put them back into the game. When it starts at a user folder (Roaming, LocalLow…) that destination is already known on this machine and is used directly.",
-    "result_not_yet": "{count} destinations do not exist yet: registered anyway, ready for a restore."
+    "result_not_yet": "{count} destinations do not exist yet: not archived (folders must be on disk)."
+  },
+  "batch": {
+    "backup_label": "Backup",
+    "sync_label": "Sync",
+    "search_label": "Search",
+    "verify_label": "Verify",
+    "verify_snapshot": "Config snapshots",
+    "verify_index": "Backup index",
+    "verify_done": "Verification complete",
+    "backup_done": "Backup complete ({done})",
+    "backup_done_one": "Backup of {name} complete",
+    "backup_done_none": "Nothing to back up — everything is up to date",
+    "sync_done": "Sync complete ({done})",
+    "sync_done_one": "Sync of {name} complete",
+    "search_done": "Search complete ({matched}/{total})",
+    "search_done_cancelled": "Search cancelled ({matched}/{total})"
   },
   "exe_scan": {
     "title": "Scan games folder",
@@ -1014,6 +1082,13 @@
     "then_search": "Then search the web for each title",
     "then_search_tooltip": "After saving, run a web search for every added title, auto-accepting the first valid result.",
     "save": "Add selected",
+    "storing": "Saving to library {current}/{total} — {name}",
+    "cancelling": "Cancelling…",
+    "cancelled": "Operation cancelled.",
+    "shelved_nav": "Folder scan",
+    "shelved_scanning": "Scan running — click to reopen",
+    "shelved_inserting": "Adding rows — click to reopen",
+    "shelved_storing": "Saving to library — click to reopen",
     "nothing_selected": "No titles selected.",
     "nothing_added": "No titles added.",
     "search_warning_title": "Web search",
@@ -1024,13 +1099,14 @@
   },
   "game_search": {
     "title": "Web search for titles",
-    "running_hint": "Looking up each title in turn. SaveSync stays usable while it runs, and minimising this window does not stop it.",
+    "running_hint": "Looking up each title in turn. SaveSync stays usable; progress is also in the sidebar. Minimise only if you want — the search keeps running and reopens from there.",
     "nav": "Web search",
-    "nav_tooltip_done": "Web search finished — open to review.",
-    "nav_tooltip_failed": "Web search cancelled — open to review what completed.",
+    "nav_tooltip_done": "Web search finished — click the sidebar bar to review.",
+    "nav_tooltip_failed": "Web search cancelled — click the sidebar bar to review what completed.",
+    "sidebar_tooltip_running": "Web search running — click to open details. Minimising does not stop it.",
     "progress": "{done}/{total} done — {matched} matched",
     "minimize": "Minimise",
-    "minimize_tooltip": "Hide the window: the search keeps running and reopens from the sidebar.",
+    "minimize_tooltip": "Hide the window: the search keeps running; progress stays in the sidebar.",
     "cancel": "Cancel search",
     "cancelling": "Cancelling… it stops after the title in flight.",
     "done": "Finished: {matched} of {total} titles enriched.",
@@ -1071,6 +1147,10 @@
     "edit_hint": "The original is copied aside before anything is written, so any edit can be undone from the previous screen.",
     "editing": "{name} — read as {engine}.",
     "editing_read_only": "{name} — read as {engine} (read-only).",
+    "loading_side": "Loading save…",
+    "loading_done": "Loaded {name}.",
+    "loading_cancelled": "Loading cancelled.",
+    "loading_failed": "Loading failed.",
     "err_cannot_read": "{name} could not be read: {reason}",
     "err_copy_gone": "That copy is no longer there.",
     "err_empty": "That file is empty.",
@@ -1132,5 +1212,37 @@
     "no_notes": "No release notes for this version.",
     "open_page": "Open download page",
     "later": "Later"
+  },
+  "dpi": {
+    "emergency_title": "Window size restored",
+    "emergency_message": "The saved window size was too large for your screen. The window has been sized to fit.",
+    "emergency_message_auto": "The saved window size was too large for your screen. The window has been sized to fit; your scale settings are unchanged."
+  },
+  "file_picker": {
+    "look_in": "Look in:",
+    "file_name": "File name:",
+    "file_type": "Files of type:",
+    "add_to_sidebar": "Add to sidebar",
+    "remove_from_sidebar": "Remove from sidebar",
+    "all_files": "All Files",
+    "executables": "Executables",
+    "folders": "Folders",
+    "save_files": "Save files",
+    "folders_and_files": "Folders and files",
+    "select": "Select",
+    "save": "Save",
+    "open": "Open",
+    "filter_all_files": "All Files (*.*)",
+    "filter_folders": "Folders",
+    "back": "Back",
+    "forward": "Forward",
+    "parent_directory": "Parent Directory",
+    "new_folder": "New Folder",
+    "list_view": "List View",
+    "detail_view": "Detail View",
+    "rename": "Rename",
+    "delete": "Delete",
+    "show_hidden": "Show hidden files",
+    "cannot_remove_system_pin": "System locations cannot be removed"
   }
 }

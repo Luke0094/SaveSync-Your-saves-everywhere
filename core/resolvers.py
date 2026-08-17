@@ -53,11 +53,26 @@ def is_executable_file(path) -> bool:
     the real signal; the suffix list only covers the conventions that do exist
     (.sh, .AppImage, Unity's .x86_64…). A macOS .app is a directory and is
     accepted as itself.
+
+    On Windows the platform suffixes are recognised as always, PLUS the Unix
+    conventions: a game directory can hold Linux binaries (WSL, Proton,
+    mounted drives) and the custom browse must see them. A suffix-less file
+    is accepted when its first bytes are a real program's (ELF, Mach-O) or a
+    shebang — a cheap 4-byte read, no exec-bit tests that mean nothing on NTFS.
     """
     p = Path(path)
     suffix = p.suffix.lower()
     if _IS_WINDOWS:
-        return suffix in _EXEC_SUFFIXES_WINDOWS
+        if suffix in _EXEC_SUFFIXES_WINDOWS or suffix in _EXEC_SUFFIXES_POSIX:
+            return True
+        if suffix:
+            return False
+        try:
+            with open(p, 'rb') as fh:
+                head = fh.read(4)
+        except OSError:
+            return False
+        return any(head.startswith(magic) for magic in _BINARY_MAGICS)
     if suffix in _EXEC_SUFFIXES_POSIX:
         return True
     if suffix == _MACOS_BUNDLE_SUFFIX:
@@ -94,12 +109,24 @@ def is_program_binary(path) -> bool:
     positive silently narrows what gets backed up. So an extension-less file
     must both carry the exec bit AND actually start like a binary.
 
-    Windows keeps the exact ``.exe`` test the heuristic has always used.
+    Windows keeps the exact ``.exe`` test the heuristic has always used, with
+    the Unix conventions added: a game folder may hold Linux builds (WSL,
+    Proton, mounted drives), and their binaries must not be mistaken for
+    data files when the folder is evaluated as an install root.
     """
     p = Path(path)
     suffix = p.suffix.lower()
     if _IS_WINDOWS:
-        return suffix == '.exe'
+        if suffix in (_EXEC_SUFFIXES_WINDOWS + _EXEC_SUFFIXES_POSIX):
+            return True
+        if suffix:
+            return False
+        try:
+            with open(p, 'rb') as fh:
+                head = fh.read(4)
+        except OSError:
+            return False
+        return any(head.startswith(magic) for magic in _BINARY_MAGICS)
     if suffix in _EXEC_SUFFIXES_POSIX:
         return True
     if suffix:
@@ -156,8 +183,18 @@ def executable_name_filter(all_files_label: str = "All Files") -> str:
     On Unix "All Files" comes FIRST on purpose: the typical game binary has no
     extension, so no pattern can match it and a restrictive default filter
     would hide exactly what the user came to select.
+
+    On Windows the platform patterns are joined by the Unix conventions —
+    Linux binaries hide in game folders (WSL, Proton, mounted drives) and the
+    custom browse must list them, not just the *.exe family.
     """
-    patterns = " ".join(f"*{s}" for s in executable_suffixes() + shortcut_suffixes())
+    patterns = " ".join(
+        f"*{s}" for s in executable_suffixes()
+        + shortcut_suffixes()
+        + (() if _IS_WINDOWS else ())
+        + ((_EXEC_SUFFIXES_POSIX + _SHORTCUT_SUFFIXES_POSIX)
+           if _IS_WINDOWS else ())
+    )
     if _IS_WINDOWS:
         return f"Executables ({patterns});;{all_files_label} (*)"
     return f"{all_files_label} (*);;Executables ({patterns})"
@@ -288,6 +325,14 @@ def _iter_executable_candidates(search_base: Path):
     """
     if _IS_WINDOWS:
         yield from search_base.rglob("*.exe")
+        # Unix builds inside game folders (WSL, Proton, mounted drives):
+        # suffix globs only — no per-file reads, matching the Windows
+        # string-only walk. Extensionless ELF files are not globbable, and
+        # scanning every file of a tree on Windows is too heavy for the
+        # deadline budget; the interactive Browse finds them via the magic
+        # check instead.
+        for _s in _EXEC_SUFFIXES_POSIX:
+            yield from search_base.rglob(f"*{_s}")
         return
     for path in search_base.rglob("*"):
         suffix = path.suffix.lower()

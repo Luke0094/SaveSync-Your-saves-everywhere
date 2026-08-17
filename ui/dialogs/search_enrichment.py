@@ -13,13 +13,14 @@ import threading
 import webbrowser
 
 from PySide6.QtCore import Qt, QSize, QRect, QPoint, Signal
-from PySide6.QtGui import QPixmap, QIcon
+from PySide6.QtGui import QColor, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QScrollArea, QWidget, QLayout, QSizePolicy,
 )
 
 from i18n import t
+from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.styles.theme import palette
 
 logger = logging.getLogger(__name__)
@@ -82,11 +83,49 @@ class CandidatePreviewDialog(QDialog):
         self.selected = None   # set to the confirmed GameInfo on accept
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t('add_game.candidate_preview_title'))
-        self.setMinimumWidth(440)
-        self.setMaximumWidth(500)
+        self._apply_window_chrome()
         self._thumb_ready.connect(self._on_thumb_ready)
         self._build()
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=440, min_h=420)
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
         self._update()
+
+    def _apply_window_chrome(self):
+        bg = QColor(palette("bg"))
+        fg = QColor(palette("text"))
+        card = QColor(palette("bg_card"))
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, bg)
+        pal.setColor(QPalette.ColorRole.Base, card)
+        pal.setColor(QPalette.ColorRole.AlternateBase, bg)
+        pal.setColor(QPalette.ColorRole.Button, bg)
+        pal.setColor(QPalette.ColorRole.WindowText, fg)
+        pal.setColor(QPalette.ColorRole.Text, fg)
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {palette('bg')}; color: {palette('text')}; }}"
+            f"QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}"
+        )
+        try:
+            from ui.helpers import set_dark_title_bar
+            set_dark_title_bar(self)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        self._apply_window_chrome()
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
+        super().showEvent(event)
 
     def set_candidates(self, candidates: list):
         """Replace the browse list (e.g. soft-promote unlocked after an
@@ -118,36 +157,26 @@ class CandidatePreviewDialog(QDialog):
         self._counter_lbl = QLabel()
         self._counter_lbl.setWordWrap(True)
         self._counter_lbl.setStyleSheet(
-            f"color:{palette('accent')};font-size:11px;font-weight:700;"
+            f"color:{palette('accent')};font-size:{scaled(11, self)}px;font-weight:700;"
         )
         outer.addWidget(self._counter_lbl)
 
-        # Filled triangles (◀ ▶) — thin ‹ › glyphs disappear on some fonts /
-        # Windows DPI scales; these stay readable at the sidebar width.
-        _arrow_css = (
-            f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text')};"
-            f"border:1px solid {palette('border_hover')};border-radius:4px;"
-            f"font-weight:700;font-size:16px;padding:0;}}"
-            f"QPushButton:hover{{background:{palette('accent')};color:{palette('accent_text')};"
-            f"border-color:{palette('accent')};}}"
-            f"QPushButton:disabled{{color:{palette('text_muted')};"
-            f"border-color:{palette('border')};background:{palette('bg')};}}"
-        )
+        # Same slim chevron arrows as the add/edit image carousel (SVG icons
+        # from ui.styles.arrow_icons — the old ◀ ▶ triangles were too big and
+        # loud at the sidebar width). Disabled state dims the chevron to the
+        # muted colour, so an arrow with nothing to scroll looks inert.
+        from ui.styles.arrow_icons import chevron_button_style as _carousel_arrow
 
-        self._prev_btn = QPushButton("◀")
-        self._prev_btn.setFixedWidth(32)
-        self._prev_btn.setMinimumHeight(90)
-        self._prev_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._prev_btn = QPushButton("")
+        self._prev_btn.setFixedSize(scaled(22, self), scaled(56, self))
         self._prev_btn.setToolTip(t('add_game.candidate_prev'))
-        self._prev_btn.setStyleSheet(_arrow_css)
+        self._prev_btn.setStyleSheet(_carousel_arrow("left"))
         self._prev_btn.clicked.connect(self._go_prev)
 
-        self._next_btn = QPushButton("▶")
-        self._next_btn.setFixedWidth(32)
-        self._next_btn.setMinimumHeight(90)
-        self._next_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._next_btn = QPushButton("")
+        self._next_btn.setFixedSize(scaled(22, self), scaled(56, self))
         self._next_btn.setToolTip(t('add_game.candidate_next'))
-        self._next_btn.setStyleSheet(_arrow_css)
+        self._next_btn.setStyleSheet(_carousel_arrow("right"))
         self._next_btn.clicked.connect(self._go_next)
 
         content = QVBoxLayout()
@@ -155,12 +184,9 @@ class CandidatePreviewDialog(QDialog):
 
         _thumb_row = QHBoxLayout()
         self._thumb_lbl = QLabel("🎮")
-        self._thumb_lbl.setFixedSize(112, 70)
+        self._thumb_lbl.setFixedSize(scaled(112, self), scaled(70, self))
         self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumb_lbl.setStyleSheet(
-            f"background:{palette('bg_elevated')};border:1px solid {palette('border_hover')};"
-            f"border-radius:6px;font-size:26px;"
-        )
+        self._thumb_lbl.setObjectName("enrich_thumb")
         _thumb_row.addWidget(self._thumb_lbl)
         _thumb_row.addStretch()
         content.addLayout(_thumb_row)
@@ -168,24 +194,19 @@ class CandidatePreviewDialog(QDialog):
         self._name_lbl = QLabel()
         self._name_lbl.setWordWrap(True)
         self._name_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._name_lbl.setStyleSheet(f"color:{palette('text')};font-size:16px;font-weight:700;")
+        self._name_lbl.setObjectName("enrich_name")
         content.addWidget(self._name_lbl)
 
         self._source_lbl = QLabel()
         self._source_lbl.setWordWrap(True)
-        self._source_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;font-weight:600;")
+        self._source_lbl.setObjectName("enrich_source")
         content.addWidget(self._source_lbl)
 
         self._inspect_btn = QPushButton()
         self._inspect_btn.setFlat(True)
         self._inspect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._inspect_btn.setToolTip(t("add_game.candidate_inspect_tooltip"))
-        self._inspect_btn.setStyleSheet(
-            f"QPushButton{{color:{palette('accent')};font-size:11px;text-align:left;"
-            f"padding:0;background:transparent;border:none;}}"
-            f"QPushButton:hover{{text-decoration:underline;}}"
-            f"QPushButton:disabled{{color:{palette('text_disabled')};}}"
-        )
+        self._inspect_btn.setObjectName("enrich_inspect_btn")
         self._inspect_btn.clicked.connect(self._on_inspect)
         self._inspect_url = ""
         content.addWidget(self._inspect_btn)
@@ -193,40 +214,40 @@ class CandidatePreviewDialog(QDialog):
         self._desc_lbl = QLabel()
         self._desc_lbl.setWordWrap(True)
         self._desc_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._desc_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        self._desc_lbl.setObjectName("enrich_desc")
         content.addWidget(self._desc_lbl)
 
         self._meta_lbl = QLabel()
         self._meta_lbl.setWordWrap(True)
         self._meta_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._meta_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        self._meta_lbl.setObjectName("enrich_meta")
         content.addWidget(self._meta_lbl)
 
         # The source's own verdict, when it has one and the form doesn't yet.
         self._review_lbl = QLabel()
         self._review_lbl.setWordWrap(True)
         self._review_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._review_lbl.setStyleSheet(f"color:{palette('text_muted')};font-size:11px;")
+        self._review_lbl.setObjectName("enrich_meta")
         content.addWidget(self._review_lbl)
 
         self._tags_lbl = QLabel()
         self._tags_lbl.setWordWrap(True)
         self._tags_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._tags_lbl.setStyleSheet(f"color:{palette('text_hint')};font-size:11px;")
+        self._tags_lbl.setObjectName("enrich_hint")
         content.addWidget(self._tags_lbl)
         content.addStretch()
 
         mid_row = QHBoxLayout()
         mid_row.setSpacing(10)
-        mid_row.addWidget(self._prev_btn)
+        mid_row.addWidget(self._prev_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         mid_row.addLayout(content, 1)
-        mid_row.addWidget(self._next_btn)
+        mid_row.addWidget(self._next_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(mid_row)
 
         self._btn_hint_lbl = QLabel(t('add_game.candidate_buttons_hint'))
         self._btn_hint_lbl.setWordWrap(True)
         self._btn_hint_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self._btn_hint_lbl.setStyleSheet(f"color:{palette('text_hint')};font-size:10px;")
+        self._btn_hint_lbl.setObjectName("enrich_btn_hint")
         outer.addWidget(self._btn_hint_lbl)
 
         # Optional caller note — e.g. the initial search announces that
@@ -236,19 +257,19 @@ class CandidatePreviewDialog(QDialog):
             _note = QLabel(self._extra_note)
             _note.setWordWrap(True)
             _note.setStyleSheet(
-                f"color:{palette('text_muted')};font-size:10px;font-style:italic;"
+                f"color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-style:italic;"
             )
             outer.addWidget(_note)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._reject_btn = QPushButton(t('common.no'))
-        self._reject_btn.setMinimumWidth(90)
+        self._reject_btn.setMinimumWidth(scaled(90, self))
         self._reject_btn.setToolTip(t('add_game.candidate_dismiss'))
         self._reject_btn.clicked.connect(self._on_reject)
         self._confirm_btn = QPushButton(t('common.yes'))
         self._confirm_btn.setObjectName("primary_btn")
-        self._confirm_btn.setMinimumWidth(90)
+        self._confirm_btn.setMinimumWidth(scaled(90, self))
         self._confirm_btn.setToolTip(t('add_game.candidate_use'))
         self._confirm_btn.clicked.connect(self._on_confirm)
         btn_row.addWidget(self._reject_btn)
@@ -300,7 +321,7 @@ class CandidatePreviewDialog(QDialog):
         if _name_field and _name_field.get('old'):
             self._name_lbl.setText(
                 f"<span style='color:{palette('text_muted')};text-decoration:line-through;"
-                f"font-weight:400;font-size:12px;'>{_h.escape(_name_field['old'])}</span><br>"
+                f"font-weight:400;font-size:{scaled(12, self)}px;'>{_h.escape(_name_field['old'])}</span><br>"
                 f"{_h.escape(_name_field.get('new') or c.name or '?')}"
             )
         else:
@@ -571,18 +592,12 @@ def _merge_chip(text: str, tooltip: str = "") -> QPushButton:
     """Toggle chip in the same visual language as the dialog tag/URL chips."""
     b = QPushButton(text.replace('&', '&&'))
     b.setCheckable(True)
-    b.setFixedHeight(22)
+    b.setFixedHeight(scaled(22, b))
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     if tooltip:
         b.setToolTip(tooltip)
-    b.setStyleSheet(
-        f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text_secondary')};"
-        f"border:1px solid {palette('border')};border-radius:10px;padding:0 8px;font-size:11px;}}"
-        f"QPushButton:hover{{border-color:{palette('accent')};color:{palette('text')};}}"
-        f"QPushButton:checked{{background:{palette('accent')};color:{palette('accent_text')};"
-        f"border-color:{palette('accent')};}}"
-    )
+    b.setObjectName("enrich_merge_chip")
     return b
 
 
@@ -621,13 +636,47 @@ class EnrichmentMergeDialog(QDialog):
         self._source_headers: dict[str, QPushButton] = {}
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t('add_game.merge_title'))
-        self.setMinimumWidth(540)
-        self.setMinimumHeight(360)
-        self.setMaximumHeight(680)
-        self.resize(560, 520)
+        self._apply_window_chrome()
         self._thumb_ready.connect(self._on_thumb_ready)
         self._build()
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
         self._start_thumb_downloads()
+
+    def _apply_window_chrome(self):
+        bg = QColor(palette("bg"))
+        fg = QColor(palette("text"))
+        card = QColor(palette("bg_card"))
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, bg)
+        pal.setColor(QPalette.ColorRole.Base, card)
+        pal.setColor(QPalette.ColorRole.AlternateBase, bg)
+        pal.setColor(QPalette.ColorRole.Button, bg)
+        pal.setColor(QPalette.ColorRole.WindowText, fg)
+        pal.setColor(QPalette.ColorRole.Text, fg)
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {palette('bg')}; color: {palette('text')}; }}"
+            f"QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}"
+        )
+        try:
+            from ui.helpers import set_dark_title_bar
+            set_dark_title_bar(self)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        self._apply_window_chrome()
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
+        super().showEvent(event)
 
     def _short(self, value: str, limit: int = 0) -> str:
         v = " ".join((value or "").split())
@@ -668,11 +717,11 @@ class EnrichmentMergeDialog(QDialog):
         # Identity thumb — always shown when the peer has a cover, so two
         # VNDB titles are recognizable before reading the composite label.
         thumb = QLabel("🖼")
-        thumb.setFixedSize(56, 36)
+        thumb.setFixedSize(scaled(56, self), scaled(36, self))
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb.setStyleSheet(
             f"background:{palette('bg_elevated')};border:1px solid {palette('border')};"
-            f"border-radius:4px;font-size:14px;color:{palette('text_muted')};"
+            f"border-radius:4px;font-size:{scaled(14, self)}px;color:{palette('text_muted')};"
         )
         if cover:
             thumb.setToolTip((meta.get("name") or "") or cover)
@@ -692,7 +741,7 @@ class EnrichmentMergeDialog(QDialog):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setToolTip(t("add_game.merge_toggle_source"))
         btn.setStyleSheet(
-            f"QPushButton{{color:{palette('text_muted')};font-size:10px;font-weight:700;"
+            f"QPushButton{{color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;"
             f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
             f"background:transparent;border:none;}}"
             f"QPushButton:hover{{color:{palette('accent')};}}"
@@ -705,7 +754,7 @@ class EnrichmentMergeDialog(QDialog):
         if inspect:
             sep = QLabel("·")
             sep.setStyleSheet(
-                f"color:{palette('text_muted')};font-size:10px;font-weight:700;padding:0 2px;")
+                f"color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;padding:0 2px;")
             lay.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
             # The URL itself is the inspect control (opens the source page).
             link = QPushButton(self._short_inspect_host(inspect))
@@ -713,7 +762,7 @@ class EnrichmentMergeDialog(QDialog):
             link.setCursor(Qt.CursorShape.PointingHandCursor)
             link.setToolTip(t("add_game.merge_inspect_tooltip") + "\n" + inspect)
             link.setStyleSheet(
-                f"QPushButton{{color:{palette('accent')};font-size:10px;font-weight:600;"
+                f"QPushButton{{color:{palette('accent')};font-size:{scaled(10, self)}px;font-weight:600;"
                 f"text-align:left;padding:2px 0;background:transparent;border:none;}}"
                 f"QPushButton:hover{{text-decoration:underline;}}"
             )
@@ -740,7 +789,7 @@ class EnrichmentMergeDialog(QDialog):
         any_on = any(c.isChecked() for c in chips)
         color = palette('accent') if any_on else palette('text_disabled')
         btn.setStyleSheet(
-            f"QPushButton{{color:{color};font-size:10px;font-weight:700;"
+            f"QPushButton{{color:{color};font-size:{scaled(10, self)}px;font-weight:700;"
             f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
             f"background:transparent;border:none;}}"
             f"QPushButton:hover{{color:{palette('accent')};}}"
@@ -789,7 +838,7 @@ class EnrichmentMergeDialog(QDialog):
         chip.setProperty("opt_value", url)
         chip.setStyleSheet(
             f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text_muted')};"
-            f"border:1px solid {palette('border')};border-radius:6px;font-size:22px;padding:2px;}}"
+            f"border:1px solid {palette('border')};border-radius:6px;font-size:{scaled(22, self)}px;padding:2px;}}"
             f"QPushButton:hover{{border-color:{palette('accent')};}}"
             f"QPushButton:checked{{border:2px solid {palette('accent')};"
             f"background:{palette('bg_card')};}}"
@@ -807,14 +856,12 @@ class EnrichmentMergeDialog(QDialog):
 
         intro = QLabel(t('add_game.merge_intro'))
         intro.setWordWrap(True)
-        intro.setStyleSheet(f"color:{palette('accent')};font-size:11px;font-weight:600;")
+        intro.setObjectName("enrich_intro")
         outer.addWidget(intro)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content = QWidget()
         content.setObjectName("transparent_bg")
         col = QVBoxLayout(content)
@@ -899,22 +946,25 @@ class EnrichmentMergeDialog(QDialog):
 
         btn_row = QHBoxLayout()
         back_btn = QPushButton(t('add_game.merge_back'))
-        back_btn.setMinimumWidth(120)
+        back_btn.setMinimumWidth(scaled(120, self))
         back_btn.setToolTip(t('add_game.merge_back_tooltip'))
         back_btn.clicked.connect(lambda: self.done(self.RESULT_BACK))
         btn_row.addWidget(back_btn)
         btn_row.addStretch()
         cancel_btn = QPushButton(t('common.cancel'))
-        cancel_btn.setMinimumWidth(90)
+        cancel_btn.setMinimumWidth(scaled(90, self))
         cancel_btn.setToolTip(t('add_game.merge_cancel_tooltip'))
         cancel_btn.clicked.connect(self.reject)
         apply_btn = QPushButton(t('common.apply'))
         apply_btn.setObjectName("primary_btn")
-        apply_btn.setMinimumWidth(90)
+        apply_btn.setMinimumWidth(scaled(90, self))
         apply_btn.clicked.connect(self.accept)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(apply_btn)
         outer.addLayout(btn_row)
+
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=540, min_h=360, scroll=scroll, list_content=True)
 
     def _start_thumb_downloads(self):
         """Fetch cover previews off the GUI thread (same opener as candidate)."""

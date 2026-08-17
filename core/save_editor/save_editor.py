@@ -164,15 +164,42 @@ def _looks_encrypted_unreal(data: bytes) -> bool:
         return False
 
 
-def _candidates(path: Path, data: bytes) -> list:
+def _candidates(path: Path, data: bytes, game_dir=None) -> list:
     """Formats worth trying for this file, best guess first.
 
-    Extension first because it is the strongest hint, then content: plenty of
-    engines put JSON in a .dat or a .save, and plenty put something else in a
-    .sav.
+    When *game_dir* is known, the library's engine detector goes first — a
+    Ren'Py install must not waste the open path on Easy Save / JSON probes.
+    Extension and magic follow for games without a detected engine, and for
+    files whose extension is shared across engines.
     """
     out = []
     ext = path.suffix.lower()
+
+    engine = ""
+    if game_dir:
+        try:
+            from core.engines.game_engine import detect_engine
+            engine = detect_engine(game_dir=str(game_dir)) or ""
+        except Exception:
+            engine = ""
+    if engine:
+        from core.engines import game_engine as ge
+        preferred = {
+            ge.RENPY: [RenpyFormat],
+            ge.UNITY: [Es3Format, JsonFormat],
+            ge.GODOT: [JsonFormat, XmlFormat],
+            ge.UNREAL: [GvasFormat],
+            ge.RPGMAKER: [RpgMakerMzFormat, RpgMakerMvFormat, RubyMarshalFormat],
+            ge.WOLFRPG: [WolfFormat],
+            ge.ARTEMIS: [ArtemisFormat],
+            ge.ALICESOFT: [AliceSoftFormat],
+            ge.TYRANO: [TyranoFormat],
+            ge.TADS: [TadsRecFormat],
+            ge.WEBGL: [JsonFormat, SugarCubeFormat],
+            ge.JAVA: [SqliteFormat, JsonFormat],
+        }.get(engine, [])
+        out.extend(preferred)
+
     if ext in _BY_EXTENSION:
         out.append(_BY_EXTENSION[ext])
     # Ruby stamps every Marshal stream with its version, which is as strong
@@ -225,7 +252,9 @@ def _candidates(path: Path, data: bytes) -> list:
     if (data.startswith(b"QSPSAVEDGAME")
             or data.startswith("QSPSAVEDGAME".encode("utf-16-le"))):
         out.append(QspFormat)
-    if data.startswith(b"PK"):
+    # Ren'Py .save is a zip; magic catches Unity/Godot .save fall-throughs
+    # that still happen to be zips, and reinforces the extension hint.
+    if data[:4] == b"PK\x03\x04":
         out.append(RenpyFormat)
     # The LCF name is length-prefixed, so an .lsd starts with its length.
     if data[:1] == bytes([len(b"LcfSaveData")]) and data[1:12] == b"LcfSaveData":
@@ -487,7 +516,7 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         logger.info(f"{p.name}: {cls.name} {why} — read-only")
         readonly_doc = doc
 
-    for cls in ([PlayerPrefsFormat] if registry else _candidates(p, data)):
+    for cls in ([PlayerPrefsFormat] if registry else _candidates(p, data, game_dir)):
         fmt = prepare(cls)
         try:
             fmt.load(data)
@@ -498,6 +527,43 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
             # simply was not that format.
             logger.debug(f"{p.name}: not {cls.name} ({type(e).__name__}: {e})")
             continue
+        # A format that proved byte-exactness during load (json_format,
+        # naninovel, tads_rec: they compared dump()==data on the file they
+        # just saw) can skip a second dump. A class-level verify_exact=True
+        # claim is NOT trusted on sight: the dump is proven byte-exact here
+        # and now. When the claim does not hold on this file the format is
+        # downgraded to the generic value round trip below instead of being
+        # offered for editing unproven.
+        exact = getattr(fmt, "verify_exact", False)
+        if exact and "verify_exact" in fmt.__dict__:
+            doc = make_doc(cls, fmt, read_only=False)
+            if doc is not None:
+                return doc
+            continue
+        if exact:
+            try:
+                if fmt.dump() == data:
+                    doc = make_doc(cls, fmt, read_only=False)
+                    if doc is not None:
+                        return doc
+            except Exception:
+                pass
+            fmt.verify_exact = False
+            exact = False
+        # Format-specific fast verify (e.g. Ren'Py: zip rebuild + log bytes,
+        # without a second full pickle walk on tens of thousands of values).
+        if hasattr(fmt, "verify_value_round_trip"):
+            try:
+                if not fmt.verify_value_round_trip():
+                    remember_readonly(cls, fmt, "value round trip differs")
+                    continue
+            except Exception:
+                remember_readonly(cls, fmt, "value round trip failed")
+                continue
+            doc = make_doc(cls, fmt, read_only=False)
+            if doc is None:
+                continue
+            return doc
         # The round trip is the whole safety argument: if we cannot rebuild
         # what we just read, we do not understand the file well enough to
         # write to it, whatever the extension says.
@@ -516,6 +582,11 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
             # rebuilt bytes must give back the same values.
             try:
                 probe = prepare(cls)
+                # Reuse secrets the first reader already paid for (Easy Save
+                # password hunt can unpack game archives).
+                for attr in ("_password", "_iv"):
+                    if hasattr(fmt, attr):
+                        setattr(probe, attr, getattr(fmt, attr))
                 probe.load(rebuilt)
                 if ([(f.label, f.value) for f in probe.fields()]
                         != [(f.label, f.value) for f in fmt.fields()]):

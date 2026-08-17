@@ -43,6 +43,47 @@ class RenpyFormat(_Format):
         except RenpyError as e:
             raise SaveEditorError(str(e)) from e
 
+    def verify_value_round_trip(self) -> bool:
+        """Prove a rebuild without a second full pickle walk on open.
+
+        Values live only in the zip ``log`` entry. ``dump`` must write
+        exactly ``_rebuilt_log()`` — byte to byte, nothing lost or altered
+        on the way into the zip. That single check is the whole cost at
+        open time (no edits yet, so the rebuilt log IS the original log).
+
+        When the user has edited values, the splice is re-scanned with
+        pickletools (read-only, nothing unpickled): the re-scan must return
+        exactly the same sequence of names and values, position by position.
+        This only runs on save, never on open.
+        """
+        import io
+        import zipfile
+        rebuilt = self.dump()
+        with zipfile.ZipFile(io.BytesIO(rebuilt)) as zf:
+            log = zf.read("log")
+        sv = self._save
+        if log != sv._rebuilt_log():
+            return False
+        if any("new" in v for v in sv._values):
+            from core.engines.renpy import RenpyError
+            try:
+                rows = sv._scan(log)
+            except RenpyError:
+                return False
+            # Positional, not by name: the splice must leave every value at
+            # the same spot, in the same order, with the same name and value.
+            # An edited value that vanishes from the re-scan (a wrong splice
+            # offset, or a value the game never re-writes) MUST fail — the old
+            # per-name check only flagged values that happened to reappear.
+            # Positional comparison also keeps same-named values (nine quest
+            # rewards all called "money") distinguishable.
+            if len(rows) != len(sv._values):
+                return False
+            for v, row in zip(sv._values, rows):
+                if row["name"] != v["name"] or row["value"] != v["value"]:
+                    return False
+        return True
+
     def fields(self) -> list:
         rows = self._save.values()
         names = _unique([name for _i, name, _k, _v in rows])

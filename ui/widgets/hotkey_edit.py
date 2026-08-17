@@ -9,6 +9,7 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QLineEdit
 import i18n
 from ui.styles.theme import palette
+from ui.helpers import scaled
 
 # Modifier keys by their Qt int values
 _MOD_MAP: dict[int, str] = {
@@ -140,8 +141,10 @@ class HotkeyEdit(QLineEdit):
         self._capturing    = True
         self._current_mods = set()
         super().setText(i18n.t('hotkey.press_keys'))
+        pad = scaled(4, self)
+        pad_h = scaled(8, self)
         self.setStyleSheet(f"QLineEdit {{ border: 1px solid {palette('accent')}; color: {palette('accent')}; "
-                           f"background: {palette('bg_elevated')}; border-radius: 4px; padding: 4px 8px; }}")
+                           f"background: {palette('bg_elevated')}; border-radius: 4px; padding: {pad}px {pad_h}px; }}")
         self.setFocus()
 
     def _finish_capture(self, combo: str):
@@ -170,8 +173,10 @@ class HotkeyEdit(QLineEdit):
         self.clearFocus()
 
     def _set_idle_style(self):
+        pad = scaled(4, self)
+        pad_h = scaled(8, self)
         self.setStyleSheet(f"QLineEdit {{ border: 1px solid {palette('border_hover')}; color: {palette('text')}; "
-                           f"background: {palette('bg_card')}; border-radius: 4px; padding: 4px 8px; }}")
+                           f"background: {palette('bg_card')}; border-radius: 4px; padding: {pad}px {pad_h}px; }}")
 
     def _key_to_name(self, key_int: int, event: QKeyEvent) -> str:
         # 1. Special map (F-keys, arrows, etc.)

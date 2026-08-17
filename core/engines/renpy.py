@@ -217,6 +217,9 @@ class RenpySave:
             return out[::-1]
 
         for i, (op, arg, pos) in enumerate(ops):
+            if (i & 0x7FF) == 0:
+                import time
+                time.sleep(0.0005)
             name = op.name
             if name == "MARK":
                 stack.append(_MARK)

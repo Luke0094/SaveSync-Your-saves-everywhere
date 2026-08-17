@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBu
 
 from i18n import t
 from ui.backup_labels import origin_badge
+from ui.helpers import scaled
 from ui.styles.theme import palette
 
 if platform.system() == "Windows":
@@ -40,7 +41,7 @@ def _engine_badge_html(engine: str) -> str:
     if not engine:
         return ""
     return (
-        f" <span style='color:{palette('text_muted')};font-size:11px;"
+        f" <span style='color:{palette('text_muted')};font-size:{scaled(11)}px;"
         f"font-weight:500;'>· {html.escape(engine)}</span>"
     )
 
@@ -177,7 +178,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # a pointer shape while the mouse is over this panel.
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setObjectName("overlay")
-        self.setFixedWidth(340)
+        self.setFixedWidth(scaled(340, self))
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -196,7 +197,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # in place; on the unknown view itself the carousel arrows already
         # browse the queue, so there the badge is a passive counter.
         self._unknown_badge = QPushButton("")
-        self._unknown_badge.setFixedHeight(20)
+        self._unknown_badge.setFixedHeight(scaled(20, self))
         self._unknown_badge.setToolTip(t("unknown_history.badge_tooltip"))
         self._unknown_badge.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._unknown_badge.clicked.connect(self._on_badge_clicked)
@@ -208,23 +209,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # can be reviewed/accepted WITHOUT leaving the game. Shown only on
         # the manual (hotkey) overlay — see show_manual/_clear_buttons.
         self._info_btn = QPushButton("i")
-        self._info_btn.setFixedSize(20, 20)
+        _ib = scaled(20, self)
+        self._info_btn.setFixedSize(_ib, _ib)
         self._info_btn.setToolTip(t("overlay.open_auto_scan"))
         self._info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._info_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._info_btn.setStyleSheet(
-            f"QPushButton{{color:{palette('text_muted')};background:transparent;"
-            f"border:1px solid {palette('border_hover')};border-radius:10px;"
-            f"font-size:11px;font-weight:700;font-style:italic;padding:0;}}"
-            f"QPushButton:hover{{color:{palette('accent')};border-color:{palette('accent')};}}"
-        )
+        self._info_btn.setObjectName("overlay_info_btn")
         self._info_btn.clicked.connect(lambda: self._on_action("open_auto_scan"))
         self._info_btn.setVisible(False)
         # 📌: the recently pinned notes/images, plus a way to pin a new one,
         # reachable without leaving the game. Same visibility rule as [i] —
         # only on the manual (hotkey) overlay, see _clear_buttons.
         self._pin_btn = QPushButton("📌")
-        self._pin_btn.setFixedSize(20, 20)
+        self._pin_btn.setFixedSize(_ib, _ib)
         self._pin_btn.setToolTip(t("pin.menu_tooltip"))
         self._pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._pin_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -233,7 +230,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._pin_btn.setVisible(False)
         close_btn = QPushButton("✕")
         close_btn.setObjectName("icon_btn")
-        close_btn.setFixedSize(20, 20)
+        close_btn.setFixedSize(_ib, _ib)
         close_btn.clicked.connect(self.hide_animated)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -252,7 +249,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         msg_row.setContentsMargins(0, 0, 0, 0)
 
         self._carousel_prev = QPushButton("‹")
-        self._carousel_prev.setFixedSize(18, 48)
+        self._carousel_prev.setFixedSize(scaled(18, self), scaled(48, self))
         self._carousel_prev.setCursor(Qt.CursorShape.PointingHandCursor)
         self._carousel_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._carousel_prev.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -260,7 +257,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._carousel_prev.clicked.connect(self._carousel_go_prev)
 
         self._carousel_next = QPushButton("›")
-        self._carousel_next.setFixedSize(18, 48)
+        self._carousel_next.setFixedSize(scaled(18, self), scaled(48, self))
         self._carousel_next.setCursor(Qt.CursorShape.PointingHandCursor)
         self._carousel_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._carousel_next.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -286,15 +283,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._message.setTextFormat(Qt.TextFormat.RichText)
         self._message.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # Two lines for "in esecuzione / monitoraggio attivo" (and similar).
-        self._message.setFixedHeight(52)
+        self._message.setFixedHeight(scaled(52, self))
         centre_col.addWidget(self._message)
 
         # Counter (e.g. "2 / 5") below message, centred
         self._carousel_counter = QLabel("")
+        self._carousel_counter.setObjectName("overlay_carousel_counter")
         self._carousel_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._carousel_counter.setStyleSheet(
-            f"color:{palette('text_muted')};font-size:9px;"
-        )
         self._carousel_counter.setVisible(False)
         centre_col.addWidget(self._carousel_counter)
 
@@ -336,13 +331,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         layout.addLayout(self._restore_area)
 
         self._suppress_btn = QPushButton()
-        self._suppress_btn.setObjectName("icon_btn")
+        self._suppress_btn.setObjectName("overlay_suppress_btn")
         self._suppress_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._suppress_btn.setStyleSheet(
-            f"QPushButton{{font-size:10px;color:{palette('text_muted')};padding:4px 8px;"
-            f"border:1px solid {palette('border_hover')};border-radius:4px;background:transparent;}}"
-            f"QPushButton:hover{{color:{palette('text')};border-color:{palette('accent')};background:{palette('bg_elevated')};}}"
-        )
         self._suppress_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._suppress_btn.clicked.connect(self._on_suppress)
         layout.addWidget(self._suppress_btn)
@@ -428,14 +418,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if primary:
             arrow_btn.setObjectName("primary_btn")
         arrow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        arrow_btn.setFixedWidth(24)
+        arrow_btn.setFixedWidth(scaled(24, self))
 
         def _open_menu():
             menu = QMenu(self)
             menu.setStyleSheet(
                 f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
                 f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
-                f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:11px;}}"
+                f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
                 f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
             )
             for label, act in menu_items:
@@ -455,7 +445,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         v.setText(val)
         # Only a highlighted row needs a sheet of its own; clearing it lets
         # the theme's #dash_value take over again.
-        v.setStyleSheet(f"color:{accent};font-size:11px;font-weight:600;" if accent else "")
+        if accent:
+            fs = scaled(11, self)
+            v.setStyleSheet(f"color:{accent};font-size:{fs}px;font-weight:600;")
+        else:
+            v.setStyleSheet("")
 
     # Restore list sizing: cap the scrollable area so the overlay stays compact
     _RESTORE_ROW_H = 28
@@ -505,7 +499,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 b = QPushButton(label)
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
                 b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                b.setFixedHeight(20)
+                b.setFixedHeight(scaled(20, self))
                 b.clicked.connect(lambda _=False, s=src_id: self._load_restore_source(s))
                 sel_row.addWidget(b)
                 self._restore_source_btns[src_id] = b
@@ -537,13 +531,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             try:
                 if src_id == active:
                     b.setStyleSheet(
-                        f"QPushButton{{font-size:9px;color:{palette('accent_text')};"
+                        f"QPushButton{{font-size:{scaled(9, self)}px;color:{palette('accent_text')};"
                         f"background:{palette('accent')};border:1px solid {palette('accent')};"
                         f"border-radius:4px;padding:0 8px;font-weight:700;}}"
                     )
                 else:
                     b.setStyleSheet(
-                        f"QPushButton{{font-size:9px;color:{palette('text_muted')};"
+                        f"QPushButton{{font-size:{scaled(9, self)}px;color:{palette('text_muted')};"
                         f"background:transparent;border:1px solid {palette('border_hover')};"
                         f"border-radius:4px;padding:0 8px;}}"
                         f"QPushButton:hover{{color:{palette('accent')};border-color:{palette('accent')};}}"
@@ -582,7 +576,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         if source_id == "local":
             if not local_backups:
-                lbl = QLabel(f"<span style='color:{palette('text_hint')};font-size:10px;'>{t('overlay.no_backups_available')}</span>")
+                lbl = QLabel(f"<span style='color:{palette('text_hint')};font-size:{scaled(10, self)}px;'>{t('overlay.no_backups_available')}</span>")
                 lay.insertWidget(lay.count() - 1, lbl)
             for bk in local_backups:
                 lay.insertWidget(lay.count() - 1,
@@ -591,7 +585,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             return
 
         # Provider source: loading placeholder + background fetch
-        loading = QLabel(f"<span style='color:{palette('text_hint')};font-size:10px;'>⟳ {t('overlay.loading')}</span>")
+        loading = QLabel(f"<span style='color:{palette('text_hint')};font-size:{scaled(10, self)}px;'>⟳ {t('overlay.loading')}</span>")
         lay.insertWidget(lay.count() - 1, loading)
         self._resize_restore_scroll(1)
 
@@ -654,7 +648,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 return
             self._clear_restore_rows()
             if not entries:
-                lbl = QLabel(f"<span style='color:{palette('text_hint')};font-size:10px;'>{t('overlay.no_backups_available')}</span>")
+                lbl = QLabel(f"<span style='color:{palette('text_hint')};font-size:{scaled(10, self)}px;'>{t('overlay.no_backups_available')}</span>")
                 lay.insertWidget(lay.count() - 1, lbl)
             for bk in entries:
                 # Already-downloaded backups restore from the local zip
@@ -757,7 +751,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         border_col = palette('warning') if is_temp else palette('border_hover')
         btn.setStyleSheet(
-            f"QPushButton{{text-align:left;padding:4px 8px;font-size:10px;"
+            f"QPushButton{{text-align:left;padding:4px 8px;font-size:{scaled(10, self)}px;"
             f"color:{palette('text_secondary')};background:{palette('bg_elevated')};border:1px solid {border_col};border-radius:4px;}}"
             f"QPushButton:hover{{background:{palette('bg_elevated')};border-color:{palette('accent')};color:{palette('accent')};}}"
         )
@@ -852,7 +846,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         clickable = self._overlay_mode == "tracking"
         base = (
             f"QPushButton{{color:{palette('accent_text')};background:{palette('accent')};"
-            f"border:none;border-radius:10px;font-size:11px;font-weight:700;"
+            f"border:none;border-radius:10px;font-size:{scaled(11, self)}px;font-weight:700;"
             f"padding:0 8px;}}"
         )
         if clickable:
@@ -1079,7 +1073,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._title.setText(t("app.name"))
         self._message.setText(
             f"<b>{game_name}</b><br>"
-            f"<span style='color:{palette('text_hint')};font-size:11px;'>{t(f'overlay.{hint_key}')}</span>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>{t(f'overlay.{hint_key}')}</span>"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -1117,7 +1111,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     def show_unknown_queue(self):
         """REPLACE the current notification with the pending unknown-game
         queue, browsable via the carousel arrows: the in-overlay successor
-        of the old dedicated 'detected games (not in library)' panel."""
+        of the old dedicated 'detected games (not in library)' panel.
+
+        The notification queue is COVERED, not cleared: it stays in place,
+        and a notification that arrives while the unknown view is active
+        (e.g. the aggregated Backup/Sync Tutti toast) drops the unknown
+        view and falls back to the queue, so no pending toast is lost.
+        hide_animated() still clears everything on manual dismiss.
+        """
         from core.config_manager import get_config
         if not get_config().get("show_overlay_on_unknown", True):
             self.refresh_unknown_badge()
@@ -1128,7 +1129,6 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if not entries:
             self.refresh_unknown_badge()
             return
-        self._clear_notification_queue()
         self._set_mode("unknown")
         self._unknown_queue = entries
         self._unknown_index = 0
@@ -1161,7 +1161,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._title.setText(t("app.name"))
         self._message.setText(
             f"<b>{game_name}</b> {t('overlay.detected_msg')}<br>"
-            f"<span style='color:{palette('text_hint')};font-size:11px;'>{t('overlay.save_detected')}</span>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>{t('overlay.save_detected')}</span>"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -1241,7 +1241,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # a different one here told the user a shortcut that never worked.
         hotkey = get_config().get("overlay_hotkey", "alt+ctrl+s").upper()
         hotkey_lbl = QLabel(
-            f"<span style='color:{palette('text_muted')};font-size:10px;'>"
+            f"<span style='color:{palette('text_muted')};font-size:{scaled(10, self)}px;'>"
             f"{t('overlay.open_with_hotkey', hotkey=hotkey)}</span>"
         )
         hotkey_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1435,7 +1435,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._title.setText(t("app.name"))
         self._message.setText(
             f"<b>{proc_name}</b> {t('overlay.unverified_match_msg', game=game_name)}<br>"
-            f"<span style='color:{palette('text_hint')};font-size:11px;'>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
             f"{t('overlay.unverified_match_hint')}</span>"
         )
         self._hide_dashboard()
@@ -1476,7 +1476,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         hint_key = "overlay.restore_undone_hint" if after_restore else "overlay.save_reverted_hint"
         self._message.setText(
             f"{t(msg_key, game=game_name)}<br>"
-            f"<span style='color:{palette('text_hint')};font-size:11px;'>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
             f"{t(hint_key)}</span>"
         )
         self._hide_dashboard()
@@ -1782,6 +1782,28 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._push_notification(icon, t("app.name"), msg, _AUTO_HIDE_MS,
                                  game_id=game_id, notif_type="backup")
 
+    def show_batch_done(self, kind: str, done: int, name: str = ""):
+        """Queue ONE aggregated notification at the end of Backup Tutti /
+        Sync Tutti. Per-game notifications stay suppressed during a batch
+        (spam froze the UI), but the summary is still delivered through
+        the same already-built queue — a plain append, no rebuild.
+        kind: "backup" or "sync". A single finished title reports its name,
+        matching the sidebar notice.
+        """
+        if kind == "backup":
+            icon = "✓"
+            key = "batch.backup_done_one" if (done == 1 and name) else "batch.backup_done"
+            text = t(key, name=name) if done == 1 and name else t(key, done=done)
+        else:
+            icon = "☁"
+            key = "batch.sync_done_one" if (done == 1 and name) else "batch.sync_done"
+            text = t(key, name=name) if done == 1 and name else t(key, done=done)
+        msg = (
+            f"<span style='color:{palette('accent')};font-weight:700;'>"
+            f"{text}</span>"
+        )
+        self._push_notification(icon, t("app.name"), msg, _AUTO_HIDE_MS)
+
     def show_provisional_backup_done(self, game_name: str, game_id: str = ""):
         """Queue a notification for a TEMPORARY (pre-confirmation) backup —
         distinct notif_type from show_backup_done, so "don't show again"
@@ -1805,6 +1827,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         )
         self._push_notification("☁", t("app.name"), msg, _AUTO_HIDE_MS,
                                  game_id=game_id, notif_type="sync")
+
+    def show_notice(self, text: str, icon: str = "ℹ"):
+        """Show a generic one-line informational toast (no game association).
+
+        Used for cooldown messages, sync-no-changes, and other ephemeral
+        status notifications that don't belong to a specific backup event.
+        """
+        msg = (
+            f"<span style='color:{palette('text_secondary')};'>"
+            f"{text}</span>"
+        )
+        self._push_notification(icon, t("app.name"), msg, _AUTO_HIDE_MS)
 
     def show_manual(self, stats: dict | None = None):
         """Toggle dashboard. If visible → hide; else → show with live stats."""
@@ -1880,7 +1914,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 if backups:
                     restore_btn = self._add_btn(self._quick_area, t('overlay.quick_restore'), "")
                     restore_btn.setStyleSheet(
-                        f"QPushButton{{font-size:11px;color:{palette('warning')};background:transparent;"
+                        f"QPushButton{{font-size:{scaled(11, self)}px;color:{palette('warning')};background:transparent;"
                         f"border:1px solid {palette('warning')};border-radius:4px;padding:4px 10px;}}"
                         f"QPushButton:hover{{background:{palette('bg_elevated')};}}"
                     )
@@ -2425,42 +2459,16 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # ── Paint & drag ──────────────────────────────────────────────────────────
 
     def _style_carousel_arrows(self):
-        """The look of the two browse arrows, from the current palette.
-
-        A method rather than a local string because refresh_styles has to be
-        able to say it again: built once with whatever theme happened to be on
-        at the time, the arrows kept a dark box and pale glyph after a switch
-        to the light theme, which on a light card reads as two black blocks.
-        """
-        style = (
-            f"QPushButton{{background:{palette('bg_elevated')};"
-            f"color:{palette('text')};border:1px solid {palette('border')};"
-            f"border-radius:4px;font-size:15px;font-weight:bold;padding:0;}}"
-            f"QPushButton:hover{{background:{palette('accent')};"
-            f"border-color:{palette('accent')};color:#000;}}"
-            f"QPushButton:disabled{{color:{palette('text_muted')};"
-            f"border-color:{palette('border')};"
-            f"background:{palette('bg_elevated')};}}"
-        )
-        self._carousel_prev.setStyleSheet(style)
-        self._carousel_next.setStyleSheet(style)
+        self._carousel_prev.setObjectName("overlay_carousel_arrow")
+        self._carousel_next.setObjectName("overlay_carousel_arrow")
 
     def refresh_styles(self):
         """Re-apply all inline styles after theme change."""
         from ui.styles.theme import get_theme_manager
         self._is_dark = get_theme_manager().is_dark()
         self._refresh_badge_interactivity()
-        self._icon_label.setStyleSheet("font-size: 15px; min-width: 20px; background: transparent;")
-        sep = self.findChild(QFrame, "overlay_separator")
-        if sep:
-            sep.setStyleSheet(f"background:{palette('border_hover')};border:none;max-height:1px;")
-        self._message.setStyleSheet(f"color:{palette('text_secondary')};font-size:12px;")
+        # #overlay_icon / #overlay_separator / #overlay_suppress_btn are theme-owned.
         self._style_carousel_arrows()
-        self._suppress_btn.setStyleSheet(
-            f"QPushButton{{font-size:10px;color:{palette('text_muted')};padding:4px 8px;"
-            f"border:1px solid {palette('border_hover')};border-radius:4px;background:transparent;}}"
-            f"QPushButton:hover{{color:{palette('text')};border-color:{palette('accent')};background:{palette('bg_elevated')};}}"
-        )
         # The dashboard rows need nothing: #dash_key / #dash_value come from
         # the theme (a highlighted value keeps its own accent colour).
         self.update()  # trigger repaint

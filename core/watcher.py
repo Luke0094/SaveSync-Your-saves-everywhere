@@ -4,13 +4,14 @@ Watches game save directories in real-time. If a path doesn't exist yet,
 watches the nearest existing parent and triggers once the expected folder
 is created — then switches to watching the folder itself.
 """
+import errno
 import logging
 import os
 import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Callable, List, Dict, Set, Optional
+from typing import Callable, List, Dict, Set, Optional, Sequence
 
 from PySide6.QtCore import QObject, Signal, Slot
 from core.constants import SAVE_FOLDER_HINTS as _DEFAULT_HINTS, SKIP_FILENAME_STEMS, strip_version_tokens
@@ -28,7 +29,11 @@ except ImportError:
 from core import is_relative_to as _is_relative_to_compat
 
 
-_DEBOUNCE_SEC = 3.0
+# Quiet games settle quickly; busy writers (many files in a short burst)
+# get a longer coalesce window so one backup absorbs the whole save wave.
+_DEBOUNCE_SEC = 5.0
+_DEBOUNCE_SEC_BUSY = 8.0
+_BUSY_PENDING_THRESHOLD = 8
 _MAX_CACHE_SIZE = 50000  # Cap on _BACKED_UP_FILES / _KNOWN_FILES to prevent memory leaks
 
 # Words too generic to identify WHICH game a common-root (AppData/…) event
@@ -979,7 +984,12 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 return
             if self._timer:
                 self._timer.cancel()
-            self._timer = threading.Timer(_DEBOUNCE_SEC, self._fire_all_pending)
+            with _CACHE_LOCK:
+                pending_n = len(_PENDING_FILES.get(self._game_id, set()))
+            delay = (_DEBOUNCE_SEC_BUSY
+                     if pending_n >= _BUSY_PENDING_THRESHOLD
+                     else _DEBOUNCE_SEC)
+            self._timer = threading.Timer(delay, self._fire_all_pending)
             self._timer.daemon = True
             self._timer.start()
 
@@ -1075,6 +1085,141 @@ class _PendingPathHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else obje
         self.on_created(event)
 
 
+# First-level XDG dirs that host many engine saves. Recursing into these is
+# far cheaper than watching all of ~/.local/share or ~/.config. "Steam" is
+# intentionally omitted — that tree is huge; Proton prefixes are added
+# per-appid instead.
+_LINUX_ENGINE_TOP_DIRS = frozenset({
+    "godot", "unity3d", "epic", "epicgameslauncher", "renpy",
+})
+
+
+def _linux_xdg_data_home() -> Path:
+    return Path(os.getenv("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+
+
+def _linux_xdg_config_home() -> Path:
+    return Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+
+
+def _is_linux_broad_xdg_root(root: Path) -> bool:
+    """True for the whole XDG data/config homes (inotify hot spots)."""
+    try:
+        resolved = root.resolve()
+        return resolved in (
+            _linux_xdg_data_home().resolve(),
+            _linux_xdg_config_home().resolve(),
+        )
+    except OSError:
+        return False
+
+
+def _name_matches_identity(name: str, identity_parts: Sequence[str]) -> bool:
+    low = name.lower()
+    return any(part in low for part in identity_parts if len(part) > 2)
+
+
+def _linux_scoped_common_watch_specs(
+    root: Path, identity_parts: Sequence[str],
+) -> list[tuple[Path, bool]]:
+    """Watch specs ``(path, recursive)`` under a Linux common root.
+
+    Broad XDG homes (``~/.local/share``, ``~/.config``) must not be recursed
+    wholesale: inotify needs one wd per subdirectory and often hits
+    ``fs.inotify.max_user_watches``. Instead:
+
+    - recursive on known engine tops + name-matching first/second-level dirs
+    - non-recursive on the XDG home and on other first-level dirs (cheap) so
+      a late-created ``Company/Game`` folder can still be adopted
+    - if nothing recursive matches, fall back to full-root recursive
+
+    Narrow roots (``.renpy``, Proton prefix, …) → ``[(root, True)]``.
+    """
+    if not _is_linux_broad_xdg_root(root):
+        return [(root, True)]
+
+    parts = [p for p in identity_parts if len(p) > 2]
+    specs: list[tuple[Path, bool]] = []
+    seen: set[tuple[str, bool]] = set()
+
+    def _add(p: Path, recursive: bool) -> None:
+        try:
+            key = (str(p.resolve()), recursive)
+        except OSError:
+            key = (str(p), recursive)
+        if key in seen:
+            return
+        try:
+            if not p.is_dir():
+                return
+        except OSError:
+            return
+        seen.add(key)
+        specs.append((p, recursive))
+
+    try:
+        children = list(root.iterdir())
+    except OSError as e:
+        logger.debug("Could not list common-root %s: %s", root, e)
+        return [(root, True)]
+
+    recursive_hits = 0
+    for child in children:
+        if not child.is_dir():
+            continue
+        name_l = child.name.lower()
+        if name_l in _LINUX_ENGINE_TOP_DIRS or _name_matches_identity(
+            child.name, parts,
+        ):
+            _add(child, True)
+            recursive_hits += 1
+            continue
+        # Company (or other) top-level: shallow probe + any matching product.
+        _add(child, False)
+        if not parts:
+            continue
+        try:
+            subs = child.iterdir()
+        except OSError:
+            continue
+        for sub in subs:
+            if sub.is_dir() and _name_matches_identity(sub.name, parts):
+                _add(sub, True)
+                recursive_hits += 1
+
+    if recursive_hits == 0:
+        logger.info(
+            "Linux common-root watch: no engine/name match under %s — "
+            "falling back to full recursive watch (may hit inotify limits)",
+            root,
+        )
+        return [(root, True)]
+
+    # Non-recursive on the XDG home itself for brand-new top-level folders.
+    _add(root, False)
+    return specs
+
+
+def _log_watch_schedule_failure(path: Path, err: BaseException, *, kind: str) -> None:
+    """Surface inotify exhaustion; keep other schedule errors quieter."""
+    en = getattr(err, "errno", None)
+    msg = str(err).lower()
+    inotify_pressure = (
+        en in (errno.ENOSPC, errno.EMFILE)
+        or "inotify" in msg
+        or "no space left" in msg
+        or "too many" in msg
+    )
+    if inotify_pressure:
+        logger.warning(
+            "Could not watch %s (%s): %s — on Linux, raise "
+            "fs.inotify.max_user_watches if this persists",
+            path, kind, err,
+        )
+    else:
+        logger.debug("Could not watch %s (%s): %s", path, kind, err)
+
+
 def _get_common_save_roots(appid: str = "") -> list[Path]:
     """Return OS-specific common save-data roots to watch for games with no
     configured save_paths. These cover engines (Godot, Unity, etc.) that write
@@ -1104,10 +1249,10 @@ def _get_common_save_roots(appid: str = "") -> list[Path]:
                     roots.append(p)
     elif system == "Linux":
         home = Path.home()
-        # ".renpy" is Ren'Py's engine data dir on Unix (the AppData/RenPy
-        # analogue) — NOT under ~/.local/share, so it needs its own root.
-        for rel in (".local/share", ".config", ".renpy"):
-            p = home / rel
+        # Honour XDG_* like save_detector. Broad data/config homes are scoped
+        # further in watch_game (see _linux_scoped_common_watch_dirs).
+        # ".renpy" is Ren'Py's engine data dir on Unix — not under XDG data.
+        for p in (_linux_xdg_data_home(), _linux_xdg_config_home(), home / ".renpy"):
             if p.exists():
                 roots.append(p)
         if appid:
@@ -1125,6 +1270,49 @@ def _get_common_save_roots(appid: str = "") -> list[Path]:
             if p.exists():
                 roots.append(p)
     return roots
+
+
+class _XdgRootGrowthHandler:
+    """Non-recursive watch on a broad XDG home: pick up new top-level dirs.
+
+    When a matching / engine folder appears while the game is running, the
+    callback schedules a scoped recursive watch on it.
+    """
+
+    def __init__(
+        self,
+        identity_parts: Sequence[str],
+        on_new_dir: Callable[[Path], None],
+    ):
+        self._parts = [p for p in identity_parts if len(p) > 2]
+        self._on_new_dir = on_new_dir
+
+    def dispatch(self, event):
+        self.on_any_event(event)
+
+    def on_any_event(self, event):
+        if not getattr(event, "is_directory", False):
+            return
+        ev = getattr(event, "event_type", "") or ""
+        # created / moved into the XDG home
+        if ev not in ("created", "moved", "moved_to"):
+            return
+        path_str = getattr(event, "dest_path", None) or getattr(
+            event, "src_path", None,
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            if not path.is_dir():
+                return
+        except OSError:
+            return
+        name_l = path.name.lower()
+        if name_l in _LINUX_ENGINE_TOP_DIRS or _name_matches_identity(
+            path.name, self._parts,
+        ):
+            self._on_new_dir(path)
 
 
 class _CommonRootSaveHandler:
@@ -1265,7 +1453,7 @@ class SaveWatcher(QObject):
                     logger.debug(f"Watching: {path}")
                     self._initialize_backed_up_files(path)
                 except Exception as e:
-                    logger.warning(f"Could not watch {path}: {e}")
+                    _log_watch_schedule_failure(path, e, kind="save-path")
             else:
                 # Path doesn't exist yet — watch nearest existing parent
                 self._watch_pending(game_id, path)
@@ -1322,16 +1510,31 @@ class SaveWatcher(QObject):
             common_roots = _get_common_save_roots(_appid or "")
             root_handler = _CommonRootSaveHandler(
                 game_id, game_name, self._on_save_changed, extra_terms=_identity_extra)
+            identity_parts = list(root_handler._game_name_parts)
+            growth = _XdgRootGrowthHandler(
+                identity_parts,
+                lambda p, gid=game_id, h=root_handler: (
+                    self._schedule_common_root_target(
+                        gid, p, h, recursive=True,
+                    )
+                ),
+            )
             for root in common_roots:
-                key = f"{game_id}:__root__:{root}"
-                if key not in self._watches:
-                    try:
-                        w = self._observer.schedule(root_handler, str(root), recursive=True)
-                        self._watches[key] = w
+                for target, recursive in _linux_scoped_common_watch_specs(
+                    root, identity_parts,
+                ):
+                    handler_for_target = (
+                        root_handler if recursive else growth
+                    )
+                    if self._schedule_common_root_target(
+                        game_id, target, handler_for_target,
+                        recursive=recursive,
+                    ):
                         watched_any = True
-                        logger.debug(f"Common-root watching {root} for {game_name!r}")
-                    except Exception as e:
-                        logger.debug(f"Could not watch root {root} for {game_id}: {e}")
+                        logger.debug(
+                            "Common-root watching %s for %r (recursive=%s)",
+                            target, game_name, recursive,
+                        )
 
             # The game's OWN install tree — recursive, no name-filter needed
             # (everything under it is already scoped to this one game).
@@ -1351,7 +1554,9 @@ class SaveWatcher(QObject):
                         watched_any = True
                         logger.debug(f"Install-root watching {_install_dir} for {game_name!r}")
                     except Exception as e:
-                        logger.debug(f"Could not watch install root {_install_dir} for {game_id}: {e}")
+                        _log_watch_schedule_failure(
+                            _install_dir, e, kind="install-root",
+                        )
 
         if not watched_any:
             logger.debug(f"No existing save paths for {game_id}; watching for folder creation")
@@ -1519,6 +1724,33 @@ class SaveWatcher(QObject):
 
             _DISCOVERED_SAVE_FILES.difference_update(remove_discovered)
 
+    def _schedule_common_root_target(
+        self,
+        game_id: str,
+        target: Path,
+        handler,
+        *,
+        recursive: bool = True,
+    ) -> bool:
+        """Schedule a common-root (or XDG probe) watch. Returns True if added."""
+        if not self._observer:
+            return False
+        kind = "recursive" if recursive else "shallow"
+        key = f"{game_id}:__root__:{kind}:{target}"
+        if key in self._watches:
+            return False
+        try:
+            w = self._observer.schedule(
+                handler, str(target), recursive=recursive,
+            )
+            self._watches[key] = w
+            return True
+        except Exception as e:
+            _log_watch_schedule_failure(
+                target, e, kind=f"common-root/{kind}",
+            )
+            return False
+
     def unwatch_game(self, game_id: str):
         if not self._observer:
             return
@@ -1550,7 +1782,17 @@ class SaveWatcher(QObject):
         logger.debug(f"Cleaned up patterns for game {game_id}")
 
     def update_game_paths(self, game_id: str, save_paths: list[str]):
-        self.watch_game(game_id, save_paths)
+        # Preserve game_name so Linux XDG scoping / name filters stay active
+        # when the library updates paths mid-session.
+        name = ""
+        try:
+            from core.library import get_library
+            entry = get_library().get_by_id(game_id)
+            if entry is not None:
+                name = entry.name or ""
+        except Exception:
+            pass
+        self.watch_game(game_id, save_paths, game_name=name)
 
     # ── Thread → GUI marshallers ──────────────────────────────────────────────
 

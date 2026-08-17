@@ -5,6 +5,7 @@ Widget access is guarded via ui.helpers.safe_widget to avoid C++ deleted
 object crashes.
 """
 from datetime import datetime
+import logging
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
@@ -14,13 +15,15 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.helpers import safe_widget as _safe
+from ui.helpers import PageScrollMixin, safe_widget as _safe, scaled
 from ui.styles.theme import palette, ThemedMixin
 from core.config_manager import get_config
 from core.library import get_library
 from core.backup import get_backup_manager
 from core.monitor import get_monitor
 from sync import get_orchestrator
+
+logger = logging.getLogger(__name__)
 
 
 class StatCard(QFrame, ThemedMixin):
@@ -44,21 +47,32 @@ class StatCard(QFrame, ThemedMixin):
                 border: 1px solid {palette('border')};
                 border-top: 2px solid {palette(self._accent_key)};
                 border-radius: 8px;
-                min-width: 120px;
             }}
         """)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(4)
+        layout.setContentsMargins(scaled(10, self), scaled(8, self), scaled(10, self), scaled(8, self))
+        layout.setSpacing(2)
+        self.setMinimumWidth(scaled(85, self, min_px=70))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         val_lbl = QLabel(value)
-        self._sty(val_lbl, lambda: f"color: {palette(self._accent_key)}; font-size: 26px; font-weight: 700; background: transparent;")
         val_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        val_lbl.setWordWrap(False)
+        self._val_lbl = val_lbl
+        self.set_stat_value(value)
+
         lbl = QLabel(label)
         lbl.setObjectName("stat_label")
+        lbl.setWordWrap(True)
+        self._sty(lbl, lambda: f"color: {palette('text_muted')}; font-size: {scaled(10, self, min_px=9)}px; font-weight: 600; background: transparent;")
         layout.addWidget(val_lbl)
         layout.addWidget(lbl)
-        self._val_lbl = val_lbl
-        self._lbl     = lbl
+        self._lbl = lbl
+
+    def set_stat_value(self, val: str):
+        self._val_lbl.setText(val)
+        fs = scaled(16, self, min_px=14) if len(str(val)) > 5 else scaled(20, self, min_px=17)
+        self._sty(self._val_lbl, lambda: f"color: {palette(self._accent_key)}; font-size: {fs}px; font-weight: 700; background: transparent;")
+
 
 
 class ActivityRow(QFrame, ThemedMixin):
@@ -70,12 +84,12 @@ class ActivityRow(QFrame, ThemedMixin):
     re-apply here.
     """
 
-    def __init__(self, icon: str, title: str, subtitle: str, time_str: str):
+    def __init__(self, icon: str, title: str, subtitle: str, time_str: str, tooltip: str = ""):
         super().__init__()
         self.setObjectName("activity_row")
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 8, 0, 8)
-        row.setSpacing(12)
+        row.setContentsMargins(0, 4, 0, 4)
+        row.setSpacing(8)
 
         icon_lbl = QLabel(icon)
         icon_lbl.setObjectName("activity_icon")
@@ -86,14 +100,16 @@ class ActivityRow(QFrame, ThemedMixin):
         text_col.setSpacing(2)
         title_lbl = QLabel(title)
         title_lbl.setObjectName("activity_title")
-        title_lbl.setMinimumWidth(60)
+        title_lbl.setMinimumWidth(scaled(50, self))
         # Elide long titles with "…" instead of disappearing
         title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        title_lbl.setWordWrap(True)
 
         sub_lbl = QLabel(subtitle)
         sub_lbl.setObjectName("activity_sub")
-        sub_lbl.setMinimumWidth(60)
+        sub_lbl.setMinimumWidth(scaled(50, self))
         sub_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        sub_lbl.setWordWrap(True)
 
         text_col.addWidget(title_lbl)
         text_col.addWidget(sub_lbl)
@@ -102,11 +118,15 @@ class ActivityRow(QFrame, ThemedMixin):
         time_lbl = QLabel(time_str)
         time_lbl.setObjectName("activity_time")
         time_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        time_lbl.setMinimumWidth(40)
+        time_lbl.setMinimumWidth(scaled(30, self))
         time_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
         row.addWidget(time_lbl)
         # Expose label for live timestamp refresh without full rebuild
         self._ts_lbl = time_lbl
+
+        if tooltip:
+            self.setToolTip(tooltip)
+            time_lbl.setToolTip(tooltip)
 
 
 class SyncDonutChart(QWidget, ThemedMixin):
@@ -121,40 +141,61 @@ class SyncDonutChart(QWidget, ThemedMixin):
         super().__init__(parent)
         self._data: list[tuple[str, int, str]] = []  # [(label, count, color_key), ...]
         self._total = 0
-        self.setMinimumSize(180, 200)
+        self.setMinimumSize(scaled(130, self, min_px=100), scaled(100, self, min_px=80))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Charts are fully painted by us — skip Qt's background fill.
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     def set_data(self, data: list[tuple[str, int, str]]):
         # Third element is a palette KEY (resolved in paintEvent), not a hex.
-        self._data = [(l, c, col) for l, c, col in data if c > 0]
-        self._total = sum(c for _, c, _ in self._data)
+        filtered = [(l, c, col) for l, c, col in data if c > 0]
+        total = sum(c for _, c, _ in filtered)
+        if filtered == self._data and total == self._total:
+            return
+        self._data = filtered
+        self._total = total
         self.update()
 
     def refresh_styles(self):
         # Colours are read live from palette() in paintEvent, so a repaint is
         # all that's needed to pick up the new theme.
         super().refresh_styles()
+        self.setMinimumSize(scaled(130, self, min_px=100), scaled(100, self, min_px=80))
         self.update()
 
     def paintEvent(self, event):
-        if not self._data or self._total == 0:
-            return
         if self.width() < 2 or self.height() < 2:
             return
         painter = QPainter(self)
         if not painter.isActive():
             return
+        painter.fillRect(self.rect(), QColor(palette('bg_card')))
+        if not self._data or self._total == 0:
+            painter.end()
+            return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w, h = self.width(), self.height()
-        legend_h = len(self._data) * 18 + 8
-        chart_size = min(w - 16, h - legend_h - 8, 160)
-        if chart_size < 40:
+        item_spacing = scaled(17, self, min_px=14)
+        legend_h = len(self._data) * item_spacing
+        gap = scaled(8, self, min_px=4)
+        # Responsive sizing: expands smoothly with window width and height
+        avail_diam = min(w - scaled(16, self), h - legend_h - gap - scaled(6, self))
+        chart_size = max(scaled(75, self, min_px=65),
+                         min(avail_diam, scaled(220, self, min_px=120)))
+        thickness = max(int(chart_size // 5.5), 7)
+        ring_room = chart_size - thickness
+
+        if ring_room < scaled(35, self) or (h - legend_h < scaled(35, self)):
+            self._draw_legend_only(painter, h, legend_h, item_spacing)
             painter.end()
             return
-        thickness = max(chart_size // 5, 10)
+
+        total_block = chart_size + gap + legend_h
+        top_y = max(2.0, (h - total_block) / 2)
         cx = w / 2
-        cy = (h - legend_h) / 2
-        rect = QRectF(cx - chart_size / 2, cy - chart_size / 2, chart_size, chart_size)
+        cy = top_y + chart_size / 2
+        rect = QRectF(cx - ring_room / 2, cy - ring_room / 2, ring_room, ring_room)
 
         start = 90 * 16  # start at top (Qt uses 1/16th degrees, clockwise negative)
         for _, count, color_key in self._data:
@@ -168,31 +209,69 @@ class SyncDonutChart(QWidget, ThemedMixin):
         # Center text
         painter.setPen(QColor(palette('text')))
         font = QFont()
-        font.setPixelSize(max(chart_size // 5, 14))
+        font.setPixelSize(max(int(ring_room // 5), scaled(13, self, min_px=11)))
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(self._total))
 
-        font.setPixelSize(max(chart_size // 8, 9))
+        font.setPixelSize(max(int(ring_room // 8), scaled(9, self, min_px=8)))
         font.setBold(False)
         painter.setFont(font)
         painter.setPen(QColor(palette('text_muted')))
-        label_rect = QRectF(rect.x(), rect.y() + chart_size // 4, rect.width(), rect.height())
+        label_rect = QRectF(rect.x(), rect.y() + ring_room // 4, rect.width(), rect.height())
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, t('overview.chart_total'))
 
-        # Legend
-        ly = h - legend_h + 4
-        font.setPixelSize(11)
+        # Legend: positioned directly below the donut ring and follows it dynamically
+        ly = top_y + chart_size + gap
+        font.setPixelSize(scaled(11, self, min_px=10))
         painter.setFont(font)
         for label, count, color_key in self._data:
+            if ly + scaled(12, self) > h:
+                break
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(palette(color_key)))
-            painter.drawEllipse(int(8), int(ly + 2), 8, 8)
+            painter.drawEllipse(int(scaled(8, self)), int(ly + scaled(3, self)),
+                                scaled(8, self), scaled(8, self))
+            avail_w = w - scaled(32, self)
+            count_str = str(count)
+            count_w = painter.fontMetrics().horizontalAdvance(count_str)
+            label_max_w = max(20, avail_w - count_w - scaled(6, self))
+            elided_label = painter.fontMetrics().elidedText(
+                label, Qt.TextElideMode.ElideRight, int(label_max_w))
             painter.setPen(QColor(palette('text_secondary')))
-            painter.drawText(22, int(ly + 11), f"{label}  {count}")
-            ly += 18
+            painter.drawText(int(scaled(22, self)), int(ly + scaled(11, self)), elided_label)
+            painter.drawText(int(w - scaled(10, self) - count_w), int(ly + scaled(11, self)), count_str)
+            ly += item_spacing
 
         painter.end()
+
+    def _draw_legend_only(self, painter, h: int, legend_h: int, item_spacing: int = 17):
+        """Fallback when the ring cannot fit: just the legend."""
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if legend_h > h - 4:
+            painter.setClipRect(self.rect())
+        ly = max(4, h - legend_h + 4)
+        font = QFont()
+        font.setPixelSize(scaled(11, self, min_px=10))
+        painter.setFont(font)
+        w = self.width()
+        for label, count, color_key in self._data:
+            if ly + scaled(12, self) > h:
+                break
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(palette(color_key)))
+            painter.drawEllipse(int(scaled(8, self)), int(ly + scaled(3, self)),
+                                scaled(8, self), scaled(8, self))
+            avail_w = w - scaled(32, self)
+            count_str = str(count)
+            count_w = painter.fontMetrics().horizontalAdvance(count_str)
+            label_max_w = max(20, avail_w - count_w - scaled(6, self))
+            elided_label = painter.fontMetrics().elidedText(
+                label, Qt.TextElideMode.ElideRight, int(label_max_w))
+            painter.setPen(QColor(palette('text_secondary')))
+            painter.drawText(int(scaled(22, self)), int(ly + scaled(11, self)), elided_label)
+            painter.drawText(int(w - scaled(10, self) - count_w), int(ly + scaled(11, self)), count_str)
+            ly += item_spacing
 
 
 class BackupBarChart(QWidget, ThemedMixin):
@@ -209,14 +288,19 @@ class BackupBarChart(QWidget, ThemedMixin):
         self._max_val = 0
         # Per-column hover hit regions built during paint: (x_left, x_right, tip)
         self._hit_regions: list[tuple[float, float, str]] = []
-        self.setMinimumHeight(110)
-        self.setMaximumHeight(130)
+        self.setMinimumHeight(scaled(115, self, min_px=95))
+        self.setMinimumWidth(scaled(240, self, min_px=180))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # Enable per-day hover tooltips showing the backup count for that day.
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     def set_data(self, bars: list[tuple]):
         # (label, count, tooltip); a missing tooltip defaults to "".
-        self._bars = [(b[0], int(b[1]), b[2] if len(b) > 2 else "") for b in bars]
+        normalized = [(b[0], int(b[1]), b[2] if len(b) > 2 else "") for b in bars]
+        if normalized == self._bars:
+            return
+        self._bars = normalized
         self._max_val = max((c for _, c, _ in self._bars), default=0)
         self._hit_regions = []   # rebuilt on next paint — avoid stale tooltips
         self.update()
@@ -224,6 +308,8 @@ class BackupBarChart(QWidget, ThemedMixin):
     def refresh_styles(self):
         # Colours are read live from palette() in paintEvent — repaint to re-theme.
         super().refresh_styles()
+        self.setMinimumHeight(scaled(115, self, min_px=95))
+        self.setMinimumWidth(scaled(240, self, min_px=180))
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -244,19 +330,21 @@ class BackupBarChart(QWidget, ThemedMixin):
         super().mouseMoveEvent(event)
 
     def paintEvent(self, event):
-        if not self._bars:
-            return
         if self.width() < 2 or self.height() < 2:
             return
         painter = QPainter(self)
         if not painter.isActive():
             return
+        painter.fillRect(self.rect(), QColor(palette('bg_card')))
+        if not self._bars:
+            painter.end()
+            return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w, h = self.width(), self.height()
-        margin_bottom = 22
-        margin_top = 8
-        bar_area_h = h - margin_bottom - margin_top
+        margin_bottom = scaled(20, self, min_px=16)
+        margin_top = scaled(22, self, min_px=18)
+        bar_area_h = max(20.0, h - margin_bottom - margin_top)
         n = len(self._bars)
         gap = 6
         bar_w = max((w - gap * (n + 1)) / n, 8)
@@ -265,6 +353,12 @@ class BackupBarChart(QWidget, ThemedMixin):
 
         self._hit_regions = []
         for i, (label, count, tip) in enumerate(self._bars):
+            # When the window narrows the bars shrink too: keep the day labels
+            # readable by abbreviating them rather than letting them overlap
+            # and "eat" each other (same rule as the donut's legend fallback).
+            day_label = label
+            if bar_w < scaled(30, self) and len(day_label) > 3:
+                day_label = day_label[:3] + "…"
             x = gap + i * (bar_w + gap)
             # Whole-column hover region (centred on the bar, spanning the gap)
             # so hovering anywhere in a day's column shows its tooltip.
@@ -286,27 +380,32 @@ class BackupBarChart(QWidget, ThemedMixin):
             if count > 0:
                 painter.setPen(QColor(palette('text_secondary')))
                 font = QFont()
-                font.setPixelSize(9)
+                font.setPixelSize(scaled(10, self, min_px=9))
                 font.setBold(True)
                 painter.setFont(font)
-                painter.drawText(QRectF(x, y - 14, bar_w, 14),
+                cnt_h = scaled(15, self, min_px=12)
+                cnt_y = max(2.0, y - cnt_h - 1)
+                painter.drawText(QRectF(x - 2, cnt_y, bar_w + 4, cnt_h),
                                  Qt.AlignmentFlag.AlignCenter, str(count))
-
             # Day label
             painter.setPen(muted)
             font = QFont()
-            font.setPixelSize(9)
+            font.setPixelSize(scaled(9, self, min_px=8))
             painter.setFont(font)
-            painter.drawText(QRectF(x, h - margin_bottom + 2, bar_w, margin_bottom),
-                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, label)
+            painter.drawText(QRectF(x - 2, h - margin_bottom + 2, bar_w + 4, margin_bottom),
+                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, day_label)
 
         painter.end()
 
 
-class OverviewPage(QWidget, ThemedMixin):
+class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
+    _REFRESH_COOLDOWN_S = 60.0  # full wipe+rebuild once per minute max
+
     backup_requested = Signal(str)
+    backup_all_requested = Signal(object)  # list[str] game ids
     open_library     = Signal()
     open_sync        = Signal()
+    refresh_all_requested = Signal()  # wipe + re-pump every open page
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -317,24 +416,68 @@ class OverviewPage(QWidget, ThemedMixin):
         self._ts_timer = QTimer(self)
         self._ts_timer.setInterval(60_000)
         self._ts_timer.timeout.connect(self._refresh_timestamps_only)
-        self._activity_cache_key = None  # (game_count, backup_count) — skip re-sort if unchanged
+        # Coalesce bursty library/sync signals into one refresh.
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(350)
+        self._debounce.timeout.connect(self.refresh)
+        self._dirty_while_hidden = False
+        self._activity_cache_key = None  # skip activity rebuild if unchanged
+        # A full wipe+rebuild while a game is running would fight the game's
+        # file writes (and the overlay-based entry point makes that easy to
+        # hit), so the refresh button is disabled in-game. The monitor already
+        # tracks this and emits game_launched/game_exited — no polling needed;
+        # the initial check in _build() covers an app opened while a game was
+        # already running (e.g. from the overlay).
+        self._in_game = False
         # Provider-label colour depends on online state; read by _provider_style()
         # (registered once in _build_body and re-applied on refresh/theme switch).
         self._provider_online = False
         self._build()
         self._connect_signals()
+        # Warm data while hidden; the visible enter refresh is deferred so the
+        # page can paint first.
         self.refresh()
+
+    def schedule_refresh(self):
+        """Debounced refresh; no-op work while the page is hidden."""
+        if not self.isVisible():
+            self._dirty_while_hidden = True
+            return
+        # Backup Tutti and Sync Tutti run under library begin_bulk /
+        # orchestrator batch: per-entry signals would rebuild the activity
+        # list once per game (partial rows + wasted CPU). bulk_finished /
+        # batch_finished refresh once at the end instead.
+        try:
+            if get_library()._in_bulk() or get_orchestrator()._sync_batch:
+                return
+        except Exception:
+            pass
+        self._debounce.start()
+
+    def refresh_on_enter(self):
+        """Refresh after the page is already visible (non-blocking).
+
+        Every enter — the first show (app open) included — runs the refresh
+        silently: no please-wait, the page stays fully interactive and the
+        data lands when it's ready. The refresh itself only reads lightweight
+        indexes and rebuilds at most five activity rows, so there is nothing
+        a busy sheet would be covering.
+        """
+        QTimer.singleShot(0, self.refresh)
 
     def _connect_signals(self):
         """Connect to library and sync signals for immediate refresh."""
-        self._on_game_added = lambda _: self.refresh()
-        self._on_game_removed = lambda _: self.refresh()
-        self._on_backup_created = lambda _: self.refresh()
-        self._on_sync_finished = lambda *_: self.refresh()
+        self._on_game_added = lambda _: self.schedule_refresh()
+        self._on_game_removed = lambda _: self.schedule_refresh()
+        self._on_bulk_finished = lambda: self.schedule_refresh()
+        self._on_backup_created = self._on_backup_created_refresh
+        self._on_sync_finished = lambda *_: self.schedule_refresh()
         try:
-            get_library().game_updated.connect(self.refresh)
+            get_library().game_updated.connect(self.schedule_refresh)
             get_library().game_added.connect(self._on_game_added)
             get_library().game_removed.connect(self._on_game_removed)
+            get_library().bulk_finished.connect(self._on_bulk_finished)
         except Exception:
             pass
         try:
@@ -344,17 +487,38 @@ class OverviewPage(QWidget, ThemedMixin):
         try:
             orch = get_orchestrator()
             orch.sync_finished.connect(self._on_sync_finished)
-            orch.providers_updated.connect(self.refresh)
+            orch.batch_finished.connect(self.schedule_refresh)
+            orch.providers_updated.connect(self.schedule_refresh)
+        except Exception:
+            pass
+        # In-game state comes from the monitor's own signals (the same
+        # game_launched/game_exited the library page listens to).
+        try:
+            mon = get_monitor()
+            mon.game_launched.connect(lambda *_: self._update_in_game_state())
+            mon.game_exited.connect(lambda *_: self._update_in_game_state())
+            mon.unknown_game_detected.connect(lambda *_: self._update_in_game_state())
+            mon.unknown_game_exited.connect(lambda *_: self._update_in_game_state())
         except Exception:
             pass
 
+    def _on_backup_created_refresh(self, _entry=None):
+        # Backup Tutti runs under library begin_bulk — skip per-zip refreshes.
+        try:
+            if get_library()._in_bulk():
+                return
+        except Exception:
+            pass
+        self.schedule_refresh()
+
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(32, 28, 32, 28)
-        root.setSpacing(24)
+        root.setContentsMargins(scaled(20, self, min_px=14), scaled(14, self, min_px=8), scaled(20, self, min_px=14), scaled(14, self, min_px=8))
+        root.setSpacing(scaled(8, self, min_px=4))
 
         # Header
         header = QHBoxLayout()
+        header.setSpacing(scaled(8, self, min_px=4))
         self._header = QLabel(t("overview.title"))
         self._header.setObjectName("page_header")
         header.addWidget(self._header)
@@ -362,7 +526,7 @@ class OverviewPage(QWidget, ThemedMixin):
         self._refresh_btn = QPushButton(t("buttons.refresh_icon"))
         self._refresh_btn.setObjectName("icon_btn")
         self._refresh_btn.setToolTip(t("tooltips.refresh"))
-        self._refresh_btn.clicked.connect(self.refresh)
+        self._refresh_btn.clicked.connect(self._on_refresh_clicked)
         header.addWidget(self._refresh_btn)
         root.addLayout(header)
 
@@ -372,8 +536,8 @@ class OverviewPage(QWidget, ThemedMixin):
         self._active_banner.setObjectName("active_banner")
         self._update_banner_style()
         bl = QHBoxLayout(self._active_banner)
-        bl.setContentsMargins(16, 12, 16, 12)
-        bl.setSpacing(12)
+        bl.setContentsMargins(scaled(12, self, min_px=8), scaled(6, self, min_px=4), scaled(12, self, min_px=8), scaled(6, self, min_px=4))
+        bl.setSpacing(scaled(8, self, min_px=4))
         self._active_icon = QLabel("\U0001f3ae")
         self._active_icon.setObjectName("active_game_icon")
         self._active_name = QLabel(t("overview.no_active_game"))
@@ -393,7 +557,24 @@ class OverviewPage(QWidget, ThemedMixin):
         bl.addWidget(self._active_backup_btn)
         root.addWidget(self._active_banner)
 
-        self._build_body(root)
+        # Body scrolls only when the stack viewport cannot fit the dashboard
+        # (resize-first — same rule as dialogs).
+        self._page_scroll = QScrollArea()
+        self._page_scroll.setWidgetResizable(True)
+        self._page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        body_host = QWidget()
+        body_host.setObjectName("transparent_bg")
+        body_lay = QVBoxLayout(body_host)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(12)
+        self._build_body(body_lay)
+        self._page_scroll.setWidget(body_host)
+        root.addWidget(self._page_scroll, 1)
+        self._register_page_scroll(self._page_scroll)
+        if hasattr(self, "_activity_scroll"):
+            self._register_page_scroll(self._activity_scroll, list_content=True)
 
     def _update_banner_style(self):
         """Nothing to do: #active_banner (gradient, border, accent edge) is
@@ -402,7 +583,7 @@ class OverviewPage(QWidget, ThemedMixin):
     def _provider_style(self) -> str:
         """Provider-label style — colour depends on the current online state."""
         key = 'accent' if self._provider_online else 'text_muted'
-        return f"color:{palette(key)};font-size:11px;padding:4px;"
+        return f"color:{palette(key)};font-size:{scaled(11, self)}px;padding:4px;"
 
     def refresh_styles(self):
         """Re-apply every inline, palette-dependent style IN PLACE for the current
@@ -439,26 +620,61 @@ class OverviewPage(QWidget, ThemedMixin):
                     except RuntimeError:
                         pass  # underlying C++ widget deleted mid-cascade — skip
 
+    def _remediate_page_scrolls(self):
+        """Re-mediate scroll policies after DPI scale changes to maintain proportions."""
+        try:
+            # Update chart dimensions to maintain proportions
+            if _safe(self._donut_chart):
+                self._donut_chart.setMinimumSize(
+                    scaled(130, self, min_px=100), scaled(100, self, min_px=80))
+                self._donut_chart.updateGeometry()
+            if _safe(self._bar_chart):
+                self._bar_chart.setMinimumHeight(scaled(115, self, min_px=95))
+                self._bar_chart.setMaximumHeight(scaled(175, self, min_px=130))
+                self._bar_chart.setMinimumWidth(scaled(240, self, min_px=180))
+                self._bar_chart.updateGeometry()
+            if _safe(self._activity_scroll):
+                self._activity_scroll.setMinimumWidth(scaled(130, self, min_px=110))
+                self._activity_scroll.setMinimumHeight(scaled(100, self, min_px=80))
+                self._activity_scroll.updateGeometry()
+            for btn, _ in getattr(self, "_action_btns", []):
+                if _safe(btn):
+                    btn.setMinimumWidth(scaled(135, self, min_px=120))
+                    btn.updateGeometry()
+            # Update stat cards to maintain proportions
+            for card in (self._card_games, self._card_backups,
+                         self._card_synced, self._card_playtime):
+                if _safe(card):
+                    card.setMinimumWidth(scaled(65, self, min_px=55))
+                    card.updateGeometry()
+            
+            # Trigger layout recalculation
+            if hasattr(self, 'layout') and self.layout():
+                self.layout().activate()
+                self.layout().update()
+        except Exception:
+            pass
+
     def _build_body(self, root):
         """Continuation of _build — stat cards, charts, activity, actions."""
         # Stat cards
         cards_row = QHBoxLayout()
-        cards_row.setSpacing(12)
+        cards_row.setSpacing(8)
         self._card_games   = StatCard("0", t("overview.stat_games"),    "accent",  card_key="games")
         self._card_backups = StatCard("0", t("overview.stat_backups"),  "info",    card_key="backups")
         self._card_synced  = StatCard("0", t("overview.stat_synced"),   "cloud",   card_key="sync")
         self._card_playtime = StatCard("0", t("overview.stat_playtime"), "warning", card_key="playtime")
         for c in (self._card_games, self._card_backups, self._card_synced, self._card_playtime):
             cards_row.addWidget(c, 1)
-        root.addLayout(cards_row)
+        root.addLayout(cards_row, 0)
 
         # Body — 3 columns: activity | donut | actions
         body = QHBoxLayout()
-        body.setSpacing(16)
+        body.setSpacing(10)
 
         # Column 1: recent activity (stretches)
         activity_col = QVBoxLayout()
-        activity_col.setSpacing(8)
+        activity_col.setSpacing(6)
         self._activity_header = QLabel(t("overview.recent_activity"))
         self._activity_header.setObjectName("section_header")
         activity_col.addWidget(self._activity_header)
@@ -467,35 +683,30 @@ class OverviewPage(QWidget, ThemedMixin):
         self._activity_frame.setFrameShape(QFrame.Shape.NoFrame)
         self._activity_frame.setObjectName("panel_card")
         self._activity_layout = QVBoxLayout(self._activity_frame)
-        self._activity_layout.setContentsMargins(12, 8, 12, 8)
+        self._activity_layout.setContentsMargins(8, 6, 8, 6)
         self._activity_layout.setSpacing(0)
         self._activity_empty = QLabel(t("overview.no_activity"))
         self._activity_empty.setObjectName("empty_hint")
         self._activity_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # NO setVisible(True) here: the label has no parent yet, so it
-        # would be SHOWN AS A TOP-LEVEL WINDOW for one frame (the startup
-        # flash at screen centre). Once added to the layout below it is
-        # visible with its parent anyway; refresh() manages it from there.
         self._activity_layout.addWidget(self._activity_empty)
 
         # Wrap in a QScrollArea so rows are never crushed/hidden when the window
         # is made narrow — the panel scrolls vertically and never clips content.
-        activity_scroll = QScrollArea()
-        activity_scroll.setWidgetResizable(True)
-        activity_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        activity_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        activity_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        activity_scroll.setObjectName("activity_scroll")
-        activity_scroll.setWidget(self._activity_frame)
-        # Minimum width keeps the column readable at small window sizes
-        activity_scroll.setMinimumWidth(260)
+        self._activity_scroll = QScrollArea()
+        self._activity_scroll.setWidgetResizable(True)
+        self._activity_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._activity_scroll.setObjectName("activity_scroll")
+        self._activity_scroll.setWidget(self._activity_frame)
+        self._activity_scroll.setMinimumWidth(scaled(130, self, min_px=110))
+        self._activity_scroll.setMinimumHeight(scaled(100, self, min_px=80))
+        self._activity_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        activity_col.addWidget(activity_scroll, 1)
-        body.addLayout(activity_col, 2)   # weight 2: activity gets more space than donut/actions
+        activity_col.addWidget(self._activity_scroll, 1)
+        body.addLayout(activity_col, 5)
 
-        # Column 2: donut chart (fixed width)
+        # Column 2: donut chart
         donut_col = QVBoxLayout()
-        donut_col.setSpacing(4)
+        donut_col.setSpacing(6)
         donut_header = QLabel(t("overview.sync_distribution"))
         donut_header.setObjectName("section_header")
         donut_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -503,13 +714,14 @@ class OverviewPage(QWidget, ThemedMixin):
         self._donut_header = donut_header
 
         self._donut_chart = SyncDonutChart()
-        self._donut_chart.setMinimumWidth(160)
+        self._donut_chart.setMinimumSize(scaled(130, self, min_px=100), scaled(100, self, min_px=80))
+        self._donut_chart.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         donut_col.addWidget(self._donut_chart, 1)
-        body.addLayout(donut_col, 1)
+        body.addLayout(donut_col, 4)
 
-        # Column 3: quick actions (fixed width)
+        # Column 3: quick actions
         actions_col = QVBoxLayout()
-        actions_col.setSpacing(8)
+        actions_col.setSpacing(6)
         self._actions_header = QLabel(t("overview.quick_actions"))
         self._actions_header.setObjectName("section_header")
         actions_col.addWidget(self._actions_header)
@@ -522,46 +734,131 @@ class OverviewPage(QWidget, ThemedMixin):
         ]:
             btn = QPushButton(t(label_key))
             self._action_btns.append((btn, label_key))
-            btn.setMinimumHeight(34)
-            btn.setFixedWidth(160)
+            btn.setMinimumHeight(scaled(32, self))
+            btn.setMinimumWidth(scaled(135, self, min_px=120))
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setObjectName("quick_action_btn")
             btn.clicked.connect(cb)
             actions_col.addWidget(btn)
 
         self._provider_lbl = QLabel()
-        self._provider_lbl.setFixedWidth(160)
-        # Colour tracks online/offline state (self._provider_online); registered
-        # once so refresh_styles() re-applies the CURRENT state with the new theme.
+        self._provider_lbl.setMinimumWidth(scaled(135, self, min_px=120))
         self._sty(self._provider_lbl, self._provider_style)
+
         self._provider_lbl.setWordWrap(True)
         actions_col.addWidget(self._provider_lbl)
-        actions_col.addStretch()
-        body.addLayout(actions_col)
 
-        root.addLayout(body, 1)
+        # Transient feedback for the quick actions ("nothing to sync" etc.):
+        # appears for a few seconds under the buttons, then hides itself.
+        self._sync_feedback_lbl = QLabel("")
+        self._sync_feedback_lbl.setWordWrap(True)
+        self._sync_feedback_lbl.setVisible(False)
+        self._sty(self._sync_feedback_lbl,
+                  lambda: f"color:{palette('success')};font-size:{scaled(11, self)}px;")
+        actions_col.addWidget(self._sync_feedback_lbl)
+        actions_col.addStretch(1)
+        body.addLayout(actions_col, 3)
+
+        root.addLayout(body, 3)
 
         # Backup activity bar chart (full width, below body)
         bar_header = QLabel(t("overview.backup_activity"))
         bar_header.setObjectName("section_header")
+        bar_header.setContentsMargins(0, scaled(4, self, min_px=2), 0, scaled(2, self, min_px=1))
         self._bar_header = bar_header
-        root.addWidget(bar_header)
+        root.addWidget(bar_header, 0)
 
         self._bar_chart = BackupBarChart()
         self._bar_chart.setObjectName("panel_card")
-        root.addWidget(self._bar_chart)
+        self._bar_chart.setMinimumHeight(scaled(115, self, min_px=95))
+        self._bar_chart.setMaximumHeight(scaled(175, self, min_px=130))
+        self._bar_chart.setMinimumWidth(scaled(240, self, min_px=180))
+        self._bar_chart.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        root.addWidget(self._bar_chart, 1)
+
+        # Initial in-game state without waiting for the first poll tick
+        # (app opened from the overlay while a game is running).
+        self._update_in_game_state()
 
     # ── Refresh ───────────────────────────────────────────────────────────────
+
+    def _on_refresh_clicked(self):
+        """Refresh the dashboard data AND ask the window to wipe every other
+        page: their next visit re-runs the async chunk pump (the refresh
+        button was previously wired to data-only refresh, which the library
+        signals already drive). Cooldown: once per 60 s — rebuilding every
+        page on every click would thrash the UI. In-game: disabled entirely
+        (a wipe while the game is writing its saves could corrupt files)."""
+        if self._in_game:
+            return
+        from time import monotonic
+        now = monotonic()
+        remaining = self._REFRESH_COOLDOWN_S - (now - getattr(self, "_last_refresh_mono", 0.0))
+        if remaining > 0:
+            self._show_cooldown_toast(int(remaining) + 1)
+            return
+        self._last_refresh_mono = now
+
+        from ui.widgets.busy_overlay import DeferredBusy
+        self._refresh_busy = DeferredBusy(self, t("common.please_wait"), delay_ms=0)
+
+        # RAM cleanup: purge image/cover/editor caches, run GC and trim working set memory
+        try:
+            from ui.helpers import trim_process_memory
+            trim_process_memory()
+        except Exception:
+            pass
+
+        try:
+            self.refresh()
+            self.refresh_all_requested.emit()
+        finally:
+            QTimer.singleShot(400, self._stop_refresh_busy)
+            from ui.helpers import trim_process_memory
+            QTimer.singleShot(250, trim_process_memory)
+
+    def _stop_refresh_busy(self):
+        if getattr(self, "_refresh_busy", None) is not None:
+            try:
+                self._refresh_busy.close()
+            except Exception:
+                pass
+            self._refresh_busy = None
+
+    def _update_in_game_state(self):
+        """Poll the process monitor: while any game is running the refresh
+        button stays disabled (see _on_refresh_clicked)."""
+        try:
+            from core.monitor import get_monitor
+            playing = bool(get_monitor().currently_playing())
+        except Exception:
+            playing = False
+        if playing == self._in_game:
+            return
+        self._in_game = playing
+        if _safe(self._refresh_btn):
+            self._refresh_btn.setEnabled(not playing)
+            self._refresh_btn.setToolTip(
+                t("tooltips.refresh_in_game" if playing else "tooltips.refresh"))
 
     def refresh(self):
         """Refresh all live data — safe to call from GUI thread only."""
         if not _safe(self._header):
             return
+        self._dirty_while_hidden = False
+        # Cancel a pending debounce so we don't double-refresh right after.
+        if self._debounce.isActive():
+            self._debounce.stop()
 
         lib   = get_library()
         games = lib.all_games()
         mgr   = get_backup_manager()
         orch  = get_orchestrator()
+        # One lock pass — no deepcopy of the full BackupEntry index.
+        snap = mgr.overview_index_snapshot()
+        bk_rows = snap["rows"]
+        all_bk = snap["count"]
 
         # Active game
         active_entries = get_monitor().currently_playing()
@@ -580,41 +877,41 @@ class OverviewPage(QWidget, ThemedMixin):
             self._active_backup_btn.setVisible(False)
 
         # Stat cards — guard each widget access in case of teardown during theme change
-        all_bk_flat = mgr.get_all_backups()
-        all_bk = len(all_bk_flat)
         if _safe(self._card_games):
-            self._card_games._val_lbl.setText(str(len(games)))
+            self._card_games.set_stat_value(str(len(games)))
         if _safe(self._card_backups):
-            self._card_backups._val_lbl.setText(str(all_bk))
+            self._card_backups.set_stat_value(str(all_bk))
         if _safe(self._card_synced):
-            self._card_synced._val_lbl.setText(
+            self._card_synced.set_stat_value(
                 str(sum(1 for g in games if g.sync_status == "synced"))
             )
         if _safe(self._card_playtime):
             total_secs = sum(g.playtime_seconds for g in games)
             hours = total_secs // 3600
             mins = (total_secs % 3600) // 60
-            self._card_playtime._val_lbl.setText(f"{hours}h {mins}m" if hours else f"{mins}m")
+            self._card_playtime.set_stat_value(f"{hours}h {mins}m" if hours else f"{mins}m")
 
         # Donut chart — sync status distribution
         if _safe(self._donut_chart):
             status_map = {"synced": 0, "pending": 0, "conflict": 0, "local_only": 0,
-                          "cloud_only": 0, "no_saves": 0, "provisional": 0}
+                          "cloud_only": 0, "no_saves": 0, "provisional": 0,
+                          "archives": 0}
             # Games with no confirmed save_paths yet but that DO have at
             # least one live-tracking-discovered provisional backup get
             # their own bucket instead of being lumped in with "no saves"
             # — there IS restorable data, the user just hasn't confirmed
             # which paths to keep yet.
-            _provisional_game_ids = {
-                b.game_id for b in get_backup_manager().get_all_backups()
-                if (b.cloud_metadata or {}).get("pre_confirmation")
-            }
+            _provisional_game_ids = snap["provisional_ids"]
             for g in games:
                 if not g.save_paths:
                     s = "provisional" if g.id in _provisional_game_ids else "no_saves"
                 else:
                     s = g.sync_status if g.sync_status in status_map else "no_saves"
                 status_map[s] += 1
+            # Backups with no library game: Aggiungi-percorso archives (pending
+            # or already synced) AND leftovers after a game was removed. Always
+            # counted — Sync Tutti still only uploads those with needs_sync.
+            status_map["archives"] = int(snap.get("orphan_unit_count") or 0)
             # Third element is a palette KEY — the donut resolves it live in
             # paintEvent, so slices re-theme on a light/dark switch (via
             # refresh_styles -> update()) without needing a data refresh.
@@ -624,6 +921,7 @@ class OverviewPage(QWidget, ThemedMixin):
                 (t("library.status_conflict"),    status_map["conflict"],    'error'),
                 (t("library.status_local_only"),  status_map["local_only"],  'info'),
                 (t("library.status_cloud_only"),  status_map["cloud_only"],  'cloud'),
+                (t("library.status_archives"),    status_map["archives"],    'archive'),
                 (t("library.status_provisional"), status_map["provisional"], 'provisional'),
                 (t("library.status_no_saves"),    status_map["no_saves"],    'text_hint'),
             ]
@@ -642,12 +940,12 @@ class OverviewPage(QWidget, ThemedMixin):
                 short = t(f"overview.{_DAY_KEYS[d.weekday()]}")
                 day_counts[iso] = 0
                 day_labels.append((iso, short))
-            for bk in all_bk_flat:
+            from core import to_local_dt
+            for _bid, _gid, created_at, _sz in bk_rows:
                 # Bucket by LOCAL date (created_at is naive UTC): a backup
                 # made at 00:30 local must count on the local day, not on
                 # the previous UTC day.
-                from core import to_local_dt
-                _bk_dt = to_local_dt(bk.created_at)
+                _bk_dt = to_local_dt(created_at)
                 if _bk_dt is not None:
                     bk_date = _bk_dt.strftime("%Y-%m-%d")
                     if bk_date in day_counts:
@@ -675,59 +973,54 @@ class OverviewPage(QWidget, ThemedMixin):
             self._provider_online = False
         self._provider_lbl.setStyleSheet(self._provider_style())
 
-        self._rebuild_activity(games, mgr, all_bk_flat)
+        self._rebuild_activity(games, bk_rows)
 
     def _refresh_timestamps_only(self):
         """Update only the relative-time labels in the activity list.
 
         Called every 60 s by _ts_timer.  Avoids a full data reload when all
-        that changed is "2 min fa" → "3 min fa".  Also invalidates the
-        activity cache key so the next full refresh sees the change.
+        that changed is "2 min fa" → "3 min fa".
         """
-        self._activity_cache_key = None   # force rebuild on next refresh()
-        # Walk existing ActivityRow widgets and update only their timestamp label
+        if not _safe(self._activity_layout):
+            return
+        from core import to_local_dt
+        from i18n import format_dt
         for i in range(self._activity_layout.count()):
             item = self._activity_layout.itemAt(i)
             w = item.widget() if item else None
             if w is None or w is self._activity_empty:
                 continue
-            # ActivityRow stores its raw timestamp in _raw_ts
             raw_ts = getattr(w, '_raw_ts', None)
             ts_lbl = getattr(w, '_ts_lbl', None)
             if raw_ts and ts_lbl and _safe(ts_lbl):
                 try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(raw_ts)
-                    ts_lbl.setText(_fmt_relative(dt))
+                    dt = to_local_dt(raw_ts)
+                    if dt is not None:
+                        ts_lbl.setText(_fmt_relative(dt))
+                        full_date_str = format_dt(dt, "%d %b %Y, %H:%M")
+                        w.setToolTip(full_date_str)
+                        ts_lbl.setToolTip(full_date_str)
                 except (ValueError, TypeError):
                     pass
 
-    def _rebuild_activity(self, games, mgr, all_backups=None):
-        """Rebuild activity rows."""
+    def _rebuild_activity(self, games, bk_rows):
+        """Rebuild activity rows from lightweight backup tuples."""
         if not _safe(self._activity_layout):
             return
 
         # Skip full rebuild if underlying data hasn't changed.
-        # Hash all backup IDs so mid-list deletions are detected
-        # (previously only the last backup was checked).
-        bk_list = all_backups if all_backups is not None else mgr.get_all_backups()
-        bk_ids_hash = hash(tuple(b.backup_id for b in bk_list)) if bk_list else 0
+        # Relative timestamps are updated in place by _refresh_timestamps_only.
+        bk_ids_hash = hash(tuple(r[0] for r in bk_rows)) if bk_rows else 0
         game_names_hash = hash(tuple(g.name for g in games)) if games else 0
         game_mod_hash = hash(tuple((g.id, g.last_played or "", g.last_synced or "") for g in games)) if games else 0
-        from datetime import datetime as _dt2
-        # Include current minute in cache key so relative timestamps ("2 min fa")
-        # are recalculated every minute even when library data hasn't changed.
-        _now_minute = _dt2.now().strftime("%Y-%m-%dT%H:%M")
-        cache_key = (len(games), len(bk_list),
+        cache_key = (len(games), len(bk_rows),
                      games[-1].id if games else "",
                      bk_ids_hash,
                      game_names_hash,
-                     game_mod_hash,
-                     _now_minute)
+                     game_mod_hash)
         if cache_key == self._activity_cache_key:
             return
         self._activity_cache_key = cache_key
-        all_backups = bk_list
 
         # Remove only non-empty-label children
         items_to_remove = []
@@ -741,19 +1034,19 @@ class OverviewPage(QWidget, ThemedMixin):
             self._activity_layout.removeWidget(w)
             w.deleteLater()
 
-        # Build events list — use pre-fetched backups
-        # all_backups is guaranteed non-None here: resolved at line 316 via bk_list
+        # bk_rows: (backup_id, game_id, created_at, size_human)
         bk_by_game: dict[str, list] = {}
-        for bk in all_backups:
-            bk_by_game.setdefault(bk.game_id, []).append(bk)
-        # Sort each game's backups by date desc and take top 2
+        for _bid, gid, created_at, size_human in bk_rows:
+            if not gid:
+                continue
+            bk_by_game.setdefault(gid, []).append((created_at, size_human))
         for gid in bk_by_game:
-            bk_by_game[gid].sort(key=lambda b: b.created_at, reverse=True)
+            bk_by_game[gid].sort(key=lambda x: x[0] or "", reverse=True)
 
         events = []
         for g in games:
-            for bk in bk_by_game.get(g.id, [])[:2]:
-                events.append(("💾", g.name, t('overview.backup_prefix') + f" {bk.size_human}", bk.created_at))
+            for created_at, size_human in bk_by_game.get(g.id, [])[:2]:
+                events.append(("💾", g.name, t('overview.backup_prefix') + f" {size_human}", created_at))
             if g.last_synced:
                 events.append(("☁", g.name, t('overview.synced_to_cloud'), g.last_synced))
             if g.last_played:
@@ -775,13 +1068,21 @@ class OverviewPage(QWidget, ThemedMixin):
         if _safe(self._activity_empty):
             self._activity_empty.setVisible(False)
 
+        from core import to_local_dt
+        from i18n import format_dt
         for icon, title, subtitle, ts in events[:5]:
             try:
-                dt   = datetime.fromisoformat(ts)
-                tstr = _fmt_relative(dt)
+                dt = to_local_dt(ts)
+                if dt is not None:
+                    tstr = _fmt_relative(dt)
+                    full_date_str = format_dt(dt, "%d %b %Y, %H:%M")
+                else:
+                    tstr = ""
+                    full_date_str = ""
             except (ValueError, TypeError):
                 tstr = ""
-            row = ActivityRow(icon, title, subtitle, tstr)
+                full_date_str = ""
+            row = ActivityRow(icon, title, subtitle, tstr, tooltip=full_date_str)
             row._raw_ts = ts   # raw ISO timestamp for live refresh
             self._activity_layout.addWidget(row)
 
@@ -793,23 +1094,44 @@ class OverviewPage(QWidget, ThemedMixin):
             self.backup_requested.emit(gid)
 
     def _backup_all(self):
-        """Emit backup requests with staggered delays to avoid UI freeze."""
+        """Enqueue Backup Tutti via MainWindow (adaptive queue + sidebar progress).
+
+        Throttled to one launch per minute (same rule as the refresh button):
+        a second click inside the window shows a cooldown toast.
+        """
+        from time import monotonic
+        now = monotonic()
+        remaining = self._REFRESH_COOLDOWN_S - (now - getattr(self, "_last_backup_all_mono", 0.0))
+        if remaining > 0:
+            self._show_cooldown_toast(int(remaining) + 1)
+            return
+        self._last_backup_all_mono = now
         games = [g for g in get_library().all_games() if g.save_paths]
-        for i, g in enumerate(games):
-            QTimer.singleShot(i * 100, lambda gid=g.id: self.backup_requested.emit(gid))
+        self.backup_all_requested.emit([g.id for g in games])
 
     def _sync_all(self):
         """Sync games that may have changes — same skip rules as Sync page.
 
         Unchanged games are left alone so library cards / recent activity are
         not stamped for empty up/down runs. The Sync page history still logs
-        any run that does go out.
+        any run that does go out. Orphan Aggiungi-percorso archives are
+        included too (cloud folder = index game_name).
+
+        Throttled to one launch per minute, like Backup Tutti / refresh.
         """
         orch = get_orchestrator()
         if not orch.is_online():
             return
+        from time import monotonic
+        now = monotonic()
+        remaining = self._REFRESH_COOLDOWN_S - (now - getattr(self, "_last_sync_all_mono", 0.0))
+        if remaining > 0:
+            self._show_cooldown_toast(int(remaining) + 1)
+            return
+        self._last_sync_all_mono = now
         from core.backup import get_backup_manager
         bm = get_backup_manager()
+        jobs = []
         for g in get_library().all_games():
             if not g.save_paths:
                 continue
@@ -822,36 +1144,99 @@ class OverviewPage(QWidget, ThemedMixin):
                         continue
                 elif not g._saves_changed_since_sync():
                     continue
-            orch.sync_game(
-                g.id, g.name, g.save_paths,
-                exe_path=g.exe_path,
-                computed_folder_name=g.computed_folder_name,
-            )
+            jobs.append({
+                "game_id": g.id,
+                "game_name": g.name,
+                "save_paths": list(g.save_paths or []),
+                "exe_path": g.exe_path or "",
+                "computed_folder_name": g.computed_folder_name or "",
+                "name_history": list(g.name_history or []),
+            })
+        try:
+            jobs.extend(bm.orphan_sync_jobs())
+        except Exception:
+            logger.debug("orphan_sync_jobs failed", exc_info=True)
+        if not jobs:
+            # Nothing changed anywhere — show a toast (same style as Backup Tutti)
+            # instead of the old inline label (which was unique to Sync Tutti).
+            try:
+                mw = self.window()
+                if mw is not None and hasattr(mw, '_overlay') and mw._overlay:
+                    mw._overlay.show_batch_done("sync", 0, "")
+                else:
+                    self._show_sync_feedback(t("sync.nothing_to_sync"))
+            except Exception:
+                self._show_sync_feedback(t("sync.nothing_to_sync"))
+            return
+        orch.enqueue_sync_batch(jobs, source="overview")
+
+    def _show_cooldown_toast(self, seconds: int):
+        """Show a toast notification when an action is on cooldown."""
+        try:
+            mw = self.window()
+            if mw is not None and hasattr(mw, '_overlay') and mw._overlay:
+                from i18n import t as _t
+                msg = _t("notifications.cooldown_active", seconds=seconds)
+                mw._overlay.show_notice(msg)
+                return
+        except Exception:
+            pass
+        # Fallback to inline label
+        self._show_sync_feedback(f"Riprova tra {seconds}s")
+
+    def _show_sync_feedback(self, msg: str):
+        """Flash a short message under the quick actions (auto-hides)."""
+        if not _safe(self._sync_feedback_lbl):
+            return
+        self._sync_feedback_lbl.setText(msg)
+        self._sync_feedback_lbl.setVisible(True)
+        try:
+            self._sync_feedback_lbl.adjustSize()
+        except RuntimeError:
+            return
+        QTimer.singleShot(4000, self._hide_sync_feedback)
+
+    def _hide_sync_feedback(self):
+        if _safe(self._sync_feedback_lbl):
+            self._sync_feedback_lbl.setVisible(False)
 
     # ── Visibility management ────────────────────────────────────────────────
 
     def showEvent(self, event):
         super().showEvent(event)
+        # Poll less often than before — signals + debounce cover live changes;
+        # this is a safety net for playtime / active-game banner.
         if not self._refresh_timer.isActive():
-            self._refresh_timer.start(5000)
+            self._refresh_timer.start(10_000)
         if not self._ts_timer.isActive():
             self._ts_timer.start()
-        self.refresh()
+        # Cover the enter refresh after the page paints. Periodic timer
+        # refreshes stay silent.
+        self.refresh_on_enter()
 
     def hideEvent(self, event):
         super().hideEvent(event)
         self._refresh_timer.stop()
         self._ts_timer.stop()
+        self._debounce.stop()
+        # RAM cleanup on leaving the dashboard: the full-screen decoded
+        # images (view cache, up to ~192 MB) are only ever shown inside the
+        # add/edit dialog's viewer — the overview itself never uses them, so
+        # keeping them after any refresh/leave is pure memory. Freeing here
+        # costs nothing to this page.
+        from ui.helpers import clear_view_cache as _clear_view_cache
+        _clear_view_cache()
 
     def disconnect_signals(self):
         self._refresh_timer.stop()
         self._ts_timer.stop()
+        self._debounce.stop()
         try:
             self._refresh_timer.timeout.disconnect(self.refresh)
         except (RuntimeError, TypeError):
             pass
         try:
-            get_library().game_updated.disconnect(self.refresh)
+            get_library().game_updated.disconnect(self.schedule_refresh)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -860,6 +1245,10 @@ class OverviewPage(QWidget, ThemedMixin):
             pass
         try:
             get_library().game_removed.disconnect(self._on_game_removed)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            get_library().bulk_finished.disconnect(self._on_bulk_finished)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -873,7 +1262,7 @@ class OverviewPage(QWidget, ThemedMixin):
             pass
         try:
             orch = get_orchestrator()
-            orch.providers_updated.disconnect(self.refresh)
+            orch.providers_updated.disconnect(self.schedule_refresh)
         except (RuntimeError, TypeError):
             pass
 

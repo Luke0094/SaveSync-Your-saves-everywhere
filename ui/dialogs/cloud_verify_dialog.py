@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.styles.theme import palette
+from ui.helpers import finalize_adaptive_dialog_size
 
 
 def _esc(s: str) -> str:
@@ -49,10 +49,11 @@ class CloudVerifyDialog(QDialog):
         self._game_name = game_name
         self._radios = QButtonGroup(self)
         self.setWindowTitle(t("cloud_verify.title"))
-        self.setMinimumWidth(480)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._choice = "cancel"
         self._build()
+        self._panel_size = finalize_adaptive_dialog_size(
+            self, min_w=480, min_h=360)
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -60,13 +61,12 @@ class CloudVerifyDialog(QDialog):
         layout.setContentsMargins(24, 24, 24, 24)
 
         title = QLabel(t("cloud_verify.title"))
-        title.setObjectName("page_header")
-        title.setStyleSheet("font-size: 18px;")
+        title.setObjectName("dialog_heading")
         layout.addWidget(title)
 
         detected = QLabel(f"{t('cloud_verify.detected')}: <b>{_esc(self._game_name)}</b>")
         detected.setWordWrap(True)
-        detected.setStyleSheet(f"color: {palette('text_secondary')};")
+        detected.setObjectName("dialog_desc")
         layout.addWidget(detected)
 
         sep = QFrame()
@@ -76,7 +76,7 @@ class CloudVerifyDialog(QDialog):
         multi = len(self._candidates) > 1
         prompt = QLabel(t("cloud_verify.which_copy") if multi else t("cloud_verify.registered_as"))
         prompt.setWordWrap(True)
-        prompt.setStyleSheet(f"color: {palette('text_secondary')};")
+        prompt.setObjectName("dialog_desc")
         layout.addWidget(prompt)
 
         for i, c in enumerate(self._candidates):
@@ -120,11 +120,7 @@ class CloudVerifyDialog(QDialog):
 
     def _make_candidate_row(self, c: dict, idx: int, multi: bool) -> QFrame:
         row = QFrame()
-        row.setStyleSheet(
-            f"QFrame {{ background: {palette('bg_card')};"
-            f" border: 1px solid {palette('border')};"
-            f" border-radius: 8px; padding: 10px; }}"
-        )
+        row.setObjectName("cloud_verify_row")
         rl = QVBoxLayout(row)
         head = QHBoxLayout()
         if multi:
@@ -138,7 +134,7 @@ class CloudVerifyDialog(QDialog):
         path = c.get("path") or t("common.unknown")
         path_lbl = QLabel(f"{t('cloud_verify.path')}: {_esc(path)}")
         path_lbl.setWordWrap(True)
-        path_lbl.setStyleSheet(f"color: {palette('text_secondary')}; font-size: 11px;")
+        path_lbl.setObjectName("dialog_desc")
         rl.addWidget(path_lbl)
         return row
 

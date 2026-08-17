@@ -43,7 +43,22 @@ class DragProxy(QLabel):
         self._opacity.setOpacity(0.25 if over_sidebar else 0.92)
 
 
+def cancel_active_drag():
+    """Cancel any active drag in progress, destroying the proxy widget."""
+    proxy = _active_drag.pop("proxy", None)
+    if proxy is not None:
+        try:
+            proxy.hide()
+            proxy.deleteLater()
+        except Exception:
+            pass
+    src = _active_drag.pop("source", None)
+    if src is not None:
+        try:
+            src.setGraphicsEffect(None)
+        except Exception:
+            pass
+    _active_drag.clear()
+
+
 # ── Tag Filter Panel ─────────────────────────────────────────────────────────
-
-
-

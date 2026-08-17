@@ -385,49 +385,21 @@ class GameEntry:
         except Exception:
             return True
         try:
-            from pathlib import Path
-            from core.backup import _is_skip_file, _BACKUP_SKIP_DIRS
-            from core.registry_saves import is_registry_path, registry_last_write
+            from core.backup import scan_relevant_save_mtimes, _declared_chain_dirs
+            from core.registry_saves import is_registry_path
             excluded = set(self.excluded_save_paths or [])
-            for sp in self.save_paths:
-                if sp in excluded:
-                    continue
-                # Registry saves: compare the key tree's last-write against
-                # the last sync — the registry equivalent of the file mtime
-                # walk below.
-                if is_registry_path(sp):
-                    if registry_last_write(sp) > last_sync_ts:
-                        return True
-                    continue
-                p = Path(sp)
-                if not p.exists():
-                    continue
-                if p.is_file():
-                    if _is_skip_file(p):
-                        continue
-                    try:
-                        if p.stat().st_mtime > last_sync_ts:
-                            return True
-                    except OSError:
-                        pass
-                    continue
-                for f in p.rglob("*"):
-                    if not f.is_file():
-                        continue
-                    if _is_skip_file(f):
-                        continue
-                    try:
-                        rel_parts = f.relative_to(p).parts
-                        if any(part.lower() in _BACKUP_SKIP_DIRS for part in rel_parts[:-1]):
-                            continue
-                    except ValueError:
-                        pass
-                    try:
-                        if f.stat().st_mtime > last_sync_ts:
-                            return True
-                    except OSError:
-                        pass
-            return False
+            paths = [p for p in self.save_paths if p not in excluded]
+            reg = [p for p in paths if is_registry_path(p)]
+            fs = [p for p in paths if not is_registry_path(p)]
+            ok, _, _ = scan_relevant_save_mtimes(
+                fs,
+                registry_paths=reg,
+                chain_dirs=_declared_chain_dirs(self.game_id),
+                stop_if_newer_than=last_sync_ts,
+            )
+            # ok=False means something newer than last_sync (or unreadable →
+            # treat as changed). ok=True with a full walk means nothing newer.
+            return not ok
         except Exception:
             return True
 
@@ -477,17 +449,41 @@ class LibraryManager(QObject):
     game_removed = Signal(str)        # game id
     game_updated = Signal(object)     # GameEntry
     library_loaded = Signal()
+    # Fired once after begin_bulk()/end_bulk() — mass add/update without
+    # per-entry UI rebuild storms (scan folder, Aggiunta multipla, …).
+    bulk_finished = Signal()
 
     def __init__(self):
         super().__init__()
         self._lock = threading.RLock()
         self._write_lock = threading.Lock()
         self._games: dict[str, GameEntry] = {}
+        self._bulk_depth = 0
         self._save_timer = QTimer(self)          # debounce disk writes
         self._save_timer.setSingleShot(True)
-        self._save_timer.setInterval(500)        # flush at most every 500ms
+        # Batch rapid update_game() calls; interval scales with the machine.
+        from core.concurrency import config_write_debounce_ms
+        self._save_timer.setInterval(config_write_debounce_ms())
         self._save_timer.timeout.connect(self._flush_save)
         self._load()
+
+    def begin_bulk(self):
+        """Suppress per-entry signals until matching ``end_bulk()``."""
+        with self._lock:
+            self._bulk_depth += 1
+
+    def end_bulk(self):
+        """Flush disk + notify UI once after a mass mutation."""
+        with self._lock:
+            self._bulk_depth = max(0, self._bulk_depth - 1)
+            done = self._bulk_depth == 0
+        if done:
+            self._schedule_save()
+            self.bulk_finished.emit()
+
+    def _in_bulk(self) -> bool:
+        with self._lock:
+            return self._bulk_depth > 0
 
     def _load(self):
         if LIBRARY_FILE.exists():
@@ -512,6 +508,72 @@ class LibraryManager(QObject):
             except Exception as e:
                 logger.error(f"Library load error: {e}")
         self.library_loaded.emit()
+
+    def migrate_manual_path_stubs(self):
+        """Turn hand-added save stubs into orphan backup indexes (no library row).
+
+        Older builds stored Aggiungi-percorso folders as GameEntry (sometimes
+        with hide_from_library). They must only live as backup index entries
+        — same shape as cloud — and never as library games on their own.
+
+        Call after BackupManager exists (not from LibraryManager.__init__).
+        """
+        stubs = []
+        with self._lock:
+            for g in self._games.values():
+                no_exe = not (g.exe_path or "").strip()
+                hand = not g.auto_added and g.save_paths_confirmed and bool(g.save_paths)
+                # Legacy JSON may still carry hide_from_library on disk even
+                # though the field is gone from GameEntry — from_dict drops it,
+                # so detect stubs by the no-exe hand-added shape.
+                if no_exe and hand:
+                    stubs.append(copy.deepcopy(g))
+        if not stubs:
+            return 0
+        try:
+            from core.backup import get_backup_manager, _index_lock
+            bm = get_backup_manager()
+        except Exception:
+            return 0
+        removed = 0
+        for g in stubs:
+            try:
+                existing = bm.get_backups_for_game(g.id)
+                if existing:
+                    with _index_lock:
+                        for b in bm._index:
+                            if b.game_id == g.id:
+                                meta = dict(b.cloud_metadata or {})
+                                meta["orphan"] = True
+                                b.cloud_metadata = meta
+                    try:
+                        bm._save_game_index(g.id)
+                    except Exception:
+                        pass
+                else:
+                    from pathlib import Path as _P
+                    valid = [p for p in (g.save_paths or []) if p and _P(p).exists()]
+                    if valid:
+                        chains = []
+                        for p in valid:
+                            chains.append(g.chain_for_path(p) or g.save_chain or "")
+                        bm.create_backup(
+                            game_id=g.id,
+                            game_name=g.name or "Unknown",
+                            save_paths=valid,
+                            computed_folder_name=g.computed_folder_name,
+                            force=True,
+                            content_chains_override=chains,
+                            save_chains_override=chains,
+                            orphan=True,
+                        )
+                self.remove_game(g.id)
+                removed += 1
+            except Exception:
+                logger.exception("Failed migrating stub %s", getattr(g, "id", ""))
+        if removed:
+            logger.info("Migrated %s hand-added stub(s) out of the library", removed)
+        return removed
 
     def merge_tag_case_variants(self) -> int:
         """Unify tag variants ACROSS the library: every merge-key group
@@ -723,6 +785,10 @@ class LibraryManager(QObject):
             )
             entry.computed_folder_name = self.unique_folder_name(base, entry.id)
             self._games[entry.id] = copy.deepcopy(entry)
+            in_bulk = self._bulk_depth > 0
+        if in_bulk:
+            logger.info(f"Game added (bulk): {entry.name}")
+            return copy.deepcopy(entry)
         self._schedule_save()
         self.game_added.emit(copy.deepcopy(entry))
         logger.info(f"Game added: {entry.name}")
@@ -731,6 +797,9 @@ class LibraryManager(QObject):
     def update_game(self, entry: GameEntry):
         with self._lock:
             self._games[entry.id] = copy.deepcopy(entry)
+            in_bulk = self._bulk_depth > 0
+        if in_bulk:
+            return
         self._schedule_save()
         self.game_updated.emit(copy.deepcopy(entry))
 
@@ -741,6 +810,9 @@ class LibraryManager(QObject):
         where concurrent updates can overwrite each other.
 
         Returns a deep copy of the updated entry, or None if not found.
+        During ``begin_bulk``/``end_bulk`` the per-entry ``game_updated``
+        signal is suppressed (same as ``update_game``) so Backup Tutti does
+        not rebuild the library UI once per game.
         """
         with self._lock:
             live = self._games.get(game_id)
@@ -750,6 +822,9 @@ class LibraryManager(QObject):
                 if hasattr(live, key):
                     setattr(live, key, value)
             snapshot = copy.deepcopy(live)
+            in_bulk = self._bulk_depth > 0
+        if in_bulk:
+            return snapshot
         self._schedule_save()
         self.game_updated.emit(copy.deepcopy(snapshot))
         return snapshot

@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QComboBox, QMessageBox, QApplication,
+    QSizePolicy,
 )
 
 from i18n import t
@@ -19,7 +20,10 @@ from core import fmt_size as _fmt_size
 from core.library import get_library, GameEntry
 from core.backup import get_backup_manager, BackupEntry
 from ui.backup_labels import ORIGIN_LABELS, origin_badge
-from ui.helpers import open_in_file_manager, safe_widget as _safe
+from ui.helpers import (
+    PageScrollMixin, lock_min_size, open_in_file_manager,
+    safe_widget as _safe, scaled,
+)
 from ui.modal_helpers import (
     message_box_window_modal,
     question_window_modal,
@@ -40,10 +44,6 @@ class BackupRow(QFrame, ThemedMixin):
         self._cloud_only = cloud_only
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setObjectName("backup_row")
-        self._sty(self, lambda: f"""
-            QFrame#backup_row {{ background:{palette('bg_card')}; border:1px solid {palette('border')}; border-radius:6px; }}
-            QFrame#backup_row:hover {{ border-color:{palette('border_hover')}; background:{palette('bg_elevated')}; }}
-        """)
         self._build()
 
     def _build(self):
@@ -61,28 +61,28 @@ class BackupRow(QFrame, ThemedMixin):
         else:
             date_str = self._entry.created_at or "?"
 
-        # Left column
+        # Left column — chrome via theme (#backup_row_*); verify-dot stays inline.
         date_lbl = QLabel(date_str)
-        self._sty(date_lbl, lambda: f"color:{palette('text_secondary')};font-size:12px;font-weight:600;")
+        date_lbl.setObjectName("backup_row_date")
         size_lbl = QLabel(self._entry.size_human)
-        self._sty(size_lbl, lambda: f"color:{palette('text_muted')};font-size:11px;")
+        size_lbl.setObjectName("backup_row_meta")
         machine_lbl = QLabel()
         if self._entry.machine_id:
             machine_lbl.setText(f"🖥  {self._entry.machine_id[:8]}…")
-            self._sty(machine_lbl, lambda: f"color:{palette('text_muted')};font-size:10px;")
+            machine_lbl.setObjectName("backup_row_meta_sm")
 
         origin_lbl = QLabel(origin_badge(self._entry))
-        self._sty(origin_lbl, lambda: f"color:{palette('text_muted')};font-size:10px;")
+        origin_lbl.setObjectName("backup_row_meta_sm")
 
         note_lbl = QLabel(self._entry.note or "")
-        self._sty(note_lbl, lambda: f"color:{palette('text_muted')};font-size:10px;font-style:italic;")
+        note_lbl.setObjectName("backup_row_note")
 
         # Integrity dot — grey until the backup has been checked. Clicking it
         # checks this one; the page header checks them all. Colour-by-state is
         # left inline on purpose: it IS the state, so it belongs with the code
         # that knows it, not in the theme.
         self._verify_dot = QPushButton("●")
-        self._verify_dot.setFixedSize(18, 18)
+        self._verify_dot.setFixedSize(scaled(18, self), scaled(18, self))
         self._verify_dot.setCursor(Qt.CursorShape.PointingHandCursor)
         self._verify_dot.clicked.connect(self._on_verify_clicked)
         self._apply_verify_dot()
@@ -104,7 +104,7 @@ class BackupRow(QFrame, ThemedMixin):
         # In-game safety badge
         if self._is_playing:
             badge = QLabel(t('backups.game_running'))
-            self._sty(badge, lambda: f"color:{palette('warning')};font-size:10px;font-weight:600;")
+            badge.setObjectName("backup_row_playing")
             left_col.addWidget(badge)
 
         row.addLayout(left_col, 1)
@@ -112,30 +112,29 @@ class BackupRow(QFrame, ThemedMixin):
         # Backup folder button
         backup_folder_btn = QPushButton("📁")
         backup_folder_btn.setObjectName("icon_btn")
-        backup_folder_btn.setFixedSize(28, 28)
+        backup_folder_btn.setFixedSize(scaled(28, self), scaled(28, self))
         backup_folder_btn.setToolTip(t("tooltips.open_backup_folder"))
         backup_folder_btn.clicked.connect(self._on_open_backup_folder)
 
         self._restore_btn = QPushButton(t("buttons.restore"))
         self._restore_btn.setObjectName("primary_btn")
-        self._restore_btn.setFixedHeight(28)
-        self._restore_btn.setFixedWidth(80)
-        self._sty(self._restore_btn, lambda: (
-            f"QPushButton {{ background:{palette('accent')}; color:{palette('accent_text')};"
-            f"border:none; border-radius:4px; font-size:10px; font-weight:600; }}"
-            f"QPushButton:hover {{ background:{palette('accent_hover')}; }}"
-        ))
+        self._restore_btn.setFixedHeight(scaled(28, self))
+        # Never clip the label: "Ripristina" at the scaled font needs ~104px
+        # plus QSS padding. 92px was too narrow and sheared the leading "R".
+        self._restore_btn.setMinimumWidth(scaled(108, self))
+        self._restore_btn.setMaximumWidth(scaled(140, self))
         self._restore_btn.setToolTip(
             t("core.game_running_warning") if self._is_playing
             else t("backup.restore_confirm")
         )
         self._restore_btn.clicked.connect(self._on_restore_clicked)
 
-        del_btn = QPushButton(t("buttons.delete"))
+        del_btn = QPushButton("🗑")
         del_btn.setObjectName("icon_btn")
-        del_btn.setFixedSize(28, 28)
+        del_btn.setFixedSize(scaled(30, self), scaled(28, self))
         del_btn.setToolTip(t("tooltips.delete_backup"))
         del_btn.clicked.connect(self._confirm_delete)
+
 
         row.addWidget(backup_folder_btn)
         row.addWidget(self._restore_btn)
@@ -260,7 +259,7 @@ class BackupRow(QFrame, ThemedMixin):
         colour_key, msg_key = self._VERIFY_LOOK.get(state, self._VERIFY_LOOK[""])
         self._verify_dot.setStyleSheet(
             f"QPushButton{{background:transparent;border:none;padding:0;"
-            f"font-size:11px;color:{palette(colour_key)};}}"
+            f"font-size:{scaled(11, self)}px;color:{palette(colour_key)};}}"
         )
         tip = t(msg_key)
         detail = getattr(self._entry, "verify_detail", "")
@@ -281,7 +280,13 @@ class BackupRow(QFrame, ThemedMixin):
     def _on_verify_clicked(self):
         """Check just this backup. Shallow: opening the archive and checking
         every member's CRC is what catches a broken file, and it is quick
-        enough to run inline without freezing the list."""
+        enough to run inline without freezing the list. Throttled to once
+        per minute per row — a spam click on the dot re-opens the same zip."""
+        from time import monotonic
+        now = monotonic()
+        if now - getattr(self, "_last_verify_mono", 0.0) < 60.0:
+            return
+        self._last_verify_mono = now
         from core.backup import get_backup_manager
         self._verify_dot.setEnabled(False)
         try:
@@ -355,9 +360,16 @@ from ui.widgets.search_inputs import (GhostClearableLineEdit, _SearchCombo,
                                       _SuggestPopup)  # clearable ghost for title search
 
 
-class BackupsPage(QWidget, ThemedMixin):
+class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
     restore_requested = Signal(str, str)
     backup_requested  = Signal(str)
+    backup_all_requested = Signal(object)  # list[str] game ids
+    manual_paths_requested = Signal()
+    # Manual "Verifica Backup" sweep — the main window mirrors these into the
+    # sidebar notice so the UI never looks frozen while it runs.
+    verify_started = Signal(int)               # total
+    verify_progress = Signal(int, int, str)    # done, total, name
+    verify_finished = Signal(str)              # result message
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -391,16 +403,52 @@ class BackupsPage(QWidget, ThemedMixin):
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(120)
         self._search_timer.timeout.connect(self._do_game_search)
+        # First list build waits until the page is shown so busy_over can cover
+        # it (hidden rebuilds have nothing to dim).
+        self._pending_initial_load = True
         self._build()
         self._connect_signals()
-        self._load_games()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._pending_initial_load:
+            self._pending_initial_load = False
+            QTimer.singleShot(0, self._load_games)
+
+    def ensure_loaded(self):
+        """Kick the first list build without blocking the page switch."""
+        if self._pending_initial_load:
+            self._pending_initial_load = False
+            QTimer.singleShot(0, self._load_games)
+
+    def on_page_leave(self):
+        """Stop any deferred busy on leaving page."""
+        self._stop_list_busy()
+
+    def wipe_and_reload(self):
+        """Re-arm the initial load and immediately wipe off-screen widgets
+        (called by the overview refresh button)."""
+        self._refresh_gen = getattr(self, "_refresh_gen", 0) + 1
+        self._group_insert_queue = []
+        self._stop_list_busy()
+        if getattr(self, "_page_size_combo", None) is not None:
+            self._page_size_combo.setParent(self)
+        if hasattr(self, "_list_layout"):
+            while self._list_layout.count():
+                item = self._list_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        self._pending_initial_load = True
+        if self.isVisible():
+            QTimer.singleShot(0, self._load_games)
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(32, 28, 32, 28)
-        root.setSpacing(20)
+        root.setContentsMargins(scaled(20, self, min_px=14), scaled(16, self, min_px=10), scaled(20, self, min_px=14), scaled(16, self, min_px=10))
+        root.setSpacing(scaled(12, self, min_px=8))
 
         header_row = QHBoxLayout()
+        header_row.setSpacing(scaled(8, self, min_px=6))
         self._header = QLabel(t("backup.title"))
         self._header.setObjectName("page_header")
         header_row.addWidget(self._header)
@@ -410,7 +458,7 @@ class BackupsPage(QWidget, ThemedMixin):
         # outcome sit in the label beside it; the per-backup dots update too.
         self._verify_btn = QPushButton("⚕️")
         self._verify_btn.setObjectName("toolbar_icon_btn")
-        self._verify_btn.setFixedSize(30, 30)
+        self._verify_btn.setFixedSize(scaled(30, self), scaled(30, self))
         self._verify_btn.clicked.connect(self._on_verify_all)
         self._refresh_verify_tooltip()
         header_row.addWidget(self._verify_btn)
@@ -418,7 +466,7 @@ class BackupsPage(QWidget, ThemedMixin):
         self._verify_status = QLabel("")
         self._verify_status.setVisible(False)
         self._sty(self._verify_status, lambda: (
-            f"color:{palette(self._verify_status_tone)};font-size:12px;"))
+            f"color:{palette(self._verify_status_tone)};font-size:{scaled(12, self)}px;"))
         header_row.addWidget(self._verify_status)
         header_row.addStretch()
 
@@ -431,15 +479,16 @@ class BackupsPage(QWidget, ThemedMixin):
         # Same chrome as the "Open folder" / "Backup now" buttons it sits
         # next to — as a bare glyph it disappeared into the header.
         self._add_paths_btn.setObjectName("toolbar_icon_btn")
-        self._add_paths_btn.setFixedSize(30, 30)
+        self._add_paths_btn.setFixedSize(scaled(30, self), scaled(30, self))
         self._add_paths_btn.setToolTip(t("manual_path.button_tooltip"))
         self._add_paths_btn.clicked.connect(self._on_add_manual_paths)
         header_row.addWidget(self._add_paths_btn)
 
         self._open_folder_btn = QPushButton(t("buttons.open_folder"))
-        self._open_folder_btn.setFixedHeight(30)
+        self._open_folder_btn.setFixedHeight(scaled(30, self))
         self._open_folder_btn.setToolTip(t("tooltips.open_save_folder"))
         self._open_folder_btn.clicked.connect(self._on_open_save_folder)
+        lock_min_size(self._open_folder_btn, w=scaled(130, self, min_px=110))
         header_row.addWidget(self._open_folder_btn)
 
         self._backup_now_btn = QPushButton(t("buttons.backup_now"))
@@ -447,10 +496,13 @@ class BackupsPage(QWidget, ThemedMixin):
         self._backup_now_btn.setToolTip(t("backups.backup_now_tooltip"))
         self._backup_now_btn.clicked.connect(self._on_backup_now)
         self._backup_now_btn.setEnabled(True)    # always active — falls back to backup-all
+        lock_min_size(self._backup_now_btn, w=scaled(110, self, min_px=95))
         header_row.addWidget(self._backup_now_btn)
         root.addLayout(header_row)
 
         sel_row = QHBoxLayout()
+        sel_row.setSpacing(scaled(8, self, min_px=6))
+        sel_row.setContentsMargins(0, 0, 0, 0)
 
         # ── Game search field ─────────────────────────────────────────────
         # Editable combo. Typing drives a CUSTOM suggestions popup (see
@@ -463,8 +515,9 @@ class BackupsPage(QWidget, ThemedMixin):
         # a click on the popup row) confirms it; clicking away keeps the
         # typed text as a placeholder and the filter active.
         self._game_combo = _SearchCombo()
-        self._game_combo.setMinimumWidth(320)
-        self._game_combo.setMinimumHeight(34)
+        self._game_combo.setMinimumWidth(scaled(130, self, min_px=100))
+        self._game_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._game_combo.setMinimumHeight(scaled(32, self))
         self._game_combo.setEditable(True)
         self._game_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._game_combo.setLineEdit(GhostClearableLineEdit())
@@ -503,28 +556,32 @@ class BackupsPage(QWidget, ThemedMixin):
         # becomes the placeholder while the filter stays active).
         self._game_combo.lineEdit().returnPressed.connect(self._on_game_search_confirmed)
         self._game_combo.lineEdit().installEventFilter(self)
-        sel_row.addWidget(self._game_combo)
+        sel_row.addWidget(self._game_combo, 3)
 
         # ── Source-type filter ────────────────────────────────────────────
         self._origin_combo = QComboBox()
-        self._origin_combo.setMinimumWidth(160)
+        self._origin_combo.setMinimumWidth(scaled(100, self, min_px=90))
+        self._origin_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._origin_combo.currentIndexChanged.connect(self._on_source_filter_changed)
-        sel_row.addWidget(self._origin_combo)
+        sel_row.addWidget(self._origin_combo, 2)
 
         # ── Provider sub-selector (visible only when "Solo origine provider") ─
         self._provider_sub_combo = QComboBox()
-        self._provider_sub_combo.setMinimumWidth(140)
+        self._provider_sub_combo.setMinimumWidth(scaled(100, self, min_px=90))
+        self._provider_sub_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._provider_sub_combo.currentIndexChanged.connect(self._on_provider_sub_changed)
         self._provider_sub_combo.setVisible(False)
-        sel_row.addWidget(self._provider_sub_combo)
+        sel_row.addWidget(self._provider_sub_combo, 2)
 
         # Populate both combos (widgets must exist first)
         self._rebuild_origin_filter()
 
-        sel_row.addStretch()
         self._summary_lbl = QLabel()
-        self._sty(self._summary_lbl, lambda: f"color:{palette('text_hint')};font-size:11px;")
-        sel_row.addWidget(self._summary_lbl)
+        self._summary_lbl.setObjectName("backup_summary")
+        self._summary_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._summary_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        lock_min_size(self._summary_lbl, w=scaled(130, self, min_px=110))
+        sel_row.addWidget(self._summary_lbl, 0)
         root.addLayout(sel_row)
 
         # Lives on the (top) pager row with the page numbers — see _refresh_list.
@@ -532,9 +589,9 @@ class BackupsPage(QWidget, ThemedMixin):
         self._page_size_combo = PageSizeCombo(
             SCOPE_BACKUPS, self._on_page_size_changed)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._list_widget = QWidget()
         self._list_widget.setObjectName("transparent_bg")
         self._list_layout = QVBoxLayout(self._list_widget)
@@ -542,17 +599,19 @@ class BackupsPage(QWidget, ThemedMixin):
         self._list_layout.setSpacing(6)
 
         self._empty_lbl = QLabel(t("backup.no_backups"))
-        self._sty(self._empty_lbl, lambda: f"color:{palette('text_disabled')};font-size:14px;padding:32px;")
+        self._empty_lbl.setObjectName("backup_empty")
         self._empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._list_layout.addWidget(self._empty_lbl)
         self._list_layout.addStretch()
-        scroll.setWidget(self._list_widget)
-        root.addWidget(scroll, 1)
+        self._scroll.setWidget(self._list_widget)
+        root.addWidget(self._scroll, 1)
+        self._register_page_scroll(self._scroll, list_content=True)
 
     def _connect_signals(self):
         lib = get_library()
         lib.game_added.connect(self._on_lib_changed)
         lib.game_removed.connect(self._on_lib_changed)
+        lib.bulk_finished.connect(self._on_bulk_finished)
         get_backup_manager().backup_created.connect(self._on_backup_created)
         from sync import get_orchestrator
         orch = get_orchestrator()
@@ -560,15 +619,21 @@ class BackupsPage(QWidget, ThemedMixin):
         orch.providers_updated.connect(self._on_provider_state_changed)
         orch.sync_finished.connect(self._on_sync_finished)
 
+    def _on_bulk_finished(self):
+        if not getattr(self, "_pending_initial_load", False):
+            self._load_games()
+
     def _on_provider_state_changed(self, _pid: str = ""):
         """Refresh origin filter when provider connects/disconnects."""
         self._rebuild_origin_filter()
-        self._load_games()
+        if not getattr(self, "_pending_initial_load", False):
+            self._load_games()
 
     def _on_sync_finished(self, _game_id: str, _result):
         """Refresh after sync completes (new backups may have been created/downloaded)."""
         self._rebuild_origin_filter()
-        self._load_games()
+        if not getattr(self, "_pending_initial_load", False):
+            self._load_games()
 
     def _on_lib_changed(self, arg):
         # If a game was removed and it was the selected game, clear selection.
@@ -588,11 +653,19 @@ class BackupsPage(QWidget, ThemedMixin):
                 self._game_combo.blockSignals(False)
             self._selected_game_id = None
             self._game_filter_text = ""
-        self._load_games()
+        if not getattr(self, "_pending_initial_load", False):
+            self._load_games()
 
     def _on_backup_created(self, _):
+        try:
+            if get_library()._in_bulk():
+                return
+        except Exception:
+            pass
         self._rebuild_origin_filter()
-        self._refresh_list()
+        if not getattr(self, "_pending_initial_load", False):
+            self._refresh_list()
+
 
     def disconnect_signals(self):
         try:
@@ -601,6 +674,10 @@ class BackupsPage(QWidget, ThemedMixin):
             pass
         try:
             get_library().game_removed.disconnect(self._on_lib_changed)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            get_library().bulk_finished.disconnect(self._on_bulk_finished)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -617,21 +694,22 @@ class BackupsPage(QWidget, ThemedMixin):
             pass
 
     def _rebuild_origin_filter(self):
-        """Rebuild the 4-option source filter.  Provider selection is handled
+        """Rebuild the 5-option source filter.  Provider selection is handled
         separately by _rebuild_provider_sub_combo."""
         self._origin_combo.blockSignals(True)
         current = self._origin_combo.currentData()
         self._origin_combo.clear()
-        self._origin_combo.addItem(t("backups.filter_all"),        "all")
-        self._origin_combo.addItem(t("backups.filter_local_only"), "local_only")
-        self._origin_combo.addItem(t("backups.filter_local_sync"), "local_sync")
-        self._origin_combo.addItem(t("backups.provider_only"),     "provider_only")
+        self._origin_combo.addItem(t("backups.filter_all"),          "all")
+        self._origin_combo.addItem(t("backups.filter_local_only"),   "local_only")
+        self._origin_combo.addItem(t("backups.filter_local_sync"),   "local_sync")
+        self._origin_combo.addItem(t("backups.filter_archive_only"), "archive_only")
+        self._origin_combo.addItem(t("backups.provider_only"),       "provider_only")
 
         from sync import get_orchestrator
         has_provider = get_orchestrator().is_online()
 
         # Disable "provider only" when no provider connected
-        _item3 = self._origin_combo.model().item(3)
+        _item3 = self._origin_combo.model().item(4)
         if _item3:
             if has_provider:
                 _item3.setFlags(_item3.flags() | Qt.ItemFlag.ItemIsEnabled)
@@ -682,7 +760,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
     def _get_origin_filter(self) -> str:
         """Return current source filter key: 'all', 'local_only', 'local_sync',
-        'provider_only', '__sep__', or a provider_id string."""
+        'archive_only', 'provider_only', '__sep__', or a provider_id string."""
         return self._origin_combo.currentData() or "all"
 
     def _matches_origin_filter(self, entry) -> bool:
@@ -696,6 +774,25 @@ class BackupsPage(QWidget, ThemedMixin):
             return origin == "local" and not synced_to
         if filt == "local_sync":
             return origin == "local"
+        if filt == "archive_only":
+            # Same bucket as the donut's "Archivi" slice: backups with NO
+            # library game — Aggiungi-percorso archives (orphan flag) and
+            # leftovers after a game was removed (game_id no longer in the
+            # library). Cloud phantoms enter with their folder name as
+            # game_id, which is never a library id, so they match too.
+            if origin == "local":
+                bm = get_backup_manager()
+                if bm.is_orphan_entry(entry):
+                    return True
+                gid = getattr(entry, "game_id", None)
+                if not gid:
+                    return True
+                lib_ids = getattr(self, "_archive_lib_ids", None)
+                if lib_ids is None:
+                    lib_ids = bm.library_game_ids()
+                    self._archive_lib_ids = lib_ids
+                return gid not in lib_ids
+            return True  # cloud-phantom entries are archive-only by nature
         if filt == "provider_only":
             return False  # cloud-only entries injected separately in _refresh_list
         # Provider-specific filter (a provider_id like "google_drive"):
@@ -704,6 +801,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
     def _load_games(self, text_filter: str = ""):
         """Repopulate game combo respecting source-filter and optional text search."""
+        self._archive_lib_ids = None  # library may have changed; recompute on demand
         mgr = get_backup_manager()
         all_backups = mgr.get_all_backups()
         filt = self._get_origin_filter()
@@ -755,7 +853,7 @@ class BackupsPage(QWidget, ThemedMixin):
         # "Tutte le origini" should genuinely include provider-exclusive
         # titles too, matching the same extension made in _refresh_list().
         phantom_folders: dict[str, int] = {}   # folder_name -> backup count
-        if filt in ("provider_only", "all") and provider is not None:
+        if filt in ("provider_only", "archive_only", "all") and provider is not None:
             if self._provider_only_extra_game_ids is None:
                 extra: set[str] = set()
                 phantoms: dict[str, int] = {}
@@ -824,6 +922,10 @@ class BackupsPage(QWidget, ThemedMixin):
             # only; the typing popup never offers it.
             self._game_combo.addItem(t('backups.all_games'), "__all__")
             for g in sorted(get_library().all_games(), key=lambda x: x.name.lower()):
+                # Archive only = backups with NO library game: list no
+                # library titles at all — just orphan/phantom folders below.
+                if filt == "archive_only":
+                    continue
                 # Source/origin filter
                 if filt == "local_only" and g.id not in local_only_ids:
                     continue
@@ -836,14 +938,20 @@ class BackupsPage(QWidget, ThemedMixin):
                 # Typing-popup candidates: always the FULL origin-filtered
                 # set (the popup applies the text filter itself), so its
                 # entries never vanish when this model is rebuilt.
+                # Exclude games with 0 backups: after deletion a rebuild is
+                # triggered, and stale candidates would otherwise remain
+                # searchable until the next full restart.
+                n = counts.get(g.id, 0)
+                if n == 0:
+                    continue
                 self._search_candidates.append((g.name, g.id))
                 # Native dropdown items: respect the active text filter —
                 # with "dark" typed, "My Game" must not be selectable there.
                 if tf and tf not in g.name.lower():
                     continue
-                n = counts.get(g.id, 0)
-                label = f"{g.name}  ({n})" if n else g.name
+                label = f"{g.name}  ({n})"
                 self._game_combo.addItem(label, g.id)
+
 
             # Phantom entries: cloud-only backups with no matching local
             # library game at all — selectable using the folder name itself
@@ -855,6 +963,28 @@ class BackupsPage(QWidget, ThemedMixin):
                     continue
                 label = f"\u2601 {folder_name}  ({backup_count})" if backup_count else f"\u2601 {folder_name}"
                 self._game_combo.addItem(label, folder_name)
+
+            # Local orphan archives (Aggiungi percorso): same index as cloud,
+            # no library game — folder name is the selector.
+            if filt in ("all", "local_only", "local_sync", "archive_only", ""):
+                try:
+                    for folder_name, backup_count in sorted(
+                            (mgr.orphan_folders() or {}).items(),
+                            key=lambda kv: kv[0].lower()):
+                        # Skip if already listed as a cloud phantom
+                        if folder_name in phantom_folders:
+                            continue
+                        if any(self._game_combo.itemData(i) == folder_name
+                               for i in range(self._game_combo.count())):
+                            continue
+                        self._search_candidates.append((folder_name, folder_name))
+                        if tf and tf not in folder_name.lower():
+                            continue
+                        label = (f"{folder_name}  ({backup_count})"
+                                 if backup_count else folder_name)
+                        self._game_combo.addItem(label, folder_name)
+                except Exception:
+                    logger.debug("orphan folder combo failed", exc_info=True)
 
             # Re-select the previously chosen game, if it's still in the list.
             # This MUST stay inside the blocked scope: setCurrentIndex() on an
@@ -1009,7 +1139,7 @@ class BackupsPage(QWidget, ThemedMixin):
         self._suggest_popup.set_items([name for name, _ in matches])
         pos = self._game_combo.mapTo(self, QPoint(0, self._game_combo.height()))
         self._suggest_popup.move(pos)
-        self._suggest_popup.setFixedWidth(max(self._game_combo.width(), 280))
+        self._suggest_popup.setFixedWidth(max(self._game_combo.width(), scaled(280, self)))
         self._suggest_popup.show()
         self._suggest_popup.raise_()
         # Defensive: FocusIn normally installed this already.
@@ -1277,7 +1407,7 @@ class BackupsPage(QWidget, ThemedMixin):
         self._verify_status.setText(text)
         self._verify_status.setVisible(True)
         self._verify_status.setStyleSheet(
-            f"color:{palette(self._verify_status_tone)};font-size:12px;")
+            f"color:{palette(self._verify_status_tone)};font-size:{scaled(12, self)}px;")
 
     def _refresh_verify_tooltip(self):
         """Idle checkup tip: all backups, or only the selected game's."""
@@ -1293,14 +1423,42 @@ class BackupsPage(QWidget, ThemedMixin):
             return t("backups.verify_game_tooltip")
         return t("backups.verify_all_tooltip")
 
+    def _show_cooldown_toast(self, seconds: int):
+        """Show a toast notification when an action is on cooldown."""
+        try:
+            mw = self.window()
+            if mw is not None and hasattr(mw, '_overlay') and mw._overlay:
+                from i18n import t as _t
+                msg = _t("notifications.cooldown_active", seconds=seconds)
+                mw._overlay.show_notice(msg)
+                return
+        except Exception:
+            pass
+        # Fallback: use verify status label
+        self._set_verify_status(f"⏱ {seconds}s", tone="text_hint")
+        QTimer.singleShot(3000, lambda: self._set_verify_status(""))
+
     def _on_verify_all(self):
+
         """Check every backup currently listed, on a worker thread.
 
         Threaded rather than inline: opening each archive and CRC-checking
         every member is I/O bound and a game with many large backups would
         otherwise freeze the window for seconds. Progress is shown next to
         the health button; the per-backup dots update as results arrive.
+
+        Throttled to one sweep per minute: verifying re-opens every archive,
+        and a double-click or an impatient re-click must not start a second
+        sweep on top of the first.
         """
+        from time import monotonic
+        now = monotonic()
+        remaining = 60.0 - (now - getattr(self, "_last_verify_all_mono", 0.0))
+        if remaining > 0:
+            self._show_cooldown_toast(int(remaining) + 1)
+            return
+        self._last_verify_all_mono = now
+
         from core.backup import get_backup_manager
         mgr = get_backup_manager()
         gid = self._selected_game_id
@@ -1318,20 +1476,36 @@ class BackupsPage(QWidget, ThemedMixin):
         class _VerifyWorker(QThread):
             progress = Signal(int, str)      # 1-based index, backup_id in hand
             one = Signal(str, str, str)      # backup_id, state, detail
-            done = Signal(int, int)          # bad, total
+            done = Signal(int, int, bool, str)  # bad, total, snap_ok, snap_detail
 
             def run(self):
-                bad = 0
-                for i, bid in enumerate(ids, 1):
-                    self.progress.emit(i, bid)
-                    try:
-                        state, detail = mgr.verify_backup(bid, deep=False)
-                    except Exception as e:
-                        state, detail = "corrupt", str(e)[:60]
+                done_n = [0]
+                bad_n = [0]
+
+                def _on_one_cb(bid, state, detail):
+                    done_n[0] += 1
+                    self.progress.emit(done_n[0], bid)
                     if state != "ok":
-                        bad += 1
+                        bad_n[0] += 1
                     self.one.emit(bid, state, detail)
-                self.done.emit(bad, len(ids))
+
+                snap_ok, snap_detail = True, ""
+                try:
+                    # Explicit health check: always open every zip. The 12h
+                    # "still ok" skip is only for the scheduled background sweep.
+                    mgr.verify_backups(
+                        ids, deep=False, on_one=_on_one_cb,
+                        cancel=None,
+                        skip_recent_hours=0,
+                    )
+                    # Completes the loop between the automatic self-checks and
+                    # this manual one: the config snapshots (config_history
+                    # checkpoints) are part of the same data-integrity story.
+                    from core.config_transfer import self_check_config_history_restore
+                    snap_ok, snap_detail = self_check_config_history_restore()
+                except Exception as e:
+                    logger.warning(f"Backup verification aborted: {e}")
+                self.done.emit(bad_n[0], len(ids), snap_ok, snap_detail)
 
         self._verify_btn.setEnabled(False)
         total = len(ids)
@@ -1353,6 +1527,7 @@ class BackupsPage(QWidget, ThemedMixin):
                    t("backups.verify_running", done=done, total=total))
             self._set_verify_status(msg)
             self._verify_btn.setToolTip(msg)
+            self.verify_progress.emit(done, total, name)
 
         def _on_one(bid, state, detail):
             from datetime import datetime
@@ -1374,19 +1549,25 @@ class BackupsPage(QWidget, ThemedMixin):
                 except RuntimeError:
                     pass      # row already gone (list rebuilt mid-run)
 
-        def _on_done(bad, total_done):
+        def _on_done(bad, total_done, snap_ok, snap_detail):
             self._verify_btn.setEnabled(True)
             msg = (t("backups.verify_result_all_ok", total=total_done) if not bad
                    else t("backups.verify_result_bad", bad=bad, total=total_done))
+            if snap_ok:
+                msg += "\n" + t("backups.verify_snapshots_ok")
+            else:
+                msg += "\n" + t("backups.verify_snapshots_bad", detail=snap_detail)
             self._set_verify_status(
-                msg, tone="success" if not bad else "error")
+                msg, tone="success" if not bad and snap_ok else "error")
             self._verify_btn.setToolTip(
                 msg + "\n" + self._verify_idle_tooltip())
             logger.info(f"Backup verification: {msg}")
+            self.verify_finished.emit(msg)
 
         self._verify_worker.progress.connect(_on_progress)
         self._verify_worker.one.connect(_on_one)
         self._verify_worker.done.connect(_on_done)
+        self.verify_started.emit(total)
         self._verify_worker.start()
 
     def _on_open_save_folder(self):
@@ -1401,13 +1582,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
     def _on_add_manual_paths(self):
         """Register save folders by hand — for saves with no executable."""
-        from PySide6.QtWidgets import QDialog
-        from ui.dialogs.manual_path_dialog import ManualPathDialog
-        dlg = ManualPathDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.added_entries:
-            # New entries mean new titles in the picker and new rows below.
-            self._load_games()
-            self._refresh_list()
+        self.manual_paths_requested.emit()
 
     def _on_page_size_changed(self, _size: int):
         """Back to the first page: the titles have just been redistributed."""
@@ -1415,14 +1590,43 @@ class BackupsPage(QWidget, ThemedMixin):
         self._refresh_list()
 
     def _refresh_list(self):
-        """Refresh the backup list for the selected game."""
+        """Refresh the backup list for the selected game (non-blocking enter)."""
         if not _safe(self._list_layout):
             return
-        from ui.widgets.page_size import guarded_render, SCOPE_BACKUPS
-        with guarded_render(SCOPE_BACKUPS):
-            self._refresh_list_inner()
+        self._pending_initial_load = False
+        self._refresh_gen = getattr(self, "_refresh_gen", 0) + 1
+        gen = self._refresh_gen
+        self._stop_list_busy()
+        QTimer.singleShot(0, lambda g=gen: self._refresh_list_deferred(g))
 
-    def _refresh_list_inner(self):
+    def _stop_list_busy(self):
+        busy = getattr(self, "_list_busy", None)
+        if busy is not None:
+            try:
+                busy.close()
+            except Exception:
+                pass
+            self._list_busy = None
+
+    def _refresh_list_deferred(self, gen: int):
+        if gen != getattr(self, "_refresh_gen", 0):
+            return
+        if not _safe(self._list_layout):
+            return
+        from ui.widgets.busy_overlay import DeferredBusy
+        from ui.widgets.page_size import guarded_render, SCOPE_BACKUPS
+        # Cover wipe + async group insert (same idea as library cards).
+        if self.isVisible():
+            self._list_busy = DeferredBusy(
+                self, t("common.please_wait"), delay_ms=0)
+        try:
+            with guarded_render(SCOPE_BACKUPS):
+                self._refresh_list_inner(gen)
+        except Exception:
+            self._stop_list_busy()
+            raise
+
+    def _refresh_list_inner(self, gen: int = 0):
         """Rebuild the listing. Split out of _refresh_list so the render (and
         only the render) sits inside the page-size guard."""
         # Theme-restyle bookkeeping: the group headers + backup rows below are
@@ -1482,6 +1686,9 @@ class BackupsPage(QWidget, ThemedMixin):
         # Get local backups
         if gid:
             local_backups = mgr.get_backups_for_game(gid)
+            if not local_backups:
+                # Orphan / phantom folder name selected from the combo
+                local_backups = mgr.get_backups_for_folder(gid)
         elif tf:
             # No specific game selected but text filter active —
             # show backups for all games whose name contains the text
@@ -1502,7 +1709,7 @@ class BackupsPage(QWidget, ThemedMixin):
 
         # Fetch cloud-only entries when needed
         cloud_only_ids: set[str] = set()
-        if filt in ("all", "provider_only") or is_provider_specific:
+        if filt in ("all", "provider_only", "archive_only") or is_provider_specific:
             try:
                 from sync import get_orchestrator
                 from core.constants import get_install_folder_name
@@ -1590,6 +1797,8 @@ class BackupsPage(QWidget, ThemedMixin):
                                 # Exact match first, then version/build-insensitive
                                 lib_game = (_lib_folder_to_game.get(folder_lower)
                                             or _lib_norm_to_game.get(folder_norm))
+                                if filt == "archive_only" and lib_game is not None:
+                                    continue   # has a library game -> not an archive
                                 display_gid = lib_game.id if lib_game else game_folder
                                 display_name = lib_game.name if lib_game else game_folder
                                 if not _cloud_entry_matches_filter(display_name):
@@ -1683,6 +1892,7 @@ class BackupsPage(QWidget, ThemedMixin):
                 self._empty_lbl.setVisible(True)
             if _safe(self._summary_lbl):
                 self._summary_lbl.setText(t("backup.no_backups"))
+            self._stop_list_busy()
             return
 
         if _safe(self._empty_lbl):
@@ -1733,21 +1943,76 @@ class BackupsPage(QWidget, ThemedMixin):
                         size_combo=self._page_size_combo))
 
         single_group = len(order) == 1
+        # Queue group widgets; insert in QTimer chunks (library-style).
+        self._group_insert_gen = gen
+        self._group_insert_queue = []
         for key in page_keys:
             grp = groups[key]
-            # A single visible title (e.g. specific game selected) starts
-            # expanded; otherwise groups start collapsed so the page never
-            # renders every restorable save at once.
             expanded = single_group or key in self._expanded_titles
-            self._list_layout.addWidget(self._build_backup_group(
-                key, grp["name"], grp["entries"], gid, is_playing,
-                cloud_only_ids, expanded))
 
+            def _make(key=key, grp=grp, expanded=expanded):
+                return self._build_backup_group(
+                    key, grp["name"], grp["entries"], gid, is_playing,
+                    cloud_only_ids, expanded)
+
+            self._group_insert_queue.append(_make)
+        self._group_insert_bottom_pager = None
         if total_pages > 1:
-            self._list_layout.addWidget(
-                build_pager(self._backups_page_num, total_pages, _go_page))
+            self._group_insert_bottom_pager = lambda: build_pager(
+                self._backups_page_num, total_pages, _go_page)
+        from core.concurrency import library_insert_chunk_size
+        cs = library_insert_chunk_size()
+        self._group_insert_chunk = cs if cs > 0 else 16
+        if not self._group_insert_queue:
+            if self._group_insert_bottom_pager is not None:
+                self._list_layout.addWidget(self._group_insert_bottom_pager())
+            self._list_layout.addStretch()
+            self._stop_list_busy()
+            return
+        QTimer.singleShot(0, lambda g=gen: self._async_group_insert_step(g))
 
-        self._list_layout.addStretch()  # re-add stretch at end
+    def _async_group_insert_step(self, gen: int):
+        if gen != getattr(self, "_refresh_gen", 0):
+            return
+        if not _safe(self._list_layout):
+            self._stop_list_busy()
+            return
+        queue = getattr(self, "_group_insert_queue", None) or []
+        if not queue:
+            self._finish_group_insert(gen)
+            return
+        chunk_n = getattr(self, "_group_insert_chunk", 0) or len(queue)
+        chunk = queue[:chunk_n]
+        del queue[:chunk_n]
+        self._group_insert_queue = queue
+        for make in chunk:
+            if gen != getattr(self, "_refresh_gen", 0):
+                return
+            try:
+                self._list_layout.addWidget(make())
+            except RuntimeError:
+                self._stop_list_busy()
+                return
+        if queue:
+            QTimer.singleShot(0, lambda g=gen: self._async_group_insert_step(g))
+            return
+        self._finish_group_insert(gen)
+
+    def _finish_group_insert(self, gen: int):
+        if gen != getattr(self, "_refresh_gen", 0):
+            return
+        if not _safe(self._list_layout):
+            self._stop_list_busy()
+            return
+        bottom = getattr(self, "_group_insert_bottom_pager", None)
+        self._group_insert_bottom_pager = None
+        if callable(bottom):
+            try:
+                self._list_layout.addWidget(bottom())
+            except RuntimeError:
+                pass
+        self._list_layout.addStretch()
+        self._stop_list_busy()
 
     def _build_backup_group(self, key: str, title: str, entries: list,
                             gid, is_playing: bool, cloud_only_ids: set,
@@ -1764,18 +2029,27 @@ class BackupsPage(QWidget, ThemedMixin):
         header = QPushButton()
         header.setCursor(Qt.CursorShape.PointingHandCursor)
         total_size = sum(b.size_bytes for b in entries)
-
-        def _header_text(is_open: bool) -> str:
-            arrow = "▼" if is_open else "▶"
-            return (f"{arrow}  {title}    ·  "
-                    f"{t('backups.count', count=len(entries))}  ·  {_fmt_size(total_size)}")
-
-        header.setText(_header_text(expanded))
-        header.setToolTip(t("backups.hide_saves") if expanded else t("backups.show_saves"))
-        # Styled from the theme QSS by objectName: there is one of these per
-        # title, they are rebuilt on every refresh, and the look never varies
-        # between them — so it belongs in the theme, not on each instance.
         header.setObjectName("backup_group_header")
+
+        # Layout INSIDE the button: arrow, then the title (middle-elided so a
+        # long title can never push the count off the right edge), then the
+        # right-aligned "count · size". A plain text button clipped the count
+        # at narrow widths — the count mix report.
+        from ui.helpers import ElidedLabel
+        arrow_lbl = QLabel("▼" if expanded else "▶")
+        arrow_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        title_lbl = ElidedLabel(title, own_tooltip=False)
+        title_lbl.setObjectName("backup_group_title")
+        meta_lbl = QLabel(
+            f"{t('backups.count', count=len(entries))}  ·  {_fmt_size(total_size)}")
+        meta_lbl.setObjectName("backup_group_meta")
+        _head = QHBoxLayout(header)
+        _head.setContentsMargins(12, 0, 12, 0)
+        _head.setSpacing(8)
+        _head.addWidget(arrow_lbl)
+        _head.addWidget(title_lbl, 1)
+        _head.addWidget(meta_lbl)
+        header.setToolTip(t("backups.hide_saves") if expanded else t("backups.show_saves"))
         col.addWidget(header)
 
         body = QWidget()
@@ -1788,11 +2062,11 @@ class BackupsPage(QWidget, ThemedMixin):
 
         built = {"done": False}
 
-        def _build_rows():
+        def _build_rows(tick=None):
             if built["done"]:
                 return
             built["done"] = True
-            for bk in entries:
+            for i, bk in enumerate(entries):
                 # Apply any check that ran while this title was collapsed, so
                 # a freshly expanded group shows the dots it earned instead of
                 # the state its listing copy was made with.
@@ -1810,16 +2084,22 @@ class BackupsPage(QWidget, ThemedMixin):
                 # ThemedMixin registry from the page).
                 self._backup_rows.append(row)
                 body_lay.addWidget(row)
+                if tick is not None and i % 20 == 19:
+                    tick(i + 1)
 
         def _toggle():
             now_open = not body.isVisible()
             if now_open:
-                _build_rows()
+                # Building BackupRow widgets for a title can stall — cover it
+                # (sheet only if it outlasts ~100 ms).
+                from ui.widgets.busy_overlay import busy_over
+                with busy_over(self, t("common.please_wait")):
+                    _build_rows()
                 self._expanded_titles.add(key)
             else:
                 self._expanded_titles.discard(key)
             body.setVisible(now_open)
-            header.setText(_header_text(now_open))
+            arrow_lbl.setText("▼" if now_open else "▶")
             header.setToolTip(t("backups.hide_saves") if now_open else t("backups.show_saves"))
 
         header.clicked.connect(_toggle)
@@ -1852,6 +2132,27 @@ class BackupsPage(QWidget, ThemedMixin):
         # Pager buttons need nothing here: #pager_btn / #pager_btn_active come
         # from the theme, already re-resolved by the stylesheet swap.
 
+    def _remediate_page_scrolls(self):
+        """Re-mediate scroll policies after DPI scale changes to maintain proportions.
+        
+        Ensures backup rows maintain proper sizing after DPI changes.
+        """
+        try:
+            # Update row geometries
+            for row in list(getattr(self, "_backup_rows", ())):
+                if hasattr(row, "updateGeometry"):
+                    try:
+                        row.updateGeometry()
+                    except RuntimeError:
+                        pass
+            
+            # Trigger layout recalculation
+            if hasattr(self, 'layout') and self.layout():
+                self.layout().activate()
+                self.layout().update()
+        except Exception:
+            pass
+
     def _on_backup_now(self):
         """Trigger backup.
 
@@ -1861,9 +2162,8 @@ class BackupsPage(QWidget, ThemedMixin):
         gid = self._selected_game_id
         if not gid:
             from core.library import get_library
-            for g in get_library().all_games():
-                if g.save_paths:
-                    self.backup_requested.emit(g.id)
+            ids = [g.id for g in get_library().all_games() if g.save_paths]
+            self.backup_all_requested.emit(ids)
             return
 
         filt = self._get_origin_filter()

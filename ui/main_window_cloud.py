@@ -41,12 +41,13 @@ class CloudFlowsMixin:
 
 
     def _entry_has_local_backups(self, entry) -> bool:
-        """True if this game has at least one local SaveSync backup zip.
+        """True if this game has applied local SaveSync backups of its own.
 
-        Primary lookup is by library game_id; falls back to the stable
-        name-derived backup folder (same belt-and-suspenders as
-        _restore_after_cloud_download) so a cross-PC or re-imported index
-        does not falsely look "backup-less" and trigger the no_local prompt.
+        Only backups filed under *entry.id* count, plus same-folder backups
+        that are NOT unapplied archives (orphan / no library game). Hand-added
+        Aggiungi-percorso zips share the title folder but were never restored
+        onto the game — treating them as "local saves" wrongly opened the
+        cloud conflict dialog instead of the archive-restore prompt.
         """
         from core.backup import get_backup_manager
         bm = get_backup_manager()
@@ -58,7 +59,17 @@ class CloudFlowsMixin:
                 entry.exe_path or "", entry.name, entry.id,
                 entry.computed_folder_name,
             )
-            if folder and bm.get_backups_for_folder(folder):
+            if not folder:
+                return False
+            lib_ids = bm.library_game_ids()
+            for b in bm.get_backups_for_folder(folder) or []:
+                if bm.is_orphan_entry(b):
+                    continue
+                if b.game_id and b.game_id not in lib_ids:
+                    continue
+                if b.game_id and b.game_id != entry.id and b.game_id in lib_ids:
+                    # Another live library game owns this zip — not ours.
+                    continue
                 return True
         except Exception:
             pass
@@ -70,6 +81,9 @@ class CloudFlowsMixin:
         action pattern as "unknown game with cloud saves → download & add
         to library", minus the add-to-library step since the game is
         already known.
+
+        Also runs when offline: hand-added orphan archives (same index shape
+        as cloud) are offered through this same notification path.
 
         *on_resolved*, if given, is called once the (backgrounded) network
         check has completed — see _on_cloud_check_result(). It fires as
@@ -92,15 +106,24 @@ class CloudFlowsMixin:
                 on_resolved()
             return
 
-        orch = get_orchestrator()
-        if not orch.is_online():
-            if on_resolved:
-                on_resolved()
-            return
-
         if on_resolved:
             with self._cloud_check_lock:
                 self._cloud_check_on_resolved[game_id] = on_resolved
+
+        orch = get_orchestrator()
+        if not orch.is_online():
+            with self._cloud_check_lock:
+                self._cloud_check_results[game_id] = False
+            from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
+            try:
+                QMetaObject.invokeMethod(
+                    self, "_on_cloud_check_result", _Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, game_id),
+                )
+            except RuntimeError:
+                if on_resolved:
+                    on_resolved()
+            return
 
         import threading
         _game_id = game_id
@@ -131,6 +154,111 @@ class CloudFlowsMixin:
         threading.Thread(target=_do_check, daemon=True).start()
 
 
+    def _stash_orphan_match(self, entry) -> bool:
+        """If an orphan archive matches *entry*, remember it for accept.
+
+        Returns True when a matching unapplied archive exists and this game
+        still has no backups under its own id. Orphan zips in the title
+        folder must NOT block this — they are the thing being offered.
+        """
+        if entry is None:
+            return False
+        try:
+            from core.backup import get_backup_manager
+            bm = get_backup_manager()
+            if bm.get_backups_for_game(entry.id):
+                self._pending_orphan_adopt.pop(entry.id, None)
+                return False
+            orphans = bm.find_orphan_backups_for_game(entry)
+            if not orphans:
+                self._pending_orphan_adopt.pop(entry.id, None)
+                return False
+            self._pending_orphan_adopt[entry.id] = orphans[0].game_id
+            return True
+        except Exception:
+            logger.debug("Orphan match failed", exc_info=True)
+            return False
+
+    def _apply_orphan_backup_to_game(self, entry) -> bool:
+        """Adopt matching orphan index + restore to the chain destination.
+
+        The archive folder (collection copy under e.g. D:\\VN Games\\Save) is
+        only the zip *source*. Live game save_paths must come from the recorded
+        chain (AppData/Roaming/…, www/save, …) — never from that origin path.
+        """
+        if entry is None:
+            return False
+        try:
+            from core.backup import get_backup_manager, chain_destination
+            bm = get_backup_manager()
+            orphan_gid = getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
+            orphans = bm.get_backups_for_game(orphan_gid) if orphan_gid else []
+            if not orphans:
+                orphans = bm.find_orphan_backups_for_game(entry)
+            if not orphans:
+                return False
+
+            by_oid: dict[str, list] = {}
+            for b in orphans:
+                by_oid.setdefault(b.game_id, []).append(b)
+
+            paths: list[str] = []
+            for oid, backs in by_oid.items():
+                newest = backs[0]
+                for p in (newest.save_paths or []):
+                    chain = (
+                        newest.content_chain_for(p)
+                        or newest.chain_for(p)
+                        or ""
+                    ).strip()
+                    dest = ""
+                    if chain:
+                        resolved = chain_destination(chain, entry.id)
+                        if resolved is not None:
+                            dest = str(resolved)
+                    if not dest:
+                        # Keep the chain for later rebases / restore; do NOT
+                        # register the archive copy as the live save folder.
+                        if chain and not (entry.save_chain or "").strip():
+                            entry.save_chain = chain
+                        logger.info(
+                            f"Orphan archive for {entry.name!r}: chain "
+                            f"{chain!r} — no live destination yet "
+                            f"(skipped origin {p!r})"
+                        )
+                        continue
+                    if dest not in paths:
+                        paths.append(dest)
+                        if chain:
+                            entry.record_path_chain(dest, chain)
+                bm.adopt_backups(
+                    oid, entry.id, entry.name,
+                    entry.exe_path or "",
+                    entry.computed_folder_name or "",
+                )
+
+            if paths or (entry.save_chain or "").strip():
+                if paths:
+                    merged = list(entry.save_paths or [])
+                    for p in paths:
+                        if p not in merged:
+                            merged.append(p)
+                    entry.save_paths = merged
+                    entry.save_paths_confirmed = True
+                get_library().update_game(entry)
+
+            owned = bm.get_backups_for_game(entry.id)
+            if owned:
+                bm.restore_backup(owned[0].backup_id, lib_game_id=entry.id)
+            logger.info(
+                f"Applied orphan archive to {entry.name!r} "
+                f"({len(paths)} destination path(s))"
+            )
+            return True
+        except Exception:
+            logger.exception("Failed to apply orphan archive")
+            return False
+
     @Slot(str)
     def _on_cloud_check_result(self, game_id: str):
         """GUI-thread continuation of _check_cloud_on_launch, run once the
@@ -149,7 +277,10 @@ class CloudFlowsMixin:
             self._suppress_cloud_prompt_once.discard(game_id)
             has_cloud = False
 
-        entry = get_library().get_by_id(game_id) if has_cloud else None
+        entry = get_library().get_by_id(game_id)
+
+        # Hand-added orphan archives: same notification as cloud no_local.
+        has_orphan = self._stash_orphan_match(entry) if entry is not None else False
 
         # Decide FIRST whether a cloud notification will actually be shown,
         # before calling on_resolved — that decision is exactly what
@@ -170,52 +301,71 @@ class CloudFlowsMixin:
             last_machine = cloud_meta.get("last_sync_machine", "")
             confirmed_machines: list = cloud_meta.get("download_confirmed_machines", [])
             has_local = self._entry_has_local_backups(entry)
+            _muted = entry.id in get_config().get("suppressed_cloud_no_local", [])
+            show = get_config().get("show_overlay_on_cloud", True)
 
-            if (last_machine and last_machine != machine_id
-                    and machine_id not in confirmed_machines):
-                if get_config().get("show_overlay_on_cloud", True):
-                    notification_kind = "different_machine"
-            elif get_config().get("show_overlay_on_cloud", True):
-                # One per-game "don't ask me to download at launch" list backs
-                # both cloud-download prompts (the no-local one and the
-                # not-reconciled one): they ask the same question, so muting
-                # one and still being asked the other made no sense.
-                _muted = entry.id in get_config().get("suppressed_cloud_no_local", [])
-                if not has_local:
-                    if not _muted:
-                        notification_kind = "no_local"
-                elif _muted:
-                    pass
-                elif entry.sync_status == "conflict":
-                    # A conflict recorded in an earlier session and never
-                    # resolved: nothing used to bring it back, because the
-                    # comparison window only ever opened from a LIVE
-                    # detection during auto-sync.
-                    notification_kind = "conflict_diverged"
-                elif entry.sync_status == "local_only":
-                    # Never synced, yet a cloud copy exists — local backups
-                    # made by hand plus a cloud folder from elsewhere (or a
-                    # same-named different game). Neither side can be assumed
-                    # to win, so it is the reconcile decision, NOT a download
-                    # prompt: that is what made this ask every single launch
-                    # before, since nothing about the status ever changed.
-                    # Any resolution syncs, which moves the status off
-                    # local_only and stops the asking.
-                    notification_kind = "conflict_unreconciled"
-                elif entry.sync_status in ("cloud_only", "pending"):
-                    # Keep-local already chosen: pending_local_wins forces the
-                    # next auto-sync to upload — do not re-ask "download?".
-                    if getattr(entry, "pending_local_wins", False):
+            # 1) Unapplied local archives first (Aggiungi percorso / leftover
+            #    after delete). Same no_local UI; accept restores from index.
+            # 2) Only then cloud prompts — and has_local ignores archives so
+            #    they never fake a local-vs-cloud conflict.
+            if has_orphan and show and not _muted:
+                notification_kind = "no_local"
+            elif has_cloud:
+                if (last_machine and last_machine != machine_id
+                        and machine_id not in confirmed_machines):
+                    if show:
+                        notification_kind = "different_machine"
+                elif show:
+                    # One per-game "don't ask me to download at launch" list backs
+                    # both cloud-download prompts (the no-local one and the
+                    # not-reconciled one): they ask the same question, so muting
+                    # one and still being asked the other made no sense.
+                    if not has_local:
+                        if not _muted:
+                            notification_kind = "no_local"
+                    elif _muted:
                         pass
-                    else:
-                        # Local backups already exist — only prompt a download
-                        # when reconciliation is actually needed (cloud-only
-                        # copy, or local saves changed since the last sync).
-                        notification_kind = "sync_prompt"
+                    elif entry.sync_status == "conflict":
+                        # A conflict recorded in an earlier session and never
+                        # resolved: nothing used to bring it back, because the
+                        # comparison window only ever opened from a LIVE
+                        # detection during auto-sync.
+                        notification_kind = "conflict_diverged"
+                    elif entry.sync_status == "local_only":
+                        # Never synced, yet a cloud copy exists — local backups
+                        # made by hand plus a cloud folder from elsewhere (or a
+                        # same-named different game). Neither side can be assumed
+                        # to win, so it is the reconcile decision, NOT a download
+                        # prompt: that is what made this ask every single launch
+                        # before, since nothing about the status ever changed.
+                        # Any resolution syncs, which moves the status off
+                        # local_only and stops the asking.
+                        notification_kind = "conflict_unreconciled"
+                    elif entry.sync_status in ("cloud_only", "pending"):
+                        # Keep-local already chosen: pending_local_wins forces the
+                        # next auto-sync to upload — do not re-ask "download?".
+                        if getattr(entry, "pending_local_wins", False):
+                            pass
+                        elif not has_local:
+                            # Local backups already exist — only prompt a download
+                            # when reconciliation is actually needed (cloud-only
+                            # copy, or local saves changed since the last sync).
+                            notification_kind = "sync_prompt"
+                        elif self._local_content_matches_last_backup(entry):
+                            # "Newer than last sync" is only the mtime saying so —
+                            # the content hash still matches the last backup, so
+                            # there is nothing new to download. The date-only
+                            # (sync_status pending) check used to ask every
+                            # launch for mtime touches; the local content check
+                            # goes beyond the date.
+                            pass
+                        else:
+                            notification_kind = "sync_prompt"
 
             logger.info(
                 f"Cloud launch check for {entry.name!r}: "
-                f"has_cloud={has_cloud}, has_local={has_local}, "
+                f"has_cloud={has_cloud}, has_orphan={has_orphan}, "
+                f"has_local={has_local}, "
                 f"sync_status={entry.sync_status!r}, "
                 f"last_sync_machine={last_machine!r}, "
                 f"prompt={notification_kind!r}"
@@ -264,7 +414,12 @@ class CloudFlowsMixin:
                     entry.computed_folder_name,
                 )
                 if folder:
-                    backs = list(bm.get_backups_for_folder(folder) or [])
+                    lib_ids = bm.library_game_ids()
+                    backs = [
+                        b for b in (bm.get_backups_for_folder(folder) or [])
+                        if not bm.is_orphan_entry(b)
+                        and (not b.game_id or b.game_id in lib_ids)
+                    ]
             if backs:
                 info["local"] = max(
                     (b.created_at or "" for b in backs), default="")
@@ -272,6 +427,33 @@ class CloudFlowsMixin:
         except Exception:
             logger.debug("Could not resolve local conflict time", exc_info=True)
 
+
+    def _local_content_matches_last_backup(self, entry) -> bool:
+        """True when the CURRENT save contents are identical to the last local
+        backup — only the mtime changed since the last sync.
+
+        Date-only logic (``sync_status == "pending"``) treats any touch as new
+        work and re-asks the cloud download at every launch; comparing the
+        content hash instead of the dates stops asking when the bytes are
+        already what the cloud holds. Falls back to False (keep asking) when
+        the comparison cannot be made.
+        """
+        try:
+            from core.backup import get_backup_manager
+            bm = get_backup_manager()
+            backups = bm.get_backups_for_game(entry.id)
+            if not backups:
+                return False
+            newest = backups[0]
+            meta = newest.cloud_metadata or {}
+            recorded_hash = meta.get("save_hash") or ""
+            if not recorded_hash:
+                return False
+            current = bm.current_state_hash(entry.id, entry.save_paths or [])
+            return bool(current) and current == recorded_hash
+        except Exception:
+            logger.debug("Local content check failed", exc_info=True)
+            return False
 
     def _ensure_conflict_times(self, entry) -> None:
         """Make sure ``_pending_conflict_info`` has local/remote dates to show.
@@ -376,6 +558,28 @@ class CloudFlowsMixin:
             return
 
         latest = max(backups, key=lambda b: b.created_dt)
+
+        # Backup-before-download: restoring writes the downloaded archive
+        # OVER the live save folder, so any local-only progress must be
+        # archived first (the same rule the "keep both" conflict path uses).
+        # create_backup dedups by content hash — unchanged saves cost nothing.
+        try:
+            if entry.save_paths:
+                from core.config_manager import get_config
+                _cfg = get_config()
+                bm.create_backup(
+                    game_id, entry.name, list(entry.save_paths),
+                    exe_path=entry.exe_path or "",
+                    note=t("main.backup_before_download_note"),
+                    max_size_mb=_cfg.get("max_backup_size_mb", 512),
+                    force=False,
+                    computed_folder_name=entry.computed_folder_name or "",
+                    excluded_paths=list(entry.excluded_save_paths or []),
+                    name_history=list(entry.name_history or []),
+                )
+        except Exception as e:
+            logger.warning(
+                f"Backup-before-download failed for {entry.name}: {e}")
 
         logger.info(f"Restoring cloud backup {latest.backup_id} for {entry.name}")
         # Pass the LOCAL game_id so cross-PC path resolution finds this

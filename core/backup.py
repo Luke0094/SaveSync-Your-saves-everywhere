@@ -49,6 +49,71 @@ def _is_skip_file(f: Path) -> bool:
             or f.stem.lower() in _BACKUP_SKIP_FILENAME_STEMS)
 
 
+def scan_relevant_save_mtimes(
+    fs_paths: list[str] | list[Path],
+    *,
+    registry_paths: list[str] | None = None,
+    chain_dirs: frozenset | None = None,
+    stop_if_newer_than: float | None = None,
+) -> tuple[bool, int, float]:
+    """Light walk of backup-relevant saves: count + newest mtime.
+
+    Returns ``(ok, entry_count, max_mtime)``. ``ok`` is False when a path
+    cannot be inspected or when *stop_if_newer_than* is exceeded (early exit).
+    Registry keys count as one entry each (via ``registry_last_write``).
+    """
+    from core.registry_saves import registry_last_write
+
+    keep = chain_dirs if chain_dirs is not None else frozenset()
+    eps = 1e-6
+    count = 0
+    max_mtime = 0.0
+    threshold = stop_if_newer_than
+
+    for rp in registry_paths or []:
+        try:
+            mtime = float(registry_last_write(rp) or 0.0)
+        except Exception:
+            return False, count, max_mtime
+        if threshold is not None and mtime > threshold + eps:
+            return False, count, max(max_mtime, mtime)
+        max_mtime = max(max_mtime, mtime)
+        count += 1
+
+    for raw in fs_paths:
+        try:
+            sp = Path(raw) if not isinstance(raw, Path) else raw
+            if sp.is_file():
+                if _is_skip_file(sp):
+                    continue
+                mtime = sp.stat().st_mtime
+                if threshold is not None and mtime > threshold + eps:
+                    return False, count, max(max_mtime, mtime)
+                max_mtime = max(max_mtime, mtime)
+                count += 1
+                continue
+            if not sp.is_dir():
+                continue
+            for f in sp.rglob("*"):
+                try:
+                    if not f.is_file():
+                        continue
+                    if _is_skip_file(f):
+                        continue
+                    if _is_in_skipped_subdir(f, sp, keep):
+                        continue
+                    mtime = f.stat().st_mtime
+                    if threshold is not None and mtime > threshold + eps:
+                        return False, count, max(max_mtime, mtime)
+                    max_mtime = max(max_mtime, mtime)
+                    count += 1
+                except OSError:
+                    continue
+        except OSError:
+            return False, count, max_mtime
+    return True, count, max_mtime
+
+
 def _is_in_skipped_subdir(f: Path, root: Path, keep: frozenset = frozenset()) -> bool:
     """True if any directory between *root* and *f* is a banned backup
     subdirectory (game assets, caches — see _BACKUP_SKIP_DIRS). Files whose
@@ -488,9 +553,16 @@ class BackupManager(QObject):
     backup_created = Signal(object)   # BackupEntry
     backup_restored = Signal(str)     # game_id
     backup_deleted = Signal(str)      # backup_id
+    # Startup zip-existence sweep failed after retries (GUI should notify).
+    index_validation_failed = Signal(str)
+    # A later retry succeeded after a failure had been reported.
+    index_validation_recovered = Signal()
 
     # Cap per game for the deleted-ids tombstone list (newest kept)
     _MAX_TOMBSTONES_PER_GAME = 200
+    # Background validate: immediate, then 5s, then 30s — never blocks get_*
+    # for minutes on every call.
+    _VALIDATE_RETRY_DELAYS_S = (0.0, 5.0, 30.0)
 
     def __init__(self):
         super().__init__()
@@ -501,7 +573,17 @@ class BackupManager(QObject):
         # download/prune/download loop is what made every sync report
         # uploads+downloads even with completely unchanged data.
         self._deleted_ids: dict[str, list[str]] = self._load_deleted_ids()
+        self._index_validated = threading.Event()
+        self._index_validate_ok = False
+        self._last_validation_error: str = ""
+        # True only after index_validation_failed was emitted to the UI.
+        self._validation_failure_notified = False
+        self._validate_lock = threading.Lock()
         self._load_all_indexes()
+        # Zip existence check can touch hundreds of files — do it off the
+        # startup path so the UI can come up first.
+        threading.Thread(target=self._background_validate_index,
+                         name="backup-index-validate", daemon=True).start()
 
     # ── Deleted-backup tombstones ────────────────────────────────────────────
 
@@ -618,7 +700,61 @@ class BackupManager(QObject):
 
         with _index_lock:
             self._index = entries
-        self._validate_index()
+        # Validation runs in _background_validate_index (or on demand).
+
+    def last_validation_error(self) -> str:
+        """Empty when the last completed validation attempt succeeded."""
+        return self._last_validation_error
+
+    def _background_validate_index(self):
+        """Validate with short retries; unblock getters without a long wait."""
+        last_err: Exception | None = None
+        for delay in self._VALIDATE_RETRY_DELAYS_S:
+            if delay:
+                threading.Event().wait(delay)
+            try:
+                self._validate_index()
+                with self._validate_lock:
+                    # Toast "recovered" only if the UI already saw a failure
+                    # (not for internal retries within the same startup run).
+                    notify_recovered = self._validation_failure_notified
+                    self._index_validate_ok = True
+                    self._last_validation_error = ""
+                    self._validation_failure_notified = False
+                    self._index_validated.set()
+                if notify_recovered:
+                    try:
+                        self.index_validation_recovered.emit()
+                    except RuntimeError:
+                        pass
+                return
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Background index validation failed: {e}")
+
+        msg = str(last_err) if last_err else "unknown error"
+        with self._validate_lock:
+            self._index_validate_ok = False
+            self._last_validation_error = msg[:200]
+            self._validation_failure_notified = True
+            # Unblock get_* — index stays usable; missing-zip cleanup may be incomplete.
+            self._index_validated.set()
+        logger.error(
+            "Backup index validation failed after retries: %s", msg
+        )
+        try:
+            self.index_validation_failed.emit(self._last_validation_error)
+        except RuntimeError:
+            pass
+
+    def _ensure_index_validated(self):
+        """Zip-existence cleanup is fully async — getters never block on it.
+
+        Waiting here used to stall the UI for up to two minutes when the
+        background sweep failed or ran long. The sweep retries on its own and
+        notifies the UI via ``index_validation_failed`` / ``recovered``.
+        """
+        return
 
     def _validate_index(self):
         """Remove entries whose zip file no longer exists on disk."""
@@ -627,7 +763,17 @@ class BackupManager(QObject):
         with _index_lock:
             valid = []
             for entry in self._index:
-                if Path(entry.zip_path).exists():
+                try:
+                    exists = Path(entry.zip_path).exists()
+                except OSError as e:
+                    # Transient IO (locked volume, network share blip): keep
+                    # the entry and continue — do not abort the whole sweep.
+                    logger.warning(
+                        f"Backup index: could not stat {entry.backup_id}: {e}"
+                    )
+                    valid.append(entry)
+                    continue
+                if exists:
                     valid.append(entry)
                 else:
                     removed.append(entry.backup_id)
@@ -637,9 +783,18 @@ class BackupManager(QObject):
         if removed:
             for gid in affected_games:
                 self._save_game_index(gid)
+            # Emit only from the GUI thread — background startup validation
+            # must not touch Qt signals directly.
+            from PySide6.QtCore import QCoreApplication, QThread
+            app = QCoreApplication.instance()
+            can_emit = (
+                app is not None
+                and QThread.currentThread() is app.thread()
+            )
             for bid in removed:
                 logger.info(f"Backup index: removed stale entry {bid} (zip missing)")
-                self.backup_deleted.emit(bid)
+                if can_emit:
+                    self.backup_deleted.emit(bid)
 
     def import_backup(self, entry: BackupEntry, zip_data: bytes) -> bool:
         """Import a backup ZIP downloaded from cloud into the local backup dir.
@@ -752,7 +907,14 @@ class BackupManager(QObject):
             own = [b for b in self._index if b.game_id == game_id]
             folder = ""
             if own:
-                folder = self._game_folder_for_entry(own[0])
+                # Use the NEWEST entry, not the first loaded: after a folder
+                # rename the oldest entry may still point at the old folder,
+                # and deriving the folder from it used to write the index to
+                # the old folder — silently dropping the freshly-created
+                # backups in the new one.
+                folder = self._game_folder_for_entry(
+                    max(own, key=lambda b: b.created_dt)
+                )
             elif _folder_hint:
                 folder = _folder_hint
             if not folder:
@@ -818,6 +980,96 @@ class BackupManager(QObject):
             return f"{size_mtime}|{h.hexdigest()}"
         except OSError:
             return f"{size_mtime}|"      # unreadable → empty content hash
+
+    @staticmethod
+    def _manifest_max_mtime(manifest: dict) -> float:
+        """Newest mtime recorded in fingerprint values (``size|mtime|…``)."""
+        mx = 0.0
+        for fp in (manifest or {}).values():
+            parts = str(fp).split("|")
+            if len(parts) >= 2:
+                try:
+                    mx = max(mx, float(parts[1]))
+                except ValueError:
+                    pass
+        return mx
+
+    def _saves_unchanged_by_mtime(
+        self,
+        valid_paths: list,
+        valid_reg: list,
+        chain_dirs,
+        max_prev_mtime: float,
+        expected_count: int,
+    ) -> bool:
+        """True when a light mtime/count scan matches the previous backup.
+
+        Used as a preflight before ``_collect_save_files`` / ``_build_manifest``
+        so Backup Tutti can skip games that clearly have not been touched.
+        A newer mtime or a different entry count falls through to the full
+        content-hash path (same-bytes rewrite with a fresh mtime still needs
+        that path to avoid a false "changed").
+        """
+        if max_prev_mtime <= 0:
+            return False
+        ok, count, _ = scan_relevant_save_mtimes(
+            [str(p) for p in valid_paths],
+            registry_paths=list(valid_reg),
+            chain_dirs=chain_dirs or frozenset(),
+            stop_if_newer_than=max_prev_mtime,
+        )
+        if not ok:
+            return False
+        return count == int(expected_count or 0)
+
+    def is_backup_current(
+        self,
+        game_id: str,
+        save_paths: list[str],
+        *,
+        excluded_paths: list[str] | None = None,
+        force: bool = False,
+    ) -> bool:
+        """True when the newest local backup already matches saves by mtime/count.
+
+        Cheap preflight for SyncWorker so a second create_backup walk is skipped
+        when nothing changed since the last backup.
+        """
+        if force or not save_paths:
+            return False
+        recent = self.get_backups_for_game(game_id)
+        if not recent:
+            return False
+        prev_meta = recent[0].cloud_metadata or {}
+        prev_manifest = prev_meta.get("file_manifest") or {}
+        if not prev_manifest:
+            return False
+        max_prev = prev_meta.get("saves_max_mtime")
+        try:
+            max_prev = float(max_prev) if max_prev is not None else 0.0
+        except (TypeError, ValueError):
+            max_prev = 0.0
+        if max_prev <= 0:
+            max_prev = self._manifest_max_mtime(prev_manifest)
+        expected = prev_meta.get("saves_entry_count")
+        if expected is None:
+            expected = len(prev_manifest)
+        if max_prev <= 0:
+            return False
+
+        from core.registry_saves import is_registry_path, registry_key_exists
+        excluded = set(excluded_paths or [])
+        paths = [p for p in save_paths if p not in excluded]
+        reg = [p for p in paths if is_registry_path(p) and registry_key_exists(p)]
+        fs = [p for p in paths if not is_registry_path(p)]
+        chain_dirs = _declared_chain_dirs(game_id)
+        ok, count, _ = scan_relevant_save_mtimes(
+            fs,
+            registry_paths=reg,
+            chain_dirs=chain_dirs,
+            stop_if_newer_than=max_prev,
+        )
+        return ok and count == int(expected or 0)
 
     # ── Save-state derivation ────────────────────────────────────────────────
     # These two used to live inline in create_backup. They are shared now
@@ -1021,6 +1273,11 @@ class BackupManager(QObject):
         excluded_paths: list[str] | None = None,
         pre_confirmation: bool = False,
         return_status: bool = False,
+        skip_mtime_preflight: bool = False,
+        content_chains_override: list[str] | None = None,
+        save_chains_override: list[str] | None = None,
+        orphan: bool = False,
+        recorded_save_paths: list[str] | None = None,
     ) -> "Optional[BackupEntry] | tuple[Optional[BackupEntry], bool]":
         """Create a zip backup of all save paths for a game.
         Skips silently if nothing changed since last backup (unless force=True).
@@ -1047,6 +1304,16 @@ class BackupManager(QObject):
                 or discarded (discard_pre_confirmation_backups) when the
                 detections are rejected/suppressed. Same store and same
                 rotation limits as ordinary backups.
+            skip_mtime_preflight: When True, skip the light mtime/count check
+                (caller already ran ``is_backup_current`` / an equivalent scan).
+            content_chains_override / save_chains_override: When set, used
+                instead of deriving chains from the library (hand-added
+                orphan archives have no GameEntry yet).
+            orphan: Index like any other backup, but not tied to a library
+                game — proposed later via the same cloud-saves notification.
+            recorded_save_paths: When set, stored on the index instead of the
+                zip source paths (collection archives: zip from the copy,
+                record the destination / zip-root label).
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -1089,6 +1356,13 @@ class BackupManager(QObject):
             self._migrate_old_backup_folders(
                 game_id, game_folder, name_history, exe_path
             )
+        # Index-driven migration: Backup All (and other callers that never
+        # pass name_history) must still consolidate a game whose
+        # computed_folder_name changed without recording the old folder in
+        # name_history. The actual index is the source of truth for where a
+        # game's backups live, so move any of them that aren't in the
+        # current folder yet. Safe when there's nothing to do.
+        self._migrate_stale_backup_folders(game_id, game_folder)
 
         game_backup_dir = BACKUP_DIR / game_folder
         game_backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1108,6 +1382,34 @@ class BackupManager(QObject):
                 return _ret(None, False)
             recent_file_set = {str(f.resolve()) for f in recent_files}
 
+        # ── Mtime/date preflight (before collect + manifest) ───────────────
+        # When every save mtime is still ≤ the newest mtime recorded on the
+        # previous backup and the entry count matches, skip without walking
+        # into hashing. Newer mtimes fall through to the content path.
+        recent = self.get_backups_for_game(game_id) if not force else []
+        prev_manifest: dict = {}
+        if recent and not selective:
+            prev_meta = recent[0].cloud_metadata or {}
+            prev_manifest = prev_meta.get("file_manifest") or {}
+            if prev_manifest and not skip_mtime_preflight:
+                max_prev = prev_meta.get("saves_max_mtime")
+                try:
+                    max_prev = float(max_prev) if max_prev is not None else 0.0
+                except (TypeError, ValueError):
+                    max_prev = 0.0
+                if max_prev <= 0:
+                    max_prev = self._manifest_max_mtime(prev_manifest)
+                expected = prev_meta.get("saves_entry_count")
+                if expected is None:
+                    expected = len(prev_manifest)
+                if max_prev > 0 and self._saves_unchanged_by_mtime(
+                        valid_paths, valid_reg, chain_dirs,
+                        max_prev, int(expected or 0)):
+                    logger.info(
+                        f"Backup already current for '{game_name}' — mtime preflight"
+                    )
+                    return _ret(recent[0], False)
+
         all_files = self._collect_save_files(valid_paths, chain_dirs, recent_file_set)
 
         if not all_files and not valid_reg:
@@ -1123,8 +1425,8 @@ class BackupManager(QObject):
         # self-contained), but we skip creating a new one if nothing changed.
         # Unchanged files are never re-read: _file_fingerprint reuses the
         # stored content hash when size+mtime still match.
-        recent = self.get_backups_for_game(game_id) if not force else []
-        prev_manifest = (recent[0].cloud_metadata or {}).get("file_manifest", {}) if recent else {}
+        if not prev_manifest and recent:
+            prev_manifest = (recent[0].cloud_metadata or {}).get("file_manifest", {}) or {}
         (new_manifest, resolved_files, reg_exports,
          changed_arc_names, current_hash) = self._build_manifest(
             all_files, valid_reg, prev_manifest)
@@ -1198,11 +1500,38 @@ class BackupManager(QObject):
                 "files_changed": len(changed_real),
                 "files_total": len(new_manifest),
                 "backup_type": "full",  # always self-contained
+                "saves_max_mtime": self._manifest_max_mtime(new_manifest),
+                "saves_entry_count": len(new_manifest),
             }
             if pre_confirmation:
                 metadata["pre_confirmation"] = True
+            if orphan:
+                metadata["orphan"] = True
 
             _recorded_paths = [str(p) for p in valid_paths] + valid_reg
+            if recorded_save_paths is not None:
+                # Zip still used valid_paths; index carries destinations /
+                # zip-root labels (parallel list, padded/truncated to match).
+                _rec = [str(p) for p in recorded_save_paths if p]
+                if _rec:
+                    while len(_rec) < len(_recorded_paths):
+                        _rec.append(_rec[-1])
+                    _recorded_paths = _rec[:len(_recorded_paths)]
+            if save_chains_override is not None:
+                _save_chains = list(save_chains_override)
+                while len(_save_chains) < len(_recorded_paths):
+                    _save_chains.append("")
+                _save_chains = _save_chains[:len(_recorded_paths)]
+            else:
+                _save_chains = self._install_relative_chains(
+                    _recorded_paths, exe_path, game_id)
+            if content_chains_override is not None:
+                _content = list(content_chains_override)
+                while len(_content) < len(_recorded_paths):
+                    _content.append("")
+                _content = _content[:len(_recorded_paths)]
+            else:
+                _content = _content_chains(_recorded_paths, game_id)
             entry = BackupEntry(
                 game_id=game_id,
                 game_name=game_name,
@@ -1216,9 +1545,8 @@ class BackupManager(QObject):
                 cloud_metadata=metadata,
                 origin=origin,
                 exe_path=exe_path,
-                save_chains=self._install_relative_chains(
-                    _recorded_paths, exe_path, game_id),
-                content_chains=_content_chains(_recorded_paths, game_id),
+                save_chains=_save_chains,
+                content_chains=_content,
             )
             with _index_lock:
                 self._index.append(entry)
@@ -1653,8 +1981,9 @@ class BackupManager(QObject):
     def restore_backup(self, backup_id: str,
                        freeze_pid: int = 0,
                        only_files: set[str] | None = None,
-                       lib_game_id: str = "") -> RestoreResult:
-        """Restore a backup zip to its original save locations.
+                       lib_game_id: str = "",
+                       target_dir: str = "") -> RestoreResult:
+        """Restore a backup zip to its original save locations or target_dir.
 
         Files whose content matches the backup are skipped.  Files that
         cannot be written (locked) are recorded in *result.failed* — the
@@ -1666,6 +1995,9 @@ class BackupManager(QObject):
             only_files:  If set, only restore these arc_names (used for
                          retrying previously failed files).  Safety backup
                          is skipped when retrying.
+            lib_game_id: Optional matching library game ID.
+            target_dir:  Optional custom target directory to extract files into
+                         (used for orphan backups without library game entry).
 
         Returns:
             RestoreResult with per-file detail.
@@ -1852,7 +2184,21 @@ class BackupManager(QObject):
                             result.errors.append(f"{arc}: registry import failed")
 
                 fs_save_paths = [p for p in entry.save_paths if not _is_reg(p)]
-                if not fs_save_paths:
+                if target_dir:
+                    target_path = Path(target_dir)
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    _target_files = [a for a in zf.namelist()
+                                     if not a.endswith('/')
+                                     and not arc_name_is_registry(a)]
+                    for arc_name in _target_files:
+                        dest = target_path / arc_name
+                        if not _is_relative_to(dest.resolve(), target_path.resolve()):
+                            continue
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        self._write_restore_file(dest, zf.read(arc_name), arc_name, result)
+                    result.used_fallback_dir = str(target_path)
+                    logger.info(f"Orphan backup restored directly to target_dir: {target_path}")
+                elif not fs_save_paths:
                     fallback = BACKUP_DIR / f"restored_{backup_id}"
                     _fallback_files = [a for a in zf.namelist()
                                        if not a.endswith('/')
@@ -2079,6 +2425,40 @@ class BackupManager(QObject):
         # Persist updated paths
         self._save_index()
 
+    def _migrate_stale_backup_folders(self, game_id: str, current_folder: str) -> int:
+        """Move this game's zips that still live under an OLD folder name.
+
+        Unlike ``_migrate_old_backup_folders`` — which reconstructs candidate
+        old folders from name_history — this reads the ACTUAL index: every
+        entry for *game_id* whose zip sits in a folder other than
+        *current_folder* is relocated there. Covers renames that were never
+        recorded in name_history (e.g. computed_folder_name changed by the
+        library) and callers that don't pass name_history at all (Backup All).
+
+        Returns how many zips were relocated.
+        """
+        from core.library import get_library
+        with _index_lock:
+            own = [b for b in self._index if b.game_id == game_id]
+        stale_folders: set[str] = set()
+        for b in own:
+            folder = self._game_folder_for_entry(b)
+            if folder and folder != current_folder:
+                stale_folders.add(folder)
+
+        moved = 0
+        for old_folder in sorted(stale_folders):
+            # Never steal a folder that is still another live game's home.
+            try:
+                if get_library().folder_name_in_use_by_other(old_folder, game_id):
+                    continue
+            except Exception:
+                pass
+            moved += self._move_game_zips(game_id, old_folder, current_folder)
+        if moved:
+            self._save_index()
+        return moved
+
     def _move_game_zips(self, game_id: str, old_folder: str,
                         current_folder: str) -> int:
         """Move *game_id*'s zips out of *old_folder* into *current_folder*.
@@ -2095,8 +2475,22 @@ class BackupManager(QObject):
         current_dir = BACKUP_DIR / current_folder
         if not old_dir.is_dir():
             return 0
+        # A backup's file is named after its backup_id, which embeds the
+        # game_id that was current WHEN it was created — that may differ from
+        # today's game_id (library id can change). So besides the id-scoped
+        # glob, also move the exact files the index points at in old_folder.
+        targets: dict[str, Path] = {}
+        for zip_file in old_dir.glob(f"{game_id}_*.zip"):
+            targets[zip_file.name] = zip_file
+        with _index_lock:
+            for entry in self._index:
+                if entry.game_id != game_id:
+                    continue
+                p = Path(entry.zip_path)
+                if p.parent == old_dir and p.name not in targets:
+                    targets[p.name] = p
         moved = 0
-        for zip_file in list(old_dir.glob(f"{game_id}_*.zip")):
+        for zip_file in targets.values():
             dest = current_dir / zip_file.name
             try:
                 current_dir.mkdir(parents=True, exist_ok=True)
@@ -2336,6 +2730,9 @@ class BackupManager(QObject):
                         b.game_id = to_game_id
                         b.game_name = to_game_name or b.game_name
                         b.zip_path = str(dest)
+                        if b.cloud_metadata and b.cloud_metadata.get("orphan"):
+                            b.cloud_metadata = dict(b.cloud_metadata)
+                            b.cloud_metadata.pop("orphan", None)
             moved += 1
 
         if moved:
@@ -2352,6 +2749,7 @@ class BackupManager(QObject):
         return moved
 
     def get_backups_for_game(self, game_id: str) -> list[BackupEntry]:
+        self._ensure_index_validated()
         with _index_lock:
             snapshot = [copy.deepcopy(b) for b in self._index if b.game_id == game_id]
         return sorted(
@@ -2368,6 +2766,7 @@ class BackupManager(QObject):
         entry that hasn't been re-imported yet)."""
         if not folder_name:
             return []
+        self._ensure_index_validated()
         with _index_lock:
             snapshot = [copy.deepcopy(b) for b in self._index
                         if self._game_folder_for_entry(b) == folder_name]
@@ -2375,10 +2774,303 @@ class BackupManager(QObject):
 
     def get_all_backups(self) -> list[BackupEntry]:
         """Return entire index (flat). Use for batch counting — no disk I/O."""
+        self._ensure_index_validated()
         with _index_lock:
             return [copy.deepcopy(b) for b in self._index]
 
+    def overview_index_snapshot(self) -> dict:
+        """Cheap one-pass read for Overview charts / activity (no deepcopy).
+
+        Returns keys:
+          count — total index entries
+          rows — (backup_id, game_id, created_at, size_human) tuples
+          provisional_ids — game_ids with a pre_confirmation backup
+          orphan_unit_count — unique orphan / no-library game_ids (donut Archivi)
+        """
+        self._ensure_index_validated()
+        lib_ids = self.library_game_ids()
+        provisional: set[str] = set()
+        orphan_gids: set[str] = set()
+        rows: list[tuple[str, str, str, str]] = []
+        with _index_lock:
+            for b in self._index:
+                meta = b.cloud_metadata or {}
+                gid = b.game_id or ""
+                if meta.get("pre_confirmation") and gid:
+                    provisional.add(gid)
+                if gid and (bool(meta.get("orphan")) or gid not in lib_ids):
+                    orphan_gids.add(gid)
+                rows.append((b.backup_id, gid, b.created_at or "", b.size_human))
+        return {
+            "count": len(rows),
+            "rows": rows,
+            "provisional_ids": provisional,
+            "orphan_unit_count": len(orphan_gids),
+        }
+
+    @staticmethod
+    def is_orphan_entry(entry: BackupEntry) -> bool:
+        return bool((entry.cloud_metadata or {}).get("orphan"))
+
+    def _unique_backup_folder(self, base: str) -> str:
+        """``base`` or ``base_2``… avoiding existing BACKUP_DIR folders."""
+        if not base:
+            base = "Unknown"
+        taken = set()
+        try:
+            if BACKUP_DIR.is_dir():
+                taken = {p.name.casefold() for p in BACKUP_DIR.iterdir() if p.is_dir()}
+        except OSError:
+            pass
+        try:
+            from core.library import get_library
+            taken |= get_library()._resolved_folder_names()
+        except Exception:
+            pass
+        if base.casefold() not in taken:
+            return base
+        n = 2
+        while f"{base}_{n}".casefold() in taken:
+            n += 1
+        return f"{base}_{n}"
+
+    def create_orphan_backup(
+        self,
+        game_name: str,
+        save_paths: list[str],
+        content_chain: str = "",
+        save_chain: str = "",
+        force: bool = True,
+        recorded_save_paths: list[str] | None = None,
+    ) -> Optional[BackupEntry]:
+        """Zip save folders with a normal index, not tied to a library game.
+
+        ``game_name`` is the folder/title hint (as with cloud indexes);
+        ``save_paths`` are the zip *sources* (may be a collection copy).
+        ``recorded_save_paths`` (optional) is what the index stores — the
+        destination / zip-root label, never a collection parent path.
+        """
+        import uuid
+        game_id = str(uuid.uuid4())
+        base = get_folder_name_for_save(game_name or "", "", "")
+        folder = self._unique_backup_folder(base)
+        sources = list(save_paths or [])
+        n = len(sources)
+        recorded = list(recorded_save_paths) if recorded_save_paths is not None else None
+        if recorded is not None and n and len(recorded) < n:
+            recorded = recorded + [recorded[-1]] * (n - len(recorded))
+        cc = [content_chain or ""] * n if n else None
+        sc = [save_chain or ""] * n if n else None
+        return self.create_backup(
+            game_id=game_id,
+            game_name=game_name or base or "Unknown",
+            save_paths=sources,
+            computed_folder_name=folder,
+            force=force,
+            content_chains_override=cc,
+            save_chains_override=sc,
+            orphan=True,
+            recorded_save_paths=recorded,
+        )
+
+    def library_game_ids(self) -> set[str]:
+        try:
+            from core.library import get_library
+            return {g.id for g in get_library().all_games()}
+        except Exception:
+            return set()
+
+    def get_orphan_backups(self) -> list[BackupEntry]:
+        """Backups marked orphan, or whose game_id is not in the library."""
+        lib_ids = self.library_game_ids()
+        out = []
+        for b in self.get_all_backups():
+            if self.is_orphan_entry(b) or (b.game_id and b.game_id not in lib_ids):
+                out.append(b)
+        return out
+
+    def orphan_folders(self) -> dict[str, int]:
+        """folder_name → backup count for archives with no library game."""
+        counts: dict[str, int] = {}
+        for b in self.get_orphan_backups():
+            folder = self._game_folder_for_entry(b)
+            if not folder:
+                continue
+            counts[folder] = counts.get(folder, 0) + 1
+        return counts
+
+    def find_orphan_backups_for_game(self, game) -> list[BackupEntry]:
+        """Orphan index entries whose name/folder matches *game*."""
+        if game is None:
+            return []
+        from core.constants import (
+            version_insensitive_slug,
+            get_install_folder_name,
+            get_folder_name_for_save,
+        )
+
+        names = set()
+        for n in (
+            getattr(game, "name", "") or "",
+            *(getattr(game, "name_history", None) or []),
+            *(getattr(game, "name_hints", None) or []),
+        ):
+            n = (n or "").strip()
+            if n:
+                names.add(n.casefold())
+                names.add(version_insensitive_slug(n))
+
+        folders = set()
+        try:
+            fn = get_install_folder_name(
+                getattr(game, "exe_path", "") or "",
+                getattr(game, "name", "") or "",
+                getattr(game, "id", "") or "",
+                getattr(game, "computed_folder_name", None),
+            )
+            if fn:
+                folders.add(fn.casefold())
+                folders.add(version_insensitive_slug(fn))
+            for hn in (getattr(game, "name_history", None) or []):
+                f = get_folder_name_for_save(
+                    hn, getattr(game, "exe_path", "") or "",
+                    getattr(game, "id", "") or "")
+                if f:
+                    folders.add(f.casefold())
+                    folders.add(version_insensitive_slug(f))
+            for fh in (getattr(game, "folder_history", None) or []):
+                if fh:
+                    folders.add(str(fh).casefold())
+                    folders.add(version_insensitive_slug(str(fh)))
+        except Exception:
+            pass
+
+        if not names and not folders:
+            return []
+
+        matched: list[BackupEntry] = []
+        seen_ids: set[str] = set()
+        for b in self.get_orphan_backups():
+            if b.backup_id in seen_ids:
+                continue
+            gname = (b.game_name or "").strip()
+            folder = self._game_folder_for_entry(b)
+            hit = False
+            if gname:
+                if gname.casefold() in names or version_insensitive_slug(gname) in names:
+                    hit = True
+            if not hit and folder:
+                if folder.casefold() in folders or version_insensitive_slug(folder) in folders:
+                    hit = True
+            if hit:
+                seen_ids.add(b.backup_id)
+                matched.append(b)
+        return sorted(matched, key=lambda b: b.created_dt, reverse=True)
+
+    def orphan_units(self) -> list[dict]:
+        """One dict per orphan archive (unique game_id), newest backup wins.
+
+        Fields: game_id, game_name, save_paths, folder, save_hash, synced_to,
+        needs_sync (True when not yet uploaded to any provider).
+        """
+        by_id: dict[str, BackupEntry] = {}
+        for b in self.get_orphan_backups():
+            if not b.game_id:
+                continue
+            cur = by_id.get(b.game_id)
+            if cur is None or b.created_dt > cur.created_dt:
+                by_id[b.game_id] = b
+        units = []
+        for gid, b in by_id.items():
+            meta = b.cloud_metadata or {}
+            synced_to = list(meta.get("synced_to") or [])
+            units.append({
+                "game_id": gid,
+                "game_name": b.game_name or self._game_folder_for_entry(b) or "Unknown",
+                "save_paths": list(b.save_paths or []),
+                "folder": self._game_folder_for_entry(b),
+                "save_hash": meta.get("save_hash") or "",
+                "synced_to": synced_to,
+                "last_synced_hash": meta.get("last_synced_hash") or "",
+                "needs_sync": not bool(synced_to) or (
+                    bool(meta.get("save_hash"))
+                    and meta.get("save_hash") != meta.get("last_synced_hash")
+                ),
+            })
+        return units
+
+    def orphan_sync_jobs(self) -> list[dict]:
+        """Sync-queue jobs for orphan archives that still need a cloud upload."""
+        jobs = []
+        for u in self.orphan_units():
+            if not u.get("needs_sync"):
+                continue
+            if not u.get("save_paths"):
+                continue
+            jobs.append({
+                "game_id": u["game_id"],
+                "game_name": u["game_name"],
+                "save_paths": list(u["save_paths"]),
+                "exe_path": "",
+                "computed_folder_name": u.get("folder") or "",
+                "name_history": [],
+                "orphan": True,
+            })
+        return jobs
+
+    def mark_orphan_synced(self, game_id: str, provider_ids: list[str] | None = None,
+                           save_hash: str = "", persist: bool = True) -> None:
+        """Stamp orphan backups after a successful cloud upload (no library row).
+
+        *persist*=False updates the in-memory index only — Sync Tutti uses that
+        to avoid rewriting index.json on the GUI thread for every archive.
+        """
+        if not game_id:
+            return
+        providers = [p for p in (provider_ids or []) if p]
+        with _index_lock:
+            touched = False
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                meta = dict(b.cloud_metadata or {})
+                meta["orphan"] = True
+                synced = list(meta.get("synced_to") or [])
+                for pid in providers:
+                    if pid not in synced:
+                        synced.append(pid)
+                if synced:
+                    meta["synced_to"] = synced
+                h = save_hash or meta.get("save_hash") or ""
+                if h:
+                    meta["last_synced_hash"] = h
+                    meta["save_hash"] = meta.get("save_hash") or h
+                meta["orphan_sync_status"] = "synced" if synced else "local_only"
+                b.cloud_metadata = meta
+                touched = True
+        if touched and persist:
+            try:
+                self._save_game_index(game_id)
+            except Exception:
+                logger.debug("mark_orphan_synced save failed", exc_info=True)
+
+    def flush_orphan_indexes(self, game_ids: list[str] | None = None) -> None:
+        """Write index.json for orphan game_ids (after a deferred batch stamp)."""
+        ids = list(game_ids or [])
+        if not ids:
+            return
+        seen = set()
+        for gid in ids:
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            try:
+                self._save_game_index(gid)
+            except Exception:
+                logger.debug("flush_orphan_indexes failed for %s", gid, exc_info=True)
+
     def get_backup(self, backup_id: str) -> Optional[BackupEntry]:
+        self._ensure_index_validated()
         with _index_lock:
             entry = next((b for b in self._index if b.backup_id == backup_id), None)
             return copy.deepcopy(entry) if entry else None
@@ -2477,7 +3169,344 @@ class BackupManager(QObject):
 
     # ── Integrity ────────────────────────────────────────────────────────────
 
-    def verify_backup(self, backup_id: str, deep: bool = False) -> tuple[str, str]:
+    def _repair_legacy_metadata(self, backup_id: str) -> bool:
+        """Rebuild manifest/save_hash/mtime metadata for a backup made before
+        per-file manifests existed.
+
+        Walks the zip once: every member's size, mtime (from the zip's stored
+        timestamps, fallback: the archive's own mtime) and sha256 become a
+        fingerprint — the exact ``size|mtime|sha256`` format the current code
+        produces — and ``saves_entry_count`` / ``saves_max_mtime`` are derived
+        from it. Without this, such a backup is invisible to the mtime preflight
+        and content-hash dedup: Backup Tutti would re-create the game every
+        time even though nothing changed (the reported legacy-game symptom).
+        """
+        import hashlib
+        import zipfile
+
+        entry = self.get_backup(backup_id)
+        if entry is None:
+            return False
+        zp = Path(entry.zip_path)
+        if not zp.exists() or not zipfile.is_zipfile(zp):
+            return False
+        manifest: dict[str, str] = {}
+        try:
+            with zipfile.ZipFile(zp) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    size = info.file_size
+                    try:
+                        dt = info.date_time
+                        mtime = datetime(*dt).timestamp()
+                    except (ValueError, TypeError, OverflowError):
+                        mtime = 0.0
+                    h = hashlib.sha256(zf.read(info.filename)).hexdigest()
+                    manifest[info.filename] = f"{size}|{mtime:.6f}|{h}"
+        except (zipfile.BadZipFile, OSError, KeyError) as e:
+            logger.warning(f"Legacy repair could not read {backup_id}: {e}")
+            return False
+        if not manifest:
+            return False
+        state_hash = self.state_hash_of(manifest)
+        max_mtime = self._manifest_max_mtime(manifest)
+        with _index_lock:
+            for b in self._index:
+                if b.backup_id == backup_id:
+                    meta = dict(b.cloud_metadata or {})
+                    meta["file_manifest"] = manifest
+                    meta["save_hash"] = state_hash
+                    meta["saves_entry_count"] = len(manifest)
+                    meta["saves_max_mtime"] = max_mtime
+                    b.cloud_metadata = meta
+                    break
+        logger.info(
+            f"Legacy backup {backup_id} repaired: {len(manifest)} files, "
+            f"save_hash {state_hash[:12]}"
+        )
+        return True
+
+    def repair_legacy_backups(self) -> tuple[int, int]:
+        """Scan every indexed backup and repair legacy entries (those lacking
+        per-file manifests / save hashes). Returns ``(repaired, failures)``.
+
+        Runs on a worker thread during startup self-checks: it re-reads every
+        legacy zip once, which is the only way to derive the metadata, and
+        writes the repaired index per game. Backups that are already current
+        are left untouched, so steady-state runs are free.
+        """
+        with _index_lock:
+            candidates = [
+                b.backup_id for b in self._index
+                if not ((b.cloud_metadata or {}).get("file_manifest")
+                        and (b.cloud_metadata or {}).get("save_hash"))
+            ]
+        repaired = 0
+        failures = 0
+        dirty: set[str] = set()
+        for bid in candidates:
+            try:
+                if self._repair_legacy_metadata(bid):
+                    repaired += 1
+                    entry = self.get_backup(bid)
+                    if entry is not None:
+                        dirty.add(entry.game_id)
+                else:
+                    failures += 1
+            except Exception as e:
+                failures += 1
+                logger.warning(f"Legacy repair failed for {bid}: {e}")
+        for gid in dirty:
+            try:
+                self._save_game_index(gid)
+            except Exception as e:
+                logger.warning(f"Could not persist legacy repair for {gid}: {e}")
+        if repaired:
+            logger.info(f"Legacy backup repair: {repaired} fixed, {failures} failed")
+        # Second repair pass: orphan entries whose save_paths still hold the
+        # absolute collection copy (zip source) are archive-only. Rewrite them
+        # to the destination/zip-root label the manual dialog records today,
+        # and fold the count into the total so the self-check reports it.
+        try:
+            entries, paths = self.repair_legacy_origin_paths()
+            repaired += entries
+        except Exception as e:
+            logger.warning(f"Legacy origin-path repair failed: {e}")
+            failures += 1
+        # Third repair pass: a library game whose computed_folder_name changed
+        # keeps its old backups in the old folder, invisible to dedup (the
+        # index was written to the folder of the oldest entry) → every Backup
+        # Tutti re-creates the game. Migrate those zips into the current
+        # folder so the self-check actually heals the symptom instead of only
+        # repairing pre-manifest metadata.
+        try:
+            moved = self.repair_stale_backup_folders()
+            repaired += moved
+        except Exception as e:
+            logger.warning(f"Stale-folder repair failed: {e}")
+            failures += 1
+        # Fourth repair pass: manual saves recorded the whole collection
+        # folder as the game name, store labels and all ("… KAGURA", "… -
+        # STEAM", "… mtl"). Strip that trailing publisher noise from the
+        # registered title and re-home the folder, so the self-check heals
+        # the names the manual add dialog left behind.
+        try:
+            titles = self.repair_orphan_title_noise()
+            repaired += titles
+        except Exception as e:
+            logger.warning(f"Orphan-title noise repair failed: {e}")
+            failures += 1
+        return repaired, failures
+
+    def repair_stale_backup_folders(self) -> int:
+        """Move each library game's backups that still live under an OLD
+        folder name into the game's CURRENT computed folder.
+
+        A game whose ``computed_folder_name`` changed keeps its old zips in
+        the old folder forever: Backup Tutti never passes name_history, and
+        even the name-history migration can't find a folder name that was
+        never recorded there. The index then keeps pointing at the old folder
+        and the game is re-backed-up on every run. This pass — run from the
+        ``backup_index`` self-check — migrates them based on the ACTUAL index,
+        exactly like ``create_backup`` does for the folder it writes into.
+
+        Returns how many zips were relocated (0 when nothing to do).
+        """
+        from core.library import get_library
+        try:
+            lib = get_library()
+        except Exception as e:
+            logger.warning(f"Stale-folder repair skipped (no library): {e}")
+            return 0
+        with _index_lock:
+            game_ids = {b.game_id for b in self._index}
+        total = 0
+        for gid in sorted(game_ids):
+            try:
+                entry = lib.get_by_id(gid)
+            except Exception:
+                entry = None
+            if entry is None:
+                continue
+            current = entry.computed_folder_name or get_install_folder_name(
+                entry.exe_path or "", entry.name, gid)
+            if not current:
+                continue
+            try:
+                total += self._migrate_stale_backup_folders(gid, current)
+            except Exception as e:
+                logger.warning(f"Stale-folder repair failed for {gid}: {e}")
+        if total:
+            logger.info(f"Stale-folder repair: {total} backup(s) relocated")
+        return total
+
+    def _repair_entry_title_noise(self, entry: BackupEntry) -> bool:
+        """Strip a trailing store/publisher label off an orphan backup's title.
+
+        Reads the title REGISTERED in the index (``game_name``) — never
+        re-derived from the folder, which would only reproduce the noise —
+        and, when it ends on release decoration (a store label, a language
+        marker, a separated "Steam"), rewrites the entry with the clean title
+        and moves the backup folder to match. Only the tail after the last
+        ``-`` delimiter or version is eligible; the title before it is never
+        touched. Returns True when the entry changed.
+        """
+        from core.game_sources.common import strip_publisher_noise
+        from core.constants import get_folder_name_for_save
+        clean = strip_publisher_noise(entry.game_name)
+        if not clean or clean == entry.game_name:
+            return False
+        old_folder = self._game_folder_for_entry(entry)
+        with _index_lock:
+            for b in self._index:
+                if b.backup_id == entry.backup_id:
+                    b.game_name = clean
+                    break
+        new_base = get_folder_name_for_save(clean, "", "")
+        new_folder = self._unique_backup_folder(new_base)
+        if old_folder and new_folder and new_folder != old_folder:
+            self._move_game_zips(entry.game_id, old_folder, new_folder)
+        self._save_game_index(entry.game_id)
+        logger.info(
+            f"Backup {entry.backup_id}: title '{entry.game_name}' → '{clean}'")
+        return True
+
+    def repair_orphan_title_noise(self) -> int:
+        """Strip store/publisher labels from every orphan backup's title.
+
+        The self-check companion of the per-entry repair used by manual
+        verification: manual saves recorded the whole collection folder as
+        the game name, store labels and all. Returns how many titles were
+        cleaned.
+        """
+        count = 0
+        for entry in self.get_orphan_backups():
+            try:
+                if self._repair_entry_title_noise(entry):
+                    count += 1
+            except Exception as e:
+                logger.warning(
+                    f"Orphan-title repair failed for {entry.backup_id}: {e}")
+        if count:
+            logger.info(f"Orphan-title repair: {count} title(s) cleaned")
+        return count
+
+    def _legacy_origin_label(self, entry: BackupEntry, i: int) -> str:
+        """Label a legacy orphan save_path should be rewritten to, or "".
+
+        Old manual backups recorded the absolute collection copy path (the
+        zip *source*, e.g. ``D:\\VN Games\\Save\\Game``) as save_paths. A
+        restore then treats the backup as archive-only. The manual dialog
+        today records the destination / zip-root label instead; this derives
+        the same label for an existing entry:
+
+          - chain resolves to a profile destination → that destination
+          - path already under this machine's user profile → a LIVE
+            destination, never an origin → keep ("" = no rewrite)
+          - otherwise the absolute path is a collection origin → the
+            folder name (zip-root label)
+        """
+        sp = entry.save_paths or []
+        if i >= len(sp):
+            return ""
+        p = sp[i]
+        if not p:
+            return ""
+        try:
+            if not Path(p).is_absolute():
+                return ""     # already a label
+        except (OSError, ValueError):
+            return ""
+        chain = ""
+        try:
+            cc = entry.content_chains or []
+            sc = entry.save_chains or []
+            if i < len(cc):
+                chain = (cc[i] or "").strip()
+            if not chain and i < len(sc):
+                chain = (sc[i] or "").strip()
+        except Exception:
+            chain = ""
+        if chain:
+            try:
+                from core.manual_paths import profile_destination
+                dest = profile_destination(chain)
+            except Exception:
+                dest = None
+            if dest is not None:
+                return str(dest)
+        try:
+            home = os.path.expanduser("~")
+            if home and os.path.normcase(p).startswith(os.path.normcase(home)):
+                return ""     # live destination under the profile — keep
+        except Exception:
+            pass
+        try:
+            return Path(p).name or p
+        except Exception:
+            return ""
+
+    def _repair_entry_origin_paths(self, entry: BackupEntry) -> int:
+        """Rewrite *entry*'s legacy origin save_paths in place.
+
+        Returns how many paths were rewritten (0 = nothing to do).
+        """
+        sp = list(entry.save_paths or [])
+        if not sp:
+            return 0
+        new_sp = list(sp)
+        for i in range(len(sp)):
+            label = self._legacy_origin_label(entry, i)
+            if label and label != sp[i]:
+                new_sp[i] = label
+        if new_sp == sp:
+            return 0
+        entry.save_paths = new_sp
+        return sum(1 for a, b in zip(sp, new_sp) if a != b)
+
+    def repair_legacy_origin_paths(self) -> tuple[int, int]:
+        """Rewrite every orphan entry's absolute collection-origin paths.
+
+        Returns ``(entries_rewritten, paths_rewritten)``. Runs as part of the
+        startup self-checks (via repair_legacy_backups) and of the manual
+        "Verifica Backup" per-entry check, so both maintenance paths converge
+        on the same label the manual dialog records on write.
+        """
+        with _index_lock:
+            targets = [b for b in self._index if self.is_orphan_entry(b)]
+        entries_rewritten = 0
+        paths_rewritten = 0
+        dirty: set[str] = set()
+        for entry in targets:
+            try:
+                n = self._repair_entry_origin_paths(entry)
+                if n:
+                    entries_rewritten += 1
+                    paths_rewritten += n
+                    dirty.add(entry.game_id)
+            except Exception as e:
+                logger.warning(f"Origin-path repair failed for {entry.backup_id}: {e}")
+        for gid in dirty:
+            try:
+                self._save_game_index(gid)
+            except Exception as e:
+                logger.warning(f"Origin-path repair save failed for {gid}: {e}")
+        if entries_rewritten:
+            logger.info(
+                f"Legacy origin-path repair: {entries_rewritten} entries, "
+                f"{paths_rewritten} path(s) rewritten"
+            )
+        return entries_rewritten, paths_rewritten
+
+    def verify_backup(
+        self,
+        backup_id: str,
+        deep: bool = False,
+        *,
+        persist: bool = True,
+        repair_legacy: bool = True,
+    ) -> tuple[str, str]:
         """Check that a backup is still what it claims to be.
 
         Returns ``(state, detail)`` and records both on the entry, so the list
@@ -2497,6 +3526,14 @@ class BackupManager(QObject):
 
         A backup made before per-file manifests existed has nothing to compare
         against; it still gets the CRC check, and "ok" then means exactly that.
+        With *repair_legacy*, such a backup is upgraded in place: the manifest,
+        save hash and mtime/count metadata are rebuilt from the archive, so the
+        next backup/sync preflight can compare against real values instead of
+        treating the game as permanently "changed".
+
+        *persist*: when False, update the in-memory index only — batch callers
+        flush with ``_save_game_index`` once per game (avoids rewriting the
+        same index.json after every zip on a huge library).
         """
         import hashlib
         import zipfile
@@ -2551,7 +3588,48 @@ class BackupManager(QObject):
                 if b.backup_id == backup_id:
                     b.verify_state, b.verify_at, b.verify_detail = state, stamp, detail
                     break
-        self._save_game_index(entry.game_id)
+        # Legacy upgrade: an archive that verifies ok but predates per-file
+        # manifests is rewritten in place — manifest + save_hash + mtime/count
+        # derived from the zip — so future preflights have real values to
+        # compare against. This is the "index construction" repair.
+        if state == "ok" and repair_legacy and not (
+            (entry.cloud_metadata or {}).get("file_manifest")
+            and (entry.cloud_metadata or {}).get("save_hash")
+        ):
+            try:
+                self._repair_legacy_metadata(entry.backup_id)
+            except Exception as e:
+                logger.warning(f"Legacy metadata repair failed for {backup_id}: {e}")
+        # Legacy origin paths: an orphan entry whose save_paths still hold the
+        # absolute collection copy (zip source) is archive-only — the manual
+        # dialog records the destination/zip-root label today. Rewrite in
+        # place so manual "Verifica Backup" converges on the same shape.
+        if repair_legacy and self.is_orphan_entry(entry):
+            try:
+                n = self._repair_entry_origin_paths(entry)
+                if n:
+                    logger.info(
+                        f"Backup {backup_id}: {n} origin path(s) rewritten")
+                    # get_backup() returned a deepcopy — write the result back
+                    # onto the real index entry.
+                    with _index_lock:
+                        for b in self._index:
+                            if b.backup_id == backup_id:
+                                b.save_paths = entry.save_paths
+                                break
+            except Exception as e:
+                logger.warning(f"Origin-path repair failed for {backup_id}: {e}")
+        # Registered title noise: a manual backup whose game_name still ends
+        # on a store/publisher label ("… KAGURA", "… - STEAM") gets the clean
+        # title here too, so manual "Verifica Backup" converges on the same
+        # shape as the startup self-check.
+        if repair_legacy and self.is_orphan_entry(entry):
+            try:
+                self._repair_entry_title_noise(entry)
+            except Exception as e:
+                logger.warning(f"Title-noise repair failed for {backup_id}: {e}")
+        if persist:
+            self._save_game_index(entry.game_id)
         if state != "ok":
             logger.warning(f"Backup {backup_id} verify: {state} ({detail})")
         else:
@@ -2559,25 +3637,103 @@ class BackupManager(QObject):
                         + (" (deep)" if deep else ""))
         return state, detail
 
-    def verify_backups(self, backup_ids: list, deep: bool = False,
-                       cancel=None, on_one=None) -> dict:
+    # Re-checking an archive that was "ok" this recently is almost always
+    # wasted read bandwidth; callers can force a full pass with skip_recent_hours=0.
+    _VERIFY_SKIP_RECENT_HOURS = 12.0
+
+    def verify_backups(
+        self,
+        backup_ids: list,
+        deep: bool = False,
+        cancel=None,
+        on_one=None,
+        *,
+        throttle_s: float | None = None,
+        skip_recent_hours: float | None = None,
+    ) -> dict:
         """Verify several backups. Returns ``{backup_id: (state, detail)}``.
 
         *cancel* is anything with ``is_set()`` (a threading.Event): checked
         between backups so a long run stops promptly. *on_one* is called with
         ``(backup_id, state, detail)`` after each one, for progress.
+
+        Index files are flushed once per affected game at the end (not after
+        every zip). Between real CRC checks a short adaptive sleep may yield
+        the disk on weak machines (0 on capable ones); backups still marked
+        ``ok`` within *skip_recent_hours* are reused.
         """
+        import time as _time
+
+        if throttle_s is None:
+            from core.concurrency import verify_throttle_s
+            throttle_s = verify_throttle_s()
+        if skip_recent_hours is None:
+            skip_recent_hours = self._VERIFY_SKIP_RECENT_HOURS
+
         out: dict = {}
+        dirty_games: set[str] = set()
+        skip_cutoff = None
+        if skip_recent_hours and skip_recent_hours > 0:
+            skip_cutoff = (
+                datetime.utcnow() - timedelta(hours=float(skip_recent_hours))
+            )
+
         for bid in backup_ids:
             if cancel is not None and cancel.is_set():
                 break
-            state, detail = self.verify_backup(bid, deep=deep)
+
+            entry = self.get_backup(bid)
+            if entry is None:
+                state, detail = "missing", "no such backup"
+                out[bid] = (state, detail)
+                if on_one is not None:
+                    try:
+                        on_one(bid, state, detail)
+                    except Exception:
+                        logger.debug("verify progress callback failed", exc_info=True)
+                continue
+
+            # Fresh "ok" → skip the zip open (biggest win on re-runs).
+            if (
+                skip_cutoff is not None
+                and (entry.verify_state or "") == "ok"
+                and entry.verify_at
+            ):
+                try:
+                    at = datetime.fromisoformat(entry.verify_at)
+                    if at.tzinfo is not None:
+                        at = at.replace(tzinfo=None)
+                    if at >= skip_cutoff:
+                        state = entry.verify_state or "ok"
+                        detail = entry.verify_detail or ""
+                        out[bid] = (state, detail)
+                        if on_one is not None:
+                            try:
+                                on_one(bid, state, detail)
+                            except Exception:
+                                logger.debug(
+                                    "verify progress callback failed", exc_info=True)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            state, detail = self.verify_backup(
+                bid, deep=deep, persist=False, repair_legacy=True)
+            dirty_games.add(entry.game_id)
             out[bid] = (state, detail)
             if on_one is not None:
                 try:
                     on_one(bid, state, detail)
                 except Exception:
                     logger.debug("verify progress callback failed", exc_info=True)
+            if throttle_s and throttle_s > 0:
+                _time.sleep(float(throttle_s))
+
+        for gid in dirty_games:
+            try:
+                self._save_game_index(gid)
+            except Exception as e:
+                logger.warning(f"Could not persist verify results for {gid}: {e}")
         return out
 
     @staticmethod

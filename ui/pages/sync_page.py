@@ -30,6 +30,7 @@ from ui.modal_helpers import (
     warning_window_modal,
 )
 from ui.styles.theme import palette, ThemedMixin
+from ui.helpers import PageScrollMixin, scaled
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ class ProviderCredentialForm(QWidget, ThemedMixin):
                 data_w = QLineEdit()
                 data_w.setPlaceholderText(field.get("placeholder", ""))
                 browse_btn = QPushButton(t("add_game.browse"))
-                browse_btn.setFixedWidth(80)
+                browse_btn.setFixedWidth(scaled(80, self))
                 if ftype == "folder":
                     browse_btn.clicked.connect(
                         lambda _, w=data_w: w.setText(
@@ -137,10 +138,7 @@ class ProviderCredentialForm(QWidget, ThemedMixin):
             # ── guide (step-by-step setup instructions) ──────────────────────
             elif ftype == "guide":
                 guide_w = QFrame()
-                self._sty(guide_w, lambda: (
-                    f"QFrame {{ background:{palette('bg_card')}; border:1px solid {palette('border')};"
-                    f"border-radius:6px; padding:10px 12px; }}"
-                ))
+                guide_w.setObjectName("sync_setup_guide")
                 guide_layout = QVBoxLayout(guide_w)
                 guide_layout.setContentsMargins(0, 0, 0, 0)
                 guide_layout.setSpacing(6)
@@ -159,12 +157,8 @@ class ProviderCredentialForm(QWidget, ThemedMixin):
                 if portal_url and portal_label:
                     import webbrowser as _wb
                     open_btn = QPushButton(f"\U0001f310  {portal_label}")
+                    open_btn.setObjectName("sync_portal_btn")
                     open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                    self._sty(open_btn, lambda: (
-                        f"QPushButton {{ background:{palette('accent')}; color:white; border:none;"
-                        f"border-radius:4px; padding:6px 12px; font-size:11px; font-weight:600; }}"
-                        f"QPushButton:hover {{ background:{palette('accent_hover')}; }}"
-                    ))
                     open_btn.clicked.connect(lambda _, url=portal_url: _wb.open(url))
                     guide_layout.addWidget(open_btn)
 
@@ -344,18 +338,13 @@ class QuickConnectCard(QFrame, ThemedMixin):
 
     def _build(self, icon: str, name: str, path: str, method: str):
         self.setObjectName("quick_card")
-        self._sty(self, lambda: (
-            f"QFrame#quick_card {{ background:{palette('bg_card')}; border:1px solid {palette('border')};"
-            f"border-radius:8px; }}"
-            f"QFrame#quick_card:hover {{ border-color:{palette('accent')}; }}"
-        ))
         card_layout = QHBoxLayout(self)
         card_layout.setContentsMargins(12, 10, 12, 10)
         card_layout.setSpacing(12)
 
         icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet("font-size:20px; background:transparent;")  # static — no palette()
-        icon_lbl.setFixedWidth(28)
+        icon_lbl.setObjectName("emoji_icon")
+        icon_lbl.setFixedWidth(scaled(28, self))
         card_layout.addWidget(icon_lbl)
 
         info = QVBoxLayout()
@@ -363,8 +352,7 @@ class QuickConnectCard(QFrame, ThemedMixin):
         # Show provider name with method indicator
         method_tag = f"  ({t('sync.local_folder_tag')})" if method == "local_folder" else ""
         name_lbl = QLabel(f"{name}{method_tag}")
-        self._sty(name_lbl, lambda: f"color:{palette('text')};font-size:13px;font-weight:600;"
-                                    f"background:transparent;")
+        name_lbl.setObjectName("quick_card_name")
         info.addWidget(name_lbl)
         path_lbl = QLabel(path)
         path_lbl.setObjectName("form_hint")
@@ -373,7 +361,7 @@ class QuickConnectCard(QFrame, ThemedMixin):
 
         self.button = QPushButton(t("sync.one_click_connect"))
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.button.setFixedWidth(120)
+        self.button.setFixedWidth(scaled(120, self))
         # Registered once; the fn reads self._connected so refresh_styles picks
         # the right variant with the currently-active palette.
         self._sty(self.button, lambda: self._button_style())
@@ -384,11 +372,11 @@ class QuickConnectCard(QFrame, ThemedMixin):
             # Connected: solid success fill, no hover rule (matches original).
             return (
                 f"QPushButton {{ background:{palette('success')}; color:{palette('accent_text')}; border:none;"
-                f"border-radius:4px; padding:6px 12px; font-size:12px; font-weight:600; }}"
+                f"border-radius:4px; padding:6px 12px; font-size:{scaled(12, self)}px; font-weight:600; }}"
             )
         return (
             f"QPushButton {{ background:{palette('accent')}; color:{palette('accent_text')}; border:none;"
-            f"border-radius:4px; padding:6px 12px; font-size:12px; font-weight:600; }}"
+            f"border-radius:4px; padding:6px 12px; font-size:{scaled(12, self)}px; font-weight:600; }}"
             f"QPushButton:hover {{ background:{palette('accent_hover')}; }}"
         )
 
@@ -408,23 +396,57 @@ class QuickConnectCard(QFrame, ThemedMixin):
 
 # ── Sync Page ────────────────────────────────────────────────────────────────
 
-class SyncPage(QWidget, ThemedMixin):
+class SyncPage(PageScrollMixin, QWidget, ThemedMixin):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_form: ProviderCredentialForm | None = None
         self._connect_worker = None
         self._abandoned_workers: list = []  # prevent GC of still-running threads
+        self._pending_initial_load = True
         self._build()
-        self._load_saved_config()
-        # Populate persisted sync history right away (survives restarts)
-        self._refresh_history()
+        # Config + history load on first show so opening Sync never blocks.
 
         # Connect sync progress and provider state changes
         orch = get_orchestrator()
         orch.sync_started.connect(self._on_sync_started)
         orch.sync_finished.connect(self._on_sync_done)
+        orch.batch_finished.connect(self._on_sync_batch_ui_finished)
         orch.provider_changed.connect(self._on_orchestrator_provider_changed)
         orch.providers_updated.connect(self._on_orchestrator_provider_changed)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._pending_initial_load:
+            self._pending_initial_load = False
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._enter_load)
+
+    def ensure_loaded(self):
+        if self._pending_initial_load:
+            self._pending_initial_load = False
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._enter_load)
+
+    def on_page_leave(self):
+        """Clean up when leaving sync page."""
+        pass
+
+    def wipe_and_reload(self):
+        """Re-arm the initial load so the next visit reloads config +
+        history (called by the overview refresh button)."""
+        self._pending_initial_load = True
+        if self.isVisible():
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._enter_load)
+
+    def _enter_load(self):
+        from ui.widgets.busy_overlay import DeferredBusy
+        busy = DeferredBusy(self, t("common.please_wait"))
+        try:
+            self._load_saved_config()
+            self._refresh_history()
+        finally:
+            busy.close()
 
     def _on_orchestrator_provider_changed(self, _pid: str = ""):
         """Refresh UI when provider connects/disconnects (e.g. on startup)."""
@@ -437,6 +459,10 @@ class SyncPage(QWidget, ThemedMixin):
             orch = get_orchestrator()
             orch.sync_started.disconnect(self._on_sync_started)
             orch.sync_finished.disconnect(self._on_sync_done)
+            try:
+                orch.batch_finished.disconnect(self._on_sync_batch_ui_finished)
+            except (RuntimeError, TypeError):
+                pass
             orch.provider_changed.disconnect(self._on_orchestrator_provider_changed)
             orch.providers_updated.disconnect(self._on_orchestrator_provider_changed)
         except (RuntimeError, TypeError):
@@ -456,9 +482,9 @@ class SyncPage(QWidget, ThemedMixin):
         self._header.setObjectName("page_header")
         root.addWidget(self._header)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
         content.setObjectName("transparent_bg")
         layout  = QVBoxLayout(content)
@@ -486,20 +512,16 @@ class SyncPage(QWidget, ThemedMixin):
         prov_row.addWidget(self._provider_combo, 1)
 
         self._connect_btn = QPushButton(t("sync.connect"))
+        self._connect_btn.setObjectName("primary_btn")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._connect_btn.setFixedWidth(120)
-        self._sty(self._connect_btn, lambda: (
-            f"QPushButton {{ background:{palette('accent')}; color:{palette('accent_text')}; border:none;"
-            f"border-radius:4px; padding:6px 12px; font-size:12px; font-weight:600; }}"
-            f"QPushButton:hover {{ background:{palette('accent_hover')}; }}"
-        ))
+        self._connect_btn.setFixedWidth(scaled(120, self))
         self._connect_btn.clicked.connect(self._on_connect_toggle)
         self._connect_btn.setVisible(False)  # Hidden until a provider is selected
         prov_row.addWidget(self._connect_btn)
         prov_layout.addLayout(prov_row)
 
         self._conn_status = QLabel()
-        self._sty(self._conn_status, lambda: f"color: {palette('text_hint')}; font-size: 12px;")
+        self._conn_status.setObjectName("sync_status")
         prov_layout.addWidget(self._conn_status)
 
         # Dynamic credential form area
@@ -509,11 +531,8 @@ class SyncPage(QWidget, ThemedMixin):
         self._form_layout.setSpacing(6)
 
         self._provider_hint = QLabel()
+        self._provider_hint.setObjectName("sync_provider_hint")
         self._provider_hint.setWordWrap(True)
-        self._sty(self._provider_hint, lambda: (
-            f"color:{palette('success')};font-size:11px;padding:6px 8px;"
-            f"background:{palette('bg_card')};border-radius:4px;border:1px solid {palette('border')};"
-        ))
         self._provider_hint.setVisible(False)
         self._provider_hint.setMaximumHeight(0)  # No space when hidden
         self._form_layout.addWidget(self._provider_hint)
@@ -533,7 +552,7 @@ class SyncPage(QWidget, ThemedMixin):
         layout.addWidget(self._sync_all_btn)
 
         self._sync_progress = QLabel()
-        self._sty(self._sync_progress, lambda: f"color: {palette('text_hint')}; font-size: 11px;")
+        self._sync_progress.setObjectName("sync_muted")
         self._sync_progress.setVisible(False)
         layout.addWidget(self._sync_progress)
 
@@ -541,14 +560,15 @@ class SyncPage(QWidget, ThemedMixin):
         self._history_group = self._make_group(t("sync.history"))
         history_layout = QVBoxLayout(self._history_group)
         self._history_list = QLabel(t("sync.no_history"))
-        self._sty(self._history_list, lambda: f"color: {palette('text_hint')}; font-size: 11px;")
+        self._history_list.setObjectName("sync_muted")
         self._history_list.setWordWrap(True)
         history_layout.addWidget(self._history_list)
         layout.addWidget(self._history_group)
 
         layout.addStretch()
-        scroll.setWidget(content)
-        root.addWidget(scroll)
+        self._scroll.setWidget(content)
+        root.addWidget(self._scroll, 1)
+        self._register_page_scroll(self._scroll, list_content=True)
 
     def _make_group(self, title: str) -> QGroupBox:
         """A sync section. Styled by the theme's QGroupBox rule, same as the
@@ -587,8 +607,7 @@ class SyncPage(QWidget, ThemedMixin):
             return
 
         header = QLabel(t("sync.quick_connect_header"))
-        self._sty(header, lambda: f"color:{palette('text_muted')};font-size:11px;font-weight:600;"
-                                  f"letter-spacing:0.5px;")
+        header.setObjectName("sync_section_header")
         self._quick_cards_layout.addWidget(header)
 
         for pid, icon, name, path, creds_dict in detected:
@@ -626,6 +645,7 @@ class SyncPage(QWidget, ThemedMixin):
         back to that label's registered resting style on a switch.
         """
         super().refresh_styles()
+        self._apply_provider_hint_style()
         for card in list(getattr(self, "_quick_cards", ())):
             try:
                 card.refresh_styles()
@@ -637,6 +657,36 @@ class SyncPage(QWidget, ThemedMixin):
                 form.refresh_styles()
             except RuntimeError:
                 pass
+
+    def _remediate_page_scrolls(self):
+        """Re-mediate scroll policies after DPI scale changes to maintain proportions.
+        
+        Ensures quick-connect cards and forms maintain proper sizing after DPI changes.
+        """
+        try:
+            self._apply_provider_hint_style()
+            # Update card geometries
+            for card in list(getattr(self, "_quick_cards", ())):
+                if hasattr(card, "updateGeometry"):
+                    try:
+                        card.updateGeometry()
+                    except RuntimeError:
+                        pass
+            
+            # Update form geometry
+            form = getattr(self, "_current_form", None)
+            if form is not None and hasattr(form, "updateGeometry"):
+                try:
+                    form.updateGeometry()
+                except RuntimeError:
+                    pass
+            
+            # Trigger layout recalculation
+            if hasattr(self, 'layout') and self.layout():
+                self.layout().activate()
+                self.layout().update()
+        except Exception:
+            pass
 
     @staticmethod
     def _get_method_label(provider_id: str, method: str) -> str:
@@ -779,10 +829,26 @@ class SyncPage(QWidget, ThemedMixin):
         hint = t(key)
         return f"💡 {hint}" if hint != key else ""
 
+    def _apply_provider_hint_style(self):
+        fs = scaled(11, self, min_px=10)
+        pad_v = scaled(6, self, min_px=4)
+        pad_h = scaled(8, self, min_px=6)
+        self._provider_hint.setStyleSheet(
+            f"QLabel#sync_provider_hint {{"
+            f"color:{palette('accent')};"
+            f"font-size:{fs}px;"
+            f"padding:{pad_v}px {pad_h}px;"
+            f"background:{palette('bg_input')};"
+            f"border-radius:4px;"
+            f"border:1px solid {palette('border')};"
+            f"}}"
+        )
+
     def _show_hint(self, text: str):
         """Show provider hint box with text, or hide it completely if empty."""
         if text:
             self._provider_hint.setText(text)
+            self._apply_provider_hint_style()
             self._provider_hint.setVisible(True)
             self._provider_hint.setMaximumHeight(16777215)
         else:
@@ -794,7 +860,8 @@ class SyncPage(QWidget, ThemedMixin):
         """Show or hide the connection status label. Hides completely when empty."""
         if text:
             self._conn_status.setText(text)
-            self._conn_status.setStyleSheet(f"color:{color or palette('text_hint')};font-size:12px;")
+            fs = scaled(12, self, min_px=10)
+            self._conn_status.setStyleSheet(f"color:{color or palette('text_hint')};font-size:{fs}px;")
             self._conn_status.setVisible(True)
         else:
             self._conn_status.setText("")
@@ -1514,6 +1581,14 @@ class SyncPage(QWidget, ThemedMixin):
         if not orch.is_online():
             self._show_status(t("sync.no_provider"), palette('warning'))
             return
+        # Throttle: one Sync Tutti launch per minute — a second click inside
+        # the window only re-enqueues a batch that is already running (or
+        # finished seconds ago) and double-stamps the recent activity.
+        from time import monotonic
+        now = monotonic()
+        if now - getattr(self, "_last_sync_all_mono", 0.0) < 60.0:
+            return
+        self._last_sync_all_mono = now
         from core.backup import get_backup_manager
         from core.machine import get_machine_id
         from PySide6.QtWidgets import QMessageBox
@@ -1550,6 +1625,13 @@ class SyncPage(QWidget, ThemedMixin):
             games_to_sync.append(entry)
 
         if not games_to_sync:
+            try:
+                orphan_jobs = bm.orphan_sync_jobs()
+            except Exception:
+                orphan_jobs = []
+            if orphan_jobs:
+                orch.enqueue_sync_batch(orphan_jobs, source="sync_page")
+                return
             # Nothing changed — the status line says so instead of staying silent
             self._show_status(t("sync.nothing_to_sync"), palette('success'))
             return
@@ -1578,37 +1660,87 @@ class SyncPage(QWidget, ThemedMixin):
                     from core.library import get_library as _gl
                     _gl().update_game_fields(entry.id, cloud_metadata=cloud_meta)
             else:
-                # Only upload; remove download candidates from the download direction
-                # by syncing remaining without the download-candidate set
+                # Only upload for cross-machine candidates; keep the rest auto.
                 games_to_sync = [e for e in games_to_sync if e not in download_candidates]
-                for entry in download_candidates:
-                    orch.sync_game(
-                        entry.id, entry.name, entry.save_paths,
-                        direction="up",
-                        exe_path=entry.exe_path,
-                        computed_folder_name=entry.computed_folder_name,
-                        name_history=list(entry.name_history),
-                    )
+                up_jobs = [{
+                    "game_id": entry.id,
+                    "game_name": entry.name,
+                    "save_paths": list(entry.save_paths or []),
+                    "direction": "up",
+                    "exe_path": entry.exe_path or "",
+                    "computed_folder_name": entry.computed_folder_name or "",
+                    "name_history": list(entry.name_history or []),
+                } for entry in download_candidates]
+                auto_jobs = [{
+                    "game_id": entry.id,
+                    "game_name": entry.name,
+                    "save_paths": list(entry.save_paths or []),
+                    "exe_path": entry.exe_path or "",
+                    "computed_folder_name": entry.computed_folder_name or "",
+                    "name_history": list(entry.name_history or []),
+                } for entry in games_to_sync]
+                orch.enqueue_sync_batch(up_jobs + auto_jobs + bm.orphan_sync_jobs(),
+                                        source="sync_page")
+                return
 
-        for entry in games_to_sync:
-            orch.sync_game(
-                entry.id, entry.name, entry.save_paths,
-                exe_path=entry.exe_path,
-                computed_folder_name=entry.computed_folder_name,
-                name_history=list(entry.name_history),
-            )
+        jobs = [{
+            "game_id": entry.id,
+            "game_name": entry.name,
+            "save_paths": list(entry.save_paths or []),
+            "exe_path": entry.exe_path or "",
+            "computed_folder_name": entry.computed_folder_name or "",
+            "name_history": list(entry.name_history or []),
+        } for entry in games_to_sync]
+        try:
+            jobs.extend(bm.orphan_sync_jobs())
+        except Exception:
+            logger.debug("orphan_sync_jobs failed", exc_info=True)
+        if not jobs:
+            self._show_status(t("sync.nothing_to_sync"), palette('success'))
+            return
+        orch.enqueue_sync_batch(jobs, source="sync_page")
 
     def _on_sync_started(self, game_id: str):
+        orch = get_orchestrator()
+        if getattr(orch, "_sync_batch", None):
+            # Sidebar BatchProgressNotice owns progress during Sync Tutti.
+            self._sync_all_btn.setEnabled(False)
+            return
         entry = get_library().get_by_id(game_id)
-        name = entry.name if entry else game_id
+        name = entry.name if entry else ""
+        if not name:
+            try:
+                from core.backup import get_backup_manager
+                backs = get_backup_manager().get_backups_for_game(game_id)
+                if backs:
+                    name = backs[0].game_name or ""
+            except Exception:
+                pass
+        if not name:
+            name = game_id
         self._sync_progress.setText(f"⟳ {t('sync.syncing')} {name}...")
         self._sync_progress.setVisible(True)
         self._sync_all_btn.setEnabled(False)
 
     def _on_sync_done(self, game_id: str, result):
+        orch = get_orchestrator()
+        in_batch = bool(getattr(orch, "_sync_batch", None))
+        if in_batch:
+            # Keep the Sync Tutti button disabled until batch_finished; avoid
+            # rebuilding the history list on every archive (main lag source).
+            return
         self._sync_progress.setVisible(False)
         self._sync_all_btn.setEnabled(True)
         self._refresh_history()
+
+    def _on_sync_batch_ui_finished(self, done: int):
+        self._sync_progress.setVisible(False)
+        self._sync_all_btn.setEnabled(True)
+        self._refresh_history()
+        try:
+            self._update_quick_card_states()
+        except Exception:
+            pass
 
     def _refresh_history(self):
         """One line PER SYNC RUN — never aggregated per game. The orchestrator
