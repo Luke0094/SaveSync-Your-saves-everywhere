@@ -1990,12 +1990,12 @@ class BackupManager(QObject):
             kept_reg = [p for p in existing if is_registry_path(p)
                         and p not in paths]
             new_paths = list(paths) + kept_reg
-        if existing == new_paths:
+        if existing == new_paths and getattr(lib_entry, "save_paths_confirmed", False):
             return
         try:
             from core.library import get_library
             get_library().update_game_fields(
-                lib_entry.id, save_paths=new_paths, save_paths_confirmed=True,
+                lib_entry.id, save_paths=new_paths, save_paths_confirmed=True, requires_confirmation=False,
             )
         except Exception as _persist_err:
             logger.debug(f"restore_backup: failed to persist resolved paths: {_persist_err}")

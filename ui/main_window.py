@@ -1757,25 +1757,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     pending = list(self._pending_auto_scans.get(gid, []))
                 pre_scanned = pending or None
             try:
-                # Manual overlay open must NEVER auto-start a scan: it shows
-                # the paths live tracking already found (pre_scanned), and if
-                # there are none it opens EMPTY. Scanning — the normal scan or
-                # the broader Extended one, which merges live-tracking results
-                # with new finds — is only ever a conscious action the user
-                # takes via the panel button, never something that fires just
-                # because the panel was opened.
+                # Do not auto-start scan: display live tracking discoveries or open idle
                 dlg = show_auto_scan_dialog(self, pre_scanned, game_id=gid,
                                             user_initiated=True, auto_scan=False)
                 if not dlg:
-                    # Pending paths existed but were all excluded/already
-                    # covered (nothing selectable to hand over) — the user
-                    # explicitly asked for the panel, so it must still open,
-                    # but EMPTY, with Extended Scan available as the opt-in.
                     dlg = show_auto_scan_dialog(self, None, game_id=gid,
                                                 user_initiated=True, auto_scan=False)
-                self._track_scan_dialog(dlg)
-                # Same in-game backdrop as "open app" from the overlay.
-                self._show_blur_for_dialog(dlg)
+                if dlg:
+                    self._track_scan_dialog(dlg)
+                    self._show_blur_for_dialog(dlg)
             except Exception as e:
                 logger.error(f"Open auto-scan from overlay failed: {e}")
         elif action == "quick_restore":
@@ -3361,7 +3351,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._live_tracking_timers[game_id] = timer
 
         # Also fire immediately (after a short delay so the process settles)
-        QTimer.singleShot(3000, _poll)
+        QTimer.singleShot(1000, _poll)
 
     def _start_ingame_backup_timer(self, entry: GameEntry):
         """Start a repeating timer to backup saves every N seconds while playing.
@@ -3375,18 +3365,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._stop_ingame_backup_timer(entry.id)
         # Per-game flag controls in-game periodic backup (no separate global toggle needed)
         if not entry.auto_backup_enabled:
-            return
-
-        backup_paths = entry.save_paths
-        if not backup_paths:
-            # Unconfirmed paths → temporary backups (see _ingame_backup_tick);
-            # not for suppressed games, whose detections are discarded at exit.
-            if get_config().get("scan_auto_accept_games", {}).get(entry.id):
-                return
-            pre_scanned = getattr(self, '_pending_auto_scans', {}).get(entry.id, [])
-            backup_paths = pre_scanned
-
-        if not backup_paths:
             return
 
         interval_ms = max(30, entry.backup_interval_sec) * 1000
@@ -3449,7 +3427,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._stop_ingame_backup_timer(game_id)
             return
         entry = get_library().get_by_id(game_id)
-        if not entry:
+        if not entry or not entry.auto_backup_enabled:
             self._stop_ingame_backup_timer(game_id)
             return
 
@@ -3958,15 +3936,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         confirmed_paths = set(entry.save_paths or [])
 
-        # Case A: game was auto-added and has never had paths confirmed
+        # Case A: game was auto-added, has unconfirmed paths, or has empty save_paths
         needs_first_confirmation = (
-            entry.requires_confirmation and not entry.save_paths_confirmed
+            entry.requires_confirmation
+            or not entry.save_paths_confirmed
+            or not entry.save_paths
         )
 
         # Case B: live tracking found paths not yet in confirmed list.
-        # Path-containment check (shared with the manual in-game panel):
-        # a pre-scanned file under an already-configured save folder is NOT
-        # a new path, and neither is a parent of an already-confirmed one.
         from ui.dialogs.auto_scan_dialog import filter_uncovered_paths
         new_paths = filter_uncovered_paths(pre_scanned_paths, list(confirmed_paths))
         has_new_paths = bool(new_paths)
@@ -3982,19 +3959,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Per-game "don't show again": the user opted this game out of the
         # at-exit confirmation dialog — discard whatever was found, without
-        # touching save_paths. Auto-adding here would be dangerous: live
-        # tracking can pick up paths that aren't saves at all (e.g. an RPG
-        # Maker game writing process logs elsewhere), and only the dialog
-        # gives the user a chance to reject those. Suppressing means
-        # suppressing, not silently accepting.
+        # touching save_paths.
         per_game_skip: dict = config.get("scan_auto_accept_games", {})
         if per_game_skip.get(entry.id):
             logger.info(
                 f"Discarding {len(new_paths)} detected path(s) for {entry.name!r} "
                 f"(per-game 'don't show again')"
             )
-            # Discarded detections take their temporary session backups with
-            # them (definitive/confirmed backups are never touched).
             try:
                 get_backup_manager().discard_pre_confirmation_backups(entry.id)
             except Exception as e:
@@ -4003,14 +3974,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
 
         # ── Build paths to show in the dialog ─────────────────────────────────
-        # For first confirmation, show ALL pre-scanned paths (even those already
-        # in confirmed_paths, since the user hasn't confirmed them yet).
-        # For subsequent scans, show only genuinely new paths.
-        # If ALL pre-scanned paths are already confirmed and we only have
-        # needs_first_confirmation, there's nothing new to show — confirm silently.
         if needs_first_confirmation:
-            # If all pre-scanned paths are already confirmed (or subpaths of confirmed),
-            # just mark confirmed — saves in an already-configured folder are not new.
             if pre_scanned_paths and not new_paths:
                 logger.info(
                     f"_check_auto_scan: all {len(pre_scanned_paths)} paths already "
@@ -4021,8 +3985,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     save_paths_confirmed=True,
                     requires_confirmation=False,
                 )
-                # Silent confirmation still IS a confirmation: any temporary
-                # session backups of these paths become definitive history.
                 try:
                     get_backup_manager().promote_pre_confirmation_backups(
                         entry.id, note=t('main.auto_in_game'))
@@ -4031,14 +3993,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         f"Could not promote pre-confirmation backups for {entry.name}: {e}")
                 self._update_sidebar_status()
                 return
-            paths_to_show = pre_scanned_paths
+            paths_to_show = pre_scanned_paths or list(confirmed_paths)
         else:
             paths_to_show = new_paths
 
         # Final gate: only paths with actually-selectable content justify a
-        # dialog. A detected path whose files are all excluded (or that was
-        # permanently deleted before) must produce NO notification and NO
-        # panel at all — not even a "1 path found" that then shows nothing.
+        # dialog. If no pre-scanned paths exist but first confirmation is needed,
+        # open the auto-scan dialog to scan and discover paths.
         try:
             from ui.dialogs.auto_scan_dialog import filter_selectable_paths
             paths_to_show = filter_selectable_paths(entry.id, paths_to_show)
@@ -4486,7 +4447,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         dlg.background_idle.connect(lambda d=dlg: self._on_add_game_background_idle(d))
         dlg.background_status_changed.connect(
             lambda status, d=dlg: self._on_add_game_bg_status(d, status))
+        dlg.game_added.connect(self._on_game_saved_from_dialog)
         dlg.finished.connect(lambda _r, d=dlg: self._on_add_game_dialog_finished(d))
+
+    def _on_game_saved_from_dialog(self, entry):
+        """React immediately if an active game's backup settings or paths are edited while playing."""
+        if not entry:
+            return
+        playing_ids = {e.id for e in get_monitor().currently_playing()}
+        if entry.id in playing_ids:
+            if not entry.auto_backup_enabled:
+                self._stop_ingame_backup_timer(entry.id)
+                logger.info(f"In-game backup timer stopped for {entry.name} (auto backup disabled in settings)")
+            else:
+                self._start_ingame_backup_timer(entry)
+                logger.info(f"In-game backup timer updated for {entry.name} (interval={entry.backup_interval_sec}s)")
 
     def _shelved_entry_for(self, dlg) -> dict | None:
         for entry in self._shelved_add_entries:
