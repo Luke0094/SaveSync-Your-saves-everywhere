@@ -139,10 +139,17 @@ def get_current_language() -> str:
     """Return the currently active locale code (e.g. 'it', 'en')."""
     return get_engine().locale
 
-
 def get_locale() -> str:
     """Return the currently active locale code (e.g. 'it', 'en')."""
     return get_engine().locale
+
+def set_locale(locale: str):
+    """Set the currently active locale code (e.g. 'it', 'en')."""
+    get_engine().set_locale(locale)
+
+def set_language(locale: str):
+    """Set the currently active locale code (e.g. 'it', 'en')."""
+    get_engine().set_locale(locale)
 
 
 _MONTH_KEYS = ("jan", "feb", "mar", "apr", "may", "jun",

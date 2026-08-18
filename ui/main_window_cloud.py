@@ -41,14 +41,7 @@ class CloudFlowsMixin:
 
 
     def _entry_has_local_backups(self, entry) -> bool:
-        """True if this game has applied local SaveSync backups of its own.
-
-        Only backups filed under *entry.id* count, plus same-folder backups
-        that are NOT unapplied archives (orphan / no library game). Hand-added
-        Aggiungi-percorso zips share the title folder but were never restored
-        onto the game — treating them as "local saves" wrongly opened the
-        cloud conflict dialog instead of the archive-restore prompt.
-        """
+        """True if this game has local backup archives stored (in BackupManager)."""
         from core.backup import get_backup_manager
         bm = get_backup_manager()
         if bm.get_backups_for_game(entry.id):
@@ -73,6 +66,26 @@ class CloudFlowsMixin:
                 return True
         except Exception:
             pass
+        return False
+
+    def _entry_has_live_saves_on_disk(self, entry) -> bool:
+        """True if at least one configured save path exists and contains non-empty files."""
+        if not entry or not entry.save_paths:
+            return False
+        from pathlib import Path
+        for p_str in entry.save_paths:
+            if not p_str:
+                continue
+            try:
+                p = Path(p_str)
+                if p.is_file() and p.exists() and p.stat().st_size > 0:
+                    return True
+                if p.is_dir() and p.exists():
+                    for f in p.rglob("*"):
+                        if f.is_file() and f.stat().st_size > 0:
+                            return True
+            except Exception:
+                pass
         return False
 
     def _check_cloud_on_launch(self, game_id: str, on_resolved: Optional[Callable] = None):
@@ -301,14 +314,16 @@ class CloudFlowsMixin:
             last_machine = cloud_meta.get("last_sync_machine", "")
             confirmed_machines: list = cloud_meta.get("download_confirmed_machines", [])
             has_local = self._entry_has_local_backups(entry)
+            has_live_saves = self._entry_has_live_saves_on_disk(entry)
             _muted = entry.id in get_config().get("suppressed_cloud_no_local", [])
             show = get_config().get("show_overlay_on_cloud", True)
 
-            # 1) Unapplied local archives first (Aggiungi percorso / leftover
-            #    after delete). Same no_local UI; accept restores from index.
-            # 2) Only then cloud prompts — and has_local ignores archives so
-            #    they never fake a local-vs-cloud conflict.
-            if has_orphan and show and not _muted:
+            # 1) When user has no live saves on disk (deleted save files or empty save folder),
+            #    propose restoring/downloading available backups (local, orphan, or cloud)
+            #    instead of firing premature live tracking notification.
+            if not has_live_saves and (has_cloud or has_local or has_orphan) and show and not _muted:
+                notification_kind = "no_local"
+            elif has_orphan and show and not _muted:
                 notification_kind = "no_local"
             elif has_cloud:
                 if (last_machine and last_machine != machine_id
@@ -320,7 +335,7 @@ class CloudFlowsMixin:
                     # both cloud-download prompts (the no-local one and the
                     # not-reconciled one): they ask the same question, so muting
                     # one and still being asked the other made no sense.
-                    if not has_local:
+                    if not has_local or not has_live_saves:
                         if not _muted:
                             notification_kind = "no_local"
                     elif _muted:
@@ -346,7 +361,7 @@ class CloudFlowsMixin:
                         # next auto-sync to upload — do not re-ask "download?".
                         if getattr(entry, "pending_local_wins", False):
                             pass
-                        elif not has_local:
+                        elif not has_local or not has_live_saves:
                             # Local backups already exist — only prompt a download
                             # when reconciliation is actually needed (cloud-only
                             # copy, or local saves changed since the last sync).

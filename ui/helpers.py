@@ -558,7 +558,7 @@ def force_topmost(widget) -> None:
 
 
 def set_dark_title_bar(widget, dark: bool | None = None) -> None:
-    """Ensure native Windows 10/11 title bar and HWND frame match current dark/light mode."""
+    """Ensure native Windows 10/11 title bar and HWND frame match current dark/light mode and eliminate white flash."""
     if platform.system() != "Windows":
         return
     try:
@@ -569,6 +569,8 @@ def set_dark_title_bar(widget, dark: bool | None = None) -> None:
         hwnd = int(widget.winId())
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
+        DWMWA_CAPTION_COLOR = 35
+        DWMWA_TEXT_COLOR = 36
         val = ctypes.c_int(1 if dark else 0)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(val), ctypes.sizeof(val)
@@ -576,6 +578,27 @@ def set_dark_title_bar(widget, dark: bool | None = None) -> None:
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, ctypes.byref(val), ctypes.sizeof(val)
         )
+        if dark:
+            caption_color = ctypes.c_uint32(0x00181818)
+            text_color = ctypes.c_uint32(0x00FFFFFF)
+            bg_rgb = 0x00121212
+        else:
+            caption_color = ctypes.c_uint32(0x00F6F6F6)
+            text_color = ctypes.c_uint32(0x001A1A1A)
+            bg_rgb = 0x00FAFAFA
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_CAPTION_COLOR, ctypes.byref(caption_color), ctypes.sizeof(caption_color)
+        )
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_TEXT_COLOR, ctypes.byref(text_color), ctypes.sizeof(text_color)
+        )
+        # Seed Win32 background class brush so initial HWND frame paint matches dark/light theme
+        frame_brush = ctypes.windll.gdi32.CreateSolidBrush(bg_rgb)
+        if frame_brush:
+            if ctypes.sizeof(ctypes.c_void_p) == 8:
+                ctypes.windll.user32.SetClassLongPtrW(hwnd, -10, ctypes.c_void_p(frame_brush))
+            else:
+                ctypes.windll.user32.SetClassLongW(hwnd, -10, ctypes.c_long(frame_brush))
     except Exception:
         pass
 

@@ -99,18 +99,20 @@ if {$_sentinel ne ""} {
 }
 """
 
+_datas = [
+    (str(ROOT / 'i18n' / 'locales'), 'i18n/locales'),
+    (str(ROOT / 'sync' / 'app_credentials.py'), 'sync'),
+    (str(ROOT / 'assets' / 'splash.png'), 'assets'),
+    (str(ROOT / 'assets' / 'splash_animated.gif'), 'assets'),
+    (str(ROOT / 'assets' / 'icon.ico'), 'assets'),
+    (str(ROOT / 'assets' / 'icon.png'), 'assets'),
+]
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        (str(ROOT / 'i18n' / 'locales'), 'i18n/locales'),
-        (str(ROOT / 'sync' / 'app_credentials.py'), 'sync'),
-        (str(ROOT / 'assets' / 'splash.png'), 'assets'),
-        (str(ROOT / 'assets' / 'splash_animated.gif'), 'assets'),
-        (str(ROOT / 'assets' / 'icon.ico'), 'assets'),
-        (str(ROOT / 'assets' / 'icon.png'), 'assets'),
-    ],
+    datas=_datas,
     hiddenimports=[
         'core', 'core.config_transfer', 'core.config_manager', 'core.library',
         'core.backup', 'core.monitor', 'core.watcher', 'core.credentials',

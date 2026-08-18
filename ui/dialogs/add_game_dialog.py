@@ -4022,8 +4022,6 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._category_combo.addItem(QIcon(px), f"{indent}{name}", path)
 
     def _add_game(self):
-        if not getattr(self, "_ui_ready", False):
-            return
         exe = self._exe_edit.text().strip()
         lib = get_library()
 
@@ -4074,8 +4072,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if existing:
                 self._editing_entry = existing
 
-        # Empty exe is fine when a launcher URL is present (launch via appid).
-        if exe and not Path(exe).exists():
+        # For brand-new games without launcher URLs or save paths, require valid executable if entered
+        if not self._editing_entry and exe and not Path(exe).exists() and not _launcher_url:
             self._status_lbl.setText(t('add_game.executable_not_found', exe=exe))
             fs = scaled(12, self)
             self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
@@ -4090,17 +4088,54 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         if self._editing_entry:
             entry = self._editing_entry
+            old_exe = entry.exe_path or ""
             # Capture the path list BEFORE we overwrite it, so rows the user
             # hard-deleted (via _remove_path) can be detected and their
             # provisional backups pruned on save (see the resolve call below).
             _prev_save_paths = set(entry.save_paths or [])
             entry.name       = name
             entry.exe_path   = exe
-            # Keep every row's path in save_paths — unchecking a path
-            # (manual or auto-detected) is a soft exclusion, not a removal;
-            # only excluded_save_paths tracks which ones are currently
-            # skipped at backup time.
-            all_paths, excluded_paths = self._get_all_and_excluded_paths()
+
+            # Auto-rebase install-relative paths if executable path changed or relative paths used
+            raw_all_paths, raw_excluded_paths = self._get_all_and_excluded_paths()
+            all_paths = []
+            excluded_paths = []
+            for p in raw_all_paths:
+                rebased_p = p
+                is_excl = p in raw_excluded_paths
+                if not Path(p).is_absolute() and exe:
+                    # User entered a relative path (e.g. saves/ or save/)
+                    rebased_p = str(Path(exe).parent / p)
+                    entry.record_path_chain(rebased_p, Path(p).as_posix())
+                elif old_exe and exe and old_exe != exe:
+                    # Executable path updated to new location/version
+                    try:
+                        old_exe_p = Path(old_exe).resolve()
+                        new_exe_p = Path(exe).resolve()
+                        p_path = Path(p).resolve()
+                        old_parents = [old_exe_p.parent] + list(old_exe_p.parents)
+                        new_parents = [new_exe_p.parent] + list(new_exe_p.parents)
+                        for i, old_parent in enumerate(old_parents):
+                            if i >= len(new_parents):
+                                break
+                            new_parent = new_parents[i]
+                            if len(old_parent.parts) <= 1 or len(new_parent.parts) <= 1:
+                                break
+                            try:
+                                if p_path == old_parent or old_parent in p_path.parents:
+                                    rel = p_path.relative_to(old_parent)
+                                    cand = str(new_parent / rel)
+                                    rebased_p = cand
+                                    entry.record_path_chain(rebased_p, rel.as_posix())
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                all_paths.append(rebased_p)
+                if is_excl:
+                    excluded_paths.append(rebased_p)
+
             entry.save_paths = all_paths
             entry.excluded_save_paths = excluded_paths
             entry.save_paths_confirmed = len(all_paths) > 0
@@ -4220,9 +4255,18 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._save_file_exclusions(entry.id)
 
         else:
-            # Keep every row's path — unchecking is a soft exclusion, not a
-            # removal (see _get_all_and_excluded_paths docstring).
-            all_paths, excluded_paths = self._get_all_and_excluded_paths()
+            raw_all_paths, raw_excluded_paths = self._get_all_and_excluded_paths()
+            all_paths = []
+            excluded_paths = []
+            for p in raw_all_paths:
+                rebased_p = p
+                is_excl = p in raw_excluded_paths
+                if not Path(p).is_absolute() and exe:
+                    rebased_p = str(Path(exe).parent / p)
+                all_paths.append(rebased_p)
+                if is_excl:
+                    excluded_paths.append(rebased_p)
+
             checked_paths = [p for p in all_paths if p not in excluded_paths]
             
             # Determine detection method

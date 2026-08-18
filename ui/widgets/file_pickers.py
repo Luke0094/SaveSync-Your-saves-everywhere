@@ -59,19 +59,19 @@ def _translate_file_type(raw: str) -> str:
     low = raw.lower()
     if "folder" in low or "directory" in low or "cartella" in low:
         return t("file_picker.type_folder")
-    if "application" in low or "executable" in low or "eseguibile" in low or "applicazion" in low or "exe" in low:
+    if "application" in low or "executable" in low or "eseguibile" in low or "applicazion" in low or "program" in low or "exe" in low or low == "app":
         return t("file_picker.type_app")
-    if "text" in low or "plain" in low or "testo" in low:
+    if "text" in low or "plain" in low or "testo" in low or ("document" in low and "pdf" not in low):
         return t("file_picker.type_text")
     if "pdf" in low or "portable document" in low:
         return t("file_picker.type_pdf")
     if "archive" in low or "zip" in low or "compressed" in low or "rar" in low or "7z" in low or "archivio" in low:
         return t("file_picker.type_archive")
-    if "image" in low or "png" in low or "jpeg" in low or "jpg" in low or "immagine" in low or "bitmap" in low:
+    if "image" in low or "png" in low or "jpeg" in low or "jpg" in low or "immagine" in low or "bitmap" in low or "gif" in low or "webp" in low:
         return t("file_picker.type_image")
-    if "audio" in low or "sound" in low or "mp3" in low or "wav" in low or "flac" in low:
+    if "audio" in low or "sound" in low or "mp3" in low or "wav" in low or "flac" in low or "ogg" in low:
         return t("file_picker.type_audio")
-    if "video" in low or "mp4" in low or "mkv" in low or "avi" in low:
+    if "video" in low or "mp4" in low or "mkv" in low or "avi" in low or "webm" in low:
         return t("file_picker.type_video")
     if "shortcut" in low or "link" in low or "collegamento" in low:
         return t("file_picker.type_shortcut")
@@ -86,10 +86,6 @@ def _translate_system_name(raw: str) -> str:
         return t("file_picker.my_computer")
     if low == "desktop":
         return t("file_picker.desktop")
-    if "documents" in low or "documenti" in low:
-        return t("file_picker.documents")
-    if "downloads" in low or "download" in low:
-        return t("file_picker.downloads")
     home_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.HomeLocation)
     user_name = Path(home_p).name.lower() if home_p else ""
     user_env = os.environ.get("USERNAME", "").lower()
@@ -98,7 +94,7 @@ def _translate_system_name(raw: str) -> str:
     return ""
 
 
-from PySide6.QtWidgets import QStyledItemDelegate, QHeaderView, QStyleOptionHeader
+from PySide6.QtWidgets import QStyledItemDelegate, QHeaderView, QStyleOptionHeader, QStyle
 
 
 class _LocalizedHeader(QHeaderView):
@@ -119,6 +115,15 @@ class _LocalizedHeader(QHeaderView):
         col = option.section
         if col in self._COL_KEYS:
             option.text = t(self._COL_KEYS[col])
+
+    def paintSection(self, painter, rect, logicalIndex):
+        opt = QStyleOptionHeader()
+        self.initStyleOption(opt)
+        opt.rect = rect
+        opt.section = logicalIndex
+        if logicalIndex in self._COL_KEYS:
+            opt.text = t(self._COL_KEYS[logicalIndex])
+        self.style().drawControl(QStyle.ControlElement.CE_Header, opt, painter, self)
 
 
 class _SidebarItemDelegate(QStyledItemDelegate):
@@ -146,15 +151,7 @@ class _FileDetailsDelegate(QStyledItemDelegate):
 
 
 def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
-    """Identify if a URL is a permanent protected system pin:
-    - My Computer / root / special URLs
-    - User Home folder
-    - Desktop
-    - Documents
-    - Downloads
-    - Drive roots (C:\\, D:\\, /)
-    - Any URL recorded in system_urls
-    """
+    """True ONLY for the 3 default system pins: My Computer / Questo PC, Desktop, User Home."""
     if not url.isValid() or not url.toString() or url.toString() in ("file:", "file:///", "", "computer:"):
         return True
 
@@ -162,13 +159,12 @@ def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
     if not path_str:
         return True
 
-    # Normalize incoming path for robust case/separator-agnostic comparison
     try:
         norm_incoming = os.path.normcase(os.path.normpath(os.path.abspath(path_str)))
     except Exception:
         norm_incoming = os.path.normcase(path_str.replace("/", "\\").rstrip("\\"))
 
-    # Drive root (e.g. C:\ or /)
+    # Check drive root (e.g. C:\ or /)
     try:
         p = Path(path_str).resolve()
         if len(p.parts) <= 1 or str(p).rstrip("/\\") == str(p.drive).rstrip("/\\") or norm_incoming.endswith(":\\"):
@@ -176,35 +172,18 @@ def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
     except Exception:
         pass
 
-    # Standard system locations & user folders
-    system_paths = set()
-    for env_var in ("USERPROFILE", "HOMEPATH", "HOME", "PUBLIC", "OneDrive"):
-        val = os.environ.get(env_var)
-        if val:
-            system_paths.add(val)
-
+    # The 3 default system locations: Desktop, User Home, Computer
+    desktop_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+    home_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.HomeLocation)
     user_home = os.path.expanduser("~")
-    if user_home:
-        system_paths.add(user_home)
-        system_paths.add(os.path.join(user_home, "Desktop"))
-        system_paths.add(os.path.join(user_home, "Documents"))
-        system_paths.add(os.path.join(user_home, "Downloads"))
-        system_paths.add(os.path.join(user_home, "Pictures"))
-        system_paths.add(os.path.join(user_home, "Music"))
-        system_paths.add(os.path.join(user_home, "Videos"))
+    userprofile = os.environ.get("USERPROFILE")
 
-    for loc in (
-        QStandardPaths.StandardLocation.DesktopLocation,
-        QStandardPaths.StandardLocation.HomeLocation,
-        QStandardPaths.StandardLocation.DocumentsLocation,
-        QStandardPaths.StandardLocation.DownloadLocation,
-        QStandardPaths.StandardLocation.MusicLocation,
-        QStandardPaths.StandardLocation.PicturesLocation,
-        QStandardPaths.StandardLocation.MoviesLocation,
-    ):
-        p_str = QStandardPaths.writableLocation(loc)
-        if p_str:
-            system_paths.add(p_str)
+    system_paths = set()
+    for p in (desktop_p, home_p, user_home, userprofile):
+        if p:
+            system_paths.add(p)
+            if p in (user_home, userprofile, home_p):
+                system_paths.add(os.path.join(p, "Desktop"))
 
     for sp in system_paths:
         try:
@@ -303,12 +282,13 @@ class _LnkAwareDialog(QFileDialog):
         self.setAutoFillBackground(True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
-            f"QFileDialog, QDialog {{ background-color: {palette('bg')}; color: {palette('text')}; }}"
+            f"QFileDialog, QDialog, QSplitter, QFrame, QLabel {{ background-color: {palette('bg')}; color: {palette('text')}; }}"
             f"QListView, QTreeView {{ background-color: {palette('bg_input')}; color: {palette('text')}; border: 1px solid {border}; border-radius: 4px; }}"
             f"QLineEdit, QComboBox {{ background-color: {palette('bg_input')}; color: {palette('text')}; border: 1px solid {border}; border-radius: 4px; padding: 2px 4px; }}"
             f"QToolButton, QPushButton {{ background-color: {palette('bg_card')}; color: {palette('text')}; border: 1px solid {border}; border-radius: 4px; padding: 4px 8px; }}"
             f"QToolButton:hover, QPushButton:hover {{ background-color: {palette('bg_input')}; border-color: {accent}; }}"
             f"QScrollBar:vertical, QScrollBar:horizontal {{ background: transparent; }}"
+            f"QHeaderView::section {{ background-color: {palette('bg_card')}; color: {palette('text_muted')}; border: none; border-right: 1px solid {border}; padding: 4px 6px; font-weight: 600; }}"
         )
         try:
             from ui.helpers import set_dark_title_bar
@@ -316,14 +296,50 @@ class _LnkAwareDialog(QFileDialog):
         except Exception:
             pass
 
-    def exec(self):
+    def _center_on_parent(self):
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            geo = self.frameGeometry()
+            geo.moveCenter(parent.frameGeometry().center())
+            self.move(geo.topLeft())
+        else:
+            from PySide6.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                geo = self.frameGeometry()
+                geo.moveCenter(screen.availableGeometry().center())
+                self.move(geo.topLeft())
+
+    def show_settled(self):
+        """Map the window at its already-chosen size with zero white flash (identical to AddGameDialog and ReviewsDialog)."""
         self._apply_window_chrome()
         self._localize_labels()
+        if getattr(self, "_sidebar_view", None) is not None:
+            sw = scaled(185, self, min_px=165)
+            self._sidebar_view.setMinimumWidth(sw)
+        self._center_on_parent()
+        self.setWindowOpacity(0.0)
+        self.setUpdatesEnabled(False)
+        try:
+            QFileDialog.show(self)
+            self.ensurePolished()
+        finally:
+            self.setUpdatesEnabled(True)
+        self.repaint()
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self.setWindowOpacity(1.0)
+        self.raise_()
+        self.activateWindow()
+
+    def exec(self):
+        self.show_settled()
         return super().exec()
 
     def open(self):
-        self._apply_window_chrome()
-        self._localize_labels()
+        self.show_settled()
         super().open()
 
     def showEvent(self, event):
@@ -333,11 +349,6 @@ class _LnkAwareDialog(QFileDialog):
         if getattr(self, "_sidebar_view", None) is not None:
             sw = scaled(185, self, min_px=165)
             self._sidebar_view.setMinimumWidth(sw)
-        parent = self.parentWidget()
-        if parent is not None and parent.isVisible():
-            geo = self.frameGeometry()
-            geo.moveCenter(parent.frameGeometry().center())
-            self.move(geo.topLeft())
 
     # ── Localisation ──────────────────────────────────────────────────────────
 
@@ -504,6 +515,19 @@ class _LnkAwareDialog(QFileDialog):
         rename_act = self.findChild(QAction, "qt_rename_action")
         delete_act = self.findChild(QAction, "qt_delete_action")
         hidden_act = self.findChild(QAction, "qt_show_hidden_action")
+
+        if delete_act:
+            delete_act.setText(t("file_picker.delete"))
+            delete_act.setToolTip(t("file_picker.delete"))
+        if rename_act:
+            rename_act.setText(t("file_picker.rename"))
+            rename_act.setToolTip(t("file_picker.rename"))
+        if new_folder_act:
+            new_folder_act.setText(t("file_picker.new_folder"))
+            new_folder_act.setToolTip(t("file_picker.new_folder"))
+        if hidden_act:
+            hidden_act.setText(t("file_picker.show_hidden"))
+            hidden_act.setToolTip(t("file_picker.show_hidden"))
 
         menu = QMenu(view)
 

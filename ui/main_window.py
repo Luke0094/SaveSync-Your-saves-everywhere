@@ -268,26 +268,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._tray_click_timer.setSingleShot(True)
         self._tray_click_timer.timeout.connect(self._on_tray_single_click)
 
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setAutoFillBackground(True)
-        try:
-            from ui.styles.theme import palette, get_theme_manager
-            from PySide6.QtGui import QColor, QPalette
-            is_dark = get_theme_manager().is_dark()
-            bg = QColor(palette("bg"))
-            fg = QColor(palette("text"))
-            card = QColor(palette("bg_card"))
-            pal = self.palette()
-            pal.setColor(QPalette.ColorRole.Window, bg)
-            pal.setColor(QPalette.ColorRole.Base, bg)
-            pal.setColor(QPalette.ColorRole.AlternateBase, card)
-            pal.setColor(QPalette.ColorRole.WindowText, fg)
-            pal.setColor(QPalette.ColorRole.Text, fg)
-            self.setPalette(pal)
-            from ui.helpers import set_dark_title_bar
-            set_dark_title_bar(self, dark=is_dark)
-        except Exception:
-            pass
+        self._apply_window_chrome()
 
         self._setup_ui()
         self._setup_tray()
@@ -356,6 +337,53 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if appid:
                 logger.info(f"Handling launcher URL: {parsed.get('launcher')} appid={appid}")
                 launch_with_url(url_str)
+
+    def _apply_window_chrome(self):
+        """Apply theme palette and dark/light title bar before mapping to eliminate white flash."""
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
+        try:
+            from ui.styles.theme import palette, get_theme_manager
+            from PySide6.QtGui import QColor, QPalette
+            is_dark = get_theme_manager().is_dark()
+            bg = QColor(palette("bg"))
+            fg = QColor(palette("text"))
+            card = QColor(palette("bg_card"))
+            pal = self.palette()
+            pal.setColor(QPalette.ColorRole.Window, bg)
+            pal.setColor(QPalette.ColorRole.Base, bg)
+            pal.setColor(QPalette.ColorRole.AlternateBase, card)
+            pal.setColor(QPalette.ColorRole.WindowText, fg)
+            pal.setColor(QPalette.ColorRole.Text, fg)
+            self.setPalette(pal)
+            from ui.helpers import set_dark_title_bar
+            set_dark_title_bar(self, dark=is_dark)
+        except Exception:
+            pass
+
+    def show_settled(self):
+        """Map MainWindow at settled state with zero white/un-themed flash and pre-rendered layout."""
+        self._apply_window_chrome()
+        self.setWindowOpacity(0.0)
+        self.setUpdatesEnabled(False)
+        try:
+            super().show()
+            self.ensurePolished()
+            if hasattr(self, "_overview_page") and self._overview_page is not None:
+                self._overview_page.ensurePolished()
+        finally:
+            self.setUpdatesEnabled(True)
+        self.repaint()
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self.setWindowOpacity(1.0)
+        self.raise_()
+        self.activateWindow()
+
+    def show(self):
+        self.show_settled()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -1558,7 +1586,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._add_homonym_unknown(context, (stash or {}).get("name", ""))
 
         elif action == "download_saves_no_local":
-            # context = exe_path of known library game with no local backups
+            # context = exe_path of known library game with no local backups / missing live saves
             entry = get_library().get_by_exe(context)
             if entry:
                 self._pending_cloud_notification.pop(entry.id, None)
@@ -1572,7 +1600,32 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     except Exception:
                         pass
                     return
+
+                # If local backups exist in BackupManager, and cloud is offline or has no saves, restore local directly:
+                from core.backup import get_backup_manager
+                bm = get_backup_manager()
+                owned = bm.get_backups_for_game(entry.id)
+                if not owned:
+                    from core.constants import get_install_folder_name
+                    folder = get_install_folder_name(entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
+                    if folder:
+                        owned = bm.get_backups_for_folder(folder)
+
                 orch = get_orchestrator()
+                has_cloud_saves = orch.is_online() and getattr(self, "_cloud_check_results", {}).get(entry.id, False)
+
+                if owned and not has_cloud_saves:
+                    try:
+                        bm.restore_backup(owned[0].backup_id, lib_game_id=entry.id)
+                    except Exception as e:
+                        logger.warning(f"Failed to restore local backup for {entry.name}: {e}")
+                    self._show_tracking_toast_if_playing(entry.id)
+                    try:
+                        self._backups_page._load_games()
+                        self._backups_page._refresh_list()
+                    except Exception:
+                        pass
+                    return
 
                 def _on_no_local_sync_done(game_id: str, result):
                     if game_id != entry.id:
