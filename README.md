@@ -243,6 +243,7 @@ savesync/
 │   ├── registry_saves.py          # Windows-registry save locations
 │   ├── skip_dirs.py               # Shared skip-list of noise directories
 │   ├── backup.py                  # Versioned zip backups, retention, dedup
+│   ├── pending_batch_jobs.py      # Persisted multi-operation batch queues
 │   ├── resolvers.py               # Launcher URLs, executable resolution
 │   ├── exe_scan.py                # Folder scan for installed game executables
 │   ├── game_api.py                # Web metadata search orchestration
@@ -721,6 +722,9 @@ Other automatic I/O habits worth knowing:
   `config_history/`; older ones are rotated out. A sandbox self-check after
   startup verifies that restore still works when the history is full (same
   notification path as backup integrity failures)
+- **Pending batch jobs persistence** (`core/pending_batch_jobs.py` / `pending_batch_jobs.json`) —
+  tracks active multi-operation batch queues (Backup All, Sync All, Multi-Add)
+  and safely restores remaining items after an unexpected restart
 - **Page-size crash guard** for oversized custom page sizes uses a tiny sidecar
   file (`page_size_render_guard.json`), not a full rewrite of `config.json`
 

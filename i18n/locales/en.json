@@ -1243,6 +1243,25 @@
     "rename": "Rename",
     "delete": "Delete",
     "show_hidden": "Show hidden files",
-    "cannot_remove_system_pin": "System locations cannot be removed"
+    "cannot_remove_system_pin": "System locations cannot be removed",
+    "remove": "Remove",
+    "col_name": "Name",
+    "col_size": "Size",
+    "col_type": "Type",
+    "col_date_modified": "Date modified",
+    "my_computer": "This PC",
+    "user_home": "User folder",
+    "desktop": "Desktop",
+    "documents": "Documents",
+    "downloads": "Downloads",
+    "type_folder": "File folder",
+    "type_app": "Application",
+    "type_text": "Text Document",
+    "type_pdf": "PDF Document",
+    "type_archive": "Compressed Archive",
+    "type_image": "Image file",
+    "type_audio": "Audio file",
+    "type_video": "Video file",
+    "type_shortcut": "Shortcut"
   }
 }

@@ -1323,9 +1323,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     old_page.on_page_leave()
                 except Exception:
                     logger.debug("on_page_leave failed", exc_info=True)
-            # Automatic memory trim when leaving previous page
-            from ui.helpers import trim_process_memory
-            QTimer.singleShot(350, trim_process_memory)
         if idx == 5:
             self._ensure_cheats_page()
         for i, btn in enumerate(self._nav_buttons):
@@ -1339,7 +1336,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if getattr(page, "_styles_stale", False):
             self._refresh_page_styles(page)
         # Overview / Library / Backups / Sync load after the page paints.
-        if idx == 1:
+        if idx == 0:
+            if hasattr(self, '_overview_page') and self._overview_page:
+                self._overview_page.refresh_on_enter()
+        elif idx == 1:
             self._library_page.on_page_enter()
         elif idx == 2:
             self._sync_page.ensure_loaded()

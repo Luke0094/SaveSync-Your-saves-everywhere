@@ -789,6 +789,14 @@ class _GameItemMixin:
             if (event.pos() - self._drag_start).manhattanLength() < 15:
                 return
             self._dragging = True
+            # Stop any running slideshow and crossfade immediately on drag start
+            try:
+                self._slideshow_timer.stop()
+                self._stop_cover_fade()
+                self._dots_bar.setVisible(False)
+                self._update_cover()
+            except Exception:
+                pass
             # A proxy already in _active_drag is ALWAYS stale here: a dead
             # source card (refresh mid-drag) could not run its own cleanup,
             # so the old ghost must not be left floating next to the new one.
@@ -1198,6 +1206,8 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
     # ── Hover slideshow ───────────────────────────────────────────────────────
     def enterEvent(self, event):
         super().enterEvent(event)
+        if getattr(self, '_dragging', False) or bool(_active_drag):
+            return
         # Keep the slideshow list in sync with the icon cache on every hover:
         # drop images deleted since the last scan, and force a full re-scan
         # when the cache folder holds images we don't know about yet (a cheap
@@ -1246,21 +1256,21 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
     _DOTS_VISIBLE = 7   # number of dot slots always shown
 
     def _rebuild_dots(self, n: int):
-        """Create exactly min(n, _DOTS_VISIBLE) dot widgets."""
-        while self._dots_layout.count():
-            item = self._dots_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
+        """Create or reuse exactly min(n, _DOTS_VISIBLE) dot widgets."""
         slots = min(n, self._DOTS_VISIBLE)
-        for _ in range(slots):
-            dot = QWidget()
-            _d = scaled(6, self, min_px=5)
-            dot.setFixedSize(_d, _d)
-            r = max(2, _d // 2)
-            dot.setStyleSheet(
-                f"background:rgba(255,255,255,0.5);border-radius:{r}px;")
-            self._dots_layout.addWidget(dot)
+        if self._dots_layout.count() != slots:
+            while self._dots_layout.count():
+                item = self._dots_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            for _ in range(slots):
+                dot = QWidget()
+                _d = scaled(6, self, min_px=5)
+                dot.setFixedSize(_d, _d)
+                r = max(2, _d // 2)
+                dot.setStyleSheet(
+                    f"background:rgba(255,255,255,0.5);border-radius:{r}px;")
+                self._dots_layout.addWidget(dot)
 
         self._total_images = n          # remember total for window calc
         self._dots_slots  = slots
@@ -1316,6 +1326,11 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             dot.setStyleSheet(style)
 
     def _slideshow_tick(self):
+        if getattr(self, '_dragging', False) or bool(_active_drag):
+            self._slideshow_timer.stop()
+            self._stop_cover_fade()
+            self._dots_bar.setVisible(False)
+            return
         if not self._all_images:
             self._slideshow_timer.stop()
             return

@@ -1243,6 +1243,25 @@
     "rename": "Rinomina",
     "delete": "Elimina",
     "show_hidden": "Mostra file nascosti",
-    "cannot_remove_system_pin": "Gli elementi di sistema non possono essere rimossi"
+    "cannot_remove_system_pin": "Gli elementi di sistema non possono essere rimossi",
+    "remove": "Rimuovi",
+    "col_name": "Nome",
+    "col_size": "Dimensione",
+    "col_type": "Tipo",
+    "col_date_modified": "Ultima modifica",
+    "my_computer": "Questo PC",
+    "user_home": "Cartella utente",
+    "desktop": "Desktop",
+    "documents": "Documenti",
+    "downloads": "Download",
+    "type_folder": "Cartella di file",
+    "type_app": "Applicazione",
+    "type_text": "Documento di testo",
+    "type_pdf": "Documento PDF",
+    "type_archive": "Archivio compresso",
+    "type_image": "File di immagine",
+    "type_audio": "File audio",
+    "type_video": "File video",
+    "type_shortcut": "Collegamento"
   }
 }

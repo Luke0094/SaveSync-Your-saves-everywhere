@@ -3,6 +3,7 @@ SaveSync - Library Page
 Game library with card/list view toggle, game images, launch button, and detail panel.
 """
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -179,13 +180,11 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         path = urls[0].toLocalFile()
         p = Path(path)
-        # A whole folder dropped in: act like the batch scan — walk it and
-        # find one candidate executable per game (first level that has any,
-        # descending only while a level is empty, noise like uninstallers
-        # excluded). The user still confirms the picks.
+        # A whole folder dropped in: find the first candidate executable and
+        # open Add Game (or Edit Game if already present), bypassing bulk scan.
         if p.is_dir():
             event.acceptProposedAction()
-            self.folder_dropped.emit(str(p))
+            self._handle_folder_drop(p)
             return
         # Platform-aware: .exe/.bat/.lnk/.url on Windows, and on Unix the
         # extension-less exec-bit binaries plus .sh/.AppImage/.x86_64/.desktop.
@@ -217,13 +216,30 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
             exe_path = self._resolve_lnk_target(str(p))
             _t = (exe_path or "").strip().strip('"')
             if _t and Path(_t).is_dir():
-                # Folder shortcut: a directory must never be prefilled as the
-                # executable — and it is exactly the "drop a whole folder"
-                # case, so run the batch scan on it.
-                self.folder_dropped.emit(str(Path(_t)))
+                self._handle_folder_drop(Path(_t))
                 return
         else:
             exe_path = path
+        self._dispatch_add_or_edit(name, exe_path)
+
+    def _handle_folder_drop(self, folder: Path):
+        """Find the single first candidate executable in the dropped folder
+        and trigger Add Game or Edit Game."""
+        from core.exe_scan import find_single_game_in_folder
+        candidate = find_single_game_in_folder(folder)
+        if candidate is not None:
+            name, exe_path = candidate
+            self._dispatch_add_or_edit(name, exe_path)
+        else:
+            self._dispatch_add_or_edit(folder.name, "")
+
+    def _dispatch_add_or_edit(self, name: str, exe_path: str):
+        """Open Edit Game if the executable is already in the library, otherwise Add Game."""
+        if exe_path:
+            existing = get_library().get_by_exe(exe_path)
+            if existing is not None:
+                self.edit_requested.emit(existing.id)
+                return
         self.add_game_requested.emit(name, exe_path)
 
     # ── Responsive grid: rebuild when column count changes ────────────────────
@@ -438,13 +454,8 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         self._rebuild_view()
 
     def on_page_leave(self):
-        """Release off-screen rendered cover caches and stop any deferred busy."""
+        """Stop any deferred busy when leaving page."""
         self._stop_deferred_busy()
-        try:
-            from ui.widgets.game_items import trim_cover_cache
-            trim_cover_cache()
-        except Exception:
-            pass
 
     def wipe_and_reload(self):
         """Drop every built widget and re-arm the initial load: the next
@@ -837,26 +848,12 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         card = self._cards.get(entry.id)
         if card is not None and hasattr(card, "_entry"):
             tags_changed = set(entry.tags) != set(card._entry.tags)
-            # Detect if sort-relevant fields changed so the grid order stays current
-            sort_fields_changed = (
-                entry.last_played != card._entry.last_played
-                or entry.playtime_seconds != card._entry.playtime_seconds
-                or entry.last_backed_up != card._entry.last_backed_up
-                or entry.sync_status != card._entry.sync_status
-                or entry.name != card._entry.name
-                or entry.average_rating() != card._entry.average_rating()
-            )
+            if hasattr(card, "refresh"):
+                card.refresh(entry)
+            if tags_changed:
+                self._refresh_tag_sidebar()
         else:
-            tags_changed = True
-            sort_fields_changed = True
-        if tags_changed:
             self._refresh_tag_sidebar()
-        # Rebuild to reorder cards when sort-relevant data changed, otherwise
-        # just refresh the individual card widget (cheaper).
-        if sort_fields_changed:
-            self._rebuild_view()
-        elif card and hasattr(card, "refresh"):
-            card.refresh(entry)
 
     def _on_game_removed(self, gid: str):
         if gid in self._cards:

@@ -73,6 +73,9 @@ class StatCard(QFrame, ThemedMixin):
         fs = scaled(16, self, min_px=14) if len(str(val)) > 5 else scaled(20, self, min_px=17)
         self._sty(self._val_lbl, lambda: f"color: {palette(self._accent_key)}; font-size: {fs}px; font-weight: 700; background: transparent;")
 
+    def set_stat_label(self, label: str):
+        self._lbl.setText(label)
+
 
 
 class ActivityRow(QFrame, ThemedMixin):
@@ -439,6 +442,39 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         # page can paint first.
         self.refresh()
 
+    def update_locale(self):
+        """Re-translate all static and dynamic text when application language changes."""
+        if _safe(self._header):
+            self._header.setText(t("overview.title"))
+        if _safe(self._refresh_btn):
+            self._refresh_btn.setToolTip(
+                t("tooltips.refresh_in_game" if self._in_game else "tooltips.refresh"))
+        if _safe(self._card_games):
+            self._card_games.set_stat_label(t("overview.stat_games"))
+        if _safe(self._card_backups):
+            self._card_backups.set_stat_label(t("overview.stat_backups"))
+        if _safe(self._card_synced):
+            self._card_synced.set_stat_label(t("overview.stat_synced"))
+        if _safe(self._card_playtime):
+            self._card_playtime.set_stat_label(t("overview.stat_playtime"))
+        if _safe(self._activity_header):
+            self._activity_header.setText(t("overview.recent_activity"))
+        if _safe(self._activity_empty):
+            self._activity_empty.setText(t("overview.no_activity"))
+        if _safe(self._donut_header):
+            self._donut_header.setText(t("overview.sync_distribution"))
+        if _safe(self._actions_header):
+            self._actions_header.setText(t("overview.quick_actions"))
+        if _safe(self._bar_header):
+            self._bar_header.setText(t("overview.backup_activity"))
+        for btn, label_key in getattr(self, "_action_btns", []):
+            if _safe(btn):
+                btn.setText(t(label_key))
+        if _safe(self._active_backup_btn):
+            self._active_backup_btn.setText(t("buttons.backup_now"))
+        self._activity_cache_key = None
+        self.refresh()
+
     def schedule_refresh(self):
         """Debounced refresh; no-op work while the page is hidden."""
         if not self.isVisible():
@@ -467,38 +503,73 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         QTimer.singleShot(0, self.refresh)
 
     def _connect_signals(self):
-        """Connect to library and sync signals for immediate refresh."""
+        """Connect to ALL library, backup, sync, monitor, config, and watcher signals for immediate refresh."""
         self._on_game_added = lambda _: self.schedule_refresh()
         self._on_game_removed = lambda _: self.schedule_refresh()
         self._on_bulk_finished = lambda: self.schedule_refresh()
         self._on_backup_created = self._on_backup_created_refresh
         self._on_sync_finished = lambda *_: self.schedule_refresh()
+
+        # 1. LibraryManager signals
         try:
-            get_library().game_updated.connect(self.schedule_refresh)
-            get_library().game_added.connect(self._on_game_added)
-            get_library().game_removed.connect(self._on_game_removed)
-            get_library().bulk_finished.connect(self._on_bulk_finished)
+            lib = get_library()
+            lib.game_updated.connect(self.schedule_refresh)
+            lib.game_added.connect(self._on_game_added)
+            lib.game_removed.connect(self._on_game_removed)
+            lib.bulk_finished.connect(self._on_bulk_finished)
+            lib.library_loaded.connect(self.schedule_refresh)
         except Exception:
             pass
+
+        # 2. BackupManager signals
         try:
-            get_backup_manager().backup_created.connect(self._on_backup_created)
+            bm = get_backup_manager()
+            bm.backup_created.connect(self._on_backup_created)
+            bm.backup_restored.connect(lambda *_: self.schedule_refresh())
+            bm.backup_deleted.connect(lambda *_: self.schedule_refresh())
+            bm.index_validation_failed.connect(lambda *_: self.schedule_refresh())
+            bm.index_validation_recovered.connect(lambda *_: self.schedule_refresh())
         except Exception:
             pass
+
+        # 3. SyncOrchestrator signals
         try:
             orch = get_orchestrator()
+            orch.sync_started.connect(lambda *_: self.schedule_refresh())
             orch.sync_finished.connect(self._on_sync_finished)
-            orch.batch_finished.connect(self.schedule_refresh)
+            orch.conflict_detected.connect(lambda *_: self.schedule_refresh())
+            orch.provider_changed.connect(lambda *_: self.schedule_refresh())
             orch.providers_updated.connect(self.schedule_refresh)
+            orch.batch_finished.connect(self.schedule_refresh)
         except Exception:
             pass
-        # In-game state comes from the monitor's own signals (the same
-        # game_launched/game_exited the library page listens to).
+
+        # 4. ProcessMonitor signals
         try:
             mon = get_monitor()
             mon.game_launched.connect(lambda *_: self._update_in_game_state())
             mon.game_exited.connect(lambda *_: self._update_in_game_state())
             mon.unknown_game_detected.connect(lambda *_: self._update_in_game_state())
             mon.unknown_game_exited.connect(lambda *_: self._update_in_game_state())
+            mon.game_match_unverified.connect(lambda *_: self._update_in_game_state())
+            mon.game_match_unverified_gone.connect(lambda *_: self._update_in_game_state())
+        except Exception:
+            pass
+
+        # 5. ConfigManager signals
+        try:
+            from core.config_manager import get_config
+            get_config().config_changed.connect(lambda *_: self.schedule_refresh())
+        except Exception:
+            pass
+
+        # 6. SaveWatcher signals
+        try:
+            from core.watcher import get_watcher
+            w = get_watcher()
+            if w is not None:
+                w.save_changed.connect(lambda *_: self.schedule_refresh())
+                w.folder_appeared.connect(lambda *_: self.schedule_refresh())
         except Exception:
             pass
 
@@ -1010,14 +1081,17 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
 
         # Skip full rebuild if underlying data hasn't changed.
         # Relative timestamps are updated in place by _refresh_timestamps_only.
+        from i18n import get_current_language
+        cur_lang = get_current_language()
         bk_ids_hash = hash(tuple(r[0] for r in bk_rows)) if bk_rows else 0
         game_names_hash = hash(tuple(g.name for g in games)) if games else 0
-        game_mod_hash = hash(tuple((g.id, g.last_played or "", g.last_synced or "") for g in games)) if games else 0
+        game_mod_hash = hash(tuple((g.id, g.last_played or "", g.last_synced or "", g.playtime_seconds, g.last_session_seconds) for g in games)) if games else 0
         cache_key = (len(games), len(bk_rows),
                      games[-1].id if games else "",
                      bk_ids_hash,
                      game_names_hash,
-                     game_mod_hash)
+                     game_mod_hash,
+                     cur_lang)
         if cache_key == self._activity_cache_key:
             return
         self._activity_cache_key = cache_key

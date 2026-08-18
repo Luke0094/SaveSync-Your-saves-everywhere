@@ -3839,8 +3839,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if item.widget():
                 item.widget().deleteLater()
         for i, url in enumerate(self._store_urls):
-            # Label part (clickable to open)
-            label = url.replace("https://", "").replace("http://", "").split("/")[0]
+            # Label part (clickable to open, bounded to 10 characters max)
+            raw_host = url.replace("https://", "").replace("http://", "").split("/")[0]
+            label = raw_host[:10] if len(raw_host) > 10 else raw_host
             chip_frame = QFrame()
             chip_frame.setFixedHeight(scaled(22, self))
             chip_frame.setSizePolicy(

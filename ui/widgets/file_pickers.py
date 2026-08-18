@@ -52,38 +52,124 @@ def _save_sidebar_pins(pins: list[str]) -> None:
         logger.debug("could not persist browse sidebar pins", exc_info=True)
 
 
+def _translate_file_type(raw: str) -> str:
+    if not raw:
+        return ""
+    low = raw.lower()
+    if "folder" in low or "directory" in low or "cartella" in low:
+        return t("file_picker.type_folder")
+    if "application" in low or "executable" in low or "eseguibile" in low or "applicazion" in low or "exe" in low:
+        return t("file_picker.type_app")
+    if "text" in low or "plain" in low or "testo" in low:
+        return t("file_picker.type_text")
+    if "pdf" in low or "portable document" in low:
+        return t("file_picker.type_pdf")
+    if "archive" in low or "zip" in low or "compressed" in low or "rar" in low or "7z" in low or "archivio" in low:
+        return t("file_picker.type_archive")
+    if "image" in low or "png" in low or "jpeg" in low or "jpg" in low or "immagine" in low or "bitmap" in low:
+        return t("file_picker.type_image")
+    if "audio" in low or "sound" in low or "mp3" in low or "wav" in low or "flac" in low:
+        return t("file_picker.type_audio")
+    if "video" in low or "mp4" in low or "mkv" in low or "avi" in low:
+        return t("file_picker.type_video")
+    if "shortcut" in low or "link" in low or "collegamento" in low:
+        return t("file_picker.type_shortcut")
+    return raw
+
+
+def _translate_system_name(raw: str) -> str:
+    if not raw:
+        return ""
+    low = raw.lower().strip()
+    if "my computer" in low or "this pc" in low or "questo pc" in low or low == "computer":
+        return t("file_picker.my_computer")
+    if low == "desktop":
+        return t("file_picker.desktop")
+    if "documents" in low or "documenti" in low:
+        return t("file_picker.documents")
+    if "downloads" in low or "download" in low:
+        return t("file_picker.downloads")
+    home_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.HomeLocation)
+    if home_p and (low == Path(home_p).name.lower() or low == "home"):
+        return t("file_picker.user_home")
+    return ""
+
+
+from PySide6.QtWidgets import QStyledItemDelegate
+
+
+class _SidebarItemDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        raw = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        tr = _translate_system_name(raw)
+        if tr:
+            option.text = tr
+
+
+class _FileDetailsDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        col = index.column()
+        if col == 0:
+            raw = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            tr = _translate_system_name(raw)
+            if tr:
+                option.text = tr
+        elif col == 2:
+            raw = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            if raw:
+                option.text = _translate_file_type(raw)
+
+
 def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
-    """Identify if a URL is one of the 3 permanent default pins:
-    1. Questo PC / My Computer
-    2. Cartella Utente / Home
-    3. Desktop
-    All other locations (drives, documents, custom folders) can be removed by the user.
+    """Identify if a URL is a permanent protected system pin:
+    - My Computer / root / special URLs
+    - User Home folder
+    - Desktop
+    - Documents
+    - Downloads
+    - Drive roots (C:\\, D:\\, /)
+    - Any URL recorded in system_urls
     """
-    if not url.isValid() or not url.toString() or url.toString() in ("file:", "file:///", ""):
+    if not url.isValid() or not url.toString() or url.toString() in ("file:", "file:///", "", "computer:"):
+        return True
+    if system_urls and url in system_urls:
         return True
     path = url.toLocalFile()
     if not path:
         return True
     try:
-        norm_p = Path(path).resolve()
+        p = Path(path).resolve()
     except Exception:
-        norm_p = Path(path)
+        p = Path(path)
 
-    # Exactly 2 filesystem default locations: Desktop and Home
-    default_system_paths = set()
+    # Drive root (e.g. C:\ or /)
+    if len(p.parts) <= 1 or str(p).rstrip("/\\") == str(p.drive).rstrip("/\\"):
+        return True
+
+    # Standard system locations
+    system_loc_paths = set()
     for loc in (
         QStandardPaths.StandardLocation.DesktopLocation,
         QStandardPaths.StandardLocation.HomeLocation,
+        QStandardPaths.StandardLocation.DocumentsLocation,
+        QStandardPaths.StandardLocation.DownloadLocation,
+        QStandardPaths.StandardLocation.MusicLocation,
+        QStandardPaths.StandardLocation.PicturesLocation,
+        QStandardPaths.StandardLocation.MoviesLocation,
     ):
         p_str = QStandardPaths.writableLocation(loc)
         if p_str:
             try:
-                default_system_paths.add(Path(p_str).resolve())
+                system_loc_paths.add(Path(p_str).resolve())
             except Exception:
                 pass
 
-    if norm_p in default_system_paths or str(norm_p).rstrip("/\\").lower() in [str(sp).rstrip("/\\").lower() for sp in default_system_paths]:
-        return True
+    p_norm = str(p).rstrip("/\\").lower()
+    for sp in system_loc_paths:
+        if p == sp or p_norm == str(sp).rstrip("/\\").lower():
+            return True
 
     return False
 
@@ -93,8 +179,8 @@ class _LnkAwareDialog(QFileDialog):
     """QFileDialog that treats a folder shortcut as a navigation step.
 
     Also provides:
-    - Full Italian/English localisation for all visible labels, tooltips, and actions.
-    - System sidebar pins (Desktop, Home, Drives) protected from removal.
+    - Full Italian/English localisation for all visible labels, columns, tooltips, and actions.
+    - Protected system sidebar pins (My Computer, User Home, Desktop, Drives, Documents, Downloads).
     - Right-click on any folder in the view with "Aggiungi alla barra laterale".
     """
 
@@ -102,9 +188,6 @@ class _LnkAwareDialog(QFileDialog):
         super().__init__(parent, caption)
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        # Hand back the RAW .lnk path: the widget dialog otherwise resolves
-        # shortcuts itself, and callers need the .lnk (display name from the
-        # shortcut filename, its folder as a search hint).
         self.setOption(QFileDialog.Option.DontResolveSymlinks, True)
 
         self._apply_window_chrome()
@@ -114,16 +197,23 @@ class _LnkAwareDialog(QFileDialog):
         self._load_pinned_places()
         self._hook_folder_context_menu()
         self._localize_labels()
-        # Qt treats .lnk files as symlinks, so double-clicking a FOLDER
-        # shortcut makes isDir() true and the dialog "enters" the .lnk FILE
-        # itself — Look-in shows "...\Folder.lnk", the listing is empty, and
-        # accept() is never reached. rootPathChanged fires for EVERY
-        # directory change (directoryEntered only covers UI navigation), so
-        # hook that and redirect on the next loop turn.
+
         from PySide6.QtWidgets import QFileSystemModel
         model = self.findChild(QFileSystemModel)
         if model is not None:
             model.rootPathChanged.connect(self._redirect_lnk_directory)
+            model.directoryLoaded.connect(lambda *_: self._localize_labels())
+
+    def eventFilter(self, watched, event):
+        """Block Delete/Backspace key from removing protected system pins on sidebar."""
+        if watched is getattr(self, "_sidebar_view", None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                idx = self._sidebar_view.currentIndex()
+                if idx.isValid():
+                    urls = list(self.sidebarUrls())
+                    if idx.row() < len(urls) and _is_system_pin(urls[idx.row()], self._system_sidebar_urls):
+                        return True
+        return super().eventFilter(watched, event)
 
     def _apply_window_chrome(self):
         """Apply theme palette and stylesheet before mapping to prevent color flash in both light and dark modes."""
@@ -169,6 +259,7 @@ class _LnkAwareDialog(QFileDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_window_chrome()
+        self._localize_labels()
         if getattr(self, "_sidebar_view", None) is not None:
             sw = scaled(185, self, min_px=165)
             self._sidebar_view.setMinimumWidth(sw)
@@ -178,11 +269,10 @@ class _LnkAwareDialog(QFileDialog):
             geo.moveCenter(parent.frameGeometry().center())
             self.move(geo.topLeft())
 
-
     # ── Localisation ──────────────────────────────────────────────────────────
 
     def _localize_labels(self):
-        """Set all visible QFileDialog labels, buttons, and actions to the active locale strings."""
+        """Set all visible QFileDialog labels, headers, buttons, and actions to the active locale strings."""
         try:
             self.setLabelText(QFileDialog.DialogLabel.LookIn,
                               t("file_picker.look_in"))
@@ -195,8 +285,34 @@ class _LnkAwareDialog(QFileDialog):
             self.setLabelText(QFileDialog.DialogLabel.Reject,
                               t("common.cancel"))
 
-            from PySide6.QtWidgets import QToolButton
+            from PySide6.QtWidgets import QToolButton, QTreeView, QListView, QComboBox, QHeaderView
             from PySide6.QtGui import QAction
+
+            # Header columns
+            tree = self.findChild(QTreeView, "treeView")
+            if tree is not None:
+                model = tree.model()
+                if model is not None:
+                    try:
+                        model.setHeaderData(0, Qt.Orientation.Horizontal, t("file_picker.col_name"))
+                        model.setHeaderData(1, Qt.Orientation.Horizontal, t("file_picker.col_size"))
+                        model.setHeaderData(2, Qt.Orientation.Horizontal, t("file_picker.col_type"))
+                        model.setHeaderData(3, Qt.Orientation.Horizontal, t("file_picker.col_date_modified"))
+                    except Exception:
+                        pass
+                tree.setItemDelegate(_FileDetailsDelegate(tree))
+
+            list_v = self.findChild(QListView, "listView")
+            if list_v is not None:
+                list_v.setItemDelegate(_FileDetailsDelegate(list_v))
+
+            sidebar = self.findChild(QListView, "sidebar")
+            if sidebar is not None:
+                sidebar.setItemDelegate(_SidebarItemDelegate(sidebar))
+
+            combo = self.findChild(QComboBox, "lookInCombo")
+            if combo is not None:
+                combo.setItemDelegate(_SidebarItemDelegate(combo))
 
             # Toolbuttons tooltips
             btn_tooltips = {
@@ -225,14 +341,19 @@ class _LnkAwareDialog(QFileDialog):
                 if a is not None:
                     a.setText(txt)
                     a.setToolTip(txt)
+
+            for act in self.findChildren(QAction):
+                txt = act.text().replace('&', '').strip().lower()
+                if txt in ("remove", "delete from sidebar", "rimuovi"):
+                    act.setText(t("file_picker.remove_from_sidebar"))
+                    act.setToolTip(t("file_picker.remove_from_sidebar"))
         except Exception:
-            pass   # labels are cosmetic — never crash on localisation failure
+            pass
 
     # ── Sidebar places ────────────────────────────────────────────────────────
 
     def _add_common_places(self):
-        """Desktop and Home in the sidebar — the widget dialog ships only
-        Home, and game shortcuts overwhelmingly live on the Desktop."""
+        """Desktop and Home in the sidebar."""
         urls = list(self.sidebarUrls())
         for location in (QStandardPaths.StandardLocation.DesktopLocation,
                          QStandardPaths.StandardLocation.HomeLocation):
@@ -242,13 +363,10 @@ class _LnkAwareDialog(QFileDialog):
                 if url not in urls:
                     urls.append(url)
         self.setSidebarUrls(urls)
-        # Store strictly the 3 default system pins (My Computer, User Home, Desktop)
         self._system_sidebar_urls = [u for u in self.sidebarUrls() if _is_system_pin(u)]
 
-
     def _load_pinned_places(self):
-        """Re-apply the user's pinned folders onto the sidebar (kept across
-        opens, like the Desktop/Home default places)."""
+        """Re-apply the user's pinned folders onto the sidebar."""
         urls = list(self.sidebarUrls())
         for p in _load_sidebar_pins():
             url = QUrl.fromLocalFile(p)
@@ -257,10 +375,8 @@ class _LnkAwareDialog(QFileDialog):
         self.setSidebarUrls(urls)
 
     def _hook_folder_context_menu(self):
-        """Right-click on a FOLDER in the listing offers to pin it into the
-        sidebar as a shortcut. Files keep the dialog's own context menu
-        (rename/delete/new-folder) untouched."""
-        from PySide6.QtWidgets import QListView, QTreeView, QAbstractItemView
+        """Right-click on a FOLDER in the listing offers to pin it into the sidebar."""
+        from PySide6.QtWidgets import QListView, QTreeView
         self._pins_views = []
         for view_type in (QListView, QTreeView):
             for v in self.findChildren(view_type):
@@ -276,7 +392,7 @@ class _LnkAwareDialog(QFileDialog):
             self._sidebar_view.setMaximumWidth(scaled(280, self))
             self._sidebar_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self._sidebar_view.customContextMenuRequested.connect(self._on_sidebar_context_menu)
-
+            self._sidebar_view.installEventFilter(self)
 
     def _on_sidebar_context_menu(self, pos) -> None:
         """Right-click on the sidebar: protect system pins, allow removing custom pins."""
@@ -294,14 +410,13 @@ class _LnkAwareDialog(QFileDialog):
         system_list = getattr(self, "_system_sidebar_urls", [])
         global_pos = sidebar.mapToGlobal(pos)
         if _is_system_pin(url, system_list):
-            # System location: show informative disabled item
             from PySide6.QtWidgets import QMenu
             menu = QMenu(sidebar)
             act = menu.addAction(t("file_picker.cannot_remove_system_pin"))
             act.setEnabled(False)
             menu.exec(global_pos)
             return
-        # Custom user pin: allow removal
+
         from PySide6.QtWidgets import QMenu
         menu = QMenu(sidebar)
         act = menu.addAction(t("file_picker.remove_from_sidebar"))
@@ -357,7 +472,6 @@ class _LnkAwareDialog(QFileDialog):
                     self._load_pinned_places()
                 return
         elif idx.isValid():
-            # File
             if rename_act:
                 menu.addAction(rename_act)
             if delete_act:
@@ -368,7 +482,6 @@ class _LnkAwareDialog(QFileDialog):
             menu.exec(global_pos)
             return
         else:
-            # Empty background
             if new_folder_act:
                 menu.addAction(new_folder_act)
             if hidden_act:

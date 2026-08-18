@@ -758,6 +758,14 @@ class ProcessMonitor(QObject):
         self._stem_lookup = None
         self._proc_match_cache.clear()
 
+    def prune_caches(self):
+        """Trim memory held by cached lookup maps and snapshot verdicts."""
+        with self._data_lock:
+            self._invalidate_entry_lookup()
+            self._proc_resolved_cache.clear()
+            self._snap_verdicts.clear()
+            self._snap_gen = getattr(self, "_snap_gen", 0) + 1
+
     def _build_entry_lookup(self):
         from core.resolvers import fuzzy_slug as _slug
         exe_lookup: dict[str, str] = {}      # lowered / resolved path → id

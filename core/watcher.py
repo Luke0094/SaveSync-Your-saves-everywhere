@@ -154,6 +154,14 @@ _CORR_DEFAULT_WINDOW_MS = 1000
 _CORR_WEAK_RATIO = 0.4   # weaker candidates get a stricter slice of the window
 _CORR_WEAK_CAP = 2       # max weak claims per anchor sweep
 
+
+def prune_watcher_caches() -> None:
+    """Trim memory held by temporary watcher file indices and correlation buffers."""
+    with _CACHE_LOCK:
+        _KNOWN_FILES_BY_DIR.clear()
+        _UNATTRIBUTED_EVENTS.clear()
+        _PENDING_FILES.clear()
+
 # Only a real WRITE moves the correlation clock. This has to be enforced
 # explicitly, twice over, because neither check is sufficient alone:
 #

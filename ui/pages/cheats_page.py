@@ -452,9 +452,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._load_notice = None
         self._hold_watch = QTimer(self)
         self._hold_watch.setInterval(1000)
-
-
         self._hold_watch.timeout.connect(self._watch_hold_game)
+
+        # 10-minute idle timer: release loaded save doc from RAM if untouched and no hold is running
+        self._idle_save_timer = QTimer(self)
+        self._idle_save_timer.setInterval(10 * 60 * 1000)
+        self._idle_save_timer.timeout.connect(self._on_idle_save_timeout)
+
         self._build()
         # Shell only — game rows fill on first on_page_enter (async chunks).
         # Like the library: once filled, keep the UI for the whole session
@@ -824,12 +828,43 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         QTimer.singleShot(0, self._enter_after_paint)
 
+    def _reset_idle_save_timer(self):
+        """Reset the 10-minute idle save timer if a document is loaded and game is not actively executing holds."""
+        is_actively_holding_in_game = bool(self._playing() and self._hold is not None and self._hold.is_running())
+        if getattr(self, "_doc", None) is not None and not is_actively_holding_in_game:
+            self._idle_save_timer.start()
+        else:
+            self._idle_save_timer.stop()
+
+    def _on_idle_save_timeout(self):
+        """Release loaded save document from RAM if untouched for 10 minutes and game is not actively executing holds."""
+        is_actively_holding_in_game = bool(self._playing() and self._hold is not None and self._hold.is_running())
+        if getattr(self, "_doc", None) is not None and not is_actively_holding_in_game:
+            logger.info("CheatsPage: 10-minute idle reached outside active game, releasing save document from memory.")
+            self._cancel_row_insert()
+            self._stop_hold()
+            self._hold_watch.stop()
+            self._doc = None
+            self._pending.clear()
+            self._editors.clear()
+            self._clear(self._fields_col)
+            if self._entry is not None:
+                self.show_step(self.STEP_SAVES)
+            else:
+                self.show_step(self.STEP_PICK)
+            try:
+                from ui.helpers import trim_process_memory
+                trim_process_memory()
+            except Exception:
+                pass
+
     def on_page_leave(self):
         """Clean up in-flight pumps and active holds when user switches to another tab.
         Shelved save-loads in the sidebar continue running uninterrupted."""
         self._cancel_row_insert()
         self._stop_hold()
         self._hold_watch.stop()
+        self._reset_idle_save_timer()
         busy = getattr(self, "_save_load_busy", None)
         is_shelved = busy is not None and getattr(busy, "_shelved", False)
         if not is_shelved:
@@ -1287,6 +1322,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._field_filter.clear()
         self._fill_groups()
         self._render_page()
+        self._reset_idle_save_timer()
         if not shelved:
             self.show_step(self.STEP_EDIT)
 
@@ -1498,6 +1534,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _step_page(self, delta: int):
         self._page += delta
         self._render_page()
+        self._reset_idle_save_timer()
 
     def _editor_for(self, f):
         # An edit made on one page must survive turning to another, so every
@@ -1532,6 +1569,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _remember(self, path, value):
         self._pending[path] = value
+        self._reset_idle_save_timer()
         # A held value follows what you type: changing it while it is held
         # means "hold THIS instead", not "hold the old one and show a lie".
         label = next((f.label for f in self._doc.fields if f.path == path), "")
@@ -1543,10 +1581,12 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _apply_field_filter(self, _text: str):
         self._page = 0
         self._render_page()
+        self._reset_idle_save_timer()
 
     def _apply_edits(self):
         if self._doc is None or getattr(self._doc, "read_only", False):
             return
+        self._reset_idle_save_timer()
         # Pause an active hold across the write: both write this same file.
         was_holding = self._hold is not None and self._hold.is_running()
         if was_holding:
@@ -1690,40 +1730,6 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._row_insert_queue = []
         self._row_insert_on_done = None
         self._stop_deferred_busy()
-
-    def wipe_and_reload(self):
-        """Wipe cached save docs and game pick list; called by the overview refresh button."""
-        self._cancel_row_insert()
-        self._clear(self._games_col)
-        self._clear(self._files_col)
-        self._clear(self._kept_col)
-        worker = getattr(self, "_save_load_worker", None)
-        if worker is not None:
-            try:
-                worker.cancel()
-            except Exception:
-                pass
-            self._save_load_worker = None
-        busy = getattr(self, "_save_load_busy", None)
-        if busy is not None:
-            try:
-                busy.close_overlay()
-            except Exception:
-                pass
-            self._save_load_busy = None
-        self._doc = None
-        self._loaded_path = None
-        self._save_load_gen = getattr(self, "_save_load_gen", 0) + 1
-        self._editors.clear()
-        self._pending.clear()
-        self._held.clear()
-        self._stop_hold()
-        self._close_load_notice()
-        self._pending_initial_load = True
-        self.show_step(self.STEP_PICK, refresh_pick=False)
-        if self.isVisible():
-            QTimer.singleShot(0, self._enter_after_paint)
-
 
     def _begin_async_rows(self, jobs: list, on_done=None):
         """Insert list rows in QTimer chunks (same pattern as library cards).

@@ -138,46 +138,72 @@ def _pick(candidates: list, folder: Path) -> Optional[Path]:
     return max(candidates, key=lambda c: _score_candidate(c, folder))
 
 
-def _find_in_tree(folder: Path, max_depth: int,
-                  cancel: Optional[Callable[[], bool]] = None) -> tuple:
-    """Executables for *folder*, descending only while a level has none.
+def _scan_subfolder(folder: Path, depth: int, max_depth: int = 4,
+                     cancel: Optional[Callable[[], bool]] = None) -> list[ScanHit]:
+    """Scan a folder tree recursively, discovering games at each level."""
+    if cancel and cancel():
+        return []
+    if depth > max_depth:
+        return []
 
-    Breadth-first on purpose: "Game/x86/game.exe" must be found before
-    "Game/tools/editor/editor.exe", and the walk stops at the first level that
-    yields anything at all.
-    """
-    level = [folder]
-    for depth in range(0, max_depth + 1):
-        if cancel and cancel():
-            return [], depth
-        found: list = []
-        for directory in level:
-            found.extend(_executables_in(directory))
-        if found:
-            return found, depth
-        # Nothing here — go one level down, skipping folders that never hold
-        # a game binary.
-        nxt: list = []
-        for directory in level:
+    from core.save_detector import derive_display_name
+
+    # Check if this folder itself directly contains a game binary
+    direct_exes = _executables_in(folder)
+    if direct_exes:
+        best = _pick(direct_exes, folder)
+        if best is not None:
+            return [ScanHit(
+                folder=str(folder),
+                exe_path=str(best),
+                name=derive_display_name(str(best)),
+                depth=depth,
+                alternatives=[str(p) for p in direct_exes if p != best][:20],
+            )]
+
+    # No direct executable: search non-noise subdirectories
+    subdirs: list[Path] = []
+    try:
+        for child in folder.iterdir():
             try:
-                for child in directory.iterdir():
-                    try:
-                        if child.is_dir() and not _is_noise_dir(child.name):
-                            nxt.append(child)
-                    except OSError:
-                        continue
+                if child.is_dir() and not _is_noise_dir(child.name):
+                    subdirs.append(child)
             except OSError:
                 continue
-        if not nxt:
-            return [], depth
-        level = nxt
-    return [], max_depth
+    except OSError:
+        return []
+
+    hits: list[ScanHit] = []
+    for sub in subdirs:
+        if cancel and cancel():
+            break
+        sub_hits = _scan_subfolder(sub, depth + 1, max_depth, cancel)
+        hits.extend(sub_hits)
+    return hits
+
+
+def find_single_game_in_folder(folder_path: str | Path, max_depth: int = 3) -> Optional[tuple[str, str]]:
+    """Find the single most likely game executable inside *folder_path*.
+
+    Returns ``(display_name, exe_path)`` or None if no game executable found.
+    Used for single-folder drag & drop onto the library page.
+    """
+    p = Path(folder_path)
+    if not p.is_dir():
+        return None
+    hits = _scan_subfolder(p, 0, max_depth=max_depth)
+    if not hits:
+        return None
+    # Pick top hit (or shallowest depth)
+    hits.sort(key=lambda h: h.depth)
+    best = hits[0]
+    return (best.name, best.exe_path)
 
 
 def scan_folder_for_games(root: str, max_depth: int = 4,
                           cancel: Optional[Callable[[], bool]] = None,
                           progress: Optional[Callable[[int, int, str], None]] = None) -> list:
-    """Scan *root* and return one ScanHit per top-level folder that has a game.
+    """Scan *root* and return one ScanHit per game found in any subfolder.
 
     *max_depth* bounds how far below a folder the walk may go before giving
     up on it — an unbounded descent over a games drive is exactly the
@@ -200,11 +226,10 @@ def scan_folder_for_games(root: str, max_depth: int = 4,
         logger.warning(f"Scan: cannot list {root}: {e}")
         return []
 
-    hits: list = []
+    hits: list[ScanHit] = []
     total = len(children)
 
-    # Loose executables sitting directly in the scanned folder count too — a
-    # portable game dropped in beside the installed ones.
+    # Loose executables sitting directly in the scanned root folder count too
     for exe in _executables_in(base):
         hits.append(ScanHit(folder=str(base), exe_path=str(exe),
                             name=derive_display_name(str(exe)), depth=0))
@@ -215,19 +240,8 @@ def scan_folder_for_games(root: str, max_depth: int = 4,
             break
         if progress:
             progress(index, total, folder.name)
-        found, depth = _find_in_tree(folder, max_depth, cancel)
-        if not found:
-            continue
-        best = _pick(found, folder)
-        if best is None:
-            continue
-        hits.append(ScanHit(
-            folder=str(folder),
-            exe_path=str(best),
-            name=derive_display_name(str(best)),
-            depth=depth,
-            alternatives=[str(p) for p in found if p != best][:20],
-        ))
+        folder_hits = _scan_subfolder(folder, depth=0, max_depth=max_depth, cancel=cancel)
+        hits.extend(folder_hits)
 
     logger.info(f"Scan of {root}: {len(hits)} candidate(s) from {total} folder(s)")
     return hits

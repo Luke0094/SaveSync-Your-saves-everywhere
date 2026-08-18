@@ -12,20 +12,21 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_IS_WINDOWS = os.name == 'nt'
+_IS_WINDOWS = sys.platform == 'win32' or os.name == 'nt'
+_IS_MACOS = sys.platform == 'darwin'
+_IS_LINUX = not _IS_WINDOWS and not _IS_MACOS
 
 # ── What counts as "an executable the user can add" ───────────────────────────
 # Windows says it with an extension; Unix mostly doesn't — the common case is a
 # suffix-less file carrying the exec bit, so recognition there needs a stat, not
 # a glob. Shortcuts are the platform's own indirection format (.lnk/.url vs
-# .desktop) and are deliberately kept apart from real executables: the add flow
-# resolves them to a target and derives the display name from the shortcut's
-# filename rather than the binary's.
+# .desktop) and are deliberately kept apart from real executables.
+#
+# On Windows, executables are .exe/.bat/.cmd (.bin files are assets, never executables).
+# On Linux/Unix, .bin, .sh, .appimage, .x86_64, .run, .command are executable extensions.
+# On macOS, .app is a bundle directory and scripts/binaries are recognized.
 _EXEC_SUFFIXES_WINDOWS = ('.exe', '.bat', '.cmd')
 _SHORTCUT_SUFFIXES_WINDOWS = ('.lnk', '.url')
-# .x86_64/.x86 are Unity's Linux builds, .AppImage a self-contained bundle,
-# .command a double-clickable macOS script. .app is a macOS bundle DIRECTORY,
-# handled separately since every suffix/is_file() test would reject it.
 _EXEC_SUFFIXES_POSIX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin', '.command')
 _SHORTCUT_SUFFIXES_POSIX = ('.desktop',)
 _MACOS_BUNDLE_SUFFIX = '.app'
@@ -49,21 +50,21 @@ def is_shortcut_file(path) -> bool:
 def is_executable_file(path) -> bool:
     """True when *path* is a runnable program on this platform.
 
-    On Unix a game binary usually has NO extension at all, so the exec bit is
-    the real signal; the suffix list only covers the conventions that do exist
-    (.sh, .AppImage, Unity's .x86_64…). A macOS .app is a directory and is
-    accepted as itself.
+    On Windows: only native executables (.exe, .bat, .cmd) are recognized as
+    programs; .bin files are assets/data on Windows and never executables.
+    Suffix-less files or Linux binaries are checked for ELF/Mach-O magic headers.
 
-    On Windows the platform suffixes are recognised as always, PLUS the Unix
-    conventions: a game directory can hold Linux binaries (WSL, Proton,
-    mounted drives) and the custom browse must see them. A suffix-less file
-    is accepted when its first bytes are a real program's (ELF, Mach-O) or a
-    shebang — a cheap 4-byte read, no exec-bit tests that mean nothing on NTFS.
+    On Unix/Linux: extension-less files carrying the exec bit are recognized,
+    along with POSIX executable extensions (.sh, .AppImage, .x86_64, .bin, .run).
+
+    On macOS: .app bundles (directories) and POSIX scripts/binaries are recognized.
     """
     p = Path(path)
     suffix = p.suffix.lower()
     if _IS_WINDOWS:
-        if suffix in _EXEC_SUFFIXES_WINDOWS or suffix in _EXEC_SUFFIXES_POSIX:
+        if suffix in _EXEC_SUFFIXES_WINDOWS:
+            return True
+        if suffix in ('.appimage', '.x86_64', '.x86', '.sh'):
             return True
         if suffix:
             return False
@@ -99,25 +100,18 @@ _BINARY_MAGICS = (
 
 
 def is_program_binary(path) -> bool:
-    """Stricter than is_executable_file: is this the program a game is
-    *installed as*?
+    """True only when *path* is definitely an executable binary (not an asset
+    file, script, or directory).
 
-    is_executable_file answers "could the user launch this" and is
-    deliberately permissive, because there the user picked the file. This one
-    backs an automatic decision — "this folder is an install root, so back up
-    its save files individually instead of the whole folder" — where a false
-    positive silently narrows what gets backed up. So an extension-less file
-    must both carry the exec bit AND actually start like a binary.
-
-    Windows keeps the exact ``.exe`` test the heuristic has always used, with
-    the Unix conventions added: a game folder may hold Linux builds (WSL,
-    Proton, mounted drives), and their binaries must not be mistaken for
-    data files when the folder is evaluated as an install root.
+    On Windows: tests .exe/.bat/.cmd as always (.bin is never an executable on Windows).
+    On Unix/macOS: checks POSIX executable formats or binary magics with exec bit.
     """
     p = Path(path)
     suffix = p.suffix.lower()
     if _IS_WINDOWS:
-        if suffix in (_EXEC_SUFFIXES_WINDOWS + _EXEC_SUFFIXES_POSIX):
+        if suffix in _EXEC_SUFFIXES_WINDOWS:
+            return True
+        if suffix in ('.appimage', '.x86_64', '.x86'):
             return True
         if suffix:
             return False
@@ -178,23 +172,8 @@ def is_addable_file(path) -> bool:
 
 
 def executable_name_filter(all_files_label: str = "All Files") -> str:
-    """QFileDialog name filter for picking a game executable.
-
-    On Unix "All Files" comes FIRST on purpose: the typical game binary has no
-    extension, so no pattern can match it and a restrictive default filter
-    would hide exactly what the user came to select.
-
-    On Windows the platform patterns are joined by the Unix conventions —
-    Linux binaries hide in game folders (WSL, Proton, mounted drives) and the
-    custom browse must list them, not just the *.exe family.
-    """
-    patterns = " ".join(
-        f"*{s}" for s in executable_suffixes()
-        + shortcut_suffixes()
-        + (() if _IS_WINDOWS else ())
-        + ((_EXEC_SUFFIXES_POSIX + _SHORTCUT_SUFFIXES_POSIX)
-           if _IS_WINDOWS else ())
-    )
+    """QFileDialog name filter for picking a game executable."""
+    patterns = " ".join(f"*{s}" for s in executable_suffixes() + shortcut_suffixes())
     if _IS_WINDOWS:
         return f"Executables ({patterns});;{all_files_label} (*)"
     return f"{all_files_label} (*);;Executables ({patterns})"

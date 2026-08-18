@@ -169,14 +169,16 @@ class ThemedMixin:
         try:
             reg = self._themed_styles
         except AttributeError:
-            reg = self._themed_styles = {}
+            import weakref
+            reg = self._themed_styles = weakref.WeakKeyDictionary()
         from ui.helpers import scale_stylesheet_fonts
         widget.setStyleSheet(scale_stylesheet_fonts(style_fn()))
-        # Keyed by widget, not appended: a page that re-registers the same
-        # widget (a row restyled on selection, a card re-themed on hover)
-        # would otherwise accumulate one entry per call, and refresh_styles
-        # would replay them all on every theme switch.
-        reg[widget] = style_fn
+        # Keyed by widget using WeakKeyDictionary so destroyed widgets
+        # are automatically discarded without accumulating RAM.
+        try:
+            reg[widget] = style_fn
+        except TypeError:
+            pass
         return widget
 
     def refresh_styles(self):
@@ -188,14 +190,13 @@ class ThemedMixin:
         for widget, style_fn in list(reg.items()):
             try:
                 widget.setStyleSheet(scale_stylesheet_fonts(style_fn()))
-            except RuntimeError:
-                # Underlying C++ widget already deleted. DROP it — leaving it
-                # behind grew the registry for the whole session (every page
-                # rebuild added its replaced widgets), so each theme switch
-                # replayed an ever-longer list of entries that only raise.
+            except (RuntimeError, Exception):
                 dead.append(widget)
         for widget in dead:
-            reg.pop(widget, None)
+            try:
+                reg.pop(widget, None)
+            except Exception:
+                pass
 
     def prune_themed_styles(self):
         """Forget entries whose widget is already gone.

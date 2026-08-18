@@ -645,6 +645,16 @@ def trim_process_memory() -> None:
     except Exception:
         pass
     try:
+        from core.monitor import get_monitor
+        get_monitor().prune_caches()
+    except Exception:
+        pass
+    try:
+        from core.watcher import prune_watcher_caches
+        prune_watcher_caches()
+    except Exception:
+        pass
+    try:
         from PySide6.QtGui import QPixmapCache
         QPixmapCache.clear()
     except Exception:

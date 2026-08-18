@@ -135,6 +135,16 @@ def t(key: str, **kwargs) -> str:
     return get_engine().t(key, **kwargs)
 
 
+def get_current_language() -> str:
+    """Return the currently active locale code (e.g. 'it', 'en')."""
+    return get_engine().locale
+
+
+def get_locale() -> str:
+    """Return the currently active locale code (e.g. 'it', 'en')."""
+    return get_engine().locale
+
+
 _MONTH_KEYS = ("jan", "feb", "mar", "apr", "may", "jun",
                "jul", "aug", "sep", "oct", "nov", "dec")
 

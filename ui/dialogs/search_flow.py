@@ -550,17 +550,31 @@ class SearchFlowMixin:
             return False
 
         # ── Apply — the user already confirmed this exact candidate ───────
-        # Destructive overwrite is no longer driven by "description looks
-        # different" or a higher tier alone. A dead primary may be replaced
-        # as the marker, but filled fields stay (enrich path).
+        entry = getattr(self, '_entry', None)
+        is_from_bulk_auto = bool(
+            entry and (
+                getattr(entry, 'auto_added', False)
+                or getattr(entry, 'requires_confirmation', False)
+                or (getattr(entry, 'cloud_metadata', {}) or {}).get('auto_enriched', False)
+            )
+        )
         if not diff['has_existing']:
             self._apply_result_init(result)
+        elif is_from_bulk_auto:
+            # Game was added/enriched automatically in bulk — replace primary info to fix potential false positives
+            self._apply_result_overwrite(result)
+            if entry:
+                entry.auto_added = False
+                if isinstance(getattr(entry, 'cloud_metadata', None), dict):
+                    entry.cloud_metadata['auto_enriched'] = False
         else:
-            self._apply_result_enrich(result, diff['new_tags'])
+            # User-managed game — non-destructive enrichment (only fill missing fields)
+            self._apply_result_init(result)
         self._store_result_fingerprint(
             _raw_source, result, diff['result_year'],
             as_primary=bool(
                 not diff['has_existing']
+                or is_from_bulk_auto
                 or diff.get('promote_primary')
                 or diff.get('same_origin')
             ),
@@ -689,28 +703,43 @@ class SearchFlowMixin:
             and not self._is_primary_source_reachable()
         )
 
-        is_overwrite = False
+        entry = getattr(self, '_entry', None)
+        is_from_bulk_auto = bool(
+            entry and (
+                getattr(entry, 'auto_added', False)
+                or getattr(entry, 'requires_confirmation', False)
+                or (getattr(entry, 'cloud_metadata', {}) or {}).get('auto_enriched', False)
+            )
+        )
+
+        is_overwrite = bool(has_existing and is_from_bulk_auto)
         same_origin_no_diff = bool(already_applied and not has_material
                                    and not promote_primary)
 
-        # ── Per-field diff (for display — fill empty / rename only) ─────
+        # ── Per-field diff (for display — showing proposed changes) ─────
         fields: dict = {}
-        if name_change:
-            fields['name'] = {'old': current_name or None, 'new': result.name}
+        if is_from_bulk_auto or not has_existing:
+            if name_change:
+                fields['name'] = {'old': current_name or None, 'new': result.name}
+            _rd = result.description or ''
+            if _rd and _rd != current_desc:
+                fields['description'] = {'old': current_desc or None, 'new': _rd}
+            _rv = getattr(result, 'developer', '') or ''
+            if _rv and _rv != current_dev:
+                fields['developer'] = {'old': current_dev or None, 'new': _rv}
+            if result_year and result_year != current_year:
+                fields['year'] = {'old': current_year or None, 'new': result_year}
+        else:
+            # User-managed game: only show fields that are currently empty (fill)
+            if not current_desc and result.description:
+                fields['description'] = {'old': None, 'new': result.description}
+            if not current_dev and getattr(result, 'developer', ''):
+                fields['developer'] = {'old': None, 'new': result.developer}
+            if not current_year and result_year:
+                fields['year'] = {'old': None, 'new': result_year}
 
-        _rd = result.description or ''
-        if _rd and not current_desc:
-            fields['description'] = {'old': None, 'new': _rd}
-
-        _rv = getattr(result, 'developer', '') or ''
-        if _rv and not current_dev:
-            fields['developer'] = {'old': None, 'new': _rv}
-
-        if result_year and not current_year:
-            fields['year'] = {'old': None, 'new': result_year}
-
-        has_enrich = bool(has_material)
-        has_changes = bool(has_material or promote_primary)
+        has_enrich = bool(has_material or (has_existing and bool(fields)))
+        has_changes = bool(has_material or promote_primary or (has_existing and bool(fields)))
 
         return {
             'has_existing': has_existing,
