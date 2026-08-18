@@ -12,6 +12,7 @@ same treatment: a .lnk pointing at a directory is entered in place (same
 window, history preserved), a .lnk pointing at a file comes back as the raw
 .lnk path so callers can still derive a name from the shortcut.
 """
+import os
 import logging
 from pathlib import Path
 
@@ -90,12 +91,34 @@ def _translate_system_name(raw: str) -> str:
     if "downloads" in low or "download" in low:
         return t("file_picker.downloads")
     home_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.HomeLocation)
-    if home_p and (low == Path(home_p).name.lower() or low == "home"):
+    user_name = Path(home_p).name.lower() if home_p else ""
+    user_env = os.environ.get("USERNAME", "").lower()
+    if low in (user_name, user_env, "home", "user", "cartella utente") and low:
         return t("file_picker.user_home")
     return ""
 
 
-from PySide6.QtWidgets import QStyledItemDelegate
+from PySide6.QtWidgets import QStyledItemDelegate, QHeaderView, QStyleOptionHeader
+
+
+class _LocalizedHeader(QHeaderView):
+    _COL_KEYS = {
+        0: "file_picker.col_name",
+        1: "file_picker.col_size",
+        2: "file_picker.col_type",
+        3: "file_picker.col_date_modified",
+    }
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+
+    def initStyleOption(self, option: QStyleOptionHeader) -> None:
+        super().initStyleOption(option)
+        col = option.section
+        if col in self._COL_KEYS:
+            option.text = t(self._COL_KEYS[col])
 
 
 class _SidebarItemDelegate(QStyledItemDelegate):
@@ -134,22 +157,42 @@ def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
     """
     if not url.isValid() or not url.toString() or url.toString() in ("file:", "file:///", "", "computer:"):
         return True
-    if system_urls and url in system_urls:
+
+    path_str = url.toLocalFile() if url.isLocalFile() else url.toString()
+    if not path_str:
         return True
-    path = url.toLocalFile()
-    if not path:
-        return True
+
+    # Normalize incoming path for robust case/separator-agnostic comparison
     try:
-        p = Path(path).resolve()
+        norm_incoming = os.path.normcase(os.path.normpath(os.path.abspath(path_str)))
     except Exception:
-        p = Path(path)
+        norm_incoming = os.path.normcase(path_str.replace("/", "\\").rstrip("\\"))
 
     # Drive root (e.g. C:\ or /)
-    if len(p.parts) <= 1 or str(p).rstrip("/\\") == str(p.drive).rstrip("/\\"):
-        return True
+    try:
+        p = Path(path_str).resolve()
+        if len(p.parts) <= 1 or str(p).rstrip("/\\") == str(p.drive).rstrip("/\\") or norm_incoming.endswith(":\\"):
+            return True
+    except Exception:
+        pass
 
-    # Standard system locations
-    system_loc_paths = set()
+    # Standard system locations & user folders
+    system_paths = set()
+    for env_var in ("USERPROFILE", "HOMEPATH", "HOME", "PUBLIC", "OneDrive"):
+        val = os.environ.get(env_var)
+        if val:
+            system_paths.add(val)
+
+    user_home = os.path.expanduser("~")
+    if user_home:
+        system_paths.add(user_home)
+        system_paths.add(os.path.join(user_home, "Desktop"))
+        system_paths.add(os.path.join(user_home, "Documents"))
+        system_paths.add(os.path.join(user_home, "Downloads"))
+        system_paths.add(os.path.join(user_home, "Pictures"))
+        system_paths.add(os.path.join(user_home, "Music"))
+        system_paths.add(os.path.join(user_home, "Videos"))
+
     for loc in (
         QStandardPaths.StandardLocation.DesktopLocation,
         QStandardPaths.StandardLocation.HomeLocation,
@@ -161,15 +204,28 @@ def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
     ):
         p_str = QStandardPaths.writableLocation(loc)
         if p_str:
-            try:
-                system_loc_paths.add(Path(p_str).resolve())
-            except Exception:
-                pass
+            system_paths.add(p_str)
 
-    p_norm = str(p).rstrip("/\\").lower()
-    for sp in system_loc_paths:
-        if p == sp or p_norm == str(sp).rstrip("/\\").lower():
-            return True
+    for sp in system_paths:
+        try:
+            norm_sp = os.path.normcase(os.path.normpath(os.path.abspath(sp)))
+            if norm_incoming == norm_sp:
+                return True
+        except Exception:
+            if norm_incoming == os.path.normcase(sp.replace("/", "\\").rstrip("\\")):
+                return True
+
+    if system_urls:
+        for su in system_urls:
+            if su == url:
+                return True
+            if su.isLocalFile():
+                try:
+                    norm_su = os.path.normcase(os.path.normpath(os.path.abspath(su.toLocalFile())))
+                    if norm_incoming == norm_su:
+                        return True
+                except Exception:
+                    pass
 
     return False
 
@@ -205,14 +261,18 @@ class _LnkAwareDialog(QFileDialog):
             model.directoryLoaded.connect(lambda *_: self._localize_labels())
 
     def eventFilter(self, watched, event):
-        """Block Delete/Backspace key from removing protected system pins on sidebar."""
-        if watched is getattr(self, "_sidebar_view", None) and event.type() == QEvent.Type.KeyPress:
-            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-                idx = self._sidebar_view.currentIndex()
-                if idx.isValid():
-                    urls = list(self.sidebarUrls())
-                    if idx.row() < len(urls) and _is_system_pin(urls[idx.row()], self._system_sidebar_urls):
-                        return True
+        """Block Delete/Backspace key from removing protected system pins and manage context menu on sidebar."""
+        if watched is getattr(self, "_sidebar_view", None):
+            if event.type() == QEvent.Type.ContextMenu:
+                self._on_sidebar_context_menu(event.pos())
+                return True
+            if event.type() == QEvent.Type.KeyPress:
+                if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                    idx = self._sidebar_view.currentIndex()
+                    if idx.isValid():
+                        urls = list(self.sidebarUrls())
+                        if idx.row() < len(urls) and _is_system_pin(urls[idx.row()], self._system_sidebar_urls):
+                            return True
         return super().eventFilter(watched, event)
 
     def _apply_window_chrome(self):
@@ -256,6 +316,16 @@ class _LnkAwareDialog(QFileDialog):
         except Exception:
             pass
 
+    def exec(self):
+        self._apply_window_chrome()
+        self._localize_labels()
+        return super().exec()
+
+    def open(self):
+        self._apply_window_chrome()
+        self._localize_labels()
+        super().open()
+
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_window_chrome()
@@ -291,15 +361,9 @@ class _LnkAwareDialog(QFileDialog):
             # Header columns
             tree = self.findChild(QTreeView, "treeView")
             if tree is not None:
-                model = tree.model()
-                if model is not None:
-                    try:
-                        model.setHeaderData(0, Qt.Orientation.Horizontal, t("file_picker.col_name"))
-                        model.setHeaderData(1, Qt.Orientation.Horizontal, t("file_picker.col_size"))
-                        model.setHeaderData(2, Qt.Orientation.Horizontal, t("file_picker.col_type"))
-                        model.setHeaderData(3, Qt.Orientation.Horizontal, t("file_picker.col_date_modified"))
-                    except Exception:
-                        pass
+                if not isinstance(tree.header(), _LocalizedHeader):
+                    hdr = _LocalizedHeader(Qt.Orientation.Horizontal, tree)
+                    tree.setHeader(hdr)
                 tree.setItemDelegate(_FileDetailsDelegate(tree))
 
             list_v = self.findChild(QListView, "listView")

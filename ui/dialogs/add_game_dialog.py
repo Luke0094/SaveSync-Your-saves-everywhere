@@ -1369,7 +1369,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         btn_row.addStretch()
         cancel_btn = QPushButton(t("add_game.cancel"))
         cancel_btn.clicked.connect(self.reject)
-        self._add_btn = QPushButton(t("add_game.add"))
+        self._add_btn = QPushButton(t("common.save") if self._editing_entry else t("add_game.add"))
         self._add_btn.setObjectName("primary_btn")
         self._add_btn.setEnabled(False)  # until populate finishes
         self._add_btn.clicked.connect(self._add_game)
@@ -4072,20 +4072,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if existing is None:
                 existing = self._find_game_by_launcher(_launcher_url, appid or "")
             if existing:
-                if appid and not existing.appid:
-                    existing.appid = appid
-                    lib.update_game(existing)
-                    self._status_lbl.setText(t('add_game.game_updated_appid', name=existing.name))
-                    fs = scaled(12, self)
-                    self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
-                else:
-                    self._status_lbl.setText(t('add_game.game_exists_with_appid', name=existing.name))
-                    fs = scaled(12, self)
-                    self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
-                self.game_added.emit(existing)
-                self._created_icon_dirs.clear()  # Keep icon folders on successful save
-                self.accept()
-                return
+                self._editing_entry = existing
 
         # Empty exe is fine when a launcher URL is present (launch via appid).
         if exe and not Path(exe).exists():

@@ -789,6 +789,7 @@
     "need_rating_or_text": "A rating or some text is needed."
   },
   "common": {
+    "save": "Save",
     "cancel": "Cancel",
     "yes": "Yes",
     "no": "No",

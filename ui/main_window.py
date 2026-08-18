@@ -268,6 +268,27 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._tray_click_timer.setSingleShot(True)
         self._tray_click_timer.timeout.connect(self._on_tray_single_click)
 
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
+        try:
+            from ui.styles.theme import palette, get_theme_manager
+            from PySide6.QtGui import QColor, QPalette
+            is_dark = get_theme_manager().is_dark()
+            bg = QColor(palette("bg"))
+            fg = QColor(palette("text"))
+            card = QColor(palette("bg_card"))
+            pal = self.palette()
+            pal.setColor(QPalette.ColorRole.Window, bg)
+            pal.setColor(QPalette.ColorRole.Base, bg)
+            pal.setColor(QPalette.ColorRole.AlternateBase, card)
+            pal.setColor(QPalette.ColorRole.WindowText, fg)
+            pal.setColor(QPalette.ColorRole.Text, fg)
+            self.setPalette(pal)
+            from ui.helpers import set_dark_title_bar
+            set_dark_title_bar(self, dark=is_dark)
+        except Exception:
+            pass
+
         self._setup_ui()
         self._setup_tray()
         self._setup_blur_modal()
@@ -534,6 +555,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._ui_scale_reapply_timer.setInterval(200)
         self._ui_scale_reapply_timer.timeout.connect(self._reapply_ui_scale)
         self._last_ui_scale = None
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            from ui.helpers import set_dark_title_bar
+            from ui.styles.theme import get_theme_manager
+            set_dark_title_bar(self, dark=get_theme_manager().is_dark())
+        except Exception:
+            pass
 
     def _on_auto_memory_trim_tick(self):
         """Periodic background memory cleanup: free working set and caches when app is idle."""
@@ -4372,7 +4402,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         QTimer.singleShot(0, lambda: self._open_add_game_dialog(name, exe_path))
 
     def _open_add_game_dialog(self, name: str = "", exe_path: str = ""):
-        dlg = AddGameDialog(name=name, exe_path=exe_path, parent=self)
+        entry = None
+        if exe_path:
+            entry = get_library().get_by_exe(exe_path)
+        if entry is None and name:
+            for g in get_library().all_games():
+                if g.name.strip().lower() == name.strip().lower():
+                    entry = g
+                    break
+        if entry is not None:
+            dlg = AddGameDialog(entry=entry, parent=self)
+        else:
+            dlg = AddGameDialog(name=name, exe_path=exe_path, parent=self)
 
         def _on_added(entry):
             self._session_shown_exes.discard(entry.exe_path)

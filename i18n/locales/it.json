@@ -794,6 +794,7 @@
     "need_rating_or_text": "Serve almeno una valutazione o un testo."
   },
   "common": {
+    "save": "Salva",
     "cancel": "Annulla",
     "unknown": "Sconosciuto",
     "save_changes": "Salva modifiche",
