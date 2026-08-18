@@ -1733,26 +1733,34 @@ class BackupManager(QObject):
             return False
 
         def _rebase_on_current_install(p: str) -> Optional[str]:
-            """Tier 3: if *p* sits under the OLD exe's install directory,
-            re-root the same relative path under the CURRENT exe's install
-            directory. Returns None if there's nothing to rebase against
-            (no recorded old exe_path, no current exe_path, or *p* isn't
-            actually inside the old install directory at all)."""
+            """Tier 3: if *p* sits under the OLD exe's install directory (or matches a game root),
+            re-root the same relative path under the CURRENT exe's install directory."""
             old_exe = entry.exe_path
             new_exe = lib_entry.exe_path if lib_entry else ""
             if not old_exe or not new_exe:
                 return None
             try:
-                old_install_dir = Path(old_exe).parent
-                new_install_dir = Path(new_exe).parent
-                rel = Path(p).relative_to(old_install_dir)
+                old_exe_p = Path(old_exe).resolve()
+                new_exe_p = Path(new_exe).resolve()
+                p_path = Path(p).resolve()
+                old_parents = [old_exe_p.parent] + list(old_exe_p.parents)
+                new_parents = [new_exe_p.parent] + list(new_exe_p.parents)
+                for i, old_parent in enumerate(old_parents):
+                    if i >= len(new_parents):
+                        break
+                    new_parent = new_parents[i]
+                    if len(old_parent.parts) <= 1 or len(new_parent.parts) <= 1:
+                        break
+                    try:
+                        if p_path == old_parent or old_parent in p_path.parents:
+                            rel = p_path.relative_to(old_parent)
+                            candidate = str(new_parent / rel)
+                            return candidate
+                    except Exception:
+                        continue
             except (ValueError, OSError):
-                return None   # p isn't under old_install_dir at all
-            try:
-                candidate = str(new_install_dir / rel)
-            except Exception:
                 return None
-            return candidate
+            return None
 
         def _under_current_install(p: str) -> bool:
             """Accept a save path under THIS machine's current install
@@ -1786,6 +1794,8 @@ class BackupManager(QObject):
             machine's install folder that is all it takes.
             """
             chain = entry.chain_for(p) if hasattr(entry, "chain_for") else ""
+            if not chain and lib_entry and hasattr(lib_entry, "chain_for_path"):
+                chain = lib_entry.chain_for_path(p)
             new_exe = lib_entry.exe_path if lib_entry else ""
             if not chain or not new_exe:
                 return None
@@ -1802,22 +1812,43 @@ class BackupManager(QObject):
         def _resolve_via_tiers(paths_in: list[str]):
             """Run Tiers 1-3 over *paths_in* and return
             (resolved, all_ok, any_changed). The game's own recorded path is
-            authoritative; only the two things that differ between machines are
+            authoritative; only the two things that differ between machines or game versions are
             adjusted, and a not-yet-created target is accepted (restore creates
             it — the game would otherwise create it on first save):
-              1. valid here (exists / direct-parent exists / under this user's
-                 profile or this machine's install dir, even if not created),
-              2. username substitution across every users/home marker,
-              3. install-directory-relative rebasing (disk/path change).
+              1. profile paths remain in this user's profile,
+              2. install-relative paths rebase onto the current active executable version,
+              3. username substitution across every users/home marker.
             """
             current_user = Path.home().name
             resolved_: list[str] = []
             all_ok_ = True
             any_changed_ = False
             for p in paths_in:
-                if _parent_exists(p) or _under_current_profile(p) or _under_current_install(p):
+                # 1. Profile paths (e.g. AppData/Documents) always stay in profile
+                if _under_current_profile(p):
                     resolved_.append(p)
                     continue
+
+                # 2. Check if p was inside an older executable's install dir and rebase onto current active executable:
+                rebased = _rebase_on_current_install(p)
+                if rebased and rebased != p:
+                    resolved_.append(rebased)
+                    any_changed_ = True
+                    continue
+
+                # 3. Check declared relative chain on backup or library entry:
+                declared = _rebase_on_declared_chain(p)
+                if declared and declared != p:
+                    resolved_.append(declared)
+                    any_changed_ = True
+                    continue
+
+                # 4. Already under current active install directory or valid here:
+                if _under_current_install(p) or _parent_exists(p):
+                    resolved_.append(p)
+                    continue
+
+                # 5. Username substitution:
                 substituted = next(
                     (c for c in _substitute_profile_user_candidates(p, current_user)
                      if _parent_exists(c) or _under_current_profile(c)),
@@ -1827,16 +1858,7 @@ class BackupManager(QObject):
                     resolved_.append(substituted)
                     any_changed_ = True
                     continue
-                rebased = _rebase_on_current_install(p)
-                if rebased and (_parent_exists(rebased) or _under_current_install(rebased)):
-                    resolved_.append(rebased)
-                    any_changed_ = True
-                    continue
-                declared = _rebase_on_declared_chain(p)
-                if declared:
-                    resolved_.append(declared)
-                    any_changed_ = True
-                    continue
+
                 resolved_.append(p)
                 all_ok_ = False
             return resolved_, all_ok_, any_changed_
