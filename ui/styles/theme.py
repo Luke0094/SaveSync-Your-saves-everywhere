@@ -20,11 +20,74 @@ from ui.styles import light as _light
 
 logger = logging.getLogger(__name__)
 
-# Registry: add a module with THEME / PALETTE / ID / IS_DARK, then entry here.
+# What makes a module in ui.styles a theme. Anything declaring all four is
+# one; anything else in the package (arrow_icons, this file) is not.
+_THEME_CONTRACT = ("ID", "THEME", "PALETTE", "IS_DARK")
+# Modules that are part of ui.styles but can never be themes — skipped
+# without importing them a second time.
+_NOT_THEMES = frozenset({"theme", "arrow_icons"})
+
+
+def _discover_themes() -> dict[str, ModuleType]:
+    """Every module in ``ui.styles`` that declares the theme contract.
+
+    Adding a theme used to mean editing this file twice — an import and a
+    registry entry — and the combo in the settings page a third time. Now a
+    module dropped into ui/styles with ID / THEME / PALETTE / IS_DARK is
+    found here, and the settings combo builds itself from what is found.
+    """
+    import importlib
+    import pkgutil
+
+    found: dict[str, ModuleType] = {}
+    try:
+        package = importlib.import_module("ui.styles")
+        names = [i.name for i in pkgutil.iter_modules(package.__path__)]
+    except Exception as e:
+        logger.debug("Theme discovery could not list ui.styles: %s", e)
+        return found
+    for name in names:
+        if name in _NOT_THEMES or name.startswith("_"):
+            continue
+        try:
+            module = importlib.import_module(f"ui.styles.{name}")
+        except Exception as e:
+            logger.warning("Theme module %r could not be imported: %s", name, e)
+            continue
+        if not all(hasattr(module, attr) for attr in _THEME_CONTRACT):
+            continue
+        theme_id = getattr(module, "ID", "")
+        if isinstance(theme_id, str) and theme_id:
+            found[theme_id] = module
+    return found
+
+
+# Seeded with the two shipped themes, THEN extended by discovery. The seed is
+# not redundant: the explicit imports above are how the frozen build knows to
+# bundle them at all, and they guarantee the app still has a theme if
+# discovery ever comes back empty.
 THEMES: dict[str, ModuleType] = {
     _dark.ID: _dark,
     _light.ID: _light,
 }
+THEMES.update(_discover_themes())
+
+
+def theme_display_name(theme_id: str) -> str:
+    """Human name for *theme_id*, for the settings combo.
+
+    A shipped theme has a translated name (``settings.theme_dark``); one
+    dropped in later names itself with a ``NAME`` attribute, and failing
+    both it is called after its own id rather than showing a raw key.
+    """
+    from i18n import t as _t
+    key = f"settings.theme_{theme_id}"
+    label = _t(key)
+    if label and label != key:
+        return label
+    module = THEMES.get(theme_id)
+    name = getattr(module, "NAME", "") if module is not None else ""
+    return name or theme_id.replace("_", " ").title()
 
 # Back-compat aliases (tests / docs / rare direct QSS access).
 DARK_THEME = _dark.THEME

@@ -19,7 +19,7 @@ from PySide6.QtGui import QColor
 from i18n import t, get_engine
 from core.config_manager import get_config
 from core.startup import set_launch_on_startup, get_launch_on_startup
-from ui.styles.theme import get_theme_manager, palette
+from ui.styles.theme import get_theme_manager, palette, theme_display_name, THEMES
 from ui.helpers import PageScrollMixin, scaled, lock_min_size
 from ui.modal_helpers import information_window_modal, warning_window_modal
 from ui.widgets.hotkey_edit import HotkeyEdit
@@ -328,6 +328,14 @@ class SettingsPage(PageScrollMixin, QWidget):
 
     # ── Section builders (run as jobs by the chunk pump) ─────────────────────
 
+    @staticmethod
+    def _available_theme_ids() -> list[str]:
+        """Registered themes, dark and light first so the familiar two stay
+        at the top of the combo however many others turn up."""
+        known = [tid for tid in ("dark", "light") if tid in THEMES]
+        extra = sorted(tid for tid in THEMES if tid not in known)
+        return known + extra
+
     def _build_section_appearance(self):
         # ── Appearance ────────────────────────────────────────────────────────
         app_grp = _group(t("settings.section_appearance"))
@@ -337,13 +345,16 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._lang_combo = QComboBox()
         self._lang_combo.setMaxVisibleItems(10)
         self._lang_combo.setToolTip(t("settings.language_tooltip"))
-        _display_fallback = {"en": "English", "it": "Italiano"}
         engine = get_engine()
         locale_names = {}
         locales_dir = Path(__file__).parent.parent.parent / "i18n" / "locales"
         for f in locales_dir.glob("*.json"):
             code = f.stem
-            name = _display_fallback.get(code, code)
+            # No hardcoded name table any more: en.json and it.json carry
+            # their own endonym like any new translation would, so the
+            # self-describing path below is the one actually used rather than
+            # a fallback that the two shipped languages never reached.
+            name = code
             # Self-describing dictionaries: a locale file that carries its
             # own endonym under languages.<code> ("languages": {"es":
             # "Español"}) names itself in the combo — dropping a new
@@ -369,8 +380,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._theme_combo = QComboBox()
         self._theme_combo.setMaxVisibleItems(10)
         self._theme_combo.setToolTip(t("settings.theme_tooltip"))
-        self._theme_combo.addItem(t("settings.theme_dark"),  "dark")
-        self._theme_combo.addItem(t("settings.theme_light"), "light")
+        # Built from the registry, not typed out: a theme module dropped into
+        # ui/styles appears here on its own, the same way a JSON file dropped
+        # into i18n/locales already appears in the language combo above.
+        for _tid in self._available_theme_ids():
+            self._theme_combo.addItem(theme_display_name(_tid), _tid)
         lock_min_size(self._theme_combo, scaled(160, self, min_px=140), scaled(28, self, min_px=24))
         self._theme_combo.currentIndexChanged.connect(self._on_theme_change)
         self._theme_lbl = QLabel(t("settings.theme"))
@@ -463,24 +477,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self_checks_freq_lay.addStretch()
         beh_form.addRow(self_checks_freq_row)
 
-        # ── Run diagnostics now ───────────────────────────────────────────────
-        _diag_row = QWidget()
-        _diag_lay = QHBoxLayout(_diag_row)
-        _diag_lay.setContentsMargins(0, 0, 0, 0)
-        _diag_lay.setSpacing(10)
-        self._run_diag_btn = QPushButton(t("settings.run_diagnostics"))
-        self._run_diag_btn.setObjectName("toolbar_btn")
-        self._run_diag_btn.setFixedHeight(scaled(30, self))
-        self._run_diag_btn.setMinimumWidth(scaled(220, self, min_px=190))
-        self._run_diag_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self._run_diag_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._run_diag_btn.clicked.connect(self._on_run_diagnostics)
-        self._diag_status_lbl = QLabel()
-        self._diag_status_lbl.setObjectName("settings_hint")
-        _diag_lay.addWidget(self._run_diag_btn)
-        _diag_lay.addWidget(self._diag_status_lbl)
-        _diag_lay.addStretch()
-        beh_form.addRow(_diag_row)
+        # No "run diagnostics now" button here. This section OWNS the
+        # schedule (on/off + every N days); running them on demand is a
+        # Backups-page action, and it already has one — the ⚕️ button, which
+        # runs the very same list (core.self_checks). Two buttons for one
+        # thing, in two places, is how they drifted apart to begin with.
 
         # ── Per-game suppression list ─────────────────────────────────────────
         # Shows games that have "don't confirm scan" or "don't show notification"
@@ -823,7 +824,6 @@ class SettingsPage(PageScrollMixin, QWidget):
             (getattr(self, "_restore_paths_btn", None), 28, 140),
             (getattr(self, "_unblock_btn", None), 28, 120),
             (getattr(self, "_unblock_game_btn", None), 28, 120),
-            (getattr(self, "_run_diag_btn", None), 30, 180),
         ):
             if btn is not None:
                 self._lock_action_btn(btn, h=h, min_w=mw)
@@ -987,75 +987,6 @@ class SettingsPage(PageScrollMixin, QWidget):
         if self._loading:
             return
         self._mark_dirty()
-
-    def _on_run_diagnostics(self):
-        """Run the diagnostic self-checks suite now (button click).
-
-        Throttled to one run per 60 s.  Uses the same callback-based
-        ``run_startup_self_checks`` that the scheduler calls on startup,
-        so the worker thread does all the I/O and the GUI stays responsive.
-        """
-        from time import monotonic
-        now = monotonic()
-        remaining = 60.0 - (now - getattr(self, "_last_diag_mono", 0.0))
-        if remaining > 0:
-            self._diag_status_lbl.setText(
-                t("notifications.cooldown_active", seconds=int(remaining) + 1))
-            return
-        self._last_diag_mono = now
-        self._run_diag_btn.setEnabled(False)
-        self._diag_status_lbl.setText(t("settings.diagnostics_running"))
-
-        # Bridge: collect failures on the worker thread, emit to GUI thread
-        # via a PySide6 signal so there are no direct cross-thread widget calls.
-        from PySide6.QtCore import QObject, Signal as _Signal
-
-        class _Bridge(QObject):
-            result = _Signal(bool, str)
-
-        bridge = _Bridge(self)
-        bridge.result.connect(self._on_diag_finished)
-        self._diag_bridge = bridge   # keep alive
-
-        failures: list[str] = []
-
-        def _on_failure(check_id: str, detail: str):
-            failures.append(f"{check_id}: {detail}")
-
-        def _on_done():
-            ok = len(failures) == 0
-            bridge.result.emit(ok, "; ".join(failures[:3]))
-
-        from core.self_checks import run_startup_self_checks, _running as _sc_running
-        if _sc_running:
-            # Already running — don't re-enter; show a brief note and re-enable.
-            self._diag_status_lbl.setText(t("settings.diagnostics_running"))
-            self._run_diag_btn.setEnabled(True)
-            return
-
-        run_startup_self_checks(on_failure=_on_failure, on_done=_on_done)
-        # Failsafe: if self_checks' internal guard fires _running=True but
-        # our on_done is never called (second concurrent call), re-enable
-        # the button after 30 s so it doesn't stay greyed out forever.
-        QTimer.singleShot(30_000, lambda: (
-            self._run_diag_btn.setEnabled(True) if hasattr(self, '_run_diag_btn') else None
-        ))
-
-
-    def _on_diag_finished(self, ok: bool, detail: str):
-        if hasattr(self, '_run_diag_btn') and self._run_diag_btn:
-            self._run_diag_btn.setEnabled(True)
-        if ok:
-            self._diag_status_lbl.setText(t("settings.diagnostics_success"))
-        else:
-            msg = t("settings.diagnostics_issues")
-            if detail:
-                msg = f"{msg}: {detail}"
-            self._diag_status_lbl.setText(msg)
-        # Auto-clear after 8 s
-        QTimer.singleShot(8000, lambda: (
-            self._diag_status_lbl.setText("") if self._diag_status_lbl else None
-        ))
 
     def _on_ui_scale_auto_change(self, _checked=False):
         if self._loading:
@@ -2198,8 +2129,13 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._ui_scale_auto_cb.setToolTip(t("settings.ui_scale_auto_tooltip"))
         self._ui_scale_lbl.setText(t("settings.ui_scale"))
         # Item order fixed at build time: 0 = dark, 1 = light
-        self._theme_combo.setItemText(0, t("settings.theme_dark"))
-        self._theme_combo.setItemText(1, t("settings.theme_light"))
+        # Re-translate by the id each row actually carries, not by position:
+        # indexes 0 and 1 were only ever dark and light because the combo was
+        # filled by hand with exactly those two.
+        for _i in range(self._theme_combo.count()):
+            _tid = self._theme_combo.itemData(_i)
+            if _tid:
+                self._theme_combo.setItemText(_i, theme_display_name(_tid))
         self._hotkey_lbl.setText(t("settings.hotkey"))
         self._startup_cb.setText(t("settings.launch_on_startup"))
         self._tray_cb.setText(t("settings.minimize_to_tray"))

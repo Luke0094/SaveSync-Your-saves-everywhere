@@ -651,10 +651,141 @@ def clear_view_cache() -> None:
     _THUMB_CACHE.clear()
 
 
+_WIN_TRIM = None       # (GetCurrentProcess, EmptyWorkingSet, SetProcessWorkingSetSize)
+
+
+def _win_trim_fns():
+    """Resolve the working-set APIs ONCE, with their signatures declared.
+
+    Declaring them is the whole point, not tidiness. ctypes defaults every
+    undeclared restype/argtype to a 32-bit C int, so
+    ``windll.kernel32.GetCurrentProcess()`` handed back the process pseudo-
+    handle 0xFFFFFFFFFFFFFFFF truncated to the Python int -1, and passing
+    that on marshalled a 32-bit argument into a function expecting a 64-bit
+    HANDLE. On 64-bit Windows — every shipped build — EmptyWorkingSet
+    therefore returned FALSE and trimmed nothing, and the bare ``except:
+    pass`` around it meant nothing ever said so.
+
+    Everything above this line frees Python objects; this is the only step
+    that hands the pages back to the OS, so with it failing the process RSS
+    simply never went down: not on the Panoramica refresh, not on the idle
+    sweep, not after a game exited. Measured on a 112 MB working set, a
+    correctly-declared call takes it to 1.3 MB.
+    """
+    global _WIN_TRIM
+    if _WIN_TRIM is None:
+        import ctypes
+        import ctypes.wintypes as wt
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        k32.GetCurrentProcess.argtypes = []
+        k32.GetCurrentProcess.restype = wt.HANDLE
+        psapi.EmptyWorkingSet.argtypes = [wt.HANDLE]
+        psapi.EmptyWorkingSet.restype = wt.BOOL
+        k32.SetProcessWorkingSetSize.argtypes = [wt.HANDLE, ctypes.c_size_t,
+                                                 ctypes.c_size_t]
+        k32.SetProcessWorkingSetSize.restype = wt.BOOL
+        _WIN_TRIM = (k32.GetCurrentProcess, psapi.EmptyWorkingSet,
+                     k32.SetProcessWorkingSetSize, ctypes)
+    return _WIN_TRIM
+
+
+def _release_working_set_windows() -> bool:
+    """Hand this process's working set back to Windows. True when it took."""
+    try:
+        get_proc, empty_ws, set_ws_size, ctypes = _win_trim_fns()
+        handle = get_proc()
+        ok = bool(empty_ws(handle))
+        if not ok:
+            # Documented fallback: (size_t)-1 for both bounds asks Windows to
+            # trim to the minimum, which is what EmptyWorkingSet wraps.
+            ok = bool(set_ws_size(handle, ctypes.c_size_t(-1),
+                                  ctypes.c_size_t(-1)))
+        if not ok:
+            logger.debug("Working-set trim refused by Windows (err %s)",
+                         ctypes.get_last_error())
+        return ok
+    except Exception:
+        logger.debug("Working-set trim unavailable", exc_info=True)
+        return False
+
+
+def prune_scaled_registry() -> int:
+    """Drop registry entries whose widget is gone. Returns how many went.
+
+    _SCALED_WIDGETS_REGISTRY gains an entry for every widget ever built with
+    a scaled() dimension, keyed by id(). The weakrefs inside go dead when the
+    widget does, but the ENTRIES were only ever reaped inside
+    _recalculate_all_scaled_dimensions — i.e. on a DPI or ui-scale change,
+    which most sessions never see. Every page rebuild therefore left its
+    widgets' rows behind for the life of the process.
+
+    Reaping them also keeps the registry HONEST: the key is id(widget), and
+    CPython reuses ids, so a dead row can be adopted by an unrelated widget
+    allocated at the same address and hand it another widget's baseline.
+    """
+    dead_ids: list[int] = []
+    for widget_id, dimensions in list(_SCALED_WIDGETS_REGISTRY.items()):
+        for dim_type, entry in list(dimensions.items()):
+            if len(entry) < 3 or entry[2]() is None:
+                dimensions.pop(dim_type, None)
+        if not dimensions:
+            dead_ids.append(widget_id)
+    for widget_id in dead_ids:
+        _SCALED_WIDGETS_REGISTRY.pop(widget_id, None)
+    return len(dead_ids)
+
+
+def light_memory_sweep() -> int:
+    """Give back what costs nothing to give back. Returns entries reclaimed.
+
+    The count is the point of the return: a sweep that found nothing is a
+    sweep that should not be repeated on the same cadence, and the caller
+    uses it to back off.
+
+    Everything here is either dead already (registry rows whose widget is
+    gone) or rebuilt for free by the next event (watcher indices, once
+    nothing is being watched). Nothing decoded is thrown away and no page is
+    handed back, so running this on a short cadence costs the user nothing —
+    which is what lets a weak machine reclaim MORE often rather than less.
+
+    Deliberately excludes three things that the full trim does:
+
+    - the cover / view / pixmap caches, because dropping them means
+      re-decoding every image the next time the page is looked at;
+    - ``gc.collect(2)``, a full-heap walk;
+    - the monitor's snapshot verdicts. That one is not merely expensive to
+      rebuild, it is expensive ON THE GUI THREAD: every process has to go
+      through the full pipeline again, measured at 13x a normal poll. The
+      idle trimmer called it once a minute, forever.
+    """
+    reclaimed = 0
+    try:
+        reclaimed += prune_scaled_registry()
+    except Exception:
+        pass
+    try:
+        from core.watcher import prune_watcher_caches
+        reclaimed += prune_watcher_caches() or 0
+    except Exception:
+        pass
+    return reclaimed
+
+
 def trim_process_memory() -> None:
-    """Purge all image/cover/editor caches, run GC and trim working set RAM back to OS."""
+    """Full sweep: purge every image/cover cache, run GC and hand the working
+    set back to the OS.
+
+    The expensive one — see light_memory_sweep for what a routine tick does
+    instead. Run on explicit user action (Panoramica refresh), after a game
+    session, and on the deep tick of the idle trimmer.
+    """
     try:
         clear_view_cache()
+    except Exception:
+        pass
+    try:
+        prune_scaled_registry()
     except Exception:
         pass
     try:
@@ -662,11 +793,11 @@ def trim_process_memory() -> None:
         trim_cover_cache()
     except Exception:
         pass
-    try:
-        from core.save_editor import prune_all
-        prune_all()
-    except Exception:
-        pass
+    # NOT prune_all(): that deletes save-editor copies from DISK, on the
+    # rotation the user sets (save_edit_copies / save_edit_copy_days). It
+    # frees no memory at all, and sitting here it walked the copies folder on
+    # every trim — every 60s while idle. It still runs where it belongs: once
+    # at startup, and after a write makes a new copy.
     try:
         from core.monitor import get_monitor
         get_monitor().prune_caches()
@@ -709,12 +840,7 @@ def trim_process_memory() -> None:
     except Exception:
         pass
     if platform.system() == "Windows":
-        try:
-            import ctypes
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            ctypes.windll.psapi.EmptyWorkingSet(handle)
-        except Exception:
-            pass
+        _release_working_set_windows()
     elif platform.system() == "Linux":
         try:
             import ctypes

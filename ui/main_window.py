@@ -281,13 +281,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._setup_cleanup()
         self.backup_verify_problems.connect(self._on_backup_verify_problems)
         self.save_regression_found.connect(self._on_save_regression)
-        # Index zip-existence sweep (may already have finished before connect).
+        # Index zip-existence sweep. It runs as one of the scheduled/manual
+        # checks now, never on its own at startup, so there is no longer a
+        # result that can land before this connect.
         _bm = get_backup_manager()
         _bm.index_validation_failed.connect(self._on_index_validation_failed)
         _bm.index_validation_recovered.connect(self._on_index_validation_recovered)
-        _err = _bm.last_validation_error()
-        if _err:
-            QTimer.singleShot(0, lambda e=_err: self._on_index_validation_failed(e))
         self.launcher_exe_resolved.connect(self._on_launcher_exe_resolved)
         # backup_id SaveSync itself last restored, per game — landing on that
         # state is the intended outcome, not something to warn about.
@@ -572,17 +571,39 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Re-apply fonts/chrome when the window moves to another monitor
         # (resolution_scale follows availableGeometry width).
         QTimer.singleShot(0, self._install_dpi_change_watch)
-        # Automated background memory trimmer (periodic cleanup when idle)
+        # Automated background memory upkeep. The interval comes from the
+        # machine's capability tier and is re-read on every tick (the tier
+        # itself is cached ~45s), the same way the process monitor re-reads
+        # its own — a fixed interval set once at construction could never
+        # follow a machine whose free RAM changed.
+        from core.concurrency import memory_sweep_interval_s
         self._auto_memory_trim_timer = QTimer(self)
-        self._auto_memory_trim_timer.setInterval(60000)
+        self._auto_memory_trim_timer.setInterval(memory_sweep_interval_s() * 1000)
         self._auto_memory_trim_timer.timeout.connect(self._on_auto_memory_trim_tick)
         self._auto_memory_trim_timer.start()
+        self._sweeps_since_deep = 0
+
+        # Archives (folders handed over without adding the game to the
+        # library) re-check on a minute cadence the user sets per archive.
+        # ONE timer for all of them, not one each: the tick is a cheap
+        # "is anything due" question, and a timer per archive would be a new
+        # QObject per folder the user ever pinned.
+        self._archive_timer = QTimer(self)
+        self._archive_timer.setInterval(self._ARCHIVE_TICK_MS)
+        self._archive_timer.timeout.connect(self._on_archive_tick)
+        self._archive_timer.start()
 
         self._ui_scale_reapply_timer = QTimer(self)
         self._ui_scale_reapply_timer.setSingleShot(True)
         self._ui_scale_reapply_timer.setInterval(200)
         self._ui_scale_reapply_timer.timeout.connect(self._reapply_ui_scale)
         self._last_ui_scale = None
+
+    # How long after the window first appears the one-shot startup trim
+    # waits. Long enough for the first paint, the theme build and the initial
+    # page to settle; short enough that the startup garbage is handed back
+    # before the user has done anything that would need it again.
+    _STARTUP_TRIM_DELAY_MS = 4_000
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -592,20 +613,232 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             set_dark_title_bar(self, dark=get_theme_manager().is_dark())
         except Exception:
             pass
+        # showEvent runs on EVERY show — restoring from the tray, coming back
+        # from minimised. The startup trim is a one-shot, so it is armed here
+        # behind a flag rather than in __init__: at construction time there is
+        # no first paint to wait for yet.
+        if not getattr(self, "_startup_trim_armed", False):
+            self._startup_trim_armed = True
+            QTimer.singleShot(self._STARTUP_TRIM_DELAY_MS,
+                              self._on_startup_trim)
 
-    def _on_auto_memory_trim_tick(self):
-        """Periodic background memory cleanup: free working set and caches when app is idle."""
+    def _on_startup_trim(self):
+        """Hand back what starting up needed and nothing since will touch.
+
+        Import machinery, the stylesheet parse, the splash, the first theme
+        build and the library JSON all leave pages in the working set that
+        are dead by the time the window is up. The periodic sweep would get
+        there eventually — a minute at best, and its deep pass much later —
+        which is a long time to hold memory nobody will read again.
+
+        Deliberately not run any earlier: a trim while the library load is
+        still walking is the mistake already made (and fixed) on the refresh
+        button, where it threw away the covers the load was about to need.
+        If work is still in flight the sweep's own pacing takes it from here
+        rather than this rescheduling itself — the point is one cheap
+        one-shot, not another timer with its own retry policy.
+        """
         try:
-            from core.monitor import get_monitor
-            if get_monitor().currently_playing():
-                return  # Skip trimming while user is actively playing a game
-        except Exception:
-            pass
-        try:
+            if self._heavy_work_in_flight():
+                logger.debug("Startup trim skipped: work in flight")
+                return
             from ui.helpers import trim_process_memory
             trim_process_memory()
         except Exception:
+            logger.debug("Startup trim failed", exc_info=True)
+
+    # How often the archive scheduler asks "is anything due". The interval
+    # the user sets is per archive and in minutes, so the tick only has to be
+    # fine enough not to overshoot the smallest of them by much.
+    _ARCHIVE_TICK_MS = 60_000
+
+    def _on_archive_tick(self):
+        """Re-back-up archives whose own interval has elapsed.
+
+        Nothing else in the app would ever back these up: they have no
+        library entry, so no per-game timer and no exit hook. Skipped while
+        heavy work is in flight for the same reason the memory sweep is —
+        a backup walking save trees does not want another one alongside it.
+        """
+        try:
+            if self._heavy_work_in_flight():
+                return
+            from core.backup import get_backup_manager
+            mgr = get_backup_manager()
+            due = mgr.archives_due_for_backup()
+            if not due:
+                return
+        except Exception:
+            logger.debug("Archive scheduler could not run", exc_info=True)
+            return
+
+        import threading
+
+        def _work():
+            done = 0
+            for game_id in due:
+                try:
+                    created, detail = mgr.rebackup_archive(game_id)
+                except Exception as e:
+                    logger.warning("Archive re-backup failed for %s: %s", game_id, e)
+                    mgr._mark_archive_checked(game_id, error=str(e)[:200])
+                    continue
+                # "source unavailable" is the normal case — an external drive
+                # that is not mounted. Recorded on the archive so the panel
+                # can say why, never raised as an app failure.
+                mgr._mark_archive_checked(game_id, error="" if created else detail)
+                if created:
+                    done += 1
+            if done:
+                logger.info("Archive scheduler: %d archive(s) backed up", done)
+
+        threading.Thread(target=_work, name="savesync-archive-backup",
+                         daemon=True).start()
+
+    def _heavy_work_in_flight(self) -> bool:
+        """True while the app is doing work that WANTS the memory it holds.
+
+        Backing up a game walks its save tree, verifying archives re-reads
+        every zip, syncing holds a payload per job — none of them are helped
+        by a sweep that throws away caches and hands the working set back
+        underneath them, and the CPU is spoken for too. Playing counts for
+        the same reason.
+        """
+        try:
+            from core.monitor import get_monitor
+            if get_monitor().currently_playing():
+                return True
+        except Exception:
             pass
+        if getattr(self, "_backup_inflight", None) or getattr(self, "_backup_job_queue", None):
+            return True
+        try:
+            from core.self_checks import is_running as _checks_running
+            if _checks_running():
+                return True
+        except Exception:
+            pass
+        try:
+            # A separate singleton that may not be connected — never assume
+            # its internals are there.
+            from sync import get_orchestrator
+            orch = get_orchestrator()
+            if getattr(orch, "_syncing_games", None) or getattr(orch, "_sync_job_queue", None):
+                return True
+        except Exception:
+            pass
+        return self._shelved_work_running()
+
+    def _shelved_work_running(self) -> bool:
+        """True while a dialog shelved into the sidebar is still working.
+
+        Minimising an operation does not make it stop — a shelved folder scan
+        is still walking hundreds of directories on a worker thread. The
+        batch notices (backup, sync, verify) were already accounted for; the
+        shelved dialogs were the half of the sidebar that wasn't, so a sweep
+        could purge caches out from under one.
+
+        Per ENTRY, never per list. A dialog stays in _shelved_add_entries
+        after its work finishes, until the user reopens it — counting the
+        list would let one shelve-and-forget disable the sweep for the whole
+        session. The predicate differs by dialog: Add/Edit answers
+        _has_shelvable_work(), the scan and manual-path dialogs carry their
+        QThreads directly.
+        """
+        for entry in getattr(self, "_shelved_add_entries", ()) or ():
+            dlg = entry.get("dlg")
+            if dlg is None:
+                continue
+            try:
+                has_work = getattr(dlg, "_has_shelvable_work", None)
+                if callable(has_work):
+                    if has_work():
+                        return True
+                    continue
+                for attr in ("_worker", "_store_worker"):
+                    worker = getattr(dlg, attr, None)
+                    if worker is not None and worker.isRunning():
+                        return True
+            except RuntimeError:
+                continue      # dialog already destroyed — nothing running
+        return False
+
+    def _on_auto_memory_trim_tick(self):
+        """Periodic background memory upkeep, paced by what the app is doing.
+
+        Three rules, in this order — the order is the design:
+
+        1. REAL PRESSURE WINS. If free RAM is actually short, sweep deeply
+           now, whatever else is going on. Checked first so a long quiet
+           spell that backed the interval off to its ceiling cannot leave the
+           machine draining while this waits its turn.
+        2. HEAVY WORK IS LEFT ALONE. A backup scan, an archive verify or a
+           sync wants the memory and the CPU it is using; taking either away
+           mid-operation is the opposite of help. The interval snaps back to
+           the floor on the way out, so the first tick AFTER the work lands
+           quickly — that is when there is most to reclaim.
+        3. OTHERWISE, SWEEP AND ADAPT. A sweep that reclaimed something earns
+           the floor cadence. One that found nothing doubles the wait, up to
+           the tier's ceiling: repeating a cleanup that frees nothing costs
+           the process a wake-up and buys it nothing.
+
+        The deep sweep (cache purge + full gc + working-set release) stays on
+        its own counter and always resets it — unlike the light sweep, its
+        main job is handing pages back, which no return value can measure.
+        """
+        from core.concurrency import (memory_sweep_interval_s,
+                                      memory_sweep_max_interval_s,
+                                      deep_sweep_after_sweeps, memory_pressure)
+        from ui.helpers import light_memory_sweep, trim_process_memory
+
+        floor_ms = memory_sweep_interval_s() * 1000
+        ceiling_ms = memory_sweep_max_interval_s() * 1000
+        timer = self._auto_memory_trim_timer
+
+        def _set_interval(ms: int):
+            ms = max(floor_ms, min(ceiling_ms, int(ms)))
+            if timer.interval() != ms:
+                timer.setInterval(ms)      # restarts the countdown
+
+        pressure = memory_pressure()
+
+        # 1. Pressure — before the busy check and before any backoff.
+        if pressure == "ok" and self._heavy_work_in_flight():
+            # 2. Busy: skip, and be ready to run soon once it finishes.
+            _set_interval(floor_ms)
+            return
+
+        self._sweeps_since_deep = getattr(self, "_sweeps_since_deep", 0) + 1
+        deep = (pressure != "ok"
+                or self._sweeps_since_deep >= deep_sweep_after_sweeps())
+        try:
+            if deep:
+                self._sweeps_since_deep = 0
+                trim_process_memory()
+                # A loaded save is the single largest thing the app holds on
+                # to by choice; under real pressure it goes now rather than
+                # waiting out its own idle timer.
+                if pressure == "critical":
+                    self._release_idle_documents()
+                # Deep sweeps always earn the floor: their return value says
+                # nothing about the working set they just released.
+                _set_interval(floor_ms)
+            else:
+                # 3. Adapt to what the light sweep actually found.
+                reclaimed = light_memory_sweep()
+                _set_interval(floor_ms if reclaimed else timer.interval() * 2)
+        except Exception:
+            logger.debug("Background memory sweep failed", exc_info=True)
+
+    def _release_idle_documents(self):
+        """Ask any page holding a big document to let it go."""
+        page = getattr(self, "_cheats_page", None)
+        release = getattr(page, "release_idle_document", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                logger.debug("Could not release the loaded save", exc_info=True)
 
     def _install_dpi_change_watch(self):
         """Event-driven DPI/scale change detection (Qt screen signals).
@@ -964,10 +1197,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                                 "name_history": list(e.name_history or []),
                             })
                 if jobs:
-                    logger.info(f"Resuming Sync Tutti: {len(jobs)} remaining")
-                    # Preserve completed tally in notice via enqueue rebuild
+                    _done = list(syn.get("completed_ids") or [])
+                    logger.info(
+                        f"Resuming Sync Tutti: {len(jobs)} remaining "
+                        f"({len(_done)} already done)")
                     orch._sync_max_inflight = sync_max_inflight()
-                    orch.enqueue_sync_batch(jobs, source="resume")
+                    # Hand the tally over, or the resume overwrites the
+                    # persisted job with an empty completed list — see
+                    # enqueue_sync_batch.
+                    orch.enqueue_sync_batch(jobs, source="resume",
+                                            prior_completed_ids=_done)
             else:
                 logger.info("Pending Sync Tutti kept on disk — provider offline")
 
@@ -1435,11 +1674,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             except Exception:
                 logger.debug("wipe_and_reload failed for CheatsPage",
                              exc_info=True)
-        try:
-            from ui.helpers import trim_process_memory
-            trim_process_memory()
-        except Exception:
-            pass
+        # No trim here. This runs inside the overview button's emit(), which
+        # trims once when the whole refresh is done — trimming mid-wipe just
+        # purged caches the remaining pages were about to rebuild from.
 
     # ── Overlay ───────────────────────────────────────────────────────────────
 
@@ -2694,16 +2931,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if not get_config().get("self_checks", True):
             logger.info("Self-checks disabled in settings, skipping")
             return
-        
-        # Check if configuration history exists before running self-checks.
-        # The real checkpoint history lives under CONFIG_HISTORY_DIR — NOT a
-        # "config_dir/history" folder (that path never exists, so this gate
-        # silently skipped the checks even when snapshots were present).
-        from core.constants import CONFIG_HISTORY_DIR
-        if not CONFIG_HISTORY_DIR.exists() or not any(CONFIG_HISTORY_DIR.iterdir()):
-            logger.info("No configuration history found, skipping self-checks")
-            return
-        
+
+        # No "is there config history?" gate any more. It was written when
+        # the config snapshots were the only check, and it silently skipped
+        # the backup-integrity ones too — on a fresh install, exactly when
+        # there is nothing to restore from, nothing was being checked. The
+        # snapshot check handles an empty history on its own.
+
         # Check if enough time has passed since last check based on frequency
         frequency_days = get_config().get("self_checks_frequency", 7)
         last_check = get_config().get("last_self_check", 0)
@@ -2716,13 +2950,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.info(f"Self-checks already run recently, next check in {days_until_next} days")
             return
             
-        # Run self-checks and update last check time
-        from core.self_checks import run_startup_self_checks
+        # Run the checks and update last check time. Same list the Backups
+        # page's ⚕️ button runs — see core.self_checks.
+        from core.self_checks import run_checks, CHECK_IDS
 
         # Surface the sweep in the sidebar like Backup/Sync Tutti. The
         # callbacks run on the worker thread — the Qt signals marshal them
         # back to the GUI thread.
-        self._verify_batch_notice.begin(t("batch.verify_label"), 2)
+        self._verify_batch_notice.begin(t("batch.verify_label"), len(CHECK_IDS))
+        self._offer_checks_cancel()
 
         def _progress(check_id: str, index: int, total: int):
             self.self_check_progress.emit(check_id, index, total)
@@ -2730,7 +2966,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         def _fail(check_id: str, detail: str):
             self.self_check_failed.emit(check_id, detail)
 
-        def _on_complete():
+        def _on_complete(_result):
             # Update last check time on successful completion
             try:
                 get_config().set("last_self_check", int(time.time()))
@@ -2739,15 +2975,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 logger.warning(f"Failed to update last self-check time: {e}")
             self.self_check_done.emit()
 
-        # Run checks and record completion once the worker thread is done.
-        run_startup_self_checks(on_failure=_fail, on_done=_on_complete,
-                                on_progress=_progress)
+        # The scheduled sweep reuses an "ok" verdict newer than 12h instead
+        # of re-opening every archive; the manual button passes 0 because a
+        # user who clicked it is asking for a fresh answer.
+        run_checks(on_failure=_fail, on_done=_on_complete,
+                   on_progress=_progress, skip_recent_hours=12.0)
 
     @Slot(str, int, int)
     def _on_self_check_progress(self, check_id: str, index: int, total: int):
         names = {
             "config_history_restore": t("batch.verify_snapshot"),
             "backup_index": t("batch.verify_index"),
+            "backup_index_zips": t("batch.verify_index"),
+            "backup_archives": t("batch.verify_label"),
+            "archive_rebackup": t("batch.backup_label"),
         }
         self._verify_batch_notice.update_progress(
             index, max(total, 1), names.get(check_id, check_id))
@@ -2756,9 +2997,28 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_self_check_done(self):
         self._verify_batch_notice.finish(t("batch.verify_done"), hide_after_ms=4000)
 
+    def _offer_checks_cancel(self):
+        """Put a Cancel on the integrity-checks notice, after 30 s.
+
+        The notice already knew how to do this — set_cancel's own
+        min_seconds default is 30 — but nothing in the sidebar ever called
+        it, so the one sweep that can run over hundreds of archives was the
+        one the user could not stop. Thirty seconds is the same threshold the
+        please-wait sheet uses before offering to call work off, so the two
+        surfaces behave alike.
+        """
+        from core.self_checks import request_cancel
+        # common.cancel ("Annulla"), not cancel_search ("Interrompi la
+        # ricerca") — this sweep is not a search.
+        self._verify_batch_notice.set_cancel(
+            t("common.cancel"), request_cancel, min_seconds=30)
+
     @Slot(int)
     def _on_verify_batch_started(self, total: int):
+        # Manual run from the Backups page — same list, same sweep, so the
+        # same way out of it as the scheduled one.
         self._verify_batch_notice.begin(t("batch.verify_label"), total)
+        self._offer_checks_cancel()
 
     @Slot(int, int, str)
     def _on_verify_batch_progress(self, done: int, total: int, name: str):
@@ -3262,14 +3522,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             existing.stop()
             existing.deleteLater()
 
+        def _stop():
+            timer = self._live_tracking_timers.pop(game_id, None)
+            if timer:
+                timer.stop()
+                timer.deleteLater()
+
         def _poll():
+            # Switched off in settings mid-session. The gate at the call site
+            # only decides whether to START, so without this a loop launched
+            # before the user unticked the option kept polling open files for
+            # the rest of the session.
+            if not get_config().get("auto_scan_on_exit", True):
+                logger.info(f"Live tracking disabled in settings — stopping for {game_id}")
+                _stop()
+                return
             # Stop polling once game exits
             playing_ids = {e.id for e in get_monitor().currently_playing()}
             if game_id not in playing_ids:
-                timer = self._live_tracking_timers.pop(game_id, None)
-                if timer:
-                    timer.stop()
-                    timer.deleteLater()
+                _stop()
                 return
 
             # Find current PID for this game.
@@ -5035,9 +5306,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         is_orphan = lib_entry is None or not bk or not bk.save_paths
 
         if is_orphan:
-            # Orphan backup (archivio senza gioco in libreria): apri il browse file custom per selezionare dove salvarlo
+            # Archive with no library game: ask where to put it. Library
+            # restores are untouched — they still resolve their own absolute
+            # or relative save paths as always.
             from ui.widgets.file_pickers import pick_folder
-            target_dir = pick_folder(self, t("backup.select_restore_destination"))
+            # Open ON the folder the archive was made from, when that folder
+            # is still there. Restoring an archive almost always means putting
+            # it back where it came from, and without this the picker started
+            # at the drive root and the user re-navigated every single time.
+            start_dir = ""
+            if bk is not None:
+                for _src in get_backup_manager().orphan_source_paths(bk):
+                    if _src and Path(_src).is_dir():
+                        start_dir = _src
+                        break
+            target_dir = pick_folder(
+                self, t("backup.select_restore_destination"), start_dir)
             if not target_dir:
                 return
 
@@ -5264,33 +5548,28 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """Launch the game - via launcher URL if available, otherwise directly.
         
         When launching via URL, if game exists by exe_path, update appid."""
-        import subprocess, platform
         entry = get_library().get_by_id(game_id)
         if not entry or (not entry.exe_path and not entry.appid):
             self._status_bar.showMessage(t("status.no_executable"), 3000)
             return
         
+        # Both launches go through core.resolvers, which owns the
+        # platform split: this used to hand every non-Windows machine
+        # "xdg-open" — a Linux command macOS does not have, so launching by
+        # launcher URL simply failed there — and to exec the exe path
+        # directly, which cannot work for a macOS .app (a directory).
+        from core.resolvers import launch_executable, launch_with_url
         launched_via_url = False
         if entry.appid:
-            try:
-                if platform.system() == "Windows":
-                    import os
-                    os.startfile(entry.appid)
-                else:
-                    subprocess.Popen(["xdg-open", entry.appid])
+            if launch_with_url(entry.appid):
                 launched_via_url = True
                 self._status_bar.showMessage(t('core.launching_via_launcher', name=entry.name), 3000)
-                logger.info(f"Launched {entry.name} via {entry.appid}")
-            except Exception as e:
-                logger.warning(f"Launch via URL failed for {entry.name}: {e}")
-        
+            else:
+                logger.warning(f"Launch via URL failed for {entry.name}: {entry.appid}")
+
         if not launched_via_url:
             try:
-                if platform.system() == "Windows":
-                    import os
-                    os.startfile(entry.exe_path)
-                else:
-                    subprocess.Popen([entry.exe_path])
+                launch_executable(entry.exe_path)
                 self._status_bar.showMessage(f"{t('core.launching')} {entry.name}…", 3000)
             except Exception as e:
                 self._status_bar.showMessage(f"{t('core.launch_failed')}: {e}", 5000)

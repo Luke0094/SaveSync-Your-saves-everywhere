@@ -18,29 +18,50 @@ _IS_MACOS = sys.platform == 'darwin'
 _IS_LINUX = not _IS_WINDOWS and not _IS_MACOS
 
 # ── What counts as "an executable the user can add" ───────────────────────────
-# Windows says it with an extension; Unix mostly doesn't — the common case is a
-# suffix-less file carrying the exec bit, so recognition there needs a stat, not
-# a glob. Shortcuts are the platform's own indirection format (.lnk/.url vs
-# .desktop) and are deliberately kept apart from real executables.
+# THREE platforms, three tables — not "Windows and everything else". Windows
+# says it with an extension; Linux mostly doesn't (the common case is a
+# suffix-less file carrying the exec bit, so recognition there needs a stat,
+# not a glob); macOS ships its programs as .app bundles, which are
+# DIRECTORIES. Shortcuts are each platform's own indirection format and are
+# deliberately kept apart from real executables.
 #
-# On Windows, executables are .exe/.bat/.cmd (.bin files are assets, never executables).
-# On Linux/Unix, .bin, .sh, .appimage, .x86_64, .run, .command are executable extensions.
-# On macOS, .app is a bundle directory and scripts/binaries are recognized.
+# The tables do not bleed into each other. A .sh cannot be launched by
+# Windows and a .exe cannot be launched by Linux, so offering one on the
+# other's file dialog, drag-drop gate or install scan only ever produces a
+# candidate that fails at launch. Foreign builds sitting in a folder (a
+# Proton/WSL tree on an NTFS drive) are still recognised as evidence that the
+# folder is a game install — that is what is_program_binary is for, and it is
+# host-independent by design.
 _EXEC_SUFFIXES_WINDOWS = ('.exe', '.bat', '.cmd')
+_EXEC_SUFFIXES_LINUX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin')
+# macOS: .app is the bundle (a directory), .command is Finder's double-
+# clickable shell script. AppImage/.x86_64/.run are Linux packaging formats
+# and never appear here.
+_EXEC_SUFFIXES_MACOS = ('.app', '.command', '.sh')
 _SHORTCUT_SUFFIXES_WINDOWS = ('.lnk', '.url')
-_EXEC_SUFFIXES_POSIX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin', '.command')
-_SHORTCUT_SUFFIXES_POSIX = ('.desktop',)
+_SHORTCUT_SUFFIXES_LINUX = ('.desktop',)
+# macOS aliases are extension-less Finder metadata, not a file format this
+# can resolve — there is no macOS counterpart to .lnk/.desktop to offer.
+_SHORTCUT_SUFFIXES_MACOS: tuple[str, ...] = ()
 _MACOS_BUNDLE_SUFFIX = '.app'
 
 
 def executable_suffixes() -> tuple[str, ...]:
     """Executable file extensions for this platform (lowercase, with dot)."""
-    return _EXEC_SUFFIXES_WINDOWS if _IS_WINDOWS else _EXEC_SUFFIXES_POSIX
+    if _IS_WINDOWS:
+        return _EXEC_SUFFIXES_WINDOWS
+    if _IS_MACOS:
+        return _EXEC_SUFFIXES_MACOS
+    return _EXEC_SUFFIXES_LINUX
 
 
 def shortcut_suffixes() -> tuple[str, ...]:
     """Shortcut/launcher-file extensions for this platform."""
-    return _SHORTCUT_SUFFIXES_WINDOWS if _IS_WINDOWS else _SHORTCUT_SUFFIXES_POSIX
+    if _IS_WINDOWS:
+        return _SHORTCUT_SUFFIXES_WINDOWS
+    if _IS_MACOS:
+        return _SHORTCUT_SUFFIXES_MACOS
+    return _SHORTCUT_SUFFIXES_LINUX
 
 
 def is_shortcut_file(path) -> bool:
@@ -49,38 +70,35 @@ def is_shortcut_file(path) -> bool:
 
 
 def is_executable_file(path) -> bool:
-    """True when *path* is a runnable program on this platform.
+    """True when *path* is a program THIS machine can actually launch.
 
-    On Windows: only native executables (.exe, .bat, .cmd) are recognized as
-    programs; .bin files are assets/data on Windows and never executables.
-    Suffix-less files or Linux binaries are checked for ELF/Mach-O magic headers.
+    Strictly platform-native — the question behind every add-a-game entry
+    point (file dialog, drag & drop, folder scan) is "can the user run this
+    here", and a foreign build answers no however plausible its name looks.
 
-    On Unix/Linux: extension-less files carrying the exec bit are recognized,
-    along with POSIX executable extensions (.sh, .AppImage, .x86_64, .bin, .run).
+    On Windows: .exe/.bat/.cmd, and nothing else. A .sh, .AppImage or
+    .x86_64 on an NTFS drive is a Linux build that Windows cannot start;
+    .bin files are assets/data. Offering any of them produced a library
+    entry whose ▶ Play could only ever fail.
 
-    On macOS: .app bundles (directories) and POSIX scripts/binaries are recognized.
+    On Linux: extension-less files carrying the exec bit — the usual shape of
+    a game binary — plus .sh/.AppImage/.x86_64/.x86/.run/.bin.
+
+    On macOS: .app bundles (directories), .command/.sh scripts, and
+    extension-less exec-bit binaries.
     """
     p = Path(path)
     suffix = p.suffix.lower()
+    if suffix and suffix not in executable_suffixes():
+        return False
     if _IS_WINDOWS:
-        if suffix in _EXEC_SUFFIXES_WINDOWS:
-            return True
-        if suffix in ('.appimage', '.x86_64', '.x86', '.sh'):
-            return True
-        if suffix:
-            return False
-        try:
-            with open(p, 'rb') as fh:
-                head = fh.read(4)
-        except OSError:
-            return False
-        return any(head.startswith(magic) for magic in _BINARY_MAGICS)
-    if suffix in _EXEC_SUFFIXES_POSIX:
-        return True
+        # Windows needs the extension to run anything at all; an
+        # extension-less file is data here whatever its first bytes say.
+        return bool(suffix)
     if suffix == _MACOS_BUNDLE_SUFFIX:
         return p.is_dir()
     if suffix:
-        return False
+        return True
     try:
         return p.is_file() and os.access(p, os.X_OK)
     except OSError:
@@ -100,34 +118,44 @@ _BINARY_MAGICS = (
 )
 
 
-def is_program_binary(path) -> bool:
-    """True only when *path* is definitely an executable binary (not an asset
-    file, script, or directory).
+# Compiled-program extensions of ANY platform — see is_program_binary.
+_PROGRAM_BINARY_SUFFIXES = ('.exe', '.appimage', '.x86_64', '.x86')
+# The launcher script a game ships INSTEAD of exposing its binary — Ren'Py
+# and Unity both do this, and the binary itself sits a few folders down. It
+# counts as the same evidence the binary would: this folder is an install,
+# not save data. (The extension-less form of the same wrapper is why
+# _BINARY_MAGICS knows the shebang.)
+_LAUNCHER_SCRIPT_SUFFIXES = ('.bat', '.cmd', '.sh', '.command')
+# Suffixes that name a program on one platform and a data blob on another —
+# Windows ships assets as .bin, Linux ships game binaries and self-extracting
+# installers under both. Neither the name nor the host OS can settle it, so
+# these are decided on the file's own first bytes instead of guessed.
+_MAYBE_BINARY_SUFFIXES = ('.bin', '.run')
 
-    On Windows: tests .exe/.bat/.cmd as always (.bin is never an executable on Windows).
-    On Unix/macOS: checks POSIX executable formats or binary magics with exec bit.
+
+def is_program_binary(path) -> bool:
+    """True only when *path* is a game program — a compiled binary or the
+    launcher script standing in for one — and not an asset file or directory.
+
+    Deliberately HOST-INDEPENDENT, unlike is_executable_file: this answers
+    "is there a game program in this folder", which is how an install root is
+    told apart from a save folder, and that is a fact about the folder rather
+    than about the machine reading it. A Proton/WSL tree on a Windows drive
+    holds ELF binaries and is just as much an install root there as on Linux,
+    so the same file must get the same answer on every OS.
+
+    Recognises compiled formats and launcher scripts by extension, and reads
+    the ELF/Mach-O/PE magic of the rest — extension-less files (additionally
+    requiring the exec bit on Unix, since FAT/NTFS mounts hand it out to
+    every file) and the ambiguous .bin/.run.
     """
     p = Path(path)
     suffix = p.suffix.lower()
-    if _IS_WINDOWS:
-        if suffix in _EXEC_SUFFIXES_WINDOWS:
-            return True
-        if suffix in ('.appimage', '.x86_64', '.x86'):
-            return True
-        if suffix:
-            return False
-        try:
-            with open(p, 'rb') as fh:
-                head = fh.read(4)
-        except OSError:
-            return False
-        return any(head.startswith(magic) for magic in _BINARY_MAGICS)
-    if suffix in _EXEC_SUFFIXES_POSIX:
-        return True
-    if suffix:
-        return False
+    if suffix and suffix not in _MAYBE_BINARY_SUFFIXES:
+        return (suffix in _PROGRAM_BINARY_SUFFIXES
+                or suffix in _LAUNCHER_SCRIPT_SUFFIXES)
     try:
-        if not (p.is_file() and os.access(p, os.X_OK)):
+        if not suffix and not _IS_WINDOWS and not (p.is_file() and os.access(p, os.X_OK)):
             return False
         with open(p, 'rb') as fh:
             head = fh.read(4)
@@ -296,27 +324,24 @@ class _DeadlineHit(Exception):
 def _iter_executable_candidates(search_base: Path):
     """Files worth scoring as a game executable under *search_base*.
 
-    Windows keeps the exact ``rglob("*.exe")`` pass it always had — one glob,
-    ~1k hits in a Program Files tree. Unix cannot glob for its main case (a
-    suffix-less binary), so it walks everything and rejects by suffix, which
-    is a pure string test: the same tree yields ~80x more entries, so anything
-    per-entry costlier than that (notably the exec-bit stat) is left to the
-    caller, which only pays it for entries that actually scored.
+    Windows globs its OWN extensions only — one cheap pass per suffix over a
+    Program Files tree. It used to glob the Linux ones too, on the theory that
+    a WSL/Proton build might sit there, and every hit was a candidate the user
+    could not launch; the folder scan and the magic-byte check still find
+    foreign installs where that actually matters. Unix cannot glob for its
+    main case (a suffix-less binary), so it walks everything and rejects by
+    suffix, which is a pure string test: the same tree yields ~80x more
+    entries, so anything per-entry costlier than that (notably the exec-bit
+    stat) is left to the caller, which only pays it for entries that scored.
     """
+    suffixes = executable_suffixes()
     if _IS_WINDOWS:
-        yield from search_base.rglob("*.exe")
-        # Unix builds inside game folders (WSL, Proton, mounted drives):
-        # suffix globs only — no per-file reads, matching the Windows
-        # string-only walk. Extensionless ELF files are not globbable, and
-        # scanning every file of a tree on Windows is too heavy for the
-        # deadline budget; the interactive Browse finds them via the magic
-        # check instead.
-        for _s in _EXEC_SUFFIXES_POSIX:
+        for _s in suffixes:
             yield from search_base.rglob(f"*{_s}")
         return
     for path in search_base.rglob("*"):
         suffix = path.suffix.lower()
-        if not suffix or suffix in _EXEC_SUFFIXES_POSIX or suffix == _MACOS_BUNDLE_SUFFIX:
+        if not suffix or suffix in suffixes:
             yield path
 
 
@@ -404,33 +429,34 @@ def _search_executables_multi(weighted_names: list[tuple[str, str, float]],
 
 def _get_default_exe_search_paths() -> list[Path]:
     """Get default paths to search for executables (wide scan).
-    
-    Scans home directory and all mount points/disks.
+
+    Scans the home directory and this platform's own install/mount roots —
+    drive letters on Windows, /Applications and /Volumes on macOS, the FHS
+    mount points on Linux. macOS used to get the Linux list (plus a walk of
+    "/" that SIP and the privacy prompts block anyway).
     """
-    import os
-    
-    paths = []
-    
-    # User home
-    paths.append(Path.home())
-    
-    # Scan all drives/mounts
-    if os.name == 'nt':
-        # Windows: scan all drive letters
+    paths = [Path.home()]
+
+    if _IS_WINDOWS:
         for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-            drive = f"{letter}:/"
-            p = Path(drive)
+            p = Path(f"{letter}:/")
             if p.exists():
                 paths.append(p)
+        return paths
+
+    if _IS_MACOS:
+        roots = ["/Applications", "/Volumes"]
     else:
-        # Unix: scan common mount points
-        for mp in ["/media", "/mnt", "/opt", "/Applications"]:
-            p = Path(mp)
-            if p.exists():
-                paths.append(p)
-        # Also try root as fallback
+        roots = ["/media", "/mnt", "/opt"]
+    for mp in roots:
+        p = Path(mp)
+        if p.exists():
+            paths.append(p)
+    if not _IS_MACOS:
+        # Linux fallback: the whole tree. Not on macOS, where "/" is mostly
+        # system-owned and the interesting parts are already listed above.
         paths.append(Path("/"))
-    
+
     return paths
 
 
@@ -460,12 +486,16 @@ def _get_suggested_exe_search_paths() -> list[Path]:
 
 
 def _get_launcher_install_paths() -> dict[str, list[Path]]:
-    """Get default installation paths for different game launchers."""
-    import os
-    
+    """Get default installation paths for different game launchers.
+
+    One branch per platform: every launcher puts its library somewhere
+    different on each. macOS used to be handed the Linux branch, so none of
+    its three paths existed and a suggested scan there searched nothing —
+    Steam lives under ~/Library/Application Support, not ~/.local/share.
+    """
     paths = {}
-    
-    if os.name == 'nt':
+
+    if _IS_WINDOWS:
         # Try registry first for Steam (most common)
         try:
             import winreg
@@ -498,50 +528,62 @@ def _get_launcher_install_paths() -> dict[str, list[Path]]:
                         launcher_key = launcher.lower().replace(" ", "")
                         if lp not in paths.get(launcher_key, []):
                             paths.setdefault(launcher_key, []).append(lp)
-    else:
-        # Unix-like
+    elif _IS_MACOS:
+        # Every launcher installs under ~/Library/Application Support, and
+        # the games themselves are .app bundles in /Applications.
         home = Path.home()
-        
+        appsup = home / "Library" / "Application Support"
+        for key, dirs in (
+            ("steam", [appsup / "Steam"]),
+            ("epic", [appsup / "Epic", Path("/Users/Shared/Epic Games")]),
+            ("gog", [appsup / "GOG.com" / "Galaxy", home / "GOG Games"]),
+            ("user", [Path("/Applications"), home / "Applications"]),
+        ):
+            for d in dirs:
+                if d.exists() and d not in paths.get(key, []):
+                    paths.setdefault(key, []).append(d)
+    else:
+        # Linux
+        home = Path.home()
+
         # Steam
         steam_dirs = [
             home / ".local" / "share" / "Steam",
             home / ".steam" / "steam",
-            "/opt/steam",
-            "/usr/share/steam",
+            Path("/opt/steam"),
+            Path("/usr/share/steam"),
         ]
         for d in steam_dirs:
             if d.exists():
                 paths.setdefault("steam", []).append(d)
-        
+
         # Epic Games
         for d in [home / ".local" / "share" / "EpicGamesLauncher", home / "Epic Games"]:
             if d.exists():
                 paths.setdefault("epic", []).append(d)
-        
+
         # GOG
         for d in [home / "GOG Games", home / ".local" / "share" / "gog"]:
             if d.exists():
                 paths.setdefault("gog", []).append(d)
-        
-        # Games folder
-        if (home / "Games").exists():
-            paths.setdefault("user", []).append(home / "Games")
-    
-    # Desktop folders — user may have game launcher .url files there
-    import os as _os
-    if _os.name == 'nt':
+
+    # Desktop folders — where the platform HAS a shortcut format the fuzzy
+    # search can read there (.lnk/.url on Windows, .desktop on Linux). macOS
+    # aliases are not a readable format, so its Desktop is not searched.
+    if _IS_WINDOWS:
+        for desktop in (Path.home() / "Desktop", Path("C:/Users/Public/Desktop")):
+            if desktop.exists():
+                paths.setdefault("desktop", []).append(desktop)
+    elif not _IS_MACOS:
         desktop = Path.home() / "Desktop"
         if desktop.exists():
             paths.setdefault("desktop", []).append(desktop)
-        public_desktop = Path("C:/Users/Public/Desktop")
-        if public_desktop.exists():
-            paths.setdefault("desktop", []).append(public_desktop)
 
     # Always add user Games folder
     user_games = Path.home() / "Games"
-    if user_games.exists():
+    if user_games.exists() and user_games not in paths.get("user", []):
         paths.setdefault("user", []).append(user_games)
-    
+
     return paths
 
 
@@ -746,6 +788,27 @@ def launch_with_url(url: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to launch {url}: {e}")
         return False
+
+
+def launch_executable(exe_path: str) -> None:
+    """Start the game at *exe_path*, the way THIS platform starts things.
+
+    The counterpart of launch_with_url, and platform-split for the same
+    reason: the three systems do not agree on what "run this file" means.
+    Windows goes through the shell (``os.startfile``) so a .lnk/.url or an
+    associated file works. macOS cannot exec a .app — it is a directory —
+    so bundles go through ``open``, while a plain Unix binary or .command
+    is exec'd directly. Linux exec's directly.
+
+    Raises whatever the underlying call raises; the caller reports it.
+    """
+    if _IS_WINDOWS:
+        os.startfile(exe_path)          # type: ignore[attr-defined]
+        return
+    if _IS_MACOS and Path(exe_path).suffix.lower() == _MACOS_BUNDLE_SUFFIX:
+        subprocess.Popen(["open", exe_path])
+        return
+    subprocess.Popen([exe_path])
 
 
 def get_appid_from_url(url: str) -> Optional[str]:

@@ -108,12 +108,21 @@ _datas = [
     (str(ROOT / 'assets' / 'icon.png'), 'assets'),
 ]
 
+from PyInstaller.utils.hooks import collect_submodules as _collect_submodules
+
+# Themes are found by scanning ui.styles at runtime (see
+# ui/styles/theme.py::_discover_themes), so nothing imports a new theme
+# module by name and PyInstaller's analysis would never see it. Collecting
+# the whole package is what lets "drop a module in ui/styles" keep working
+# in a frozen build instead of only from source.
+_THEME_MODULES = _collect_submodules('ui.styles')
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
     binaries=[],
     datas=_datas,
-    hiddenimports=[
+    hiddenimports=_THEME_MODULES + [
         'core', 'core.config_transfer', 'core.config_manager', 'core.library',
         'core.backup', 'core.monitor', 'core.watcher', 'core.credentials',
         'core.machine', 'core.save_detector', 'core.startup', 'core.constants',

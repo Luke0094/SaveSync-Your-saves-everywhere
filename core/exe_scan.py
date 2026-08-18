@@ -25,23 +25,18 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Stems that are never the game, however they rank otherwise.
-_NOISE_STEMS = {
-    "unins000", "unins001", "uninstall", "uninstaller", "uninst",
-    "setup", "install", "installer", "update", "updater", "patcher",
-    "vcredist", "vcredist_x86", "vcredist_x64", "dxsetup", "dxwebsetup",
-    "directx", "dotnetfx", "ndp452-kb2901907-x86-x64-allos-enu",
-    "oalinst", "openal", "ue4prereqsetup_x64", "ueprereqsetup_x64",
-    "unitycrashhandler32", "unitycrashhandler64", "crashhandler",
-    "crashreporter", "crashpad_handler", "bugsplat", "sentry",
-    "quicksfv", "7z", "winrar", "notification_helper", "python", "pythonw",
-    "javaw", "java", "node", "nw_elf", "d3dcompiler_47",
-    # Helper scripts and tools that ship inside game folders, and that a scan
-    # kept proposing as the game itself.
-    "gamepro", "startwithtool", "tool", "tools", "patch", "gameupdate",
-    "windowsiconupdater", "iconupdater",
-    "remove tool files from game", "use me to open the tool",
-}
+# Stems that are never the game, however they rank otherwise — installers,
+# updaters, crash handlers, redistributables, interpreters and the helper
+# tools that ship in a game folder. The vocabulary (and every separator
+# spelling of it) lives in core.exe_stems, shared with the save detector's
+# generic-stem list and the process monitor's ignore list, so an updater
+# named once is rejected by all three.
+from core.exe_stems import (
+    NEVER_A_GAME_STEMS as _NOISE_STEMS,
+    normalize_stem,
+    stem_in,
+)
+
 # Exact stems are not enough: "uninstalltof.exe" sits in a folder called
 # a folder whose name it echoes, so it fuzzy-matched that folder better
 # than the real game did and won the pick. Kept deliberately narrow — an over-broad rule hides real
@@ -51,7 +46,7 @@ _NOISE_STEMS = {
 _NOISE_PREFIXES = ("unins", "uninstall", "uninst")
 _NOISE_FRAGMENTS = (
     "uninstall", "iconupdater", "crashhandler", "crashreporter",
-    "vcredist", "dxsetup", "prereqsetup",
+    "vcredist", "dxsetup", "prereqsetup", "gameupdate", "gameupdater",
 )
 # Folders never worth descending into for a game binary.
 _NOISE_DIRS = {
@@ -81,11 +76,12 @@ def _is_noise_dir(name: str) -> bool:
 
 def _is_noise_exe(path: Path) -> bool:
     stem = path.stem.strip().lower()
-    if stem in _NOISE_STEMS:
+    clean_stem = normalize_stem(stem)
+    if stem_in(stem, _NOISE_STEMS):
         return True
-    if any(stem.startswith(prefix) for prefix in _NOISE_PREFIXES):
+    if any(stem.startswith(prefix) or clean_stem.startswith(prefix) for prefix in _NOISE_PREFIXES):
         return True
-    return any(fragment in stem for fragment in _NOISE_FRAGMENTS)
+    return any(fragment in stem or fragment in clean_stem for fragment in _NOISE_FRAGMENTS)
 
 
 def _executables_in(folder: Path) -> list:
@@ -122,7 +118,7 @@ def _score_candidate(exe: Path, folder: Path) -> tuple:
     from core.save_detector import GENERIC_EXE_STEMS
     stem = exe.stem
     name_match = fuzzy_score(folder.name, stem)
-    generic = stem.strip().lower() in GENERIC_EXE_STEMS
+    generic = stem_in(stem, GENERIC_EXE_STEMS)
     try:
         size = exe.stat().st_size
     except OSError:

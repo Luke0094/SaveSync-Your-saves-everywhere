@@ -155,12 +155,66 @@ _CORR_WEAK_RATIO = 0.4   # weaker candidates get a stricter slice of the window
 _CORR_WEAK_CAP = 2       # max weak claims per anchor sweep
 
 
-def prune_watcher_caches() -> None:
-    """Trim memory held by temporary watcher file indices and correlation buffers."""
+def prune_watcher_caches() -> int:
+    """Trim memory held by watcher file indices and correlation buffers.
+
+    Returns how many entries were actually dropped, so a caller sweeping on
+    a timer can tell a useful pass from a barren one and stop repeating it.
+
+    This is what the idle trimmer and the Panoramica refresh button call, and
+    it used to clear three caches out of seven — every per-FILE index was
+    left alone, which is where all the memory actually is.
+
+    Those indices fill from watching the COMMON save roots (AppData,
+    LocalLow, Documents…) for a game with no confirmed paths yet: the seed
+    walks those trees and remembers every file it saw, tens of thousands of
+    path strings across four bounded sets capped at 50 000 EACH. None of it
+    was ever released, because unwatch_game's cleanup only removes keys
+    under the game's own save_paths — and a game being watched via the
+    common roots has none. So a play session added tens of megabytes that
+    stayed for the life of the process.
+
+    The per-file indices are NOT pure caches — _KNOWN_FILES is "what existed
+    before the game ran", and dropping it mid-session makes every existing
+    file look newly created. So they are only cleared when nothing is being
+    watched, which is exactly the idle case this runs in. While a game IS
+    watched the file indices are kept and only the rebuildable buffers go.
+    """
+    watching = False
+    try:
+        w = _watcher
+        watching = bool(w is not None and w._handlers)
+    except Exception:
+        watching = True          # unsure → keep the semantic state
+
     with _CACHE_LOCK:
-        _KNOWN_FILES_BY_DIR.clear()
+        # Always safe: rebuilt on the next event, or bounded scratch space.
+        dropped = len(_UNATTRIBUTED_EVENTS) + len(_LAST_ANCHOR_TS)
         _UNATTRIBUTED_EVENTS.clear()
+        _LAST_ANCHOR_TS.clear()
+        _CORR_SKIP_DIR_NAMES.clear()
+        _EXCL_TOKENS_CACHE["ts"] = 0.0
+        _EXCL_TOKENS_CACHE["tokens"] = set()
+        _EXCL_TOKENS_CACHE["user_tokens"] = set()
+        if watching:
+            return dropped
+        # Idle: no handler can be relying on any of this.
+        dropped += (len(_KNOWN_FILES_BY_DIR) + len(_PENDING_FILES)
+                    + len(_KNOWN_FILES._data) + len(_BACKED_UP_FILES._data)
+                    + len(_DISCOVERED_SAVE_FILES._data)
+                    + len(_CLAIMED_EVENTS._data)
+                    + len(_SEED_PATTERNS) + len(_SAVE_PATTERNS))
+        _KNOWN_FILES_BY_DIR.clear()
         _PENDING_FILES.clear()
+        _KNOWN_FILES.clear()
+        _BACKED_UP_FILES.clear()
+        _DISCOVERED_SAVE_FILES.clear()
+        _CLAIMED_EVENTS.clear()
+        _SEED_PATTERNS.clear()
+        _SAVE_PATTERNS.clear()
+        _SaveHandler._hints_cache = None
+        _SaveHandler._hints_initialized = False
+        return dropped
 
 # Only a real WRITE moves the correlation clock. This has to be enforced
 # explicitly, twice over, because neither check is sufficient alone:

@@ -444,10 +444,7 @@
     "save_edit_copies_tooltip": "Quante copie di uno stesso salvataggio tenere prima di eliminare la più vecchia. Una copia viene presa a ogni scrittura, quindi è fin dove si può tornare indietro.",
     "save_edit_copy_days": "Elimina dopo",
     "save_edit_copy_days_tooltip": "Le copie più vecchie di così vengono rimosse. La più recente resta sempre, qualunque età abbia, così c'è sempre qualcosa con cui annullare.",
-    "run_diagnostics": "Esegui controlli diagnostici",
-    "diagnostics_running": "Esecuzione controlli diagnostici in corso...",
-    "diagnostics_success": "Controlli diagnostici completati: nessun problema rilevato",
-    "diagnostics_issues": "Rilevati problemi"
+    "diagnostics_running": "Esecuzione controlli diagnostici in corso..."
   },
   "config_transfer": {
     "preview_title": "Anteprima Importazione Configurazione",
@@ -693,7 +690,6 @@
     "exclude_file": "Escludi dai backup",
     "restore_file": "Ripristina nei backup"
   },
-
   "notifications": {
     "backup_created": "Backup creato per {game}",
     "backup_unchanged": "Nessuna modifica rilevata per {game} — backup saltato",
@@ -734,7 +730,16 @@
     "verify_snapshots_ok": "Snapshot configurazione: ok",
     "verify_snapshots_bad": "Snapshot configurazione: problema — {detail}",
     "index_validate_failed": "Non è stato possibile completare il controllo dei file di backup su disco. Alcuni archivi mancanti potrebbero restare in elenco fino al prossimo controllo riuscito.",
-    "index_validate_recovered": "Controllo indice backup ripreso — gli archivi mancanti sono stati ripuliti."
+    "index_validate_recovered": "Controllo indice backup ripreso — gli archivi mancanti sono stati ripuliti.",
+    "archive_auto_backup": "Ricontrolla questa cartella e falle il backup",
+    "archive_auto_backup_tooltip": "Percorre la cartella da cui l'archivio è stato creato all'intervallo indicato e ne fa un nuovo backup quando il contenuto è cambiato. Permette di continuare a fare backup di una cartella senza aggiungere il gioco alla libreria. La rotazione segue i normali limiti di backup nelle Impostazioni.",
+    "archive_auto_every": "ogni",
+    "archive_auto_source": "Origine: {path}",
+    "archive_auto_source_missing": "Cartella di origine non disponibile — verrà saltata finché non torna",
+    "archive_auto_no_source": "Questo archivio è anteriore al tracciamento dell'origine, quindi non può essere ricontrollato. Aggiungi di nuovo la cartella per abilitarlo.",
+    "archive_auto_last": "Ultimo controllo: {when}",
+    "archive_auto_never": "Mai controllato",
+    "archive_auto_minutes": "minuti"
   },
   "errors": {
     "path_not_found": "Percorso non trovato",

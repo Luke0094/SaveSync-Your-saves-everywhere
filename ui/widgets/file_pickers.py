@@ -151,7 +151,15 @@ class _FileDetailsDelegate(QStyledItemDelegate):
 
 
 def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
-    """True ONLY for the 3 default system pins: My Computer / Questo PC, Desktop, User Home."""
+    """True ONLY for the 3 fixed places: My Computer / Questo PC, User, Desktop.
+
+    These three are the sidebar the dialog ships with, and removing one
+    leaves no way to put it back — there is no "restore default places"
+    anywhere. Everything else in the sidebar the user pinned themselves and
+    can unpin at will, DRIVE ROOTS INCLUDED: this used to call any root a
+    system pin, so a deliberately pinned ``D:\\`` could never be removed
+    again either.
+    """
     if not url.isValid() or not url.toString() or url.toString() in ("file:", "file:///", "", "computer:"):
         return True
 
@@ -163,14 +171,6 @@ def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
         norm_incoming = os.path.normcase(os.path.normpath(os.path.abspath(path_str)))
     except Exception:
         norm_incoming = os.path.normcase(path_str.replace("/", "\\").rstrip("\\"))
-
-    # Check drive root (e.g. C:\ or /)
-    try:
-        p = Path(path_str).resolve()
-        if len(p.parts) <= 1 or str(p).rstrip("/\\") == str(p.drive).rstrip("/\\") or norm_incoming.endswith(":\\"):
-            return True
-    except Exception:
-        pass
 
     # The 3 default system locations: Desktop, User Home, Computer
     desktop_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
@@ -219,6 +219,15 @@ class _LnkAwareDialog(QFileDialog):
     - Right-click on any folder in the view with "Aggiungi alla barra laterale".
     """
 
+    # i18n key for the confirm button. A CLASS attribute, not something set
+    # in a subclass constructor: _localize_labels runs from the base __init__
+    # (before any subclass body) and again on every directoryLoaded, so a
+    # label assigned after construction was overwritten the moment the user
+    # navigated anywhere — which is how "Seleziona" and "Salva" both ended
+    # up reading "Apri".
+    _ACCEPT_LABEL_KEY = "common.open"
+
+
     def __init__(self, parent, caption: str):
         super().__init__(parent, caption)
         self.setWindowModality(Qt.WindowModality.WindowModal)
@@ -240,14 +249,32 @@ class _LnkAwareDialog(QFileDialog):
             model.directoryLoaded.connect(lambda *_: self._localize_labels())
 
     def eventFilter(self, watched, event):
-        """Block Delete/Backspace key from removing protected system pins and manage context menu on sidebar."""
-        if watched is getattr(self, "_sidebar_view", None):
+        """Own the sidebar's context menu and block Delete on fixed places.
+
+        The context-menu half has to be an event FILTER, and on the viewport
+        as well as the sidebar itself. Qt's QSidebar reimplements
+        contextMenuEvent() to build its own untranslated "Remove" menu, and a
+        reimplementation never consults setContextMenuPolicy — so the
+        CustomContextMenu policy set in _hook_folder_context_menu did not
+        suppress it. What the user actually got was Qt's own menu, removing
+        fixed places without asking; our menu only appeared on a SECOND
+        right-click, by which time the pin was already gone. A filter runs
+        before the widget's own handler, which is the only place this can be
+        stopped — and the events arrive at the viewport, not the sidebar.
+        """
+        sidebar = getattr(self, "_sidebar_view", None)
+        if sidebar is not None and watched in (sidebar, sidebar.viewport()):
             if event.type() == QEvent.Type.ContextMenu:
-                self._on_sidebar_context_menu(event.pos())
+                pos = event.pos()
+                if watched is sidebar:
+                    # Sidebar-relative → viewport-relative, which is what
+                    # indexAt() expects.
+                    pos = sidebar.viewport().mapFrom(sidebar, pos)
+                self._on_sidebar_context_menu(pos)
                 return True
             if event.type() == QEvent.Type.KeyPress:
                 if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-                    idx = self._sidebar_view.currentIndex()
+                    idx = sidebar.currentIndex()
                     if idx.isValid():
                         urls = list(self.sidebarUrls())
                         if idx.row() < len(urls) and _is_system_pin(urls[idx.row()], self._system_sidebar_urls):
@@ -362,7 +389,7 @@ class _LnkAwareDialog(QFileDialog):
             self.setLabelText(QFileDialog.DialogLabel.FileType,
                               t("file_picker.file_type"))
             self.setLabelText(QFileDialog.DialogLabel.Accept,
-                              t("common.open"))
+                              t(self._ACCEPT_LABEL_KEY))
             self.setLabelText(QFileDialog.DialogLabel.Reject,
                               t("common.cancel"))
 
@@ -465,9 +492,75 @@ class _LnkAwareDialog(QFileDialog):
             sw = scaled(185, self, min_px=165)
             self._sidebar_view.setMinimumWidth(sw)
             self._sidebar_view.setMaximumWidth(scaled(280, self))
-            self._sidebar_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            self._sidebar_view.customContextMenuRequested.connect(self._on_sidebar_context_menu)
+            # The filter, not the policy, is what suppresses Qt's own sidebar
+            # menu — see eventFilter. It has to cover the viewport too, which
+            # is where the events actually land.
             self._sidebar_view.installEventFilter(self)
+            self._sidebar_view.viewport().installEventFilter(self)
+            # Last line of defence. The fixed places must survive every route
+            # out of the sidebar — Qt's menu, a drag out of the list, an
+            # internal model edit — not just the ones we can intercept, so a
+            # protected url that disappears is simply put back.
+            model = self._sidebar_view.model()
+            if model is not None:
+                model.rowsRemoved.connect(self._reassert_system_pins)
+            self._apply_sidebar_icons()
+
+    def _reassert_system_pins(self, *_args):
+        """Restore any of the 3 fixed places that just left the sidebar."""
+        if getattr(self, "_reasserting_pins", False):
+            return
+        protected = getattr(self, "_system_sidebar_urls", None)
+        if not protected:
+            return
+        urls = list(self.sidebarUrls())
+        missing = [u for u in protected if u not in urls]
+        if not missing:
+            return
+        self._reasserting_pins = True     # setSidebarUrls re-enters via rowsRemoved
+        try:
+            self.setSidebarUrls(urls + missing)
+            self._apply_sidebar_icons()
+        finally:
+            self._reasserting_pins = False
+
+    def _apply_sidebar_icons(self):
+        """Give the user's home its own glyph.
+
+        Qt takes sidebar icons from the filesystem provider, so "User" came
+        up with the same plain folder icon as any pinned folder and read as
+        one of them rather than as a fixed place it cannot remove.
+        """
+        sidebar = getattr(self, "_sidebar_view", None)
+        if sidebar is None:
+            return
+        model = sidebar.model()
+        if model is None:
+            return
+        try:
+            from PySide6.QtWidgets import QStyle
+            home = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.HomeLocation)
+            if not home:
+                return
+            norm_home = os.path.normcase(os.path.normpath(os.path.abspath(home)))
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon)
+            if icon.isNull():
+                return
+            for row, url in enumerate(self.sidebarUrls()):
+                if row >= model.rowCount():
+                    break
+                if not url.isLocalFile():
+                    continue
+                local = url.toLocalFile()
+                if not local:
+                    continue
+                if os.path.normcase(os.path.normpath(os.path.abspath(local))) == norm_home:
+                    model.setData(model.index(row, 0), icon,
+                                  Qt.ItemDataRole.DecorationRole)
+                    break
+        except Exception:
+            pass
 
     def _on_sidebar_context_menu(self, pos) -> None:
         """Right-click on the sidebar: protect system pins, allow removing custom pins."""
@@ -483,25 +576,29 @@ class _LnkAwareDialog(QFileDialog):
             return
         url = urls[row]
         system_list = getattr(self, "_system_sidebar_urls", [])
-        global_pos = sidebar.mapToGlobal(pos)
-        if _is_system_pin(url, system_list):
-            from PySide6.QtWidgets import QMenu
-            menu = QMenu(sidebar)
-            act = menu.addAction(t("file_picker.cannot_remove_system_pin"))
-            act.setEnabled(False)
-            menu.exec(global_pos)
-            return
+        global_pos = sidebar.viewport().mapToGlobal(pos)
 
+        # ONE menu, always the same shape: the same entry, greyed out on a
+        # fixed place. A separate "system locations cannot be removed" item
+        # said nothing the disabled entry doesn't say, and said it in a menu
+        # the user only ever reached after Qt's own had already removed the
+        # pin.
         from PySide6.QtWidgets import QMenu
         menu = QMenu(sidebar)
         act = menu.addAction(t("file_picker.remove_from_sidebar"))
+        protected = _is_system_pin(url, system_list)
+        if protected:
+            act.setEnabled(False)
+            act.setToolTip(t("file_picker.cannot_remove_system_pin"))
+            menu.setToolTipsVisible(True)
         chosen = menu.exec(global_pos)
-        if chosen is act:
+        if chosen is act and not protected:
             urls.pop(row)
             self.setSidebarUrls(urls)
             customs = [u.toLocalFile() for u in urls
                        if not _is_system_pin(u, system_list) and u.isLocalFile() and u.toLocalFile()]
             _save_sidebar_pins(customs)
+            self._apply_sidebar_icons()
 
     def _on_file_view_context_menu(self, pos, view) -> None:
         """Right-click in file list/tree view: add pin action + standard localized actions."""
@@ -661,16 +758,13 @@ class ExePickerDialog(_LnkAwareDialog):
 class FolderPickerDialog(_LnkAwareDialog):
     """Pick a directory, with the same shortcut behaviour."""
 
+    # "Seleziona" is more appropriate than "Apri" for folder selection.
+    _ACCEPT_LABEL_KEY = "file_picker.select"
+
     def __init__(self, parent, caption: str):
         super().__init__(parent, caption)
         self.setFileMode(QFileDialog.FileMode.Directory)
         self.setOption(QFileDialog.Option.ShowDirsOnly, True)
-        # "Seleziona" is more appropriate than "Apri" for folder selection.
-        try:
-            self.setLabelText(QFileDialog.DialogLabel.Accept,
-                              t("file_picker.select"))
-        except Exception:
-            pass
 
 
 class SavePathPickerDialog(_LnkAwareDialog):
@@ -702,11 +796,6 @@ class SavePathPickerDialog(_LnkAwareDialog):
                 t("file_picker.filter_folders"),      # Cartella
                 t("file_picker.filter_all_files"),
             ])
-        try:
-            self.setLabelText(QFileDialog.DialogLabel.Accept,
-                              t("file_picker.select"))
-        except Exception:
-            pass
 
 
 def pick_executable(parent, caption: str, name_filter: str = "",
@@ -776,6 +865,8 @@ class FilePickerDialog(_LnkAwareDialog):
 class SavePickerDialog(_LnkAwareDialog):
     """Choose where to save a new file."""
 
+    _ACCEPT_LABEL_KEY = "file_picker.save"
+
     def __init__(self, parent, caption: str, name_filter: str):
         super().__init__(parent, caption)
         self.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
@@ -785,11 +876,6 @@ class SavePickerDialog(_LnkAwareDialog):
         self.setOption(QFileDialog.Option.DontConfirmOverwrite, False)
         if name_filter:
             self.setNameFilter(name_filter)
-        try:
-            self.setLabelText(QFileDialog.DialogLabel.Accept,
-                              t("file_picker.save"))
-        except Exception:
-            pass
 
 
 def _run_picker(dialog, start_dir: str) -> str:

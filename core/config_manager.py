@@ -70,6 +70,13 @@ _DEFAULTS: dict[str, Any] = {
     # restore is attempted. Runs in the background, well after startup.
     "backup_verify_enabled": True,
     "backup_verify_interval_days": 7,
+    # Data-integrity checks (core.self_checks): index zip-existence, legacy
+    # metadata repair, archive CRC, config snapshots. Read through get() with
+    # defaults since they were added late; declared here so a corrupted file
+    # cannot set a nonsense cadence, like every other setting.
+    "self_checks": True,
+    "self_checks_frequency": 7,     # days between automatic runs
+    "last_self_check": 0,           # epoch seconds of the last completed run
     "backup_verify_last": "",      # ISO datetime of the last completed run
     # Periodic cloud config export — same encrypted payload as a manual
     # "export to provider", so library/settings are not lost between machines.
@@ -151,6 +158,9 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "save_correlation_window_ms": lambda x: isinstance(x, int) and 100 <= x <= 10000,
     "backup_verify_enabled": lambda x: isinstance(x, bool),
     "backup_verify_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    "self_checks": lambda x: isinstance(x, bool),
+    "self_checks_frequency": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    "last_self_check": lambda x: isinstance(x, (int, float)) and x >= 0,
     "auto_export_config_enabled": lambda x: isinstance(x, bool),
     "auto_export_config_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
     # A plain list is the pre-per-game shape; still accepted so an existing

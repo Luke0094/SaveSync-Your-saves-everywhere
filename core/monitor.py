@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import atexit
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -27,6 +28,7 @@ except ImportError:
     logging.warning("psutil not available - process monitoring disabled")
 
 from core.config_manager import get_config
+from core.exe_stems import NEVER_A_GAME_PROCESS_STEMS as _NEVER_A_GAME_PROCESS_STEMS
 from core.library import get_library, GameEntry
 
 logger = logging.getLogger(__name__)
@@ -34,8 +36,15 @@ logger = logging.getLogger(__name__)
 _IS_WINDOWS = platform.system() == "Windows"
 _OWN_PID    = os.getpid()
 
-# Process name stems (lower, no extension) that are always ignored
-_SYSTEM_STEMS: frozenset[str] = frozenset({
+# Process name stems (lower, no extension) that are always ignored.
+#
+# Two halves. The vendor/system half is written out below. The
+# "ships beside an application, never a game" half — installers, updaters,
+# crash handlers — comes from core.exe_stems, shared with the folder scan
+# and the save detector's generic-stem list: those two already rejected
+# GameUpdate.exe while the monitor still announced it as a game the user
+# had launched, which is exactly the drift a shared vocabulary removes.
+_SYSTEM_STEMS: frozenset[str] = _NEVER_A_GAME_PROCESS_STEMS | frozenset({
     "system", "svchost", "explorer", "taskmgr", "dwm", "winlogon",
     "lsass", "services", "smss", "csrss", "wininit", "spoolsv",
     "runtimebroker", "searchindexer", "sihost", "ctfmon", "audiodg",
@@ -52,14 +61,13 @@ _SYSTEM_STEMS: frozenset[str] = frozenset({
     "bethesdalauncher", "itchio", "taskhostw", "werfault", "wermgr",
     "nvsphelper64", "nvcontainer", "nvdisplay.container",  # NVIDIA
     "amdrsserv", "amddvr", "radeonsoft",  # AMD
-    "updater", "update", "installer", "setup", "uninstall",
     "gamebarpresencewriter", "elevation_service", "identity_helper",  # Xbox Game Bar
     "servicehost", "hostservice", "comppkgsrv",  # Windows service hosts
     "searchhost", "widgetservice", "widgets",  # Windows 11 widgets
     "phoneexperiencehost", "yourphone", "lockapp",
     "applicationframehost", "systemsettings", "settingsynchost",
     "backgroundtaskhost", "backgroundtransferhost",
-    "msedgeupdate", "googleupdate", "crashpad_handler",  # Browser updaters
+    "msedgeupdate", "googleupdate",  # Browser updaters
     "microsoftedgeupdate", "bravesoftware", "brave-browser",
     "egui", "eeclnt", "eservicehost", "ekrn",  # ESET antivirus
     "securityhealthservice", "sgrmbroker", "mpcmdrun",  # Windows Security
@@ -71,7 +79,6 @@ _SYSTEM_STEMS: frozenset[str] = frozenset({
     "adobecollabsync", "adobearm", "armsvc", "adobeipcbroker",  # Adobe services
     "epicwebhelper", "epiconlineserviceshost", "crashreport",  # Epic launcher helpers
     "epiconlineservicesuihelper", "epiconlineservicesinstallhelper",
-    "unitycrashhandler", "unitycrashhandler64",  # Unity crash reporters (not the game)
 
     "discord", "discordptb", "discordcanary",  # Chat apps
     "spotify", "slack", "teams", "telegram",
@@ -273,9 +280,26 @@ def _get_launcher_appid(pid: int) -> Optional[str]:
     return None
 
 
-# Cache for pending appid lookups (exe_path -> appid)
-_pending_launcher_appids: dict[str, str] = {}
+# Cache for pending appid lookups (exe_path -> appid).
+#
+# Read-once by design (get_pending_appid pops), which means an entry whose
+# exe is never matched to a library game is never collected — the only
+# structure here with no bound at all. Capped rather than cleared on a timer:
+# the gap between a launcher recording an appid and the game process being
+# matched is seconds, and a sweep that happened to land inside it would drop
+# the appid the match was waiting for. Oldest-out can't, since a fresh entry
+# is by definition the newest.
+_MAX_PENDING_APPIDS = 64
+_pending_launcher_appids: "OrderedDict[str, str]" = OrderedDict()
 _pending_appids_lock = threading.Lock()
+
+
+def _remember_pending_appid(exe_path: str, appid: str) -> None:
+    with _pending_appids_lock:
+        _pending_launcher_appids[exe_path] = appid
+        _pending_launcher_appids.move_to_end(exe_path)
+        while len(_pending_launcher_appids) > _MAX_PENDING_APPIDS:
+            _pending_launcher_appids.popitem(last=False)
 
 
 def get_pending_appid(exe_path: str) -> Optional[str]:
@@ -1013,9 +1037,19 @@ class ProcessMonitor(QObject):
 
     def _get_adaptive_interval(self) -> int:
         """Get adaptive polling interval based on recent activity.
-        Uses the configured process_poll_interval as the base, then applies
-        an adaptive multiplier on top of it."""
-        base = int(get_config().get("process_poll_interval", 1) * 1000)
+
+        Two multipliers, both ON TOP of the user's process_poll_interval,
+        never replacing it — that is a visible 1-60s setting and a silent
+        override would make it look broken:
+
+        - the machine's capability tier, so a weak PC spends less CPU on
+          polling than a fast one (shared with the memory sweeps and the
+          save-editor idle release, see core.concurrency);
+        - recent activity, unchanged below.
+        """
+        from core.concurrency import process_poll_multiplier
+        base = int(get_config().get("process_poll_interval", 1) * 1000
+                   * process_poll_multiplier())
 
         # IN-GAME: a tracked game is running — the CPU belongs to it. Fast
         # polling exists to catch launches quickly; with a session already
@@ -1232,8 +1266,7 @@ class ProcessMonitor(QObject):
                                     # Try to get appid from parent process (launcher)
                                     appid = _get_launcher_appid(_key[0])
                                     if appid:
-                                        with _pending_appids_lock:
-                                            _pending_launcher_appids[_runtime_check_exe] = appid
+                                        _remember_pending_appid(_runtime_check_exe, appid)
                                         logger.info(f"Detected launcher appid={appid} for {_runtime_check_exe}")
                                     # Generic exe stems ("Game", "Launcher"…) are
                                     # replaced with the install-folder name so the

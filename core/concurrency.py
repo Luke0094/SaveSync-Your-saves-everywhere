@@ -147,6 +147,127 @@ def config_write_debounce_ms() -> int:
     return 2000
 
 
+# ── Background upkeep: polling, memory sweeps, idle release ─────────────────
+# Three consumers that used to each invent their own numbers, now reading the
+# same tier — but NOT the same multiplier. Their directions genuinely differ,
+# and one shared knob applied uniformly would get at least one backwards:
+#
+#   process polling      weak machine → poll LESS often   (spend less CPU)
+#   memory sweeps        weak machine → sweep MORE often  (give RAM back sooner)
+#   idle doc release     weak machine → release SOONER    (hold less)
+#
+# Free RAM is deliberately kept out of the first and third: those decide how
+# a machine behaves in general. It drives only the deep sweep, which is the
+# one that should react to what is happening right now — the same split the
+# module docstring draws for backup/sync inflight.
+
+
+def process_poll_multiplier() -> float:
+    """Scale factor for the process-monitor poll interval.
+
+    Applied ON TOP of the user's ``process_poll_interval``, never instead of
+    it: that is a visible 1–60s setting, and silently overriding it would
+    make the spin box look broken.
+
+    Measured on a "high" machine: a steady-state poll costs ~3.4 ms, so even
+    1 s polling is ~0.3% of one core — nothing to reclaim there. The cost
+    that matters is a poll that has to resolve NEW processes (~600 ms cold),
+    and weak machines pay far more for it, which is what stretching the
+    interval for them buys.
+    """
+    tier = _tier()
+    if tier == "high":
+        return 1.0
+    if tier == "mid":
+        return 1.5
+    return 2.5
+
+
+def memory_sweep_interval_s() -> int:
+    """FLOOR for the cheap idle sweep (seconds) — how soon it may run again
+    after one that actually reclaimed something.
+
+    Cheap means it drops dead registry entries and idle watcher indices and
+    nothing else — no cache purge, no gc pass, no working-set trim — so a
+    weak machine can afford it more often, not less.
+
+    This is a floor, not a schedule: the caller backs off towards
+    memory_sweep_max_interval_s() while sweeps keep finding nothing.
+    """
+    tier = _tier()
+    if tier == "high":
+        return 60
+    if tier == "mid":
+        return 45
+    return 30
+
+
+def memory_sweep_max_interval_s() -> int:
+    """CEILING the sweep backs off to when it keeps finding nothing.
+
+    Repeating a cleanup that reclaims nothing is pure cost — it wakes the
+    process, touches its structures and buys nothing — so a quiet app should
+    drift towards checking rarely rather than keep paying every minute. The
+    ceiling is lower on a weak machine, which still wants to notice sooner
+    that there IS something to give back.
+    """
+    tier = _tier()
+    if tier == "high":
+        return 15 * 60
+    if tier == "mid":
+        return 10 * 60
+    return 6 * 60
+
+
+def deep_sweep_after_sweeps() -> int:
+    """Cheap sweeps between two DEEP ones (cache purge + gc + working-set).
+
+    Deliberately NOT shortened for weak machines, which is the one place the
+    "weak → do it sooner" rule inverts. A deep sweep throws away decoded
+    covers and hands the working set back, so the next interaction re-decodes
+    and re-faults — precisely the stutter a weak machine can least afford.
+    Real memory pressure triggers one early instead (see memory_pressure).
+    """
+    tier = _tier()
+    if tier == "high":
+        return 10
+    if tier == "mid":
+        return 12
+    return 16
+
+
+def memory_pressure() -> str:
+    """``critical`` | ``tight`` | ``ok`` from CURRENT free RAM.
+
+    The one signal here that reads live memory rather than the stable tier:
+    it answers "should the expensive sweep run NOW", which is a question
+    about this moment, not about the machine.
+    """
+    total_gb, avail_gb = _ram_gb()
+    if not avail_gb:
+        return "ok"                      # psutil missing — never guess tight
+    if avail_gb < 0.75:
+        return "critical"
+    if avail_gb < 1.5 or (total_gb and avail_gb / total_gb < 0.10):
+        return "tight"
+    return "ok"
+
+
+def idle_document_release_s() -> int:
+    """Idle time before the save editor lets a loaded document go (seconds).
+
+    A loaded save holds the original bytes plus the parsed structure. Ten
+    minutes was the fixed rule for every machine; the tier keeps that for a
+    mid one and moves the ends apart.
+    """
+    tier = _tier()
+    if tier == "high":
+        return 15 * 60
+    if tier == "mid":
+        return 10 * 60
+    return 5 * 60
+
+
 def log_limits() -> None:
     total_gb, avail_gb = _ram_gb()
     logger.info(
@@ -156,4 +277,11 @@ def log_limits() -> None:
         verify_throttle_s() * 1000, library_insert_chunk_size(),
         config_write_debounce_ms(),
         _cpu_count(), avail_gb, total_gb, _TIER_CACHE_S,
+    )
+    logger.info(
+        "Adaptive upkeep: poll=x%.1f sweep=%s..%ss deep=every %s sweeps "
+        "idle_release=%smin pressure=%s",
+        process_poll_multiplier(), memory_sweep_interval_s(),
+        memory_sweep_max_interval_s(), deep_sweep_after_sweeps(),
+        idle_document_release_s() // 60, memory_pressure(),
     )

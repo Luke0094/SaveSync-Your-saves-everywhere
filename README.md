@@ -446,8 +446,32 @@ Two rules it is built around:
 | TADS record (`system.rec`) — whitespace tokens, NUL-padded | Classic MJR TADS 3 VM state (`.t3v`) — a snapshot, not a named value list |
 | SQLite (`.db`, `.sqlite`) — Room / Compose Desktop Java progress | |
 
-<summary><strong>Some Info about Saves system</strong></summary>
 <details>
+<summary><strong>How the editor reads and writes these formats</strong></summary>
+
+#### At a glance
+
+| | What it covers |
+|---|---|
+| [Ren'Py](#renpy) | Pickles read opcode by opcode; edited saves re-signed |
+| [Values by category](#values-by-category) | Why the groups come from the file itself |
+| [Easy Save 3](#easy-save-3) | Encryption is the developer's choice, and where the key comes from |
+| [Locking a value](#locking-a-value) | Holding a value against the game's own writes |
+| [RAGS](#rags) | Three million values in the file, fifteen thousand offered |
+| [KiriKiri](#kirikiri) | A readable UTF-16 dictionary, in three wrappers |
+| [TyranoScript](#tyranoscript) | `escape()` counted in UTF-16 code units, not characters |
+| [AliceSoft](#alicesoft) | Several formats in one container; the names live in the game |
+| [Artemis](#artemis) | Three files in one container, split by what can be edited |
+| [Naninovel](#naninovel) | A raw deflate stream with nothing announcing it |
+| [Unity PlayerPrefs](#unity-playerprefs) | A save with no file behind it: the Windows registry |
+| [Encrypted Unreal saves](#encrypted-unreal-saves) | Recognised by the folder they sit in, not by their contents |
+| [Bakin and SRPG Studio](#bakin-and-srpg-studio) | Named but not edited, and why |
+| [Wolf RPG](#wolf-rpg) | Unlocked, read, locked back; names from the game's database |
+| [TADS](#tads) | Two layouts, one a NUL-padded line of tokens |
+| [Java](#java) | Bundled-JVM layouts; SQLite progress offered cell by cell |
+| [WebGL](#webgl) | HTML5 shells, and why the wrapper is not the name |
+
+##### Ren'Py
 
 Two notes on Ren'Py, because they are unusual. Its saves are Python pickles,
 and unpickling one runs code from the file — so SaveSync reads the pickle
@@ -457,7 +481,9 @@ re-signed with the key Ren'Py generated on this machine; if that key cannot be
 found, the save is not written rather than handed back in a state the game
 would reject.
 
-**Values by category.** A save is not one long list — an engine keeps its
+##### Values by category
+
+A save is not one long list — an engine keeps its
 switches, its variables, the party and the actors separately, and the editor
 shows them that way, one group at a time with the filter and the pager working
 inside it. The groups come from the file itself, so a format nobody planned
@@ -466,7 +492,9 @@ Maker keeps switches and variables in containers with the same internal name,
 so without this, switch 12 and variable 12 look like the same value and
 neither can be locked.
 
-**Easy Save 3** files are JSON, and encryption is something the developer
+##### Easy Save 3
+
+Easy Save 3 files are JSON, and encryption is something the developer
 turns on. When it is on, the password is not in the save — it is in the game,
 baked into the build as plain text, and SaveSync reads it from there. That is
 still a file on disk: nothing attaches to a running game, which is how the
@@ -480,7 +508,9 @@ JSON or plain text is read and edited like any other. The engine of a game is
 read from its executable, so a title added with only a save folder is treated
 as unknown.
 
-**Locking a value.** Set a value, press the lock next to it, and SaveSync
+##### Locking a value
+
+Set a value, press the lock next to it, and SaveSync
 watches the file: every time the game writes a lower number over it, the
 locked one goes back in. That is how a file editor gets you something like
 unlimited health. It only bites when the game actually *writes* the save — a
@@ -499,7 +529,9 @@ game overwrote it (measured: 558 ms median), which costs 0.06% of one core to
 watch for — a game that reads its save back in that half second reads its own
 value, not yours.
 
-**RAGS** saves are a .NET object graph behind a fixed key, and they are big:
+##### RAGS
+
+RAGS saves are a .NET object graph behind a fixed key, and they are big:
 the one this was built against holds three million values, nearly all of them
 the colours, fonts and command lists that make up the game's own logic. So the
 whole save is read — the format is sequential, there is no skipping — but what
@@ -507,13 +539,17 @@ is offered is the part that is game state: variables, objects, rooms, timers
 and the player, each under its own name. Fifteen thousand values instead of
 three million.
 
-**KiriKiri** saves are not a binary format at all: the game writes its state
+##### KiriKiri
+
+KiriKiri saves are not a binary format at all: the game writes its state
 out as a readable dictionary in UTF-16, and SaveSync edits it in place. It
 arrives in three wrappers — the text on its own, deflated, or behind the
 thumbnail the game shows in its load menu — and all three are written back
 exactly as they came.
 
-**TyranoScript** saves are JSON that the engine ran through JavaScript's
+##### TyranoScript
+
+TyranoScript saves are JSON that the engine ran through JavaScript's
 `escape()`, so the file is readable text with most of its punctuation written
 as `%XX`. The catch is that `escape()` counts in UTF-16 code units rather than
 characters, which makes an emoji a *pair* of sequences — get that wrong and
@@ -523,7 +559,9 @@ currently on screen. One of the files this was built against is 11 MB and
 holds 774 values worth editing, so what is offered is the game's own
 variables, one group per save slot, and not the engine's bookkeeping.
 
-**AliceSoft** puts several different things in the same container, and they
+##### AliceSoft
+
+AliceSoft puts several different things in the same container, and they
 are only told apart once it is unpacked. The game's *global data* — the flags,
 counters and text a game keeps across playthroughs — is named and typed, and
 is read, edited and written back. The *numbered save slots* are a dump of the
@@ -559,14 +597,18 @@ where the format is actually described. The file's own five section offsets
 are then checked as it is read, so a walk that goes wrong is refused instead
 of quietly producing values from the wrong places.
 
-**Artemis** writes three files into one container, and the same split applies:
+##### Artemis
+
+Artemis writes three files into one container, and the same split applies:
 the engine's settings are a flat list of named values and are edited, while
 the save slots and the data kept across playthroughs are a tagged tree whose
 nesting this was not able to establish. Reading the settings ends exactly on
 the last of the entries the file says it has, which is what says the walk was
 right; the other two are named instead.
 
-**Naninovel** hides its saves twice over. A `.nson` is usually not text at all
+##### Naninovel
+
+Naninovel hides its saves twice over. A `.nson` is usually not text at all
 but a raw deflate stream — no zlib header, no gzip header, nothing announcing
 it — so anything expecting one of those refuses the file. Unpacked, it is a
 map from a .NET type name to that part of the engine's state, and each state
@@ -590,7 +632,9 @@ parallel lists of keys and values. Read literally that gives rows called
 "values.0" and "values.1"; read as the pairing it is, it gives rows called
 `money` and `day`. SaveSync reads it the second way, wherever it appears.
 
-**Unity PlayerPrefs** are a save with no file behind them. On Windows they
+##### Unity PlayerPrefs
+
+Unity PlayerPrefs are a save with no file behind them. On Windows they
 live in the registry under the company and product the game was built with,
 and SaveSync has always backed them up, exporting the key as JSON. That same
 export is what the editor opens, so the two cannot disagree about what a key
@@ -600,7 +644,9 @@ since the name is written in front of it. Only the tail is dropped, and only
 for display: a value goes back under the name it had, as the kind it was, or
 the game would not find it.
 
-**An encrypted Unreal save** is recognised by where it sits — `Saved/SaveGames`
+##### Encrypted Unreal saves
+
+An encrypted Unreal save is recognised by where it sits — `Saved/SaveGames`
 is the engine's own folder, and identifies the save even when the file will
 not, since the game's encryption covers the `GVAS` marker along with
 everything else.
@@ -627,7 +673,9 @@ time, or kept anywhere but plainly in its own code, will simply not be found —
 and is reported as not found, rather than opened with something that looked
 close enough.
 
-**Bakin** and **SRPG Studio** saves are named but not edited. Bakin's is an
+##### Bakin and SRPG Studio
+
+Bakin and SRPG Studio saves are named but not edited. Bakin's is an
 object stream with nothing in it naming or typing the values. SRPG Studio
 encrypts its saves outright — every byte of one is as likely as every other,
 so nothing in the file can identify it, and the only thing that can is the
@@ -635,14 +683,18 @@ game it sits in. That is what the engine detector is asked for, and when the
 game is not in the library SaveSync says so, since the key to such a save
 lives in the game's own program and there is no reaching it without one.
 
-**Wolf RPG** saves are scrambled on disk, so SaveSync unlocks one, reads the
+##### Wolf RPG
+
+Wolf RPG saves are scrambled on disk, so SaveSync unlocks one, reads the
 values out and locks it back. Names come from the game's own database when it
 sits beside the save — level, HP, attack, in the game's own words. A game that
 packs that database away still gets every value, numbered instead of named. A
 Wolf file with no values in it, such as some games' `System.sav`, is reported
 as unreadable rather than opened and guessed at.
 
-**TADS** covers two layouts. The TAD-kit style (picture packs as `.tad` under
+##### TADS
+
+TADS covers two layouts. The TAD-kit style (picture packs as `.tad` under
 `pic/`, plus `system/system.rec`) is recognised from the install folder; the
 record file is a line of whitespace-separated tokens padded with NULs to a
 fixed size, and SaveSync edits those tokens and writes the same byte length
@@ -651,7 +703,9 @@ files (`.gam` / `.t3`) are recognised the same way; their `.t3v` VM state
 snapshots are named but not edited, because they are a machine dump rather
 than a list of named values.
 
-**Java** desktop titles are recognised from a bundled JVM (`java.dll` with
+##### Java
+
+Java desktop titles are recognised from a bundled JVM (`java.dll` with
 `jvm.dll` / `awt.dll` next to the launcher), from jars beside a private JRE,
 or from the Compose Desktop / Conveyor layout (`bin/` launcher + sibling
 `app/*.jar`), including MSIX installs under WindowsApps. Progress is often a
@@ -661,7 +715,9 @@ open that does not touch a page stays bit-identical — after a real edit the
 gate checks that every value still round-trips, because SQLite rewrites
 pages when it writes.
 
-**WebGL** is the answer for HTML5 / WebGL shells: Unity WebGL exports
+##### WebGL
+
+WebGL is the answer for HTML5 / WebGL shells: Unity WebGL exports
 (`Build/*.wasm` and friends), plain `index.html` + wasm/data, and NW.js or
 Electron packages whose main page is HTML — those are named WebGL rather than
 "NW.js", for the same reason Tyrano is named before the wrapper. Saves are
@@ -701,13 +757,41 @@ chunking / verify pacing on and off. **Currently available RAM** is still read
 live for Backup All / Sync All: under ~1.5 GB free, those queues drop to one
 job so they do not fight the game for memory.
 
-| Tier | Rough signal | What changes |
-|------|--------------|--------------|
-| **high** | ≥ 8 logical CPUs and ≥ ~12 GB total RAM | No pause between integrity checks; library page built in one shot; short config/library write debounce (~0.5 s); Backup All / Sync All may run more jobs in parallel (up to 8 / 4) |
-| **mid** | typical desktop (≥ 4 CPUs, comfortable total RAM) | Light verify pause (~20 ms); library inserts in chunks of ~16; debounce ~1 s; moderate batch concurrency |
-| **low** | few CPUs, or ≤ ~8 GB total RAM | Stronger verify pause (~80 ms); smaller library chunks (~6); debounce ~2 s; Backup All / Sync All capped tightly (often 1–2) |
+| Tier | Rough signal | Throughput | CPU & memory upkeep |
+|------|--------------|------------|---------------------|
+| **high** | ≥ 8 logical CPUs and ≥ ~12 GB total RAM | No pause between integrity checks; library page built in one shot; write debounce ~0.5 s; Backup All / Sync All up to 8 / 4 in parallel | Process poll at the interval you set (×1); memory sweep every 60 s, deep every 10th; a loaded save released after 15 min idle |
+| **mid** | typical desktop (≥ 4 CPUs, comfortable total RAM) | Light verify pause (~20 ms); library inserts in chunks of ~16; debounce ~1 s; moderate batch concurrency | Poll ×1.5; sweep every 45 s, deep every 12th; save released after 10 min |
+| **low** | few CPUs, or ≤ ~8 GB total RAM | Stronger verify pause (~80 ms); smaller library chunks (~6); debounce ~2 s; Backup All / Sync All capped tightly (often 1–2) | Poll ×2.5 — fewer wake-ups; sweep every 30 s but deep only every 16th; save released after 5 min |
 
-These are **not** Settings toggles. Batch jobs (Backup All, Sync All,
+The upkeep column deliberately moves in **different directions**. A weak
+machine should poll *less* often (spend less CPU), reclaim memory *more*
+often, and let go of a loaded save *sooner* — but it should defer the
+*expensive* sweep, not hurry it, because that one throws away decoded cover
+art and hands the working set back, and re-decoding is precisely what a slow
+machine can least afford. One shared multiplier would have got at least one
+of those backwards.
+
+**Two kinds of sweep.** The routine tick only drops what is already dead —
+registry rows whose widget is gone, watcher file indices once nothing is being
+watched. It costs about 12 ms including the next process poll. The full trim
+(purge cover/image caches, full GC, hand the working set back to the OS) costs
+roughly 100 ms and runs on a long counter instead, or immediately when free RAM
+is genuinely short.
+
+**It paces itself by what the app is doing**, not by the clock:
+
+- **Real memory pressure wins** over everything and forces a full trim now
+- **Heavy work is left alone** — a backup walking save trees, an archive
+  verify, a sync, a folder scan minimised into the sidebar. They want the
+  memory and CPU they are using; the cadence snaps back to its floor so the
+  first sweep *after* that work lands quickly, which is when there is most to
+  reclaim
+- **A barren sweep doubles the wait**, up to a per-tier ceiling (15 / 10 / 6
+  min). Repeating a cleanup that frees nothing costs a wake-up and buys
+  nothing; one that *does* reclaim something returns to the floor cadence
+
+The tier multiplier scales the `process_poll_interval` you set — it never
+replaces it. None of the rest are Settings toggles. Batch jobs (Backup All, Sync All,
 multiple-add) also **persist progress** and resume after a restart; the sidebar
 shows `N/M — name` while they run.
 
@@ -719,9 +803,9 @@ Other automatic I/O habits worth knowing:
   unchanged games are skipped without rebuilding zip content hashes
 - **Config export history** (snapshots created on export, cloud upload,
   pre-import / pre-restore) keeps at most **5** local folders under
-  `config_history/`; older ones are rotated out. A sandbox self-check after
-  startup verifies that restore still works when the history is full (same
-  notification path as backup integrity failures)
+  `config_history/`; older ones are rotated out. A sandbox check verifies
+  that restore still works when the history is full — one of the
+  data-integrity checks below, not a separate startup pass
 - **Pending batch jobs persistence** (`core/pending_batch_jobs.py` / `pending_batch_jobs.json`) —
   tracks active multi-operation batch queues (Backup All, Sync All, Multi-Add)
   and safely restores remaining items after an unexpected restart
@@ -747,6 +831,8 @@ Other automatic I/O habits worth knowing:
 | `save_correlation_window_ms` | 1000 | How far apart the two writes may be. Weaker candidates get 40% of it |
 | `backup_verify_enabled` | true | Check backup archives on a schedule |
 | `backup_verify_interval_days` | 7 | How often that check runs |
+| `self_checks` | true | Run the data-integrity checks automatically |
+| `self_checks_frequency` | 7 | Days between automatic runs (the manual ⚕️ on the Backups page runs the same list on demand) |
 | `auto_export_config_enabled` | false | Periodically upload an encrypted config pack to the connected sync provider |
 | `auto_export_config_interval_days` | 7 | How often that cloud config export runs |
 | `page_sizes` | per list | Items per page for library, backups, save editor, reviews (presets 10 / 20 / 50, or custom) |
@@ -758,6 +844,28 @@ From **Settings → Transfer** you can export / import an encrypted
 **Configuration History**. Each successful export or cloud upload also writes a
 local snapshot; at most five are kept. Restoring or importing first snapshots
 the current state (`pre_restore` / `pre_import`) so you can undo.
+
+### Data-integrity checks
+
+One ordered list of checks, run from exactly two places — automatically on
+the schedule you set (`self_checks_frequency`, default 7 days) and on demand
+from the ⚕️ button on the Backups page. Both run the same four:
+
+| Check | What it does |
+|-------|--------------|
+| index zip-existence | drops index rows whose archive is gone (deleted outside SaveSync, a failed sync) |
+| legacy metadata repair | rebuilds the manifest / save hash on backups made before per-file manifests, so the dedup preflight stops treating those games as permanently changed |
+| archive verification | opens every zip and CRC-checks its contents — the only check that proves a backup can actually be restored |
+| config snapshots | a sandbox restore over a full rotated history |
+
+Progress appears in the sidebar, and past 30 seconds the notice offers a
+**Cancel**: cancellation is cooperative and lands between archives, so a
+sweep over hundreds of them can be stopped without waiting it out. Per-backup
+results are written into the index, which is where the health dot on each
+backup row gets its colour.
+
+The sweep does **not** run at startup on its own — it is scheduled work, so a
+launch never pays for it.
 
 ### Diagnostics
 
@@ -787,4 +895,4 @@ the copyright notice with every copy. Selling this software, or
 distributing it as part of a paid product or service, is not permitted.
 
 > Required Notice: Copyright (c) 2026 Luke0094
-> (https://github.com/Luke0094/SaveSync-Your-saves-everywhere)
+> (https://github.com/Luke0094/SaveSync-Your-saves-everywhere) — SaveSync - Your saves everywhere

@@ -180,15 +180,18 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         path = urls[0].toLocalFile()
         p = Path(path)
+        # Platform-aware: .exe/.bat/.cmd + .lnk/.url on Windows,
+        # .sh/.AppImage/.x86_64 + exec-bit binaries + .desktop on Linux,
+        # .app bundles and .command scripts on macOS.
+        from core.resolvers import is_addable_file, is_executable_file, resolve_desktop_entry
         # A whole folder dropped in: find the first candidate executable and
         # open Add Game (or Edit Game if already present), bypassing bulk scan.
-        if p.is_dir():
+        # A macOS .app is a directory AND the program itself — it belongs on
+        # the executable path below, not in the folder scan.
+        if p.is_dir() and not is_executable_file(p):
             event.acceptProposedAction()
             self._handle_folder_drop(p)
             return
-        # Platform-aware: .exe/.bat/.lnk/.url on Windows, and on Unix the
-        # extension-less exec-bit binaries plus .sh/.AppImage/.x86_64/.desktop.
-        from core.resolvers import is_addable_file, resolve_desktop_entry
         if not is_addable_file(path):
             return
         event.acceptProposedAction()

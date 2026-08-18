@@ -171,9 +171,10 @@ class BatchProgressNotice(QFrame, ThemedMixin):
         self._flush_timer.stop()
         self._pending = None
         self._kind = kind or ""
-        self._cancel_btn.hide()
-        self._cancel_btn.setEnabled(True)
-        self._cancel_handler = None
+        # hide_cancel rather than hiding the button by hand: it also stops the
+        # pending 30 s reveal timer, which a new batch would otherwise inherit
+        # from the previous one.
+        self.hide_cancel()
         total = max(0, int(total))
         self._bar.setRange(0, max(1, total))
         self._bar.setValue(0)
@@ -214,6 +215,9 @@ class BatchProgressNotice(QFrame, ThemedMixin):
     def finish(self, message: str = "", hide_after_ms: int = 2500):
         self._flush_timer.stop()
         self._pending = None
+        # The work is over — a Cancel still sitting there (or a reveal timer
+        # about to put one there) offers to stop something that has stopped.
+        self.hide_cancel()
         if self._bar.minimum() == 0 and self._bar.maximum() == 0:
             self._bar.setRange(0, 1)
         total = self._bar.maximum()

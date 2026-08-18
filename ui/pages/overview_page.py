@@ -7,7 +7,9 @@ object crashes.
 from datetime import datetime
 import logging
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF
+import math
+
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -49,29 +51,98 @@ class StatCard(QFrame, ThemedMixin):
                 border-radius: 8px;
             }}
         """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(scaled(10, self), scaled(8, self), scaled(10, self), scaled(8, self))
-        layout.setSpacing(2)
+        self._layout = QVBoxLayout(self)
+        self._layout.setSpacing(2)
         self.setMinimumWidth(scaled(85, self, min_px=70))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._metrics_cache: tuple | None = None
         val_lbl = QLabel(value)
         val_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
         val_lbl.setWordWrap(False)
         self._val_lbl = val_lbl
-        self.set_stat_value(value)
 
         lbl = QLabel(label)
         lbl.setObjectName("stat_label")
         lbl.setWordWrap(True)
-        self._sty(lbl, lambda: f"color: {palette('text_muted')}; font-size: {scaled(10, self, min_px=9)}px; font-weight: 600; background: transparent;")
-        layout.addWidget(val_lbl)
-        layout.addWidget(lbl)
+        self._layout.addWidget(val_lbl)
+        self._layout.addWidget(lbl)
         self._lbl = lbl
+        self._apply_metrics()
+
+    # ── Responsive type ──────────────────────────────────────────────────
+    # The tile stretches with the window, so its type has to stretch too, or
+    # a wide overview shows the same small numbers in a much bigger box while
+    # the donut beside it grows — which is the inconsistency this fixes.
+    #
+    # Everything is derived from WIDTH, never height. The layout decides the
+    # width; the height follows the text, so sizing text from height would
+    # feed back into itself and grow without end.
+    _VALUE_SHARE = 0.09        # of the tile's width
+    _LABEL_SHARE = 0.045
+    _PAD_SHARE = 0.035
+    _GROWTH_CAP = 1.6          # never more than this multiple of the floor
+
+    def _metrics(self) -> tuple:
+        """``(value px, label px, vertical padding)`` for the current width.
+
+        The two font sizes are DESIGN-TIME, because that is what a stylesheet
+        takes here: _sty runs every sheet through scale_stylesheet_fonts,
+        which applies the UI scale itself. Handing it an already-scaled size
+        applied the scale twice — the tile's own long-standing quirk, visible
+        on any machine not at 100%. The padding is a real Qt call, so that
+        one IS scaled.
+
+        The floors are the sizes the tile has always had, so a narrow window
+        looks exactly as it did; only the room above them is new.
+        """
+        from ui.helpers import ui_scale
+        scale = max(0.1, float(ui_scale() or 1.0))
+        w_design = max(1.0, self.width() / scale)
+
+        def _grow(share: float, floor: int, cap_mult: float = None) -> int:
+            cap_mult = self._GROWTH_CAP if cap_mult is None else cap_mult
+            return int(max(floor, min(w_design * share, floor * cap_mult)))
+
+        return (_grow(self._VALUE_SHARE, 20),
+                _grow(self._LABEL_SHARE, 10),
+                scaled(_grow(self._PAD_SHARE, 8, 2.0), self))
+
+    def _apply_metrics(self) -> None:
+        metrics = self._metrics()
+        if metrics == self._metrics_cache:
+            return          # a resize that changes nothing must not restyle
+        self._metrics_cache = metrics
+        _val_px, lbl_px, pad = metrics
+        side = int(pad * 1.25)
+        self._layout.setContentsMargins(side, pad, side, pad)
+        self._sty(self._lbl, lambda: (
+            f"color: {palette('text_muted')}; font-size: {lbl_px}px; "
+            f"font-weight: 600; background: transparent;"))
+        self._restyle_value()
+
+    def _restyle_value(self) -> None:
+        val_px = (self._metrics_cache or self._metrics())[0]
+        # A long number in the same box needs to give some size back —
+        # the same 20/16 relationship the fixed sizes used to have.
+        if len(self._val_lbl.text()) > 5:
+            val_px = int(val_px * 0.8)
+        self._sty(self._val_lbl, lambda: (
+            f"color: {palette(self._accent_key)}; font-size: {val_px}px; "
+            f"font-weight: 700; background: transparent;"))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_metrics()
+
+    def refresh_styles(self):
+        # The UI-scale floors may have moved with the theme/scale change.
+        self._metrics_cache = None
+        super().refresh_styles()
+        self._apply_metrics()
 
     def set_stat_value(self, val: str):
         self._val_lbl.setText(val)
-        fs = scaled(16, self, min_px=14) if len(str(val)) > 5 else scaled(20, self, min_px=17)
-        self._sty(self._val_lbl, lambda: f"color: {palette(self._accent_key)}; font-size: {fs}px; font-weight: 700; background: transparent;")
+        self._restyle_value()
 
     def set_stat_label(self, label: str):
         self._lbl.setText(label)
@@ -140,14 +211,59 @@ class SyncDonutChart(QWidget, ThemedMixin):
     every slice with just a repaint — ``refresh_styles()`` only needs ``update()``.
     """
 
+    # Share of the widget's width the ring may take. A ceiling is needed —
+    # a ring touching the card edges looks broken — but it has to be a
+    # SHARE, not a fixed pixel count: the old cap of 220px was reached at
+    # any ordinary window size, so the donut was already at its maximum when
+    # the page opened and could only ever get smaller from there.
+    _RING_WIDTH_SHARE = 0.85
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data: list[tuple[str, int, str]] = []  # [(label, count, color_key), ...]
         self._total = 0
+        # Ring geometry from the last paint, for hit-testing tooltips.
+        # (cx, cy, r_outer, r_inner, [(label, count, start_deg, span_deg)])
+        self._ring_hit: tuple | None = None
         self.setMinimumSize(scaled(130, self, min_px=100), scaled(100, self, min_px=80))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # Charts are fully painted by us — skip Qt's background fill.
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    # ── Tooltips over the ring ────────────────────────────────────────────
+    def _segment_at(self, pos) -> tuple | None:
+        """(label, count) of the slice under *pos*, or None."""
+        hit = self._ring_hit
+        if not hit:
+            return None
+        cx, cy, r_out, r_in, segments = hit
+        dx = pos.x() - cx
+        dy = cy - pos.y()          # screen y grows downward; angles do not
+        dist = math.hypot(dx, dy)
+        if dist > r_out or dist < r_in:
+            return None
+        angle = math.degrees(math.atan2(dy, dx)) % 360.0
+        for label, count, start_deg, span_deg in segments:
+            # Slices are drawn clockwise from *start_deg*, so the sweep runs
+            # towards DECREASING angle; measure how far round we have come.
+            delta = (start_deg - angle) % 360.0
+            if delta < abs(span_deg):
+                return label, count
+        return None
+
+    def event(self, e):
+        if e.type() == QEvent.Type.ToolTip:
+            seg = self._segment_at(e.pos())
+            if seg is not None and self._total:
+                label, count = seg
+                pct = round(count * 100.0 / self._total)
+                QToolTip.showText(
+                    e.globalPos(), f"{label}: {count} ({pct}%)", self)
+            else:
+                QToolTip.hideText()
+                e.ignore()
+            return True
+        return super().event(e)
 
     def set_data(self, data: list[tuple[str, int, str]]):
         # Third element is a palette KEY (resolved in paintEvent), not a hex.
@@ -182,14 +298,17 @@ class SyncDonutChart(QWidget, ThemedMixin):
         item_spacing = scaled(17, self, min_px=14)
         legend_h = len(self._data) * item_spacing
         gap = scaled(8, self, min_px=4)
-        # Responsive sizing: expands smoothly with window width and height
+        # Responsive in BOTH directions: the ceiling is a share of the
+        # widget's own width, so the ring keeps growing as the window does
+        # instead of stopping at a fixed pixel size it reaches immediately.
         avail_diam = min(w - scaled(16, self), h - legend_h - gap - scaled(6, self))
         chart_size = max(scaled(75, self, min_px=65),
-                         min(avail_diam, scaled(220, self, min_px=120)))
+                         min(avail_diam, int(w * self._RING_WIDTH_SHARE)))
         thickness = max(int(chart_size // 5.5), 7)
         ring_room = chart_size - thickness
 
         if ring_room < scaled(35, self) or (h - legend_h < scaled(35, self)):
+            self._ring_hit = None          # no ring to point at
             self._draw_legend_only(painter, h, legend_h, item_spacing)
             painter.end()
             return
@@ -201,13 +320,22 @@ class SyncDonutChart(QWidget, ThemedMixin):
         rect = QRectF(cx - ring_room / 2, cy - ring_room / 2, ring_room, ring_room)
 
         start = 90 * 16  # start at top (Qt uses 1/16th degrees, clockwise negative)
-        for _, count, color_key in self._data:
+        segments: list[tuple] = []
+        for label, count, color_key in self._data:
             span = int(-count / self._total * 360 * 16)
             pen = QPen(QColor(palette(color_key)), thickness)
             pen.setCapStyle(Qt.PenCapStyle.FlatCap)
             painter.setPen(pen)
             painter.drawArc(rect, start, span)
+            segments.append((label, count, start / 16.0, span / 16.0))
             start += span
+        # Remember where the ring landed so a hover can be resolved to the
+        # slice under it — the chart is one painted widget, so this is the
+        # only record of which pixels belong to which status.
+        self._ring_hit = (cx, cy,
+                          ring_room / 2 + thickness / 2,
+                          max(0.0, ring_room / 2 - thickness / 2),
+                          segments)
 
         # Center text
         painter.setPen(QColor(palette('text')))
@@ -225,56 +353,56 @@ class SyncDonutChart(QWidget, ThemedMixin):
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, t('overview.chart_total'))
 
         # Legend: positioned directly below the donut ring and follows it dynamically
-        ly = top_y + chart_size + gap
+        self._draw_legend(painter, top_y + chart_size + gap, h, item_spacing)
+        painter.end()
+
+    def _draw_legend(self, painter, ly: float, h: int, item_spacing: int):
+        """Colour dot, label, then the label's OWN number right after it.
+
+        The count used to be right-aligned to the widget edge, which put it
+        on the far side of the chart from the label it belonged to — reading
+        a row meant crossing the whole donut to find its number. Keeping the
+        pair together is the whole point of a legend, so the number now
+        follows its label with one space of separation, and the block sits
+        clear of the ring above it.
+        """
+        w = self.width()
+        font = QFont()
         font.setPixelSize(scaled(11, self, min_px=10))
         painter.setFont(font)
+        fm = painter.fontMetrics()
+        dot_x = scaled(8, self)
+        text_x = scaled(22, self)
+        pair_gap = scaled(6, self, min_px=4)
         for label, count, color_key in self._data:
             if ly + scaled(12, self) > h:
                 break
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(palette(color_key)))
-            painter.drawEllipse(int(scaled(8, self)), int(ly + scaled(3, self)),
+            painter.drawEllipse(int(dot_x), int(ly + scaled(3, self)),
                                 scaled(8, self), scaled(8, self))
-            avail_w = w - scaled(32, self)
             count_str = str(count)
-            count_w = painter.fontMetrics().horizontalAdvance(count_str)
-            label_max_w = max(20, avail_w - count_w - scaled(6, self))
-            elided_label = painter.fontMetrics().elidedText(
+            count_w = fm.horizontalAdvance(count_str)
+            # Room for label + gap + count on one line, inside the widget.
+            avail_w = w - text_x - scaled(10, self)
+            label_max_w = max(20, avail_w - count_w - pair_gap)
+            elided_label = fm.elidedText(
                 label, Qt.TextElideMode.ElideRight, int(label_max_w))
+            baseline = int(ly + scaled(11, self))
             painter.setPen(QColor(palette('text_secondary')))
-            painter.drawText(int(scaled(22, self)), int(ly + scaled(11, self)), elided_label)
-            painter.drawText(int(w - scaled(10, self) - count_w), int(ly + scaled(11, self)), count_str)
+            painter.drawText(int(text_x), baseline, elided_label)
+            painter.setPen(QColor(palette('text')))
+            painter.drawText(
+                int(text_x + fm.horizontalAdvance(elided_label) + pair_gap),
+                baseline, count_str)
             ly += item_spacing
-
-        painter.end()
 
     def _draw_legend_only(self, painter, h: int, legend_h: int, item_spacing: int = 17):
         """Fallback when the ring cannot fit: just the legend."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if legend_h > h - 4:
             painter.setClipRect(self.rect())
-        ly = max(4, h - legend_h + 4)
-        font = QFont()
-        font.setPixelSize(scaled(11, self, min_px=10))
-        painter.setFont(font)
-        w = self.width()
-        for label, count, color_key in self._data:
-            if ly + scaled(12, self) > h:
-                break
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(palette(color_key)))
-            painter.drawEllipse(int(scaled(8, self)), int(ly + scaled(3, self)),
-                                scaled(8, self), scaled(8, self))
-            avail_w = w - scaled(32, self)
-            count_str = str(count)
-            count_w = painter.fontMetrics().horizontalAdvance(count_str)
-            label_max_w = max(20, avail_w - count_w - scaled(6, self))
-            elided_label = painter.fontMetrics().elidedText(
-                label, Qt.TextElideMode.ElideRight, int(label_max_w))
-            painter.setPen(QColor(palette('text_secondary')))
-            painter.drawText(int(scaled(22, self)), int(ly + scaled(11, self)), elided_label)
-            painter.drawText(int(w - scaled(10, self) - count_w), int(ly + scaled(11, self)), count_str)
-            ly += item_spacing
+        self._draw_legend(painter, max(4, h - legend_h + 4), h, item_spacing)
 
 
 class BackupBarChart(QWidget, ThemedMixin):
@@ -871,23 +999,48 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         self._last_refresh_mono = now
 
+        # delay_ms=0, deliberately. The refresh below is SYNCHRONOUS: both
+        # refresh() and the direct-connection emit run to completion without
+        # ever returning to the event loop. A deferred sheet arms a QTimer
+        # that therefore cannot fire, and the finally block closes it on the
+        # way out — so the please-wait was never shown at all, however long
+        # the work took. That is precisely the case the module documents for
+        # delay 0 ("blocks the event loop with no ticks"), and reveal() pumps
+        # once so the sheet is actually painted before the work starts.
+        #
+        # Close any previous sheet before making a new one, like every other
+        # DeferredBusy holder does. Overwriting the attribute would strand the
+        # old overlay with its countdown still running — a revealed sheet that
+        # nobody can reach and nobody stops.
         from ui.widgets.busy_overlay import DeferredBusy
-        self._refresh_busy = DeferredBusy(self, t("common.please_wait"), delay_ms=0)
-
-        # RAM cleanup: purge image/cover/editor caches, run GC and trim working set memory
-        try:
-            from ui.helpers import trim_process_memory
-            trim_process_memory()
-        except Exception:
-            pass
+        self._stop_refresh_busy()
+        self._refresh_busy = DeferredBusy(self, t("common.please_wait"),
+                                          delay_ms=0)
 
         try:
             self.refresh()
+            # Direct connection: _on_refresh_all_pages runs to completion
+            # inside emit(). Every page it wipes defers its rebuild only when
+            # VISIBLE, and the pages live in a QStackedWidget with Panoramica
+            # on top — so none of them are, and there is nothing still running
+            # when this returns.
             self.refresh_all_requested.emit()
         finally:
-            QTimer.singleShot(400, self._stop_refresh_busy)
-            from ui.helpers import trim_process_memory
-            QTimer.singleShot(250, trim_process_memory)
+            # Closed here rather than on a 400 ms timer that had no relation
+            # to the work: it hid the sheet while a slow refresh was still
+            # going, and kept it up after a fast one had finished.
+            self._stop_refresh_busy()
+            # ONE trim, and only now. There used to be three per click — one
+            # before the rebuild (which threw away the covers the rebuild was
+            # about to need), one inside the wipe, and one 250 ms later that
+            # landed mid-repaint and threw away what had just been decoded
+            # again. Each costs a full cache purge, three gc passes and the
+            # working set; doing it up front was the worst of the three.
+            try:
+                from ui.helpers import trim_process_memory
+                trim_process_memory()
+            except Exception:
+                pass
 
     def _stop_refresh_busy(self):
         if getattr(self, "_refresh_busy", None) is not None:

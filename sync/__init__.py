@@ -583,8 +583,18 @@ class SyncOrchestrator(QObject):
 
     # ── Sync ─────────────────────────────────────────────────────────────────
 
-    def enqueue_sync_batch(self, jobs: list[dict], source: str = "sync_page"):
-        """Queue Sync Tutti with adaptive concurrency + resume persistence."""
+    def enqueue_sync_batch(self, jobs: list[dict], source: str = "sync_page",
+                           prior_completed_ids: list[str] | None = None):
+        """Queue Sync Tutti with adaptive concurrency + resume persistence.
+
+        *prior_completed_ids* carries what an interrupted batch had already
+        finished. Without it a resume wrote ``completed_ids: []`` and a total
+        counting only what was LEFT straight over the persisted job: the
+        notice restarted at 0/remaining instead of continuing at done/total,
+        and — worse — a second close mid-resume lost the history for good,
+        because the record of the first run's completions had been erased.
+        Backup Tutti's resume already keeps its tally; this is the same shape.
+        """
         from datetime import datetime, timezone
         from core.concurrency import sync_max_inflight, log_limits
         from core import pending_batch_jobs as _pbj
@@ -593,22 +603,24 @@ class SyncOrchestrator(QObject):
         log_limits()
         self._sync_max_inflight = sync_max_inflight()
         ids = [j["game_id"] for j in jobs if j.get("game_id")]
+        completed = [g for g in (prior_completed_ids or []) if g not in ids]
+        total = len(ids) + len(completed)
         self._sync_batch = {
             "pending_ids": list(ids),
-            "completed_ids": [],
-            "total": len(ids),
+            "completed_ids": completed,
+            "total": total,
             "source": source or "sync_page",
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         _pbj.set_job(_pbj.KEY_SYNC_ALL, {
             "pending_ids": list(ids),
-            "completed_ids": [],
+            "completed_ids": list(completed),
             "jobs": list(jobs),
             "started_at": self._sync_batch["started_at"],
             "source": source or "sync_page",
         })
         first_name = (jobs[0].get("game_name") or "") if jobs else ""
-        self.batch_progress.emit(0, len(ids), first_name)
+        self.batch_progress.emit(len(completed), total, first_name)
         self._orphan_synced_pending: set[str] = set()
         for j in jobs:
             self.sync_game(

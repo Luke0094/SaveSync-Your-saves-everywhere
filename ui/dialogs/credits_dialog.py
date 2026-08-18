@@ -214,7 +214,7 @@ class CreditsDialog(QDialog):
         dev_row.setSpacing(10)
         dev_row.addStretch()
 
-        name_lbl = QLabel("Luke0094")
+        name_lbl = QLabel("Luke0094")  # i18n-ignore: a person's handle, never translated
         name_lbl.setObjectName("credits_muted")
         name_font = QFont()
         name_font.setPointSize(11)

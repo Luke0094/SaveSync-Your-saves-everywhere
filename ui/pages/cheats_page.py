@@ -454,9 +454,12 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._hold_watch.setInterval(1000)
         self._hold_watch.timeout.connect(self._watch_hold_game)
 
-        # 10-minute idle timer: release loaded save doc from RAM if untouched and no hold is running
+        # Idle timer: release the loaded save doc from RAM if untouched and no
+        # hold is running. The delay follows the machine — 10 minutes was the
+        # rule for every PC, and a weak one should let go sooner (see
+        # core.concurrency.idle_document_release_s). Re-read on each restart
+        # of the timer, so it tracks a tier that moved.
         self._idle_save_timer = QTimer(self)
-        self._idle_save_timer.setInterval(10 * 60 * 1000)
         self._idle_save_timer.timeout.connect(self._on_idle_save_timeout)
 
         self._build()
@@ -828,19 +831,42 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         QTimer.singleShot(0, self._enter_after_paint)
 
+    def _busy_holding_in_game(self) -> bool:
+        """The one condition that must never lose a loaded document: the game
+        is running AND a hold is actively re-applying values into it."""
+        return bool(self._playing() and self._hold is not None
+                    and self._hold.is_running())
+
     def _reset_idle_save_timer(self):
-        """Reset the 10-minute idle save timer if a document is loaded and game is not actively executing holds."""
-        is_actively_holding_in_game = bool(self._playing() and self._hold is not None and self._hold.is_running())
-        if getattr(self, "_doc", None) is not None and not is_actively_holding_in_game:
+        """(Re)start the idle release countdown when a document is loaded and
+        no hold is running against a live game."""
+        if getattr(self, "_doc", None) is not None and not self._busy_holding_in_game():
+            from core.concurrency import idle_document_release_s
+            self._idle_save_timer.setInterval(idle_document_release_s() * 1000)
             self._idle_save_timer.start()
         else:
             self._idle_save_timer.stop()
 
+    def release_idle_document(self) -> bool:
+        """Let go of the loaded save now, if it is safe to. True if released.
+
+        Public so the background memory sweep can ask for it when the machine
+        is genuinely short of RAM, instead of waiting out the countdown — a
+        loaded save is the largest thing this page holds by choice (the
+        original bytes plus the parsed structure). Same guard as the timer,
+        so pressure can never take a document a running hold is writing to.
+        """
+        if getattr(self, "_doc", None) is None or self._busy_holding_in_game():
+            return False
+        self._on_idle_save_timeout()
+        return True
+
     def _on_idle_save_timeout(self):
-        """Release loaded save document from RAM if untouched for 10 minutes and game is not actively executing holds."""
-        is_actively_holding_in_game = bool(self._playing() and self._hold is not None and self._hold.is_running())
+        """Release the loaded save document from RAM once it has gone
+        untouched for the tier's idle window and no hold is running."""
+        is_actively_holding_in_game = self._busy_holding_in_game()
         if getattr(self, "_doc", None) is not None and not is_actively_holding_in_game:
-            logger.info("CheatsPage: 10-minute idle reached outside active game, releasing save document from memory.")
+            logger.info("CheatsPage: idle window reached outside active game, releasing save document from memory.")
             self._cancel_row_insert()
             self._stop_hold()
             self._hold_watch.stop()

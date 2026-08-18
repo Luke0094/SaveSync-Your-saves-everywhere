@@ -95,30 +95,29 @@ _SAVE_EXTENSIONS = frozenset({
 from core.skip_dirs import SCAN_SKIP_DIRS as _SKIP_DIRS
 
 # Generic exe stems that are meaningless as search terms or context.
-# Shared across save detection and API search — must be kept in sync.
-GENERIC_EXE_STEMS = {
-    'game', 'game64', 'game32', 'launcher', 'launch', 'start',
-    'main', 'app', 'application', 'run', 'play', 'client',
-    'setup', 'install', 'installer', 'uninstall', 'unins000',
-    'update', 'patcher', 'updater',
-    'bootstrap', 'bootstrapper', 'loader', 'engine',
-    'nw', 'nwjs',   # NW.js runtime exe (RPG Maker MV/MZ ship "nw.exe")
-    'savesync', 'save',
-    'menu', 'title', 'gui', 'ui', 'frontend',
-    'runtime', 'redist', 'redistributable',
-    # Tools and helpers shipped beside a game — meaningless as a title, so a
-    # game is named after its folder instead of after them.
-    'gamepro', 'tool', 'tools', 'patch', 'gameupdate', 'startwithtool',
-    'windowsiconupdater', 'iconupdater',
-    'win64', 'win32', 'x64', 'x86', 'win',
-    'release', 'debug', 'test', 'dev',
-    'program', 'executable', 'exe',
-    'default', 'settings', 'config',
-    # Generic directory names (not typical exe stems but used for folder
-    # name filtering and walk-up — prevents matching build trees, etc.)
-    'bin', 'lib', 'lib64', 'common', 'build', 'dist', 'desktop',
-    'game_unpacked',
-}
+# Shared across save detection and API search.
+#
+# Composed from core.exe_stems rather than typed out: the generic TITLES
+# ("game.exe", "launcher.exe" — real game executables with an uninformative
+# name), the generic DIRECTORY names used by the folder walk-up, and the
+# installer/updater/helper families, which are meaningless as a title for the
+# same reason they are noise to the folder scan. Every separator spelling
+# ("game update" / "game_update" / "gameupdate") is generated there, so a new
+# entry is written once and lands in every pass that asks about exe names.
+from core.exe_stems import (
+    GENERIC_TITLE_STEMS as _GENERIC_TITLE_STEMS,
+    GENERIC_DIR_STEMS as _GENERIC_DIR_STEMS,
+    INSTALLER_STEMS as _INSTALLER_STEMS,
+    UPDATER_STEMS as _UPDATER_STEMS,
+    HELPER_TOOL_STEMS as _HELPER_TOOL_STEMS,
+    AMBIGUOUS_TOOL_STEMS as _AMBIGUOUS_TOOL_STEMS,
+)
+
+GENERIC_EXE_STEMS = (
+    _GENERIC_TITLE_STEMS | _GENERIC_DIR_STEMS
+    | _INSTALLER_STEMS | _UPDATER_STEMS
+    | _HELPER_TOOL_STEMS | _AMBIGUOUS_TOOL_STEMS
+)
 # Internal alias so save_detector's existing references work unchanged
 _GENERIC_EXE_STEMS = GENERIC_EXE_STEMS
 

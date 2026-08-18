@@ -1764,6 +1764,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             entering = not _fs["on"]
             _fs["on"] = entering
             dlg.setWindowOpacity(0.0)
+            # Let the compositor actually APPLY the transparency before the
+            # window moves. setWindowOpacity only asks; on Windows the change
+            # goes through DWM and does not take effect until the event loop
+            # turns. Without this the geometry jump below happened while the
+            # window was still fully painted, so the whole point of going
+            # transparent was lost and the resize was visible — growing out
+            # from the anchored edge, which is exactly what it looks like.
+            QApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             dlg.setUpdatesEnabled(False)
             try:
                 if entering:
@@ -2136,9 +2145,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             return
         path = urls[0].toLocalFile()
         p = Path(path)
-        # Platform-aware (see core.resolvers.is_addable_file): Windows
-        # extensions, or on Unix the exec-bit binaries and .sh/.AppImage/
-        # .x86_64/.desktop equivalents.
+        # Platform-aware (see core.resolvers.is_addable_file): .exe/.bat/.cmd
+        # + .lnk/.url on Windows, exec-bit binaries + .sh/.AppImage/.x86_64
+        # + .desktop on Linux, .app bundles + .command on macOS. Each
+        # platform accepts only what it can actually launch.
         from core.resolvers import is_addable_file, resolve_desktop_entry
         if not is_addable_file(path):
             return

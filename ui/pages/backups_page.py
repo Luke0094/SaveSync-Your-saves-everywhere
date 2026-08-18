@@ -613,6 +613,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         lib.game_removed.connect(self._on_lib_changed)
         lib.bulk_finished.connect(self._on_bulk_finished)
         get_backup_manager().backup_created.connect(self._on_backup_created)
+        get_backup_manager().backup_deleted.connect(self._on_backup_deleted)
         from sync import get_orchestrator
         orch = get_orchestrator()
         orch.provider_changed.connect(self._on_provider_state_changed)
@@ -666,6 +667,25 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         if not getattr(self, "_pending_initial_load", False):
             self._refresh_list()
 
+    def _on_backup_deleted(self, _backup_id: str):
+        """A backup went away — from ANYWHERE.
+
+        Only this page's own delete button used to refresh the listing, so
+        every other path left it showing archives that no longer exist:
+        retention pruning after a new backup, the auto-scan dialog's cleanup,
+        a sync prune, and the zip-existence check dropping rows whose archive
+        is gone. Riding the signal instead of the button covers all of them,
+        and _load_games() (which ends in _refresh_list) also rebuilds the
+        title search — the counts and candidates come from the same index.
+        """
+        try:
+            if get_library()._in_bulk():
+                return
+        except Exception:
+            pass
+        if getattr(self, "_pending_initial_load", False):
+            return
+        self._load_games()
 
     def disconnect_signals(self):
         try:
@@ -682,6 +702,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             pass
         try:
             get_backup_manager().backup_created.disconnect(self._on_backup_created)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            get_backup_manager().backup_deleted.disconnect(self._on_backup_deleted)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -915,6 +939,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         _le = self._game_combo.lineEdit()
         if _le:
             _le.blockSignals(True)
+        selection_cleared = False
         try:
             self._game_combo.clear()
             self._search_candidates = []
@@ -998,6 +1023,20 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                     if self._game_combo.itemData(i) == self._selected_game_id:
                         self._game_combo.setCurrentIndex(i)
                         break
+                else:
+                    # The selected title is no longer in the combo — its last
+                    # backup was just deleted, and with it the game's folder,
+                    # so it dropped out of the counts above. Leaving the id
+                    # set kept the page filtering by a title that is gone:
+                    # the listing came up empty with no way back, and the
+                    # placeholder still named it. Fall back to "all titles".
+                    self._selected_game_id = None
+                    self._game_filter_text = ""
+                    self._backups_page_num = 1
+                    selection_cleared = True
+                    self._game_combo.setCurrentIndex(0)
+                    if _le:
+                        _le.setPlaceholderText(t('backups.search_game'))
 
             # Whatever Qt physically wrote into the line-edit as a side effect
             # of addItem()'s auto-select-first-item behaviour or the
@@ -1015,6 +1054,11 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             if _le:
                 _le.blockSignals(False)
             self._game_combo.blockSignals(False)
+
+        if selection_cleared:
+            # The button's tooltip says "check this title" vs "check all",
+            # and the selection it named is gone.
+            self._refresh_verify_tooltip()
 
         # Candidate list changed — refresh the typing popup in place (it is
         # driven by _search_candidates, not by the combo model, so entries
@@ -1439,8 +1483,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         QTimer.singleShot(3000, lambda: self._set_verify_status(""))
 
     def _on_verify_all(self):
+        """Run the data-integrity checks now, on a worker thread.
 
-        """Check every backup currently listed, on a worker thread.
+        The SAME list the scheduler runs every N days — see core.self_checks.
+        This button used to open every archive and check the config snapshots
+        but never repaired legacy backup metadata or pruned index rows whose
+        zip was gone, while the automatic sweep did the opposite. "Run the
+        checks" now means one thing regardless of where it was asked from.
 
         Threaded rather than inline: opening each archive and CRC-checking
         every member is I/O bound and a game with many large backups would
@@ -1457,80 +1506,55 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         if remaining > 0:
             self._show_cooldown_toast(int(remaining) + 1)
             return
-        self._last_verify_all_mono = now
 
         from core.backup import get_backup_manager
         mgr = get_backup_manager()
         gid = self._selected_game_id
         entries = (mgr.get_backups_for_game(gid) if gid else mgr.get_all_backups())
         ids = [b.backup_id for b in entries]
-        if not ids:
-            return
-        names = {
-            b.backup_id: (b.game_name or "").strip()
-            for b in entries
+        names = {b.backup_id: (b.game_name or "").strip() for b in entries}
+        total = len(ids)
+
+        # Callbacks land on the checks' worker thread; these signals carry
+        # them back to the GUI thread (queued, because the emitter differs).
+        from PySide6.QtCore import QObject, Signal as _Signal
+
+        class _CheckBridge(QObject):
+            step = _Signal(str, int, int)     # check_id, index, total
+            one = _Signal(str, str, str)      # backup_id, state, detail
+            finished = _Signal(object)        # CheckResult
+
+        bridge = _CheckBridge(self)
+        self._check_bridge = bridge           # keep alive for the run
+
+        done_n = [0]
+
+        # Only the archive pass has per-item progress; the index and snapshot
+        # checks are single steps, named so the status line does not sit on a
+        # stale "12/40" while they run.
+        _step_keys = {
+            "backup_index_zips": "batch.verify_index",
+            "backup_index": "batch.verify_index",
+            "config_history_restore": "batch.verify_snapshot",
         }
 
-        from PySide6.QtCore import QThread, Signal
-
-        class _VerifyWorker(QThread):
-            progress = Signal(int, str)      # 1-based index, backup_id in hand
-            one = Signal(str, str, str)      # backup_id, state, detail
-            done = Signal(int, int, bool, str)  # bad, total, snap_ok, snap_detail
-
-            def run(self):
-                done_n = [0]
-                bad_n = [0]
-
-                def _on_one_cb(bid, state, detail):
-                    done_n[0] += 1
-                    self.progress.emit(done_n[0], bid)
-                    if state != "ok":
-                        bad_n[0] += 1
-                    self.one.emit(bid, state, detail)
-
-                snap_ok, snap_detail = True, ""
-                try:
-                    # Explicit health check: always open every zip. The 12h
-                    # "still ok" skip is only for the scheduled background sweep.
-                    mgr.verify_backups(
-                        ids, deep=False, on_one=_on_one_cb,
-                        cancel=None,
-                        skip_recent_hours=0,
-                    )
-                    # Completes the loop between the automatic self-checks and
-                    # this manual one: the config snapshots (config_history
-                    # checkpoints) are part of the same data-integrity story.
-                    from core.config_transfer import self_check_config_history_restore
-                    snap_ok, snap_detail = self_check_config_history_restore()
-                except Exception as e:
-                    logger.warning(f"Backup verification aborted: {e}")
-                self.done.emit(bad_n[0], len(ids), snap_ok, snap_detail)
-
-        self._verify_btn.setEnabled(False)
-        total = len(ids)
-        first = ids[0]
-        start_msg = (
-            t("backups.verify_running_named", done=1, total=total,
-              name=names[first])
-            if names.get(first) else
-            t("backups.verify_running", done=1, total=total))
-        self._set_verify_status(start_msg)
-        self._verify_btn.setToolTip(start_msg)
-        self._verify_worker = _VerifyWorker(self)
-
-        def _on_progress(done: int, bid: str):
-            name = names.get(bid, "")
-            msg = (t("backups.verify_running_named",
-                     done=done, total=total, name=name)
-                   if name else
-                   t("backups.verify_running", done=done, total=total))
-            self._set_verify_status(msg)
-            self._verify_btn.setToolTip(msg)
-            self.verify_progress.emit(done, total, name)
+        def _on_step(check_id: str, index: int, total_checks: int):
+            key = _step_keys.get(check_id)
+            if key:
+                self._set_verify_status(t(key))
 
         def _on_one(bid, state, detail):
             from datetime import datetime
+            done_n[0] += 1
+            name = names.get(bid, "")
+            msg = (t("backups.verify_running_named",
+                     done=done_n[0], total=total, name=name)
+                   if name else
+                   t("backups.verify_running", done=done_n[0], total=total))
+            self._set_verify_status(msg)
+            self._verify_btn.setToolTip(msg)
+            self.verify_progress.emit(done_n[0], total, name)
+
             _at = datetime.utcnow().isoformat()
             # Remember the outcome for rows that DON'T exist yet: a collapsed
             # title holds no BackupRow at all, so the loop below has nothing to
@@ -1549,26 +1573,54 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 except RuntimeError:
                     pass      # row already gone (list rebuilt mid-run)
 
-        def _on_done(bad, total_done, snap_ok, snap_detail):
+        def _on_finished(result):
             self._verify_btn.setEnabled(True)
-            msg = (t("backups.verify_result_all_ok", total=total_done) if not bad
-                   else t("backups.verify_result_bad", bad=bad, total=total_done))
-            if snap_ok:
+            bad = result.archives_bad
+            checked = result.archives_total
+            msg = (t("backups.verify_result_all_ok", total=checked) if not bad
+                   else t("backups.verify_result_bad", bad=bad, total=checked))
+            if result.snapshots_ok:
                 msg += "\n" + t("backups.verify_snapshots_ok")
             else:
-                msg += "\n" + t("backups.verify_snapshots_bad", detail=snap_detail)
+                msg += "\n" + t("backups.verify_snapshots_bad",
+                                detail=result.snapshots_detail)
             self._set_verify_status(
-                msg, tone="success" if not bad and snap_ok else "error")
+                msg, tone="success" if result.ok else "error")
             self._verify_btn.setToolTip(
                 msg + "\n" + self._verify_idle_tooltip())
-            logger.info(f"Backup verification: {msg}")
+            logger.info(f"Integrity checks: {msg}")
             self.verify_finished.emit(msg)
+            # The index checks can drop rows (zip gone) or repair metadata —
+            # either way what this page is showing is now out of date.
+            if result.removed_ids or result.repaired:
+                self._refresh_list()
+                self._load_games()
 
-        self._verify_worker.progress.connect(_on_progress)
-        self._verify_worker.one.connect(_on_one)
-        self._verify_worker.done.connect(_on_done)
-        self.verify_started.emit(total)
-        self._verify_worker.start()
+        bridge.step.connect(_on_step)
+        bridge.one.connect(_on_one)
+        bridge.finished.connect(_on_finished)
+
+        from core.self_checks import run_checks
+        started = run_checks(
+            backup_ids=ids,
+            skip_recent_hours=0,        # explicit request → always re-open
+            on_progress=lambda c, i, n: bridge.step.emit(c, i, n),
+            on_backup_result=lambda b, s, d: bridge.one.emit(b, s, d),
+            on_done=lambda r: bridge.finished.emit(r),
+        )
+        if not started:
+            # The scheduled sweep is already running — don't stack a second.
+            self._set_verify_status(t("settings.diagnostics_running"))
+            QTimer.singleShot(3000, lambda: self._set_verify_status(""))
+            return
+
+        self._last_verify_all_mono = now
+        self._verify_btn.setEnabled(False)
+        start_msg = (t("backups.verify_running", done=0, total=total)
+                     if total else t("settings.diagnostics_running"))
+        self._set_verify_status(start_msg)
+        self._verify_btn.setToolTip(start_msg)
+        self.verify_started.emit(max(total, 1))
 
     def _on_open_save_folder(self):
         """Open SaveSync's main backup directory in the file manager.
@@ -2014,6 +2066,90 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._list_layout.addStretch()
         self._stop_list_busy()
 
+    def _archive_auto_widget(self, entries: list):
+        """Per-archive scheduled-backup control, or None when not applicable.
+
+        Shown only for a LOCAL archive: a cloud-only listing has nothing on
+        this machine to re-read, and a library game already has its own
+        auto-backup setting in Add/Edit Game.
+        """
+        from core.backup import get_backup_manager
+        if not entries:
+            return None
+        newest = max(entries, key=lambda b: b.created_dt)
+        if getattr(newest, "origin", "local") != "local":
+            return None
+        mgr = get_backup_manager()
+        if not (newest.cloud_metadata or {}).get("orphan"):
+            return None
+        game_id = newest.game_id
+        if not game_id or game_id in mgr.library_game_ids():
+            return None
+
+        sources = mgr.orphan_source_paths(newest)
+        enabled, interval = mgr.archive_auto_backup(game_id)
+
+        from PySide6.QtWidgets import QCheckBox, QSpinBox
+        box = QWidget()
+        box.setObjectName("transparent_bg")
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 0, 0, 4)
+        outer.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        cb = QCheckBox(t("backups.archive_auto_backup"))
+        cb.setToolTip(t("backups.archive_auto_backup_tooltip"))
+        cb.setChecked(bool(enabled))
+        every = QLabel(t("backups.archive_auto_every"))
+        spin = QSpinBox()
+        # Minutes: an archive's folder is a live save folder, and the point
+        # of watching one is catching a session's worth of play. Capped at a
+        # week so a stray keystroke cannot park it out of sight.
+        spin.setRange(1, 10080)
+        spin.setValue(int(interval))
+        spin.setSuffix(f" {t('backups.archive_auto_minutes')}")
+        spin.setFixedWidth(scaled(110, self, min_px=96))
+        row.addWidget(cb)
+        row.addWidget(every)
+        row.addWidget(spin)
+        row.addStretch()
+        outer.addLayout(row)
+
+        hint = QLabel()
+        hint.setObjectName("settings_hint")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        def _refresh_hint():
+            if not sources:
+                hint.setText(t("backups.archive_auto_no_source"))
+                return
+            src = sources[0]
+            from pathlib import Path as _P
+            if not _P(src).is_dir():
+                hint.setText(t("backups.archive_auto_source_missing"))
+                return
+            hint.setText(t("backups.archive_auto_source", path=src))
+
+        def _apply(*_):
+            mgr.set_archive_auto_backup(game_id, cb.isChecked(), spin.value())
+            spin.setEnabled(cb.isChecked())
+            _refresh_hint()
+
+        # No source recorded means nothing to re-read: the control would
+        # promise a backup that can never happen.
+        if not sources:
+            cb.setEnabled(False)
+            spin.setEnabled(False)
+        else:
+            spin.setEnabled(cb.isChecked())
+            cb.toggled.connect(_apply)
+            spin.valueChanged.connect(_apply)
+        _refresh_hint()
+        return box
+
     def _build_backup_group(self, key: str, title: str, entries: list,
                             gid, is_playing: bool, cloud_only_ids: set,
                             expanded: bool) -> QWidget:
@@ -2059,6 +2195,14 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         body_lay.setSpacing(6)
         body.setVisible(False)
         col.addWidget(body)
+
+        # Archives only: a folder handed over without adding the game to the
+        # library gets no scheduled backups from anywhere else, so it carries
+        # its own. Inside the body rather than the header — the header is one
+        # big toggle button, and a control inside it would fight the click.
+        arch = self._archive_auto_widget(entries)
+        if arch is not None:
+            body_lay.addWidget(arch)
 
         built = {"done": False}
 
@@ -2185,10 +2329,12 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self.restore_requested.emit(game_id, backup_id)
 
     def _on_delete(self, backup_id: str):
-        ok = get_backup_manager().delete_backup(backup_id)
-        if ok:
-            self._refresh_list()
-            self._load_games()
+        # The refresh rides backup_deleted (see _on_backup_deleted): it has
+        # to work for the delete paths that never pass through here anyway,
+        # so having the button refresh separately only meant two rebuilds
+        # for one deletion — and one code path that could be kept correct
+        # while the other rotted.
+        get_backup_manager().delete_backup(backup_id)
 
     def update_locale(self):
         if _safe(self._header):

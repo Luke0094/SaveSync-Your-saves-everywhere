@@ -1,9 +1,10 @@
 """
 SaveSync — light theme (QSS + palette).
 
-Imported by ``ui.styles.theme``. New themes: same exports
-(``THEME``, ``PALETTE``, ``ID``, ``IS_DARK``) and register in
-``theme.THEMES``.
+Imported by ``ui.styles.theme``. A new theme needs nothing but the
+same four exports — ``ID``, ``THEME``, ``PALETTE``, ``IS_DARK`` —
+in a module dropped into this package: it is discovered from there,
+with no registry to edit. Add ``NAME`` to control how it is listed.
 """
 
 ID = "light"

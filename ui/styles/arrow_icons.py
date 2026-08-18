@@ -36,7 +36,13 @@ def ensure_arrow_icons(theme: str, suffix: str = "") -> dict[str, str]:
         from ui.styles.theme import palette
         fill = palette("text_muted")
     else:
-        fill = "#c0c0cc" if theme == "dark" else "#4a4a5a"
+        # Ask the theme whether it is dark, rather than comparing its NAME.
+        # Keyed on the id, a third theme fell to the light fill whatever it
+        # actually looked like — a dark one would have drawn near-black
+        # chevrons on its own dark background.
+        from ui.styles.theme import get_theme_module
+        is_dark = bool(getattr(get_theme_module(theme), "IS_DARK", True))
+        fill = "#c0c0cc" if is_dark else "#4a4a5a"
     out_dir = Path(USER_DATA_DIR) / "ui_icons" / theme
     out_dir.mkdir(parents=True, exist_ok=True)
     urls = {}

@@ -444,10 +444,7 @@
     "save_edit_copies_tooltip": "How many copies of one save file the editor keeps before the oldest is dropped. A copy is taken every time you write to a save, so this is how far back an edit can be undone.",
     "save_edit_copy_days": "Delete after",
     "save_edit_copy_days_tooltip": "Copies older than this are removed. The newest is always kept, however old it is, so there is always something to undo with.",
-    "run_diagnostics": "Run diagnostic checks",
-    "diagnostics_running": "Running diagnostic checks...",
-    "diagnostics_success": "Diagnostic checks completed: no issues found",
-    "diagnostics_issues": "Issues detected"
+    "diagnostics_running": "Running diagnostic checks..."
   },
   "config_transfer": {
     "preview_title": "Import Configuration Preview",
@@ -688,7 +685,6 @@
     "exclude_file": "Exclude from backups",
     "restore_file": "Restore to backups"
   },
-
   "notifications": {
     "backup_created": "Backup created for {game}",
     "backup_unchanged": "No changes detected for {game} — backup skipped",
@@ -729,7 +725,16 @@
     "verify_snapshots_ok": "Config snapshots: ok",
     "verify_snapshots_bad": "Config snapshots: problem — {detail}",
     "index_validate_failed": "Could not finish checking which backup files are still on disk. Some missing archives may still appear in the list until the next successful check.",
-    "index_validate_recovered": "Backup index check recovered — missing archives were cleaned up."
+    "index_validate_recovered": "Backup index check recovered — missing archives were cleaned up.",
+    "archive_auto_backup": "Re-check this folder and back it up",
+    "archive_auto_backup_tooltip": "Walks the folder this archive was made from on the interval below and creates a new backup when its contents changed. Lets a folder keep getting backups without adding the game to the library. Rotation follows the usual backup limits in Settings.",
+    "archive_auto_every": "every",
+    "archive_auto_source": "Source: {path}",
+    "archive_auto_source_missing": "Source folder not available — it will be skipped until it is back",
+    "archive_auto_no_source": "This archive predates source tracking, so it cannot be re-checked. Add the folder again to enable it.",
+    "archive_auto_last": "Last check: {when}",
+    "archive_auto_never": "Not checked yet",
+    "archive_auto_minutes": "minutes"
   },
   "errors": {
     "path_not_found": "Path not found",

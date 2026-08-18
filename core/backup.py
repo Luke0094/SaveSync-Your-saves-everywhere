@@ -560,9 +560,6 @@ class BackupManager(QObject):
 
     # Cap per game for the deleted-ids tombstone list (newest kept)
     _MAX_TOMBSTONES_PER_GAME = 200
-    # Background validate: immediate, then 5s, then 30s — never blocks get_*
-    # for minutes on every call.
-    _VALIDATE_RETRY_DELAYS_S = (0.0, 5.0, 30.0)
 
     def __init__(self):
         super().__init__()
@@ -573,17 +570,15 @@ class BackupManager(QObject):
         # download/prune/download loop is what made every sync report
         # uploads+downloads even with completely unchanged data.
         self._deleted_ids: dict[str, list[str]] = self._load_deleted_ids()
-        self._index_validated = threading.Event()
-        self._index_validate_ok = False
         self._last_validation_error: str = ""
-        # True only after index_validation_failed was emitted to the UI.
-        self._validation_failure_notified = False
-        self._validate_lock = threading.Lock()
         self._load_all_indexes()
-        # Zip existence check can touch hundreds of files — do it off the
-        # startup path so the UI can come up first.
-        threading.Thread(target=self._background_validate_index,
-                         name="backup-index-validate", daemon=True).start()
+        # The zip-existence sweep is NOT run here. It used to start its own
+        # retrying background thread on every launch, touching hundreds of
+        # files to answer a question that only changes when backups are
+        # deleted — and this class already knows when that happens. It is a
+        # data-integrity check like the others now, run from
+        # core.self_checks: automatically on the user's schedule, or on
+        # demand from the Backups page.
 
     # ── Deleted-backup tombstones ────────────────────────────────────────────
 
@@ -706,57 +701,39 @@ class BackupManager(QObject):
         """Empty when the last completed validation attempt succeeded."""
         return self._last_validation_error
 
-    def _background_validate_index(self):
-        """Validate with short retries; unblock getters without a long wait."""
-        last_err: Exception | None = None
-        for delay in self._VALIDATE_RETRY_DELAYS_S:
-            if delay:
-                threading.Event().wait(delay)
-            try:
-                self._validate_index()
-                with self._validate_lock:
-                    # Toast "recovered" only if the UI already saw a failure
-                    # (not for internal retries within the same startup run).
-                    notify_recovered = self._validation_failure_notified
-                    self._index_validate_ok = True
-                    self._last_validation_error = ""
-                    self._validation_failure_notified = False
-                    self._index_validated.set()
-                if notify_recovered:
-                    try:
-                        self.index_validation_recovered.emit()
-                    except RuntimeError:
-                        pass
-                return
-            except Exception as e:
-                last_err = e
-                logger.warning(f"Background index validation failed: {e}")
+    def validate_index_zips(self) -> tuple[list[str], str]:
+        """Drop index entries whose zip is gone. ``(removed_ids, error)``.
 
-        msg = str(last_err) if last_err else "unknown error"
-        with self._validate_lock:
-            self._index_validate_ok = False
-            self._last_validation_error = msg[:200]
-            self._validation_failure_notified = True
-            # Unblock get_* — index stays usable; missing-zip cleanup may be incomplete.
-            self._index_validated.set()
-        logger.error(
-            "Backup index validation failed after retries: %s", msg
-        )
-        try:
-            self.index_validation_failed.emit(self._last_validation_error)
-        except RuntimeError:
-            pass
+        One of the checks in core.self_checks — see __init__ for why it no
+        longer runs on its own at startup. Never raises: a failure is
+        returned as *error* so the runner can report it next to the others,
+        and the index stays usable either way.
 
-    def _ensure_index_validated(self):
-        """Zip-existence cleanup is fully async — getters never block on it.
-
-        Waiting here used to stall the UI for up to two minutes when the
-        background sweep failed or ran long. The sweep retries on its own and
-        notifies the UI via ``index_validation_failed`` / ``recovered``.
+        The removed ids are RETURNED rather than announced: this runs on the
+        checks' worker thread, and ``backup_deleted`` has GUI-thread
+        subscribers that rebuild lists, so the caller emits.
         """
-        return
+        try:
+            removed = self._validate_index()
+        except Exception as e:
+            self._last_validation_error = str(e)[:200]
+            logger.error("Backup index validation failed: %s", e)
+            try:
+                self.index_validation_failed.emit(self._last_validation_error)
+            except RuntimeError:
+                pass
+            return [], self._last_validation_error
 
-    def _validate_index(self):
+        recovered = bool(self._last_validation_error)
+        self._last_validation_error = ""
+        if recovered:
+            try:
+                self.index_validation_recovered.emit()
+            except RuntimeError:
+                pass
+        return removed, ""
+
+    def _validate_index(self) -> list[str]:
         """Remove entries whose zip file no longer exists on disk."""
         removed: list[str] = []
         affected_games: set[str] = set()
@@ -783,18 +760,9 @@ class BackupManager(QObject):
         if removed:
             for gid in affected_games:
                 self._save_game_index(gid)
-            # Emit only from the GUI thread — background startup validation
-            # must not touch Qt signals directly.
-            from PySide6.QtCore import QCoreApplication, QThread
-            app = QCoreApplication.instance()
-            can_emit = (
-                app is not None
-                and QThread.currentThread() is app.thread()
-            )
             for bid in removed:
                 logger.info(f"Backup index: removed stale entry {bid} (zip missing)")
-                if can_emit:
-                    self.backup_deleted.emit(bid)
+        return removed
 
     def import_backup(self, entry: BackupEntry, zip_data: bytes) -> bool:
         """Import a backup ZIP downloaded from cloud into the local backup dir.
@@ -1507,6 +1475,12 @@ class BackupManager(QObject):
                 metadata["pre_confirmation"] = True
             if orphan:
                 metadata["orphan"] = True
+                # The folders the zip was actually READ from. save_paths on an
+                # orphan entry holds the destination/zip-root label instead, so
+                # without this nothing remembers where the archive came from —
+                # which is what a scheduled re-backup needs, and what lets the
+                # restore picker open at the source instead of the drive root.
+                metadata["orphan_source_paths"] = [str(p) for p in valid_paths]
 
             _recorded_paths = [str(p) for p in valid_paths] + valid_reg
             if recorded_save_paths is not None:
@@ -2771,7 +2745,6 @@ class BackupManager(QObject):
         return moved
 
     def get_backups_for_game(self, game_id: str) -> list[BackupEntry]:
-        self._ensure_index_validated()
         with _index_lock:
             snapshot = [copy.deepcopy(b) for b in self._index if b.game_id == game_id]
         return sorted(
@@ -2788,7 +2761,6 @@ class BackupManager(QObject):
         entry that hasn't been re-imported yet)."""
         if not folder_name:
             return []
-        self._ensure_index_validated()
         with _index_lock:
             snapshot = [copy.deepcopy(b) for b in self._index
                         if self._game_folder_for_entry(b) == folder_name]
@@ -2796,7 +2768,6 @@ class BackupManager(QObject):
 
     def get_all_backups(self) -> list[BackupEntry]:
         """Return entire index (flat). Use for batch counting — no disk I/O."""
-        self._ensure_index_validated()
         with _index_lock:
             return [copy.deepcopy(b) for b in self._index]
 
@@ -2809,7 +2780,6 @@ class BackupManager(QObject):
           provisional_ids — game_ids with a pre_confirmation backup
           orphan_unit_count — unique orphan / no-library game_ids (donut Archivi)
         """
-        self._ensure_index_validated()
         lib_ids = self.library_game_ids()
         provisional: set[str] = set()
         orphan_gids: set[str] = set()
@@ -2873,6 +2843,12 @@ class BackupManager(QObject):
         destination / zip-root label, never a collection parent path.
         """
         import uuid
+        # Imported here rather than at module scope only because that is how
+        # the one other user of it does it — but it WAS missing entirely, so
+        # every call raised NameError, and the caller logs and skips, which
+        # is why "Aggiungi percorso" could report folders skipped with
+        # nothing to show for it.
+        from core.constants import get_folder_name_for_save
         game_id = str(uuid.uuid4())
         base = get_folder_name_for_save(game_name or "", "", "")
         folder = self._unique_backup_folder(base)
@@ -2894,6 +2870,154 @@ class BackupManager(QObject):
             orphan=True,
             recorded_save_paths=recorded,
         )
+
+    # ── Archive auto-backup ─────────────────────────────────────────────
+    # An archive is a save folder the user handed over WITHOUT adding the
+    # game to the library. It still deserves the scheduled backups a library
+    # game gets, so the settings ride on the entry itself rather than on a
+    # library record that does not exist.
+    AUTO_ENABLED_KEY = "auto_backup_enabled"
+    AUTO_INTERVAL_KEY = "auto_backup_interval_minutes"
+    AUTO_LAST_KEY = "auto_backup_last"
+    AUTO_ERROR_KEY = "auto_backup_last_error"
+    # Minutes, not days: the folder behind an archive is a live save folder,
+    # and the point of watching one is catching a session's worth of play.
+    # Rotation is NOT ours — create_backup calls _enforce_limits, so an
+    # archive is pruned by the same max_local_backups / retention_days /
+    # min_kept_backups the rest of the app uses.
+    AUTO_DEFAULT_MINUTES = 30
+
+    def orphan_source_paths(self, entry: BackupEntry) -> list[str]:
+        """Folders an orphan archive was zipped FROM, newest entry wins.
+
+        Empty for archives made before this was recorded, and for anything
+        that is not an orphan — the caller decides what to do about that
+        rather than being handed a plausible-looking wrong path.
+        """
+        raw = (entry.cloud_metadata or {}).get("orphan_source_paths")
+        return [str(x) for x in raw if str(x)] if isinstance(raw, list) else []
+
+    def set_archive_auto_backup(self, game_id: str, enabled: bool,
+                                interval_minutes: int = 0) -> bool:
+        """Turn scheduled re-backup on/off for an archive. False if unknown.
+
+        Written onto every entry of the archive so the setting survives the
+        newest backup being pruned by retention.
+        """
+        interval = max(1, int(interval_minutes or self.AUTO_DEFAULT_MINUTES))
+        touched = False
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                meta = dict(b.cloud_metadata or {})
+                meta[self.AUTO_ENABLED_KEY] = bool(enabled)
+                meta[self.AUTO_INTERVAL_KEY] = interval
+                b.cloud_metadata = meta
+                touched = True
+        if touched:
+            self._save_game_index(game_id)
+        return touched
+
+    def archive_auto_backup(self, game_id: str) -> tuple[bool, int]:
+        """``(enabled, interval_minutes)`` for an archive."""
+        for b in self.get_backups_for_game(game_id):
+            meta = b.cloud_metadata or {}
+            if self.AUTO_ENABLED_KEY in meta:
+                return (bool(meta.get(self.AUTO_ENABLED_KEY)),
+                        int(meta.get(self.AUTO_INTERVAL_KEY)
+                            or self.AUTO_DEFAULT_MINUTES))
+        return (False, self.AUTO_DEFAULT_MINUTES)
+
+    def _mark_archive_checked(self, game_id: str, error: str = "") -> None:
+        from datetime import datetime, timezone
+        stamp = datetime.now(timezone.utc).isoformat()
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                meta = dict(b.cloud_metadata or {})
+                meta[self.AUTO_LAST_KEY] = stamp
+                if error:
+                    meta[self.AUTO_ERROR_KEY] = error[:200]
+                else:
+                    meta.pop(self.AUTO_ERROR_KEY, None)
+                b.cloud_metadata = meta
+        self._save_game_index(game_id)
+
+    def _archive_is_due(self, game_id: str, interval_minutes: int) -> bool:
+        from datetime import datetime, timezone, timedelta
+        last = ""
+        for b in self.get_backups_for_game(game_id):
+            last = max(last, str((b.cloud_metadata or {}).get(self.AUTO_LAST_KEY) or ""))
+        if not last:
+            return True                       # never checked: due now
+        try:
+            when = datetime.fromisoformat(last)
+        except ValueError:
+            return True
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - when
+                >= timedelta(minutes=interval_minutes))
+
+    def rebackup_archive(self, game_id: str) -> tuple[bool, str]:
+        """Back the archive's source folders up again, INTO THE SAME archive.
+
+        ``(created, detail)``. The existing game_id and backup folder are
+        reused on purpose: minting a new pair — which is what
+        create_orphan_backup does — would leave a separate archive per run,
+        so retention would never prune any of them and the Backups page
+        would grow an entry a week for one folder.
+        """
+        existing = self.get_backups_for_game(game_id)
+        if not existing:
+            return False, "archive not found"
+        newest = max(existing, key=lambda b: b.created_dt)
+        sources = self.orphan_source_paths(newest)
+        if not sources:
+            return False, "no source recorded"
+
+        alive = [p for p in sources if Path(p).exists()]
+        if not alive:
+            # The usual case in practice: an external drive that is not
+            # mounted. Said out loud on the entry rather than passed over.
+            return False, "source unavailable"
+
+        # return_status, not "did it hand back an entry": create_backup
+        # returns the EXISTING entry when the folder has not changed, so a
+        # truthy result says nothing about whether anything was written.
+        entry, created = self.create_backup(
+            game_id=game_id,
+            game_name=newest.game_name,
+            save_paths=alive,
+            computed_folder_name=self._game_folder_for_entry(newest),
+            force=False,                      # unchanged folder: no new zip
+            orphan=True,
+            recorded_save_paths=list(newest.save_paths) or None,
+            content_chains_override=list(newest.content_chains) or None,
+            save_chains_override=list(newest.save_chains) or None,
+            return_status=True,
+        )
+        if entry is None:
+            return False, "backup failed"
+        if not created:
+            return False, "unchanged"
+        return True, entry.backup_id
+
+    def archives_due_for_backup(self) -> list[str]:
+        """game_ids of archives whose scheduled re-backup is due."""
+        due: list[str] = []
+        seen: set[str] = set()
+        for b in self.get_orphan_backups():
+            gid = b.game_id
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            enabled, interval = self.archive_auto_backup(gid)
+            if enabled and self._archive_is_due(gid, interval):
+                due.append(gid)
+        return due
 
     def library_game_ids(self) -> set[str]:
         try:
@@ -3092,7 +3216,6 @@ class BackupManager(QObject):
                 logger.debug("flush_orphan_indexes failed for %s", gid, exc_info=True)
 
     def get_backup(self, backup_id: str) -> Optional[BackupEntry]:
-        self._ensure_index_validated()
         with _index_lock:
             entry = next((b for b in self._index if b.backup_id == backup_id), None)
             return copy.deepcopy(entry) if entry else None
@@ -3804,12 +3927,20 @@ class BackupManager(QObject):
 
         # Hold _index_lock for the entire read-modify cycle to prevent races
         zip_paths_to_delete: list[str] = []
+        folder_hint = ""
         with _index_lock:
             game_backups = [b for b in self._index if b.game_id == game_id]
             to_delete = self.compute_deletions(game_backups, max_backups, retention_days, min_kept)
 
             if not to_delete:
                 return
+
+            # Derived BEFORE the rows go: if this prune empties the folder,
+            # _save_game_index has no entry left to derive it from and would
+            # return without touching index.json — leaving the pruned rows on
+            # disk to be reloaded, as real-looking entries, at the next launch.
+            folder_hint = self._game_folder_for_entry(
+                max(game_backups, key=lambda b: b.created_dt))
 
             # Collect zip paths before removing from index
             for b in game_backups:
@@ -3845,7 +3976,7 @@ class BackupManager(QObject):
             except Exception:
                 pass
 
-        self._save_game_index(game_id)
+        self._save_game_index(game_id, _folder_hint=folder_hint)
 
 
 _backup_mgr: BackupManager | None = None
