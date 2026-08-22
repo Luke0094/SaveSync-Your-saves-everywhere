@@ -34,6 +34,12 @@ _DEFAULTS: dict[str, Any] = {
     # dropped it, so "do not hide while I play" was forgotten at every start
     # and the window went to the tray again regardless.
     "hide_to_tray_on_game_launch": True,
+    # Whether "back up everything" and "sync everything" reach the archives
+    # too, or only the library. On by default: an archive is a save folder
+    # the user handed over, and leaving it out of "everything" is how it
+    # went unbacked for weeks. Off is for someone with a large collection
+    # who does not want every sweep walking all of it.
+    "backup_archives_too": True,
     "show_overlay_on_launch": True,
     # Popup + hotkey queue when an unknown process looks like a game.
     # Separate from the tracked-game launch toast. Off: no live popup, no
@@ -211,6 +217,7 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "launch_on_startup": lambda x: isinstance(x, bool),
     "minimize_to_tray": lambda x: isinstance(x, bool),
     "hide_to_tray_on_game_launch": lambda x: isinstance(x, bool),
+    "backup_archives_too": lambda x: isinstance(x, bool),
     "auto_scan_excluded_files": lambda x: isinstance(x, dict),
     "show_overlay_on_launch": lambda x: isinstance(x, bool),
     "show_overlay_on_unknown": lambda x: isinstance(x, bool),

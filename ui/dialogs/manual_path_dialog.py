@@ -604,7 +604,6 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         self._force_close = False
         self._cancel_op = False
         self._phase = "idle"  # idle|scanning|inserting|ready|storing
-        self._insert_queue: list = []
         self._insert_index = 0
         self._collection_root = ""
         self._found_serialized: list = []
@@ -802,7 +801,6 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         # enough to appear at once. What used to be inserted here folder by
         # folder — hundreds of rows, over seconds — is now the master list,
         # and the rows come and go with the page.
-        self._insert_queue = []
         self._insert_index = len(found)
         self._progress.setVisible(False)
         self._render_list()
@@ -926,7 +924,6 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         self._wl_clear()
         self._clear_rows()
         self._found_serialized = []
-        self._insert_queue = []
         self._insert_index = 0
         self._collection_root = ""
         self._pending_for_store = []
@@ -978,8 +975,11 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         """
         h = getattr(self, "_row_h", 0)
         if not h:
+            # index=-1 on BOTH: a probe is a ruler, not a view of an entry,
+            # and one claiming to be entry 0 is one bad connect away from
+            # writing a measurement into the user's first folder.
             for kw in ({"name": "", "index": -1},
-                       {"name": "x", "index": 0, "source": "x", "chain": "x"}):
+                       {"name": "x", "index": -1, "source": "x", "chain": "x"}):
                 probe = _ManualPathRow("x", parent=self, **kw)
                 h = max(h, probe.sizeHint().height())
                 probe.setParent(None)
@@ -1244,7 +1244,6 @@ class ManualPathDialog(WindowedListMixin, QDialog):
             if store_running:
                 self._store_worker.stop()
             if self._phase == "inserting":
-                self._insert_queue = []
                 self._set_idle(t("manual_path.cancelled"))
                 self._clear_persisted()
                 return
@@ -1325,16 +1324,21 @@ class ManualPathDialog(WindowedListMixin, QDialog):
             self.release_batch()
             self.accept()
             return
-        # Rebuild any row widgets skipped while hidden.
-        if (
-            self._found_serialized
-            and len(self._rows) < len(self._found_serialized)
-            and self._phase in ("inserting", "ready", "storing")
-        ):
-            if self._phase == "inserting" and self._insert_queue:
-                QTimer.singleShot(0, self._insert_next_chunk)
-            else:
-                QTimer.singleShot(0, self._finish_materialize_rows)
+        # Draw the list again: nothing was built while this was hidden.
+        #
+        # This used to hand off to a chunked row-inserter, which the windowed
+        # list replaced and which no longer EXISTS — so coming back from the
+        # sidebar raised AttributeError here, before a single row was drawn,
+        # and left the panel stuck mid-"inserting" with its buttons disabled.
+        # There is nothing to insert in chunks any more: only the rows on
+        # screen are ever built, so drawing them is the whole job.
+        if self._found_serialized and not self._rows:
+            if self._phase == "inserting":
+                self._set_idle()
+                self._status.setText(
+                    t("manual_path.multiple_added",
+                      count=len(self._found_serialized)))
+            self._render_list()
 
     def closeEvent(self, event):
         if (not self._force_close and self.has_shelvable_work()
@@ -1404,7 +1408,6 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         self._collection_root = state.get("root") or ""
         self._found_serialized = list(state.get("found") or [])
         self._insert_index = int(state.get("insert_index") or 0)
-        phase = state.get("phase") or "ready"
         if not self._found_serialized:
             return
         found = [self._deserialize_collected(d) for d in self._found_serialized]
@@ -1412,25 +1415,16 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         # Do not sync-build hundreds of row widgets here — that froze resume.
         # Shelve first; rows materialize on unshelve / while inserting hidden.
         self._collection_hint.setVisible(True)
-        resume_insert = (
-            self._insert_index < len(found) and phase in ("scanning", "inserting")
-        )
-        if resume_insert:
-            self._insert_queue = found
-            self._phase = "inserting"
-            self._multi_btn.setEnabled(False)
-            self._single_btn.setEnabled(False)
-            self._save_btn.setEnabled(False)
-            total = len(found)
-            self._progress.setRange(0, max(1, total))
-            self._progress.setValue(self._insert_index)
-            self._progress.setVisible(True)
-            self._status.setText(t("manual_path.inserting_folder",
-                                   current=self._insert_index, total=total, name=""))
-        else:
-            self._phase = "ready"
-            self._status.setText(t("manual_path.multiple_added", count=len(found)))
-        # Shelve first so the following insert ticks run hidden (no widgets).
-        QTimer.singleShot(0, self._shelve)
-        if resume_insert:
-            QTimer.singleShot(0, self._insert_next_chunk)
+        # There is no half-finished insert to resume any more. The batch IS
+        # the entries, and the list draws only the rows on screen — so a
+        # scan interrupted by a restart comes back complete and ready, not
+        # part-way through building several hundred widgets.
+        #
+        # It used to resume into an "inserting" phase driven by a chunked
+        # inserter that the windowed list replaced. That method is gone, so
+        # this raised AttributeError with the buttons already disabled: the
+        # panel came back with no rows and nothing that could be pressed.
+        self._insert_index = len(found)
+        self._phase = "ready"
+        self._status.setText(t("manual_path.multiple_added", count=len(found)))
+        self._render_list()

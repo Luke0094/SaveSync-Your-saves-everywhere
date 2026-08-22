@@ -436,6 +436,10 @@ class SettingsPage(PageScrollMixin, QWidget):
         beh_form.addRow(self._backup_on_exit_cb)
         self._auto_sync_cb = WrappedCheckBox(t("settings.auto_sync_after_backup"), t("settings.auto_sync_after_backup_tooltip"))
         beh_form.addRow(self._auto_sync_cb)
+        self._archives_too_cb = WrappedCheckBox(
+            t("settings.backup_archives_too"),
+            t("settings.backup_archives_too_tooltip"))
+        beh_form.addRow(self._archives_too_cb)
         # The explanation is on the option itself — hovering the label is what
         # people try first, and a "?" next to one option out of a dozen just
         # raised the question of why the others didn't have one.
@@ -1066,6 +1070,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._startup_cb.stateChanged.connect(self._mark_dirty)
         self._tray_cb.stateChanged.connect(self._mark_dirty)
         self._hide_on_game_cb.stateChanged.connect(self._mark_dirty)
+        self._archives_too_cb.stateChanged.connect(self._mark_dirty)
         self._backup_on_exit_cb.stateChanged.connect(self._mark_dirty)
         self._auto_sync_cb.stateChanged.connect(self._mark_dirty)
         self._auto_scan_cb.stateChanged.connect(self._mark_dirty)
@@ -1354,6 +1359,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             "auto_scan": self._auto_scan_cb.isChecked(),
             "check_updates": self._updates_cb.isChecked(),
             "hide_on_game": self._hide_on_game_cb.isChecked(),
+            "archives_too": self._archives_too_cb.isChecked(),
             "overlay_launch": self._overlay_launch_cb.isChecked(),
             "overlay_unknown": self._overlay_unknown_cb.isChecked(),
             "overlay_cloud": self._overlay_cloud_cb.isChecked(),
@@ -1418,6 +1424,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._startup_cb.setChecked(get_launch_on_startup())
         self._tray_cb.setChecked(config.get("minimize_to_tray", True))
         self._hide_on_game_cb.setChecked(config.get("hide_to_tray_on_game_launch", True))
+        self._archives_too_cb.setChecked(config.get("backup_archives_too", True))
         self._backup_on_exit_cb.setChecked(config.get("backup_on_exit", True))
         self._auto_sync_cb.setChecked(config.get("auto_sync_after_backup", False))
         self._auto_scan_cb.setChecked(config.get("auto_scan_on_exit", True))
@@ -1539,6 +1546,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("overlay_hotkey",         new_hotkey)
         config.set("minimize_to_tray",       self._tray_cb.isChecked())
         config.set("hide_to_tray_on_game_launch", self._hide_on_game_cb.isChecked())
+        config.set("backup_archives_too", self._archives_too_cb.isChecked())
         config.set("backup_on_exit",         self._backup_on_exit_cb.isChecked())
         config.set("auto_sync_after_backup", self._auto_sync_cb.isChecked())
         config.set("auto_scan_on_exit",      self._auto_scan_cb.isChecked())
@@ -2170,6 +2178,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._tray_cb.setText(t("settings.minimize_to_tray"))
         self._hide_on_game_cb.setText(t("settings.hide_to_tray_on_game_launch"))
         self._hide_on_game_cb.setToolTip(t("settings.hide_to_tray_on_game_launch_tooltip"))
+        self._archives_too_cb.setText(t("settings.backup_archives_too"))
+        self._archives_too_cb.setToolTip(t("settings.backup_archives_too_tooltip"))
         self._backup_on_exit_cb.setText(t("settings.backup_on_exit"))
         self._backup_on_exit_cb.setToolTip(t("settings.backup_on_exit_tooltip"))
         self._auto_sync_cb.setText(t("settings.auto_sync_after_backup"))

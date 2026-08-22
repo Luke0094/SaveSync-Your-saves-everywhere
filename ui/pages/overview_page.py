@@ -1320,6 +1320,27 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                                 else g.get_playtime_formatted())
                 events.append(("🎮", g.name, t('overview.played_prefix') + f" {session_info}", g.last_played))
 
+        # Backups whose game is not in the library are ARCHIVES — folders
+        # handed over without adding the game. They were dropped here for
+        # the simple reason that this loop walks the library, so backing one
+        # up left the page saying nothing had happened.
+        _lib_ids = {g.id for g in games}
+        _archives = [gid for gid in bk_by_game if gid not in _lib_ids]
+        if _archives:
+            try:
+                from core.backup import get_backup_manager as _bmgr
+                _mgr = _bmgr()
+                for _gid in _archives:
+                    _name = _mgr.archive_display_name(_gid)
+                    if not _name:
+                        continue
+                    for created_at, size_human in bk_by_game[_gid][:2]:
+                        events.append(("📦", _name,
+                                       t('overview.backup_prefix') + f" {size_human}",
+                                       created_at))
+            except Exception:
+                logger.debug("could not add archive activity", exc_info=True)
+
         events.sort(key=lambda e: e[3] or "", reverse=True)
 
         if not events:
@@ -1369,7 +1390,12 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         self._last_backup_all_mono = now
         games = [g for g in get_library().all_games() if g.save_paths]
-        self.backup_all_requested.emit([g.id for g in games])
+        # Archives too. A save folder handed over without adding the game is
+        # in no library listing, which is how "back up everything" quietly
+        # meant "everything in the library".
+        from core.backup import get_backup_manager as _bm
+        ids = [g.id for g in games] + _bm().backupable_archive_ids()
+        self.backup_all_requested.emit(ids)
 
     def _sync_all(self):
         """Sync games that may have changes — same skip rules as Sync page.
@@ -1397,13 +1423,32 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             self._show_cooldown_toast(int(remaining) + 1)
             return
         self._last_sync_all_mono = now
+        # Back everything up FIRST. Syncing publishes the newest backup a
+        # game has; without this, a game played since its last backup got
+        # its OLD one sent up and the sync reported success — the one thing
+        # "sync everything" must not quietly mean.
+        mw = self.window()
+        if mw is not None and hasattr(mw, "_start_backup_all"):
+            self._show_sync_feedback(t("overview.backing_up_first"))
+            mw._start_backup_all(source="sync_all", then_sync=True)
+            return
+        self._launch_sync_all()
+
+    def _launch_sync_all(self):
+        """Collect what has changed and hand it to the orchestrator."""
+        orch = get_orchestrator()
         from core.backup import get_backup_manager
         bm = get_backup_manager()
         jobs = []
         for g in get_library().all_games():
             if not g.save_paths:
                 continue
-            if g.sync_status == "synced":
+            if g.sync_status == "synced" and not bm.game_needs_publish(g.id):
+                # Two ways to be behind: the SAVES moved, which the hashes
+                # below catch, or what the index SAYS about them did — a
+                # note, a rename, an archive told about another folder. The
+                # second leaves every hash identical, so a sweep deciding on
+                # hashes alone skipped it and the provider kept the old row.
                 recents = bm.get_backups_for_game(g.id)
                 if recents:
                     current_hash = (recents[0].cloud_metadata or {}).get("save_hash", "")

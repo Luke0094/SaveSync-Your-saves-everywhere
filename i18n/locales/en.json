@@ -54,7 +54,8 @@
     "day_thu": "Thu",
     "day_fri": "Fri",
     "day_sat": "Sat",
-    "day_sun": "Sun"
+    "day_sun": "Sun",
+    "backing_up_first": "Backing everything up first…"
   },
   "nav": {
     "library": "Library",
@@ -447,7 +448,9 @@
     "save_edit_copies_tooltip": "How many copies of one save file the editor keeps before the oldest is dropped. A copy is taken every time you write to a save, so this is how far back an edit can be undone.",
     "save_edit_copy_days": "Delete after",
     "save_edit_copy_days_tooltip": "Copies older than this are removed. The newest is always kept, however old it is, so there is always something to undo with.",
-    "diagnostics_running": "Running diagnostic checks..."
+    "diagnostics_running": "Running diagnostic checks...",
+    "backup_archives_too": "Include archives in “back up everything” and “sync everything”",
+    "backup_archives_too_tooltip": "Archives are save folders you handed over without adding the game to the library. On, a sweep covers them like any game. Off, sweeps stay to the library and an archive is backed up by its own buttons or its scheduled re-check."
   },
   "config_transfer": {
     "preview_title": "Import Configuration Preview",

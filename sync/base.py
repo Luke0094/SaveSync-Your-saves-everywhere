@@ -268,7 +268,8 @@ class SyncProvider(ABC):
                         entry.cloud_metadata["synced_to"] = synced
                         backup_manager._mark_synced(entry.backup_id, self.PROVIDER_ID)
                     # Add to remote entries for the index update
-                    remote_entries.append(entry.to_dict())
+                    remote_entries.append(
+                        backup_manager.publishable_dict(entry))
                     remote_ids.add(entry.backup_id)
                 else:
                     _log.error(f"Failed to upload backup {entry.backup_id}")
@@ -368,11 +369,45 @@ class SyncProvider(ABC):
                 if progress_callback:
                     progress_callback(result.files_uploaded, result.files_downloaded, result.bytes_transferred)
 
+        # ── 4b. Republish what this machine changed ABOUT a backup ────────
+        # A backup's zip never changes, but what the index says about it
+        # does: where an archive is read from, which of its folders are
+        # switched on, a note, a rename. Those edits land on entries that
+        # are already up there, so nothing is queued for upload, so the
+        # index was never rewritten — and the provider kept the version
+        # from the day the zip went up, however much had changed since.
+        #
+        # Only entries THIS machine made. The local copy is the authority
+        # for its own rows; rewriting another machine's row out of a copy
+        # that may be weeks stale is how two machines start overwriting
+        # each other's index.
+        metadata_changed = False
+        if direction in ("auto", "up"):
+            try:
+                from core.machine import get_machine_id as _get_mid
+                _me = _get_mid()
+                _mine = {e.backup_id: e for e in local_entries
+                         if e.machine_id == _me}
+                for _i, _rd in enumerate(remote_entries):
+                    _local = _mine.get(_rd.get("backup_id"))
+                    if _local is None:
+                        continue
+                    _fresh = backup_manager.publishable_dict(_local)
+                    if _fresh != _rd:
+                        remote_entries[_i] = _fresh
+                        metadata_changed = True
+                if metadata_changed:
+                    _log.info(
+                        "sync_backups: republishing index for %s — metadata "
+                        "changed since the zips went up", game_folder)
+            except Exception as e:
+                _log.debug(f"sync_backups: metadata refresh skipped: {e}")
         # ── 5. Upload updated remote index.json ──────────────────────────
         # Update the remote index whenever something changed (uploads, downloads,
-        # or an explicit "up" direction) so that the index always reflects the
-        # current merged state across all machines.
-        if result.files_uploaded > 0 or result.files_downloaded > 0 or direction in ("up", "down"):
+        # metadata edits, or an explicit "up" direction) so the index always
+        # reflects the current merged state across all machines.
+        if (result.files_uploaded > 0 or result.files_downloaded > 0
+                or metadata_changed or direction in ("up", "down")):
             try:
                 import tempfile
                 with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
@@ -380,12 +415,32 @@ class SyncProvider(ABC):
                     _json.dump(remote_entries, f, indent=2)
                     idx_tmp = Path(f.name)
                 if not self.upload(idx_tmp, remote_index_path):
-                    _log.warning("Failed to upload updated remote index.json")
+                    # A failure, not a warning: the remote index IS the
+                    # record. Zips that went up without it are invisible to
+                    # every other machine, and a run that reported success
+                    # here would have this game written off as published
+                    # — nothing would ever come back for it.
+                    _log.error("Failed to upload updated remote index.json")
+                    result.success = False
                 idx_tmp.unlink(missing_ok=True)
             except Exception as e:
-                _log.warning(f"Could not update remote index: {e}")
+                _log.error(f"Could not update remote index: {e}")
+                result.success = False
 
         if result.success:
+            # A sync has been here and published whatever needed publishing,
+            # so the next sweep has no reason to come back for this one.
+            # Cleared on a successful RUN rather than on an index upload:
+            # plenty of changes need no upload at all — a local backup
+            # pruned, a row that turned out to match — and a flag that only
+            # an upload could clear would keep those games in every sweep
+            # for good. An upload that was needed and FAILED takes success
+            # down with it above, so the flag survives and the next sweep
+            # comes back for it.
+            try:
+                backup_manager.clear_index_publish_flag(game_id)
+            except Exception:
+                _log.debug("could not clear the publish flag", exc_info=True)
             result.message = t("core.sync_complete")
         else:
             result.message = t("core.sync_files_failed")

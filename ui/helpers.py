@@ -1109,6 +1109,18 @@ _SCALED_WIDGETS_REGISTRY: dict[int, dict] = {}  # widget_id -> {'width': (origin
 # "original" values from already-scaled pixels.
 _SCALED_RECALC_IN_PROGRESS: bool = False
 
+# Registrations since the registry was last swept. It gains a row per widget
+# ever given a scaled() dimension and only ever lost them on a DPI change or
+# a dialog closing — so a session that rebuilds a long list a few times an
+# hour, and closes no dialogs, grew it all day. Sweeping HERE bounds it
+# wherever widgets are built, instead of wherever someone remembered to ask.
+_SCALED_SINCE_SWEEP: int = 0
+# Far enough apart that the sweep is lost in the noise of building the
+# widgets that triggered it, close enough that the registry never holds
+# more than a page or two of dead rows.
+_SCALED_SWEEP_EVERY: int = 2000
+
+
 def _register_scaled_dimension(widget: QWidget, dimension_type: str, original_value: float | tuple, current_value: int | tuple) -> None:
     """Register a widget dimension that uses scaled() for recalculation on DPI change.
     
@@ -1124,6 +1136,11 @@ def _register_scaled_dimension(widget: QWidget, dimension_type: str, original_va
             _SCALED_WIDGETS_REGISTRY[widget_id] = {}
         import weakref
         _SCALED_WIDGETS_REGISTRY[widget_id][dimension_type] = (original_value, current_value, weakref.ref(widget))
+        global _SCALED_SINCE_SWEEP
+        _SCALED_SINCE_SWEEP += 1
+        if _SCALED_SINCE_SWEEP >= _SCALED_SWEEP_EVERY:
+            _SCALED_SINCE_SWEEP = 0
+            prune_scaled_registry()
     except Exception:
         pass
 

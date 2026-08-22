@@ -223,7 +223,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     # A scheduled archive re-backup wrote something. Same reason as the two
     # above: the archive scheduler works on its own thread and the
     # notification has to be raised on the GUI one.
-    archive_backup_done = Signal(str)  # archive (game) name
+    archive_backup_done = Signal(str, str)  # archive game_id, name
 
     def __init__(self):
         super().__init__()
@@ -291,6 +291,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Adaptive backup queue (Backup Tutti + single backups share the cap).
         self._backup_job_queue: deque = deque()   # dicts: game_id, force, silent
         self._backup_inflight: set[str] = set()
+        # Ids whose backup is to be followed by a sync of that same one,
+        # whatever "sync after backup" is set to. Kept beside the queue
+        # rather than inside the result tuple, which has grown twice and
+        # broken a handler each time.
+        self._sync_after_backup_ids: set[str] = set()
         self._backup_queued: set[str] = set()
         self._backup_batch: dict | None = None    # active Tutti tally + persist
         self._backup_max_inflight: int = 2
@@ -636,6 +641,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Wire backups page signals
         self._backups_page.backup_requested.connect(self._backup_game)
+        self._backups_page.sync_requested.connect(self._sync_game)
+        self._backups_page.backup_then_sync_requested.connect(
+            self._backup_then_sync)
         self._backups_page.backup_all_requested.connect(self._start_backup_all)
         self._backups_page.restore_requested.connect(self._restore_game_by_id)
         self._backups_page.manual_paths_requested.connect(self._show_manual_path_dialog)
@@ -802,16 +810,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     # here meant the recurring check gave no sign it was
                     # working at all. Nothing is announced when the folder
                     # was unchanged or unreachable — those are not backups.
-                    self.archive_backup_done.emit(name or game_id)
+                    self.archive_backup_done.emit(game_id, name or game_id)
             if done:
                 logger.info("Archive scheduler: %d archive(s) backed up", done)
 
         threading.Thread(target=_work, name="savesync-archive-backup",
                          daemon=True).start()
 
-    def _on_archive_backup_done(self, name: str):
-        """A scheduled archive re-backup wrote a new backup — announce it the
-        same way a manual one is announced, and honour the same setting."""
+    def _on_archive_backup_done(self, game_id: str, name: str):
+        """A scheduled archive re-backup wrote a new backup.
+
+        Announced the way a manual one is, honouring the same setting — and
+        then sent up, honouring the OTHER one. "Sync after backup" is a rule
+        about backups, not about library games: an archive that quietly
+        re-read itself every half hour and never left the machine was the
+        one kind of backup the rule passed over.
+        """
         try:
             self._status_bar.showMessage(
                 t("notifications.backup_created", game=name), 5000)
@@ -819,6 +833,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._overlay.show_backup_done(name)
         except RuntimeError:
             pass
+        if game_id and get_config().get("auto_sync_after_backup", False):
+            try:
+                logger.info("Auto-syncing after the scheduled backup of %s", name)
+                self._sync_archive(game_id)
+            except Exception:
+                logger.debug("auto-sync after an archive backup failed",
+                             exc_info=True)
 
     def _heavy_work_in_flight(self) -> bool:
         """True while the app is doing work that WANTS the memory it holds.
@@ -1365,16 +1386,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # Genuinely NEW backups (dedup-skipped games must not inflate
                 # the completion message: 21 checked ≠ 21 created).
                 "created_ids": [],
+                # A resumed batch was started by Backup Tutti, not by "sync
+                # everything"; that chain does not survive a restart.
+                "then_sync": False,
             }
             get_library().begin_bulk()
-            first = get_library().get_by_id(ids[0])
+            _first_name = self._batch_item_name(ids[0])
             self._backup_batch_notice.begin(
                 t("batch.backup_label"),
-                self._backup_batch["total"],
-                first.name if first else "")
+                self._backup_batch["total"], _first_name)
             self._backup_batch_notice.update_progress(
-                len(completed), self._backup_batch["total"],
-                first.name if first else "")
+                len(completed), self._backup_batch["total"], _first_name)
             for gid in ids:
                 self._enqueue_backup(
                     gid, force_full=bool(bak.get("force")),
@@ -5112,7 +5134,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         QTimer.singleShot(250, trim_process_memory)
 
     def _start_backup_all(self, game_ids=None, force_full: bool = False,
-                          source: str = "overview"):
+                          source: str = "overview", then_sync: bool = False):
         """Enqueue Backup Tutti with sidebar progress and disk resume state."""
         from datetime import datetime, timezone
         from core.concurrency import backup_max_inflight, log_limits
@@ -5120,6 +5142,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         if game_ids is None:
             game_ids = [g.id for g in get_library().all_games() if g.save_paths]
+            game_ids += get_backup_manager().backupable_archive_ids()
         ids = [gid for gid in game_ids if gid]
         if not ids:
             return
@@ -5136,6 +5159,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # Genuinely NEW backups (dedup-skipped games must not inflate the
             # completion message: 21 checked ≠ 21 created).
             "created_ids": [],
+            # "Sync everything" runs this batch first, so what goes up is
+            # what is on disk now rather than whatever was last backed up.
+            "then_sync": bool(then_sync),
         }
         # Suppress per-game library/overview rebuilds until the batch ends.
         get_library().begin_bulk()
@@ -5146,10 +5172,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             "started_at": self._backup_batch["started_at"],
             "source": source or "overview",
         })
-        first = get_library().get_by_id(ids[0])
         self._backup_batch_notice.begin(
-            t("batch.backup_label"), len(ids),
-            first.name if first else "")
+            t("batch.backup_label"), len(ids), self._batch_item_name(ids[0]))
         for gid in ids:
             self._enqueue_backup(gid, force_full=force_full, silent=True,
                                 part_of_batch=True)
@@ -5206,7 +5230,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         silent = job.get("silent", False)
         entry = get_library().get_by_id(game_id)
         if not entry:
-            self._finish_backup_job(game_id, batch=job.get("batch", False))
+            # No library game under this id. It may still be an ARCHIVE — a
+            # save folder handed over without adding the game — which has
+            # its own folders to re-read. Dropping the job here is how "back
+            # up everything" came to mean "everything in the library".
+            self._run_archive_backup_job(job)
             return
         if self._backup_batch and job.get("batch"):
             done = len(self._backup_batch.get("completed_ids") or [])
@@ -5244,6 +5272,44 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         threading.Thread(target=_do_backup, daemon=True).start()
 
+    def _run_archive_backup_job(self, job: dict):
+        """Re-read an archive's folders, off the GUI thread like any backup."""
+        game_id = job["game_id"]
+        mgr = get_backup_manager()
+        if not mgr.has_local_entries(game_id):
+            self._finish_backup_job(game_id, batch=job.get("batch", False))
+            return
+        if self._backup_batch and job.get("batch"):
+            done = len(self._backup_batch.get("completed_ids") or [])
+            total = int(self._backup_batch.get("total") or 0)
+            self._backup_batch_notice.update_progress(
+                done, total, self._batch_item_name(game_id))
+
+        def _do_archive():
+            created = False
+            try:
+                created, detail = mgr.rebackup_archive(game_id)
+                if not created:
+                    # "unchanged" and "source unavailable" are both ordinary
+                    # outcomes for an archive, not failures of the batch.
+                    logger.info("Archive %s not rewritten: %s", game_id, detail)
+            except Exception:
+                logger.exception("Archive backup failed for %s", game_id)
+            with self._backup_lock:
+                self._backup_results.append(
+                    (game_id, None, job.get("silent", True), created,
+                     job.get("batch", False)))
+            from PySide6.QtCore import QMetaObject, Qt
+            try:
+                QMetaObject.invokeMethod(
+                    self, "_on_backup_done",
+                    Qt.ConnectionType.QueuedConnection,
+                )
+            except RuntimeError:
+                logger.debug("Backup: MainWindow destroyed before result delivery")
+
+        threading.Thread(target=_do_archive, daemon=True).start()
+
     def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False):
         """Enqueue a single-game backup under the adaptive concurrency cap."""
         from core.concurrency import backup_max_inflight
@@ -5272,8 +5338,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._backup_batch["created_ids"].append(game_id)
             total = int(self._backup_batch.get("total") or 0)
             done = len(completed)
-            entry = get_library().get_by_id(pending[0]) if pending else None
-            name = entry.name if entry else ""
+            name = self._batch_item_name(pending[0]) if pending else ""
             self._backup_batch_notice.update_progress(done, total, name)
             persist = (not pending) or (done % 8 == 0)
             _pbj.mark_game_done(_pbj.KEY_BACKUP_ALL, game_id, persist=persist)
@@ -5283,6 +5348,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 except Exception:
                     pass
                 created_ids = list(self._backup_batch.get("created_ids") or [])
+                then_sync = bool(self._backup_batch.get("then_sync"))
                 self._backup_batch = None
                 try:
                     get_library().end_bulk()
@@ -5299,8 +5365,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                             and self._overlay):
                         _bname = ""
                         if len(created_ids) == 1:
-                            _bentry = get_library().get_by_id(created_ids[0])
-                            _bname = _bentry.name if _bentry else ""
+                            _bname = self._batch_item_name(created_ids[0])
                         self._overlay.show_batch_done(
                             "backup", len(created_ids), _bname)
                 except Exception:
@@ -5317,7 +5382,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     pass
                 from ui.helpers import trim_process_memory
                 QTimer.singleShot(400, trim_process_memory)
+                # The backups are on disk; now publish them. "Sync after
+                # backup" is a rule about backups, and a sweep is backups —
+                # so it applies here too, once, at the end. What a sweep must
+                # never do is sync PER GAME as it goes: twenty-one syncs
+                # racing twenty-one backups is what the per-item guard below
+                # exists to stop, and it is a different thing from this.
+                #
+                # Deferred a turn so the completion notice for the backup
+                # half is on screen before the sync half takes it over.
+                if then_sync or get_config().get("auto_sync_after_backup", False):
+                    QTimer.singleShot(0, self._sync_all_after_backup)
         self._pump_backup_queue()
+
+    def _sync_all_after_backup(self):
+        """Second half of "sync everything": the backups are current now."""
+        try:
+            self._overview_page._launch_sync_all()
+        except Exception:
+            logger.exception("Sync Tutti could not start after its backups")
 
     def _backup_batch_done_message(self, created_ids: list) -> str:
         """Completion notice for Backup Tutti.
@@ -5331,11 +5414,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if n == 0:
             return t("batch.backup_done_none")
         if n == 1:
-            entry = get_library().get_by_id(created_ids[0])
-            name = entry.name if entry else ""
+            name = self._batch_item_name(created_ids[0])
             return (t("batch.backup_done_one", name=name) if name
                     else t("batch.backup_done", done=1))
         return t("batch.backup_done", done=n)
+
+    def _batch_item_name(self, game_id: str) -> str:
+        """What to call one item of a batch, library game or archive.
+
+        The batch reaches both, so every place that names one has to. Asking
+        the library alone left an archive nameless — in the progress line,
+        and in a completion notice that then fell back to counting instead
+        of saying which one it was.
+        """
+        if not game_id:
+            return ""
+        entry = get_library().get_by_id(game_id)
+        if entry is not None:
+            return entry.name
+        return get_backup_manager().archive_display_name(game_id)
 
     def _backup_provisional_paths(self, game_id: str, silent: bool = True):
         """Back up whatever live tracking has found so far for a game that
@@ -5459,10 +5556,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             except IndexError:
                 return
         try:
+            entry = get_library().get_by_id(game_id)
+            if entry is None:
+                # An ARCHIVE: no library row, so everything below — the
+                # notice AND the sync that follows a backup — was skipped,
+                # which is why backing one up by hand said nothing and sent
+                # nothing anywhere. Its own ending, same two rules.
+                self._archive_backup_finished(
+                    game_id, created=bool(created), silent=silent, batch=batch)
+                return
             if backup:
-                entry = get_library().get_by_id(game_id)
-                if not entry:
-                    return
 
                 # `created` (from create_backup's return_status) says precisely
                 # whether this was a genuinely new backup or a dedup-skip that
@@ -5493,8 +5596,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     )
 
                     config = get_config()
-                    # Never auto-sync mid Backup Tutti — would stampede Sync Tutti
-                    # and freeze the UI the same way toast spam did.
+                    # Not per game inside a sweep: twenty-one syncs racing
+                    # twenty-one backups freezes the UI the way toast spam
+                    # did. The sweep syncs ONCE when it finishes — see
+                    # _finish_backup_job — so the setting is still honoured.
                     if (not batch
                             and config.get("auto_sync_after_backup", False)
                             and entry.save_paths):
@@ -5544,7 +5649,43 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         if self._overlay:
                             self._overlay.show_backup_done(entry.name, skipped=True)
         finally:
+            # Asked for explicitly, so it runs whether or not the backup
+            # wrote anything and whether or not the setting is on: the
+            # caller wanted this one published, and an unchanged backup is
+            # still the thing to publish.
+            if not batch:
+                self._sync_after_backup_if_asked(game_id)
             self._finish_backup_job(game_id, batch=batch, created=bool(created))
+
+    def _archive_backup_finished(self, game_id: str, created: bool,
+                                 silent: bool, batch: bool):
+        """The end of a backup of an archive: say so, then send it up.
+
+        The same two rules a library game gets — announce unless silenced,
+        and sync afterwards when that setting is on — applied to the one
+        kind of backup that had neither.
+        """
+        mgr = get_backup_manager()
+        name = mgr.archive_display_name(game_id)
+        if not name:
+            return                     # not an archive either: nothing to say
+        config = get_config()
+        if not silent and not batch:
+            if created and config.get("show_overlay_on_backup", True):
+                self._status_bar.showMessage(
+                    t("notifications.backup_created", game=name), 5000)
+                if self._overlay:
+                    self._overlay.show_backup_done(name)
+            elif not created:
+                self._status_bar.showMessage(
+                    t("notifications.backup_unchanged", game=name), 4000)
+                if self._overlay:
+                    self._overlay.show_backup_done(name, skipped=True)
+        # Not per item inside a sweep, for the same reason the library path
+        # is not: the sweep syncs once at the end instead.
+        if created and not batch and config.get("auto_sync_after_backup", False):
+            logger.info("Auto-syncing after the backup of archive %s", name)
+            self._sync_archive(game_id)
 
     def _restore_game_latest(self, game_id: str):
         """Open backup picker — RestoreDialog handles its own confirmation."""
@@ -5929,12 +6070,55 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _sync_game(self, game_id: str):
         entry = get_library().get_by_id(game_id)
         if not entry:
+            # An ARCHIVE — a save folder handed over without adding the game,
+            # so it is in no library listing. Returning here is why the only
+            # way to get one into the cloud was to wait for a sweep.
+            self._sync_archive(game_id)
             return
         orch = get_orchestrator()
         if not orch.is_online():
             self._status_bar.showMessage(t("sync.no_provider"), 4000)
             return
         orch.sync_game(game_id, entry.name, entry.save_paths, exe_path=entry.exe_path, computed_folder_name=entry.computed_folder_name, name_history=list(entry.name_history))
+        self._status_bar.showMessage(t("sync.syncing"), 2000)
+
+    def _backup_then_sync(self, game_id: str):
+        """Back this one up, then send it up. In that order.
+
+        What the Backups page asks for when the listing on screen is the
+        provider's: the point there is to publish, but publishing whatever
+        backup happens to exist would send yesterday's saves and call it
+        done. Same rule as "sync everything", one item wide.
+        """
+        if not game_id:
+            return
+        if not hasattr(self, "_sync_after_backup_ids"):
+            self._sync_after_backup_ids = set()
+        self._sync_after_backup_ids.add(game_id)
+        self._backup_game(game_id)
+
+    def _sync_after_backup_if_asked(self, game_id: str) -> bool:
+        """True when this id was queued as "back up, then sync"."""
+        ids = getattr(self, "_sync_after_backup_ids", None)
+        if not ids or game_id not in ids:
+            return False
+        ids.discard(game_id)
+        self._sync_game(game_id)
+        return True
+
+    def _sync_archive(self, game_id: str):
+        """Send one archive up, the way a library game's ⟳ does."""
+        job = get_backup_manager().orphan_sync_job(game_id)
+        if not job:
+            return
+        orch = get_orchestrator()
+        if not orch.is_online():
+            self._status_bar.showMessage(t("sync.no_provider"), 4000)
+            return
+        orch.sync_game(job["game_id"], job["game_name"], job["save_paths"],
+                       exe_path="",
+                       computed_folder_name=job["computed_folder_name"],
+                       name_history=[])
         self._status_bar.showMessage(t("sync.syncing"), 2000)
 
     # ── i18n ──────────────────────────────────────────────────────────────────

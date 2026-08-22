@@ -1022,8 +1022,15 @@ class BackupManager(QObject):
         logger.info(f"Imported cloud backup: {imported.backup_id} ({imported.size_human})")
         return True
 
-    def _save_game_index(self, game_id: str, _folder_hint: str = ""):
+    def _save_game_index(self, game_id: str, _folder_hint: str = "",
+                         mark_unpublished: bool = True):
         """Save index.json for the backup folder that *game_id* uses.
+
+        *mark_unpublished*: every write here changes what the index says, so
+        by default it also records that the provider has not been told. The
+        bookkeeping that records publication ITSELF passes False — otherwise
+        writing "we published this" would mean "we have something to
+        publish", forever.
 
         The file is per folder name, not per UUID: a game re-added from the
         overlay gets a new id but the same install-folder name, and writing
@@ -1052,6 +1059,13 @@ class BackupManager(QObject):
                 folder = _folder_hint
             if not folder:
                 return
+            if mark_unpublished:
+                for b in self._index:
+                    if b.game_id == game_id:
+                        meta = dict(b.cloud_metadata or {})
+                        if not meta.get(self.INDEX_PUBLISH_KEY):
+                            meta[self.INDEX_PUBLISH_KEY] = True
+                            b.cloud_metadata = meta
             # Everything that belongs in this folder's index — any game_id.
             folder_entries = [
                 b for b in self._index
@@ -2772,7 +2786,7 @@ class BackupManager(QObject):
                     break
         # Write to disk outside the lock to reduce contention
         if game_id is not None:
-            self._save_game_index(game_id)
+            self._save_game_index(game_id, mark_unpublished=False)
 
     def resolve_pre_confirmation_backups(self, game_id: str,
                                          discarded_paths: list[str] = None,
@@ -3100,8 +3114,21 @@ class BackupManager(QObject):
     AUTO_DEFAULT_MINUTES = 30
 
     # Where an archive's saves live, and which of those places to read.
+    # "The index says something the provider has not been told." Written on
+    # every index change, cleared by a sync that has been. It is what lets a
+    # sweep have a reason to go for a game whose SAVES have not moved — a
+    # note edited, a rename, an archive told about another folder — which
+    # the content hash it decides on could never give it.
+    INDEX_PUBLISH_KEY = "index_needs_publish"
     ORPHAN_SOURCES_KEY = "orphan_source_paths"
     ORPHAN_SKIPPED_KEY = "orphan_sources_skipped"
+    # "The index says something new about this archive that the provider has
+    # not been told." Set whenever the metadata is edited, cleared when a
+    # sync publishes it. Without it a sweep decides what to sync from the
+    # CONTENT hash alone — so an archive told about a new folder, with not
+    # one byte changed, was skipped by every sweep and the provider kept the
+    # old list until somebody synced that one archive by hand.
+    ORPHAN_PUBLISH_KEY = "index_needs_publish"    # back-compat alias
 
     @staticmethod
     def _excluded_files_for(game_id: str) -> dict:
@@ -3177,6 +3204,52 @@ class BackupManager(QObject):
         return [p for p in self.orphan_source_paths(entry)
                 if p.casefold() not in skipped]
 
+    def publishable_dict(self, entry: BackupEntry) -> dict:
+        """*entry* as it should appear in a remote index.
+
+        Without the bookkeeping that records publication itself — which is
+        local, and which would otherwise differ from the copy up there the
+        moment it is cleared, making every sync republish forever.
+        """
+        d = entry.to_dict()
+        meta = dict(d.get("cloud_metadata") or {})
+        if meta.pop(self.INDEX_PUBLISH_KEY, None) is not None:
+            d["cloud_metadata"] = meta
+        return d
+
+    def index_needs_publish(self, entry: BackupEntry) -> bool:
+        """Whether this entry has an index change nobody has sent up."""
+        return bool((entry.cloud_metadata or {}).get(self.INDEX_PUBLISH_KEY))
+
+    # The archives were where this started; the question is the same for a
+    # library game, and so is the answer.
+    orphan_needs_publish = index_needs_publish
+
+    def game_needs_publish(self, game_id: str) -> bool:
+        """Whether any of this game's entries is waiting to be published."""
+        with _index_lock:
+            return any(self.index_needs_publish(b) for b in self._index
+                       if b.game_id == game_id)
+
+    def clear_index_publish_flag(self, game_id: str) -> bool:
+        """The provider now has what the index says. True if anything changed."""
+        touched = False
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                meta = dict(b.cloud_metadata or {})
+                if meta.pop(self.INDEX_PUBLISH_KEY, None) is None:
+                    continue
+                b.cloud_metadata = meta
+                touched = True
+        if touched:
+            # NOT marking: this write is the record that we published.
+            self._save_game_index(game_id, mark_unpublished=False)
+        return touched
+
+    clear_orphan_publish_flag = clear_index_publish_flag
+
     def _write_orphan_meta(self, game_id: str, key: str,
                            values: list[str]) -> bool:
         """Put *values* under *key* on every entry of an archive.
@@ -3199,6 +3272,11 @@ class BackupManager(QObject):
                     if key not in meta:
                         continue
                     meta.pop(key)
+                # Something the index says about this archive changed, so
+                # the copy on the provider is now behind. A sweep reads this
+                # to decide it has a reason to go, which the content hash
+                # alone would never give it.
+                meta[self.INDEX_PUBLISH_KEY] = True
                 b.cloud_metadata = meta
                 touched = True
         if touched:
@@ -3335,7 +3413,7 @@ class BackupManager(QObject):
                 else:
                     meta.pop(self.AUTO_ERROR_KEY, None)
                 b.cloud_metadata = meta
-        self._save_game_index(game_id)
+        self._save_game_index(game_id, mark_unpublished=False)
 
     def _archive_is_due(self, game_id: str, interval_minutes: int) -> bool:
         from datetime import datetime, timezone, timedelta
@@ -3423,6 +3501,44 @@ class BackupManager(QObject):
         if not created:
             return False, "unchanged"
         return True, entry.backup_id
+
+    def archive_display_name(self, game_id: str) -> str:
+        """What to call an archive on screen. Empty when it is not one."""
+        with _index_lock:
+            names = [(b.created_dt, b.game_name or "") for b in self._index
+                     if b.game_id == game_id]
+        return max(names, key=lambda r: r[0])[1] if names else ""
+
+    def backupable_archive_ids(self) -> list[str]:
+        """Archives with somewhere to read, for "back up everything".
+
+        An archive is a save folder the user handed over WITHOUT adding the
+        game to the library, so it appears in no library listing — which is
+        exactly how "back up everything" managed to mean "everything in the
+        library" and quietly pass over folders the user is still playing out
+        of. It is the same everything.
+
+        Only ones with a folder switched on and actually present: the rest
+        have nothing to read and would add a line to the batch that could
+        only report failure.
+        """
+        try:
+            from core.config_manager import get_config
+            if not get_config().get("backup_archives_too", True):
+                return []
+        except Exception:
+            pass
+        lib_ids = self.library_game_ids()
+        out: list[str] = []
+        seen: set = set()
+        for b in self.get_orphan_backups():
+            gid = b.game_id
+            if not gid or gid in seen or gid in lib_ids:
+                continue
+            seen.add(gid)
+            if any(Path(p).exists() for p in self.orphan_sources_to_read(b)):
+                out.append(gid)
+        return out
 
     def archives_due_for_backup(self) -> list[str]:
         """game_ids of archives whose scheduled re-backup is due."""
@@ -3557,7 +3673,9 @@ class BackupManager(QObject):
                 "save_hash": meta.get("save_hash") or "",
                 "synced_to": synced_to,
                 "last_synced_hash": meta.get("last_synced_hash") or "",
-                "needs_sync": not bool(synced_to) or (
+                "needs_sync": not bool(synced_to) or bool(
+                    meta.get(self.INDEX_PUBLISH_KEY)
+                ) or (
                     bool(meta.get("save_hash"))
                     and meta.get("save_hash") != meta.get("last_synced_hash")
                 ),
@@ -3565,7 +3683,19 @@ class BackupManager(QObject):
         return units
 
     def orphan_sync_jobs(self) -> list[dict]:
-        """Sync-queue jobs for orphan archives that still need a cloud upload."""
+        """Sync-queue jobs for orphan archives that still need a cloud upload.
+
+        Empty when the user has taken archives out of "everything" — the
+        same setting that keeps them out of Backup Tutti, because a sweep
+        that backs them up and does not send them up is half an answer.
+        A button pressed on one archive is not a sweep and ignores this.
+        """
+        try:
+            from core.config_manager import get_config
+            if not get_config().get("backup_archives_too", True):
+                return []
+        except Exception:
+            pass
         jobs = []
         for u in self.orphan_units():
             if not u.get("needs_sync"):
@@ -3582,6 +3712,28 @@ class BackupManager(QObject):
                 "orphan": True,
             })
         return jobs
+
+    def orphan_sync_job(self, game_id: str) -> dict | None:
+        """The sync job for ONE archive, asked for by name. None if unknown.
+
+        orphan_sync_jobs() answers "what still needs uploading" for a sweep,
+        so it skips anything that looks up to date. This answers "this one,
+        now": a button pressed on an archive is not a question about whether
+        it looked due.
+        """
+        for u in self.orphan_units():
+            if u.get("game_id") != game_id or not u.get("save_paths"):
+                continue
+            return {
+                "game_id": u["game_id"],
+                "game_name": u["game_name"],
+                "save_paths": list(u["save_paths"]),
+                "exe_path": "",
+                "computed_folder_name": u.get("folder") or "",
+                "name_history": [],
+                "orphan": True,
+            }
+        return None
 
     def mark_orphan_synced(self, game_id: str, provider_ids: list[str] | None = None,
                            save_hash: str = "", persist: bool = True) -> None:
@@ -3615,7 +3767,7 @@ class BackupManager(QObject):
                 touched = True
         if touched and persist:
             try:
-                self._save_game_index(game_id)
+                self._save_game_index(game_id, mark_unpublished=False)
             except Exception:
                 logger.debug("mark_orphan_synced save failed", exc_info=True)
 

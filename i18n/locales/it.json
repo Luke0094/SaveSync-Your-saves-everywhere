@@ -54,7 +54,8 @@
     "day_thu": "Gio",
     "day_fri": "Ven",
     "day_sat": "Sab",
-    "day_sun": "Dom"
+    "day_sun": "Dom",
+    "backing_up_first": "Prima faccio il backup di tutto…"
   },
   "nav": {
     "library": "Libreria",
@@ -447,7 +448,9 @@
     "save_edit_copies_tooltip": "Quante copie di uno stesso salvataggio tenere prima di eliminare la più vecchia. Una copia viene presa a ogni scrittura, quindi è fin dove si può tornare indietro.",
     "save_edit_copy_days": "Elimina dopo",
     "save_edit_copy_days_tooltip": "Le copie più vecchie di così vengono rimosse. La più recente resta sempre, qualunque età abbia, così c'è sempre qualcosa con cui annullare.",
-    "diagnostics_running": "Esecuzione controlli diagnostici in corso..."
+    "diagnostics_running": "Esecuzione controlli diagnostici in corso...",
+    "backup_archives_too": "Includi gli archivi in “backup di tutto” e “sincronizza tutto”",
+    "backup_archives_too_tooltip": "Gli archivi sono cartelle di salvataggi che hai consegnato senza aggiungere il gioco alla libreria. Attivo, una passata li copre come qualsiasi gioco. Disattivo, le passate restano alla libreria e un archivio si aggiorna con i suoi pulsanti o col suo controllo ricorrente."
   },
   "config_transfer": {
     "preview_title": "Anteprima Importazione Configurazione",

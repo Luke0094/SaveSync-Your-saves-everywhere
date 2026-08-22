@@ -363,6 +363,8 @@ from ui.widgets.search_inputs import (GhostClearableLineEdit, _SearchCombo,
 class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
     restore_requested = Signal(str, str)
     backup_requested  = Signal(str)
+    sync_requested    = Signal(str)
+    backup_then_sync_requested = Signal(str)
     backup_all_requested = Signal(object)  # list[str] game ids
     manual_paths_requested = Signal()
     # Manual "Verifica Backup" sweep — the main window mirrors these into the
@@ -1798,6 +1800,22 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._list_layout.removeItem(item)
 
         gid  = self._selected_game_id
+
+        # Which titles are open survives a rebuild only when the rebuild
+        # shows the SAME listing. A delete, a verify, a new backup landing:
+        # same list, so a section the user opened stays open. A different
+        # game, filter, search or page: a different list, and carrying the
+        # expansion into it reopened sections the user had moved on from —
+        # rebuilding a row per backup for each, and holding them.
+        #
+        # Decided here rather than at each of the dozen callers of
+        # _refresh_list, which is how the same bug arrived three times in
+        # three disguises.
+        _listing = (gid or "", self._game_filter_text,
+                    self._get_origin_filter(), int(self._backups_page_num))
+        if _listing != getattr(self, "_listing_key", None):
+            self._expanded_titles = set()
+            self._listing_key = _listing
         tf   = self._game_filter_text.lower()
         mgr  = get_backup_manager()
         filt = self._get_origin_filter()
@@ -2066,12 +2084,8 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         page_keys = order[start:start + per_page]
 
         def _go_page(n: int):
-            # Turning the page is a different set of titles, so nothing
-            # carries over. Without this, a title expanded on page one came
-            # back expanded every time its page did — rebuilding a row per
-            # backup for a section the user had long since moved past, and
-            # holding them all for as long as the listing lived.
-            self._expanded_titles = set()
+            # Turning the page is a different listing; _refresh_list_inner
+            # notices and folds what was open.
             self._backups_page_num = n
             self._refresh_list()
 
@@ -2238,6 +2252,32 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # one place it can least afford the work.
         paths_btn = QPushButton(t("backups.archive_paths_btn"))
         paths_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # The same two buttons a library row carries, for the same two jobs.
+        # An archive could be backed up and sent up only by the recurring
+        # check or a sweep over everything — there was no way to say "this
+        # one, now", which is the plainest thing to want from a row.
+        from ui.helpers import lock_min_size as _lock
+        _bw = scaled(26, self, min_px=24)
+        backup_btn = QPushButton(t("buttons.backup"))
+        backup_btn.setObjectName("icon_btn")
+        backup_btn.setFixedSize(_bw, _bw)
+        _lock(backup_btn, _bw, _bw,
+              policy_h=QSizePolicy.Policy.Fixed,
+              policy_v=QSizePolicy.Policy.Fixed)
+        backup_btn.setToolTip(t("library.backup_now"))
+        backup_btn.clicked.connect(
+            lambda _=False, g=game_id: self.backup_requested.emit(g))
+        sync_btn = QPushButton(t("buttons.sync"))
+        sync_btn.setObjectName("icon_btn")
+        sync_btn.setFixedSize(_bw, _bw)
+        _lock(sync_btn, _bw, _bw,
+              policy_h=QSizePolicy.Policy.Fixed,
+              policy_v=QSizePolicy.Policy.Fixed)
+        sync_btn.setToolTip(t("sync.sync_now"))
+        sync_btn.clicked.connect(
+            lambda _=False, g=game_id: self.sync_requested.emit(g))
+
         hint_row = QHBoxLayout()
         hint_row.setContentsMargins(0, 0, 0, 0)
         hint_row.setSpacing(8)
@@ -2247,6 +2287,8 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # rather than sat next to each other, so the note reads as a remark
         # about the row and not as part of the button.
         hint_row.addWidget(paths_btn, 0, Qt.AlignmentFlag.AlignTop)
+        hint_row.addWidget(backup_btn, 0, Qt.AlignmentFlag.AlignTop)
+        hint_row.addWidget(sync_btn, 0, Qt.AlignmentFlag.AlignTop)
         hint_row.addStretch(1)
         hint_row.addWidget(hint, 0, Qt.AlignmentFlag.AlignRight
                            | Qt.AlignmentFlag.AlignVCenter)
@@ -2467,33 +2509,41 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         except Exception:
             pass
 
-    def _on_backup_now(self):
-        """Trigger backup.
+    # Source filters that show what is HERE. Under any other one the list is
+    # the provider's side, where a backup of a backup already up there is not
+    # a thing to make — those sync instead.
+    _LOCAL_FILTERS = ("all", "local_only", "local_sync", "archive_only")
 
-        No selection → backup all tracked games (same as overlay 'Backup all').
-        Game selected → backup only that game (or sync if provider filter active).
+    def _on_backup_now(self):
+        """Back up. No selection → everything; one selected → that one.
+
+        Under a provider filter the listing is the cloud's, so the point is
+        to publish — but it backs up FIRST all the same. Publishing whatever
+        backup happens to exist would send yesterday's saves up and report
+        success, which is the one thing a button pressed on live data must
+        not do. Backup, then sync: the same order "sync everything" uses.
+
+        It used to sync there by looking the selection up in the library,
+        which is why an ARCHIVE under a provider filter did nothing at all
+        — and why an archive under "archives only", a LOCAL listing, was
+        sent down that path too and did nothing either.
         """
         gid = self._selected_game_id
         if not gid:
             from core.library import get_library
             ids = [g.id for g in get_library().all_games() if g.save_paths]
+            # Including the archives listed on this very page.
+            ids += get_backup_manager().backupable_archive_ids()
             self.backup_all_requested.emit(ids)
             return
 
-        filt = self._get_origin_filter()
-        if filt not in ("all", "local_only", "local_sync"):
-            from sync import get_orchestrator
-            from core.library import get_library
-            orch = get_orchestrator()
-            entry = get_library().get_by_id(gid)
-            if orch.is_online() and entry and entry.save_paths:
-                orch.sync_game(
-                    entry.id, entry.name, entry.save_paths,
-                    exe_path=entry.exe_path,
-                    computed_folder_name=entry.computed_folder_name,
-                )
-        else:
+        if self._get_origin_filter() in self._LOCAL_FILTERS:
             self.backup_requested.emit(gid)
+        else:
+            # Both, in order. Handled where every other backup is, so an
+            # archive gets there too — the inline library lookup that used
+            # to live here did not know what one was.
+            self.backup_then_sync_requested.emit(gid)
 
     def _on_restore(self, game_id: str, backup_id: str):
         self.restore_requested.emit(game_id, backup_id)
