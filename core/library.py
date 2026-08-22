@@ -715,36 +715,41 @@ class LibraryManager(QObject):
                     names.add(fn.casefold())
         return names
 
-    def unique_folder_name(self, base: str, exclude_id: str = "", also_taken=None) -> str:
-        """Return *base*, or ``base_2`` / ``base_3`` / … when another library
-        entry already occupies that sync/backup folder name.
+    def unique_folder_name(self, base: str, exclude_id: str = "", also_taken=None,
+                           hint: str = "") -> str:
+        """Return *base*, or ``base~<tag>`` when another library entry already
+        occupies that sync/backup folder name.
 
         Two genuinely different games that share the same title would otherwise
         land in the same ``SaveSync/<name>`` folder and cross-contaminate. The
-        suffix disambiguates them. An already-free *base* is returned unchanged,
-        so a name that is unique stays stable across calls.
+        tag disambiguates them, and is deliberately not a number — see
+        core.constants.disambiguate_name for why ``base_2`` cannot be used for
+        this. An already-free *base* is returned unchanged, so a name that is
+        unique stays stable across calls.
 
         *also_taken* is an optional iterable of extra folder names to avoid
         (e.g. existing CLOUD folders): the caller can make the result unique
-        against destinations beyond the local library."""
+        against destinations beyond the local library. *hint* (an exe or save
+        path) makes the tag repeatable for the same game."""
         if not base:
             return base
         taken = self._resolved_folder_names(exclude_id)
         if also_taken:
             taken = taken | {s.casefold() for s in also_taken if s}
-        if base.casefold() not in taken:
-            return base
-        n = 2
-        while f"{base}_{n}".casefold() in taken:
-            n += 1
-        return f"{base}_{n}"
+        from core.constants import disambiguate_name
+        return disambiguate_name(base, taken, hint=hint)
 
-    def unique_display_name(self, base: str, exclude_id: str = "", also_taken=None) -> str:
-        """Return *base*, or ``base_2`` / ``base_3`` / … when another library
-        entry already uses that display title (case-insensitive).
+    def unique_display_name(self, base: str, exclude_id: str = "",
+                            also_taken=None, hint: str = "") -> str:
+        """Return *base*, or ``base~<tag>`` when another library entry already
+        uses that display title (case-insensitive).
 
-        Same suffix scheme as ``unique_folder_name`` / keep-both: two distinct
-        games whose cleaned titles collide stay visually distinct in the list.
+        Same scheme as ``unique_folder_name`` / keep-both, and for the same
+        reason it is no longer ``base_2``: a numeric suffix on a TITLE is
+        indistinguishable from a sequel, both to the reader and to the slug
+        every name comparison in the app runs on. See
+        core.constants.disambiguate_name.
+
         An already-free *base* is returned unchanged."""
         if not base:
             return base
@@ -755,12 +760,8 @@ class LibraryManager(QObject):
         }
         if also_taken:
             taken = taken | {s.casefold() for s in also_taken if s}
-        if base.casefold() not in taken:
-            return base
-        n = 2
-        while f"{base}_{n}".casefold() in taken:
-            n += 1
-        return f"{base}_{n}"
+        from core.constants import disambiguate_name
+        return disambiguate_name(base, taken, hint=hint)
 
     def folder_name_in_use_by_other(self, folder_name: str, exclude_id: str = "") -> bool:
         """True when a live entry OTHER than *exclude_id* currently resolves to
@@ -802,6 +803,33 @@ class LibraryManager(QObject):
             return
         self._schedule_save()
         self.game_updated.emit(copy.deepcopy(entry))
+
+    def notify_updated(self, game_id: str) -> Optional[GameEntry]:
+        """Announce a game that was changed IN PLACE under ``_lock``.
+
+        A handful of writers deliberately mutate ``self._games[id]`` directly
+        rather than going through update_game(), because they are adding to a
+        field (playtime) and a read-modify-write would clobber whatever a
+        concurrent writer had put there meanwhile — the process monitor's
+        end-of-session accounting is the main one. Those writers scheduled the
+        save and stopped there, so the change reached disk but nothing on
+        screen: the playtime and "last played" a session had just produced sat
+        stale on the card until something else forced a rebuild. This is the
+        missing half — same signal, same payload shape, same bulk suppression
+        as update_game, without touching the entry again.
+
+        Returns the snapshot that was emitted, or None if the game is gone.
+        """
+        with self._lock:
+            live = self._games.get(game_id)
+            if live is None:
+                return None
+            snapshot = copy.deepcopy(live)
+            in_bulk = self._bulk_depth > 0
+        if in_bulk:
+            return snapshot
+        self.game_updated.emit(copy.deepcopy(snapshot))
+        return snapshot
 
     def update_game_fields(self, game_id: str, **fields) -> Optional[GameEntry]:
         """Atomically update specific fields on a game entry.

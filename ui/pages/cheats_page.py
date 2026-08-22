@@ -377,6 +377,21 @@ class _DropZone(QFrame, ThemedMixin):
         else:
             event.ignore()
 
+    def mousePressEvent(self, event):
+        """Clicking the zone opens the file picker.
+
+        The half of this widget's own description that was never implemented:
+        the label says "click to choose one", the cursor is a pointing hand,
+        and the page connects `browse` to its picker — but nothing ever
+        emitted it, so the click landed on a frame that quietly did nothing
+        and the only way in was drag-and-drop.
+        """
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            self.browse.emit()
+            return
+        super().mousePressEvent(event)
+
 class _SaveLoadWorker(QThread):
     finished = Signal(object, object)  # (doc, exception)
     progress = Signal(float)

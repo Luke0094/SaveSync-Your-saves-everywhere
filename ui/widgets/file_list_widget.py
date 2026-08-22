@@ -44,6 +44,16 @@ class FileListWidget(QWidget):
         self._file_rows: dict[str, tuple[QCheckBox, QToolButton]] = {}
         self._built = False  # lazy build on first expand
         self._excluded_files: set[str] = set()  # relative paths excluded by user
+        # Files the user BINNED. Deselecting and deleting are different acts
+        # and were being recorded as one: unticking a file wrote it to the
+        # deleted-paths store as well, so it turned up in "restore deleted"
+        # having never been deleted, and the restore list filled with things
+        # the user had merely chosen not to back up this time.
+        #
+        #   unticked -> stays in the list, not backed up, NOT restorable
+        #               (there is nothing to restore: it is right there)
+        #   binned   -> leaves the list, and IS restorable
+        self._deleted_files: set[str] = set()
         self._cancel_event = threading.Event()  # thread-safe cancellation flag
         self._bg_thread: Optional[threading.Thread] = None  # track background count thread
 
@@ -210,7 +220,25 @@ class FileListWidget(QWidget):
         )
 
     def _build_file_list(self):
-        """Populate the file list from the directory."""
+        """Populate the file list from the directory.
+
+        Idempotent. It used to be called exactly once — lazily, the first
+        time the list was expanded — so it appended to an empty layout and
+        the question never came up. Calling it a second time (to show a
+        restored file back in its place) appended a whole second copy of
+        every row beside the first, and a third call a third copy. A build
+        that cannot be repeated is a trap for the next caller, so it clears
+        what it is about to rebuild.
+        """
+        self._files_built = True
+        self._file_checkboxes = []
+        self._file_rows = {}
+        while self._file_layout.count():
+            item = self._file_layout.takeAt(0)
+            w = item.widget() if item else None
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
         p = Path(self._path)
         if not p.exists():
             lbl = QLabel(t("file_list.path_not_found"))
@@ -263,6 +291,8 @@ class FileListWidget(QWidget):
                 row_lay.setContentsMargins(0, 1, 0, 1)
                 row_lay.setSpacing(6)
 
+                if rel_path in self._deleted_files:
+                    continue          # binned: out of the list, not greyed out
                 is_excluded = rel_path in self._excluded_files
 
                 cb = QCheckBox(rel_path)
@@ -279,26 +309,23 @@ class FileListWidget(QWidget):
                 act_btn.setFixedSize(_btn_sz, _btn_sz)
                 act_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-                def _apply_ui_state(excluded: bool, _c=cb, _b=act_btn):
-                    _c.blockSignals(True)
-                    _c.setChecked(not excluded)
-                    _c.blockSignals(False)
-                    if excluded:
-                        _b.setText("↺")
-                        _b.setToolTip(t("file_list.restore_file"))
-                        _c.setStyleSheet("color: #888888; text-decoration: line-through;")
-                    else:
-                        _b.setText("✕")
-                        _b.setToolTip(t("file_list.exclude_file"))
-                        _c.setStyleSheet("")
+                # The bin DELETES. The tick-box beside it is what says "not
+                # this time" — it used to do the same thing as this button,
+                # which left no way to actually take a file out of the list.
+                act_btn.setText("🗑")
+                act_btn.setToolTip(t("file_list.delete_file"))
+                _live = getattr(self, "_selectable", True)
+                cb.setEnabled(_live)
+                act_btn.setEnabled(_live)
+                cb.setStyleSheet(
+                    "" if not is_excluded
+                    else "color: #888888; text-decoration: line-through;")
 
-                _apply_ui_state(is_excluded)
-
-                act_btn.clicked.connect(lambda _=False, rp=rel_path, c=cb, b=act_btn: (
-                    self._on_action_btn_clicked(rp, c, b)
+                act_btn.clicked.connect(lambda _=False, rp=rel_path, w=row_w: (
+                    self._on_delete_clicked(rp, w)
                 ))
-                cb.toggled.connect(lambda checked, rp=rel_path, c=cb, b=act_btn: (
-                    self._on_cb_toggled(rp, checked, c, b)
+                cb.toggled.connect(lambda checked, rp=rel_path, c=cb: (
+                    self._on_cb_toggled(rp, checked, c)
                 ))
 
                 row_lay.addWidget(cb, 1)
@@ -320,35 +347,32 @@ class FileListWidget(QWidget):
             empty_lbl.setObjectName("file_list_meta_italic")
             self._file_layout.addWidget(empty_lbl)
 
-    def _on_action_btn_clicked(self, rel_path: str, cb: QCheckBox, btn: QToolButton):
-        curr_excl = rel_path in self._excluded_files
-        new_excl = not curr_excl
-        self._set_file_excluded_state(rel_path, new_excl)
-        cb.blockSignals(True)
-        cb.setChecked(not new_excl)
-        cb.blockSignals(False)
-        if new_excl:
-            btn.setText("↺")
-            btn.setToolTip(t("file_list.restore_file"))
-            cb.setStyleSheet("color: #888888; text-decoration: line-through;")
-        else:
-            btn.setText("✕")
-            btn.setToolTip(t("file_list.exclude_file"))
-            cb.setStyleSheet("")
+    def _on_delete_clicked(self, rel_path: str, row_w):
+        """Bin a file: out of the list, and restorable from Ignored Paths."""
+        if not getattr(self, "_selectable", True):
+            return
+        self._deleted_files.add(rel_path)
+        self._set_file_excluded_state(rel_path, True, deleted=True)
+        self._file_rows.pop(rel_path, None)
+        self._file_checkboxes = [(c, r) for c, r in self._file_checkboxes
+                                 if r != rel_path]
+        try:
+            row_w.setParent(None)
+            row_w.deleteLater()
+        except RuntimeError:
+            pass
 
-    def _on_cb_toggled(self, rel_path: str, checked: bool, cb: QCheckBox, btn: QToolButton):
-        new_excl = not checked
-        self._set_file_excluded_state(rel_path, new_excl)
-        if new_excl:
-            btn.setText("↺")
-            btn.setToolTip(t("file_list.restore_file"))
-            cb.setStyleSheet("color: #888888; text-decoration: line-through;")
-        else:
-            btn.setText("✕")
-            btn.setToolTip(t("file_list.exclude_file"))
-            cb.setStyleSheet("")
+    def _on_cb_toggled(self, rel_path: str, checked: bool, cb: QCheckBox):
+        """Tick / untick: whether this file goes into the backup. Nothing
+        leaves the list and nothing becomes restorable — it is still here."""
+        if not getattr(self, "_selectable", True):
+            return
+        self._set_file_excluded_state(rel_path, not checked)
+        cb.setStyleSheet("" if checked
+                         else "color: #888888; text-decoration: line-through;")
 
-    def _set_file_excluded_state(self, rel_path: str, excluded: bool):
+    def _set_file_excluded_state(self, rel_path: str, excluded: bool,
+                                 deleted: bool = False):
         full_p = str(Path(self._path) / rel_path)
         if excluded:
             self._excluded_files.add(rel_path)
@@ -377,10 +401,13 @@ class FileListWidget(QWidget):
                     excl_files.pop(self._game_id, None)
                 cfg.set("auto_scan_excluded_files", excl_files)
 
-                # 2. auto_scan_deleted_paths (so it appears in Ignored Paths modal)
+                # 2. auto_scan_deleted_paths — what "restore deleted" offers.
+                # Only a DELETE belongs here. An unticked file is still on
+                # screen with its box empty, so listing it as something to
+                # restore asks the user to bring back what never went away.
                 del_paths = dict(cfg.get("auto_scan_deleted_paths", {}))
                 game_del = list(del_paths.get(self._game_id, []))
-                if excluded and full_p not in game_del:
+                if deleted and full_p not in game_del:
                     game_del.append(full_p)
                 elif not excluded and full_p in game_del:
                     game_del.remove(full_p)
@@ -395,6 +422,63 @@ class FileListWidget(QWidget):
         self.selection_changed.emit()
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_selectable(self, on: bool) -> None:
+        """Enable or disable every file control, remembering the ticks.
+
+        A file inside a path nobody is backing up is not a choice anyone can
+        usefully make: the path decides. Leaving the boxes live let the user
+        tick files under an unticked path and reasonably expect something to
+        come of it. So the whole list follows its path — and the state the
+        user had chosen is put back when the path is ticked again rather than
+        being flattened to "all on", which is what would make cascading
+        destructive instead of merely obedient.
+        """
+        if on and getattr(self, "_ticks_before_disable", None) is not None:
+            self._excluded_files = set(self._ticks_before_disable)
+            self._ticks_before_disable = None
+            for rel, (cb, _btn) in list(self._file_rows.items()):
+                try:
+                    cb.blockSignals(True)
+                    cb.setChecked(rel not in self._excluded_files)
+                    cb.setStyleSheet(
+                        "" if rel not in self._excluded_files
+                        else "color: #888888; text-decoration: line-through;")
+                    cb.blockSignals(False)
+                except RuntimeError:
+                    continue
+        elif not on and getattr(self, "_ticks_before_disable", None) is None:
+            self._ticks_before_disable = set(self._excluded_files)
+
+        self._selectable = bool(on)
+        for _rel, (cb, btn) in list(self._file_rows.items()):
+            try:
+                cb.setEnabled(on)
+                btn.setEnabled(on)
+            except RuntimeError:
+                continue
+        try:
+            self._toggle_btn.setEnabled(True)      # looking is always allowed
+        except (AttributeError, RuntimeError):
+            pass
+
+    def refresh_from_store(self) -> None:
+        """Re-read this path's exclusions and rebuild the visible list.
+
+        Used after a restore: the file comes back into THIS list, where it
+        was binned from, instead of arriving as a save path of its own.
+        """
+        if self._game_id:
+            try:
+                from core.config_manager import get_config
+                saved = (get_config().get("auto_scan_excluded_files", {})
+                         or {}).get(self._game_id, {}) or {}
+                self._excluded_files = set(saved.get(self._path, []))
+            except Exception:
+                pass
+        self._deleted_files.clear()
+        if getattr(self, "_files_built", False):
+            self._build_file_list()
 
     def get_excluded_files(self) -> set[str]:
         """Return set of relative paths the user has excluded."""

@@ -11,6 +11,7 @@ its fingerprints next to its executable, and a save folder in AppData looks
 much the same whoever wrote it.
 """
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,12 @@ def _names(folder: Path) -> tuple:
     return names, suffixes
 
 
+# The engine core script RPG Maker ships in its js/ tree, whichever
+# generation wrote it: rpg_core.js (MV), rmmz_core.js (MZ), and whatever the
+# next one calls its own. See _engine_of_folder.
+_RPGMAKER_CORE_JS = re.compile(r"(?:rpg|rm[a-z0-9]{0,4})_core\.js")
+
+
 def _engine_of_folder(folder: Path) -> str:
     names, suffixes = _names(folder)
     if not names:
@@ -165,11 +172,18 @@ def _engine_of_folder(folder: Path) -> str:
     if "renpy" in names and ("lib" in names or "game" in names):
         return RENPY
     # RPG Maker MV/MZ ship a www/ (or js/) tree with the engine core in it.
+    #
+    # Matched by SHAPE rather than by a list of the two filenames that exist
+    # today. Each generation renames this file — MV's "rpg_core.js" became
+    # MZ's "rmmz_core.js" — so a fixed pair stops recognising RPG Maker the
+    # day the next one ships, and the games that engine writes are among the
+    # most common there are. The pattern stays tight enough that it cannot
+    # claim an unrelated script: an "rm" or "rpg" prefix, a short generation
+    # tag, and "_core.js".
     for js in (folder / "www" / "js", folder / "js"):
         try:
-            if js.is_dir() and any(
-                    f.name.lower() in ("rpg_core.js", "rmmz_core.js")
-                    for f in js.iterdir()):
+            if js.is_dir() and any(_RPGMAKER_CORE_JS.fullmatch(f.name.lower())
+                                   for f in js.iterdir()):
                 return RPGMAKER
         except OSError:
             pass

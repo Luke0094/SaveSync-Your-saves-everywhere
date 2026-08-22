@@ -114,6 +114,45 @@ def scan_relevant_save_mtimes(
     return True, count, max_mtime
 
 
+def relevant_save_files(root, chain: str = ""):
+    """The files under *root* that a backup of it would actually contain.
+
+    The same two rules the backup content-walk applies, in one callable, so
+    anything asking "what is in this save folder" gets the same answer the
+    archive did. Without it a caller walking the folder itself sees shaders,
+    audio and caches that were never backed up, and compares them against a
+    manifest that excluded them.
+
+    *chain* is the save chain declared for this folder, if any. It is passed
+    through to the skip rule for the reason that rule already documents: a
+    chain as ordinary as ``data/www/save`` crosses a directory that otherwise
+    reads as game assets, and the user pointing at it wins over the general
+    rule. Leaving it out here would exclude exactly the files the archive kept.
+    """
+    keep = frozenset(part.strip().lower()
+                     for part in (chain or "").replace("\\", "/").split("/")
+                     if part.strip())
+    try:
+        base = Path(root)
+        if base.is_file():
+            if not _is_skip_file(base):
+                yield base
+            return
+        if not base.is_dir():
+            return
+        for f in base.rglob("*"):
+            try:
+                if not f.is_file():
+                    continue
+                if _is_skip_file(f) or _is_in_skipped_subdir(f, base, keep):
+                    continue
+                yield f
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
 def _is_in_skipped_subdir(f: Path, root: Path, keep: frozenset = frozenset()) -> bool:
     """True if any directory between *root* and *f* is a banned backup
     subdirectory (game assets, caches — see _BACKUP_SKIP_DIRS). Files whose
@@ -285,22 +324,67 @@ def _set_process_suspended(pid: int, suspend: bool) -> bool:
 _FROZEN_MARKER = USER_DATA_DIR / "frozen_process.json"
 
 
-def _mark_frozen(pid: int) -> None:
+def _mark_frozen(pid: int, exe_hint: str = "") -> bool:
+    """Record the suspension. True when the process can be IDENTIFIED again.
+
+    More than one way to prove it, because the strongest one is the one that
+    can fail. create_time is the identity the monitor uses and stays first
+    choice, but reading it goes through psutil — and when psutil is what
+    failed, every psutil-derived fallback fails with it. So *exe_hint* comes
+    from the CALLER, which already knows which game it is about to freeze and
+    got that from the library rather than from the process table.
+
+    The recorded name/exe are weaker than create_time and are only ever a
+    fallback: a recycled PID belonging to an unrelated program will not match
+    them, which is the one thing that has to hold. A recycled PID that happens
+    to be running the SAME executable is not distinguishable this way, but
+    resuming that one is harmless — it is the same program, and resume only
+    decrements a suspend count it would then not have.
+
+    Returns False when nothing identifying could be recorded at all, so the
+    caller can decline to suspend rather than freeze something it would have
+    no way to prove it may unfreeze.
+    """
+    create_time = 0.0
+    name = exe = ""
     try:
-        create_time = 0.0
+        import psutil
+        proc = psutil.Process(pid)
         try:
-            import psutil
-            create_time = psutil.Process(pid).create_time()
+            create_time = float(proc.create_time())
         except Exception:
             pass
+        try:
+            name = (proc.name() or "").strip()
+        except Exception:
+            pass
+        try:
+            exe = (proc.exe() or "").strip()
+        except Exception:
+            # Reading another process's path can be refused outright; the
+            # caller's hint is exactly the case this exists for.
+            pass
+    except Exception:
+        pass
+    if not exe:
+        exe = (exe_hint or "").strip()
+    if not (create_time or exe or name):
+        logger.warning(
+            f"Nothing identifies process {pid} — refusing to suspend a process "
+            f"that could not be recognised again")
+        return False
+    try:
         _FROZEN_MARKER.parent.mkdir(parents=True, exist_ok=True)
         with open(_FROZEN_MARKER, "w", encoding="utf-8") as f:
             json.dump({"pid": pid, "create_time": create_time,
+                       "name": name, "exe": exe,
                        "at": datetime.utcnow().isoformat()}, f)
             f.flush()
             os.fsync(f.fileno())     # the point is surviving a hard kill
+        return True
     except Exception as e:
         logger.debug(f"Could not record the suspended process: {e}")
+        return False
 
 
 def _clear_frozen() -> None:
@@ -322,6 +406,8 @@ def resume_orphaned_process() -> bool:
             rec = json.load(f)
         pid = int(rec.get("pid", 0))
         want_ct = float(rec.get("create_time", 0.0))
+        want_exe = str(rec.get("exe", "") or "")
+        want_name = str(rec.get("name", "") or "")
     except Exception as e:
         logger.debug(f"Unreadable suspended-process marker: {e}")
         _clear_frozen()
@@ -329,13 +415,45 @@ def resume_orphaned_process() -> bool:
 
     resumed = False
     if pid > 0:
-        same = True
-        if want_ct:
-            try:
-                import psutil
-                same = abs(psutil.Process(pid).create_time() - want_ct) < 1.0
-            except Exception:
-                same = False      # process gone, or unreadable — do not touch it
+        # Default DENY, then look for a proof. The point of recording an
+        # identity at all is that a PID on its own is meaningless by the next
+        # boot, and NtResumeProcess decrements a suspend COUNT: resuming a
+        # stranger's process silently undoes whatever a debugger or Task
+        # Manager had deliberately done to it. So "I cannot prove this is the
+        # process I froze" means "leave it alone".
+        #
+        # The proofs, strongest first. create_time is exact — it is the same
+        # (pid, create_time) identity the monitor uses. Executable path is the
+        # fallback for when create_time could not be read at freeze time, and
+        # it still rules out the case that matters (the PID now belongs to
+        # something else entirely). Name alone is last and weakest, used only
+        # when neither of the others was recordable.
+        same = False
+        proof = ""
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            if want_ct:
+                same = abs(proc.create_time() - want_ct) < 1.0
+                proof = "create_time"
+            elif want_exe:
+                try:
+                    live_exe = (proc.exe() or "").strip()
+                except Exception:
+                    live_exe = ""
+                same = bool(live_exe) and _same_path(live_exe, want_exe)
+                proof = "executable path"
+            elif want_name:
+                same = (proc.name() or "").strip().casefold() == want_name.casefold()
+                proof = "process name"
+        except Exception:
+            same = False          # process gone, or unreadable — do not touch it
+        if not same and not (want_ct or want_exe or want_name):
+            logger.warning(
+                f"Suspended-process marker for {pid} carries no identity — "
+                f"cannot prove the PID was not recycled, leaving it alone")
+        elif same:
+            logger.info(f"Suspended process {pid} identified by its {proof}")
         if same:
             resumed = _resume_process(pid)
             logger.warning(
@@ -346,8 +464,31 @@ def resume_orphaned_process() -> bool:
     return resumed
 
 
-def _suspend_process(pid: int) -> bool:
-    _mark_frozen(pid)
+def _same_path(a: str, b: str) -> bool:
+    """Whether two executable paths name the same file, spelling aside."""
+    try:
+        return (os.path.normcase(os.path.normpath(os.path.abspath(a)))
+                == os.path.normcase(os.path.normpath(os.path.abspath(b))))
+    except (OSError, ValueError):
+        return a.strip().casefold() == b.strip().casefold()
+
+
+def _suspend_process(pid: int, exe_hint: str = "") -> bool:
+    """Freeze *pid*, but only if the freeze can be proved undoable.
+
+    *exe_hint* is the executable the CALLER believes this pid is running —
+    the library entry's path, not something read back out of the process
+    table — so the identity survives psutil being unable to answer.
+
+    A suspension that cannot be attributed later is refused outright rather
+    than performed and hoped over: the marker exists so a crash between
+    suspend and resume leaves a game that can be unfrozen at the next start,
+    and a marker with no identity in it cannot do that. A game left running
+    is a far better outcome than a game left frozen with nothing able to
+    prove it is ours to thaw.
+    """
+    if not _mark_frozen(pid, exe_hint):
+        return False
     ok = _set_process_suspended(pid, True)
     if not ok:
         _clear_frozen()      # never suspended, nothing to undo later
@@ -361,6 +502,17 @@ def _resume_process(pid: int) -> bool:
 
 
 from core import is_relative_to as _is_relative_to, atomic_replace as _atomic_replace
+
+
+# Entries directly under a profile ROOT that are not somebody's account:
+# ``C:\Users\Public\Documents`` is the same shared folder on every Windows
+# machine, present under the current user's name nowhere. Without this the
+# gate below reads "Public" as "another person" and drops a perfectly valid
+# save path from the restore.
+_SHARED_PROFILE_NAMES = frozenset({
+    "public", "default", "default user", "defaultuser0", "all users",
+    "shared",
+})
 
 
 def _substitute_profile_user_candidates(path_str: str, new_user: str) -> list[str]:
@@ -426,10 +578,23 @@ def _is_foreign_user_path(path_str: str, current_user: str) -> bool:
         parts = list(Path(path_str).parts)
     except (OSError, ValueError):
         return False
-    for marker in ("users", "home"):
-        for i, part in enumerate(parts[:-1]):
-            if part.strip("\\/").lower() == marker:
-                return parts[i + 1] != current_user
+    # EVERY users/home position is examined, and ANY one naming a different
+    # account makes the path foreign. This is the same "a path can contain
+    # more than one" reasoning _substitute_profile_user_candidates is built
+    # on, and the two have to agree: returning on the FIRST match cleared
+    # ``/mnt/backup/home/<me>/nested_recovery/home/OldUser/.config/Game`` as
+    # safe, because the first ``home`` happened to be the current user and
+    # the genuinely foreign one further down was never looked at. Safe means
+    # every occurrence agrees, not that the first one does.
+    want = (current_user or "").strip().casefold()
+    for i, part in enumerate(parts[:-1]):
+        if part.strip("\\/").lower() not in ("users", "home"):
+            continue
+        name = parts[i + 1].strip("\\/").casefold()
+        if name in _SHARED_PROFILE_NAMES:
+            continue        # not an account - the same folder on every machine
+        if name != want:
+            return True
     return False
 
 
@@ -1049,14 +1214,20 @@ class BackupManager(QObject):
     # comparison would start lying rather than failing loudly.
 
     @staticmethod
-    def _collect_save_files(valid_paths: list, chain_dirs, recent_file_set=None):
+    def _collect_save_files(valid_paths: list, chain_dirs, recent_file_set=None,
+                            excluded_files: dict | None = None):
         """Candidate save files as ``(file, relative_root)`` pairs.
 
         *recent_file_set*, when given, restricts the result to files that were
         modified recently (selective backups).
+
+        *excluded_files* maps a save path to the file names under it the user
+        unticked — ``{save path: {relative name}}``, both casefolded.
         """
         all_files: list[tuple[Path, Path]] = []
+        excluded_files = excluded_files or {}
         for sp in valid_paths:
+            skip_rel = excluded_files.get(str(sp).casefold()) or set()
             if sp.is_dir():
                 for f in sp.rglob("*"):
                     if not f.is_file():
@@ -1065,6 +1236,13 @@ class BackupManager(QObject):
                         continue
                     if _is_in_skipped_subdir(f, sp, chain_dirs):
                         continue
+                    if skip_rel:
+                        try:
+                            if str(f.relative_to(sp)).replace(
+                                    "\\", "/").casefold() in skip_rel:
+                                continue
+                        except ValueError:
+                            pass
                     if recent_file_set is not None:
                         try:
                             if str(f.resolve()) not in recent_file_set:
@@ -1378,7 +1556,15 @@ class BackupManager(QObject):
                     )
                     return _ret(recent[0], False)
 
-        all_files = self._collect_save_files(valid_paths, chain_dirs, recent_file_set)
+        # Files the user unticked, for any game. Unticking one is the answer
+        # to "should this be backed up", so a backup that took it anyway was
+        # answering a different question — the tick used to steer only what
+        # a later scan proposed. The file stays LISTED either way: unticking
+        # is "not this", not "forget this", and the box is there to be
+        # ticked again.
+        all_files = self._collect_save_files(
+            valid_paths, chain_dirs, recent_file_set,
+            self._excluded_files_for(game_id))
 
         if not all_files and not valid_reg:
             logger.warning(f"No files found to backup for '{game_name}'")
@@ -1480,7 +1666,25 @@ class BackupManager(QObject):
                 # without this nothing remembers where the archive came from —
                 # which is what a scheduled re-backup needs, and what lets the
                 # restore picker open at the source instead of the drive root.
-                metadata["orphan_source_paths"] = [str(p) for p in valid_paths]
+                #
+                # MERGED with what the archive already recorded, never
+                # replacing it. This backup read the folders that were here;
+                # an archive also knows about ones that are not — an external
+                # drive off its cable, a folder the user switched off — and
+                # writing only what was read would forget them permanently,
+                # one scheduled run after the drive was unplugged.
+                _prev = recent[0] if recent else None
+                _known = self.orphan_source_paths(_prev) if _prev else []
+                _seen = {p.casefold() for p in _known}
+                _sources = list(_known)
+                for _p in (str(x) for x in valid_paths):
+                    if _p.casefold() not in _seen:
+                        _seen.add(_p.casefold())
+                        _sources.append(_p)
+                metadata["orphan_source_paths"] = _sources
+                _skipped = self.orphan_sources_skipped(_prev) if _prev else []
+                if _skipped:
+                    metadata[self.ORPHAN_SKIPPED_KEY] = _skipped
 
             _recorded_paths = [str(p) for p in valid_paths] + valid_reg
             if recorded_save_paths is not None:
@@ -2306,7 +2510,11 @@ class BackupManager(QObject):
 
                     # ── Freeze if requested ───────────────────────────────
                     if freeze_pid > 0:
-                        frozen = _suspend_process(freeze_pid)
+                        # The backup entry records the executable this game
+                        # ran as. Handing it over means the suspension can
+                        # still be attributed later even if the process table
+                        # will not answer questions about the pid right now.
+                        frozen = _suspend_process(freeze_pid, entry.exe_path or "")
                         result.process_frozen = frozen
                         if frozen:
                             logger.info(f"Suspended process {freeze_pid}")
@@ -2804,8 +3012,14 @@ class BackupManager(QObject):
     def is_orphan_entry(entry: BackupEntry) -> bool:
         return bool((entry.cloud_metadata or {}).get("orphan"))
 
-    def _unique_backup_folder(self, base: str) -> str:
-        """``base`` or ``base_2``… avoiding existing BACKUP_DIR folders."""
+    def _unique_backup_folder(self, base: str, hint: str = "") -> str:
+        """``base``, or ``base~<tag>`` avoiding existing BACKUP_DIR folders.
+
+        The tag is generic on purpose and comes from core.constants — see
+        disambiguate_name for why a numeric suffix cannot be used here.
+        *hint* (the source path) makes the tag stable for the same folder.
+        """
+        from core.constants import disambiguate_name
         if not base:
             base = "Unknown"
         taken = set()
@@ -2819,12 +3033,7 @@ class BackupManager(QObject):
             taken |= get_library()._resolved_folder_names()
         except Exception:
             pass
-        if base.casefold() not in taken:
-            return base
-        n = 2
-        while f"{base}_{n}".casefold() in taken:
-            n += 1
-        return f"{base}_{n}"
+        return disambiguate_name(base, taken, hint=hint)
 
     def create_orphan_backup(
         self,
@@ -2851,8 +3060,11 @@ class BackupManager(QObject):
         from core.constants import get_folder_name_for_save
         game_id = str(uuid.uuid4())
         base = get_folder_name_for_save(game_name or "", "", "")
-        folder = self._unique_backup_folder(base)
+        # The source folder is the hint, so a name that has to be
+        # distinguished gets the SAME tag every time this archive is minted
+        # from the same place rather than a new one on each attempt.
         sources = list(save_paths or [])
+        folder = self._unique_backup_folder(base, hint=sources[0] if sources else "")
         n = len(sources)
         recorded = list(recorded_save_paths) if recorded_save_paths is not None else None
         if recorded is not None and n and len(recorded) < n:
@@ -2887,15 +3099,176 @@ class BackupManager(QObject):
     # min_kept_backups the rest of the app uses.
     AUTO_DEFAULT_MINUTES = 30
 
+    # Where an archive's saves live, and which of those places to read.
+    ORPHAN_SOURCES_KEY = "orphan_source_paths"
+    ORPHAN_SKIPPED_KEY = "orphan_sources_skipped"
+
+    @staticmethod
+    def _excluded_files_for(game_id: str) -> dict:
+        """``{save path: {relative name}}`` the user unticked for this game.
+
+        Read from the same store the file lists in Add/Edit Game and in an
+        archive's "Your user paths" write, so what those panels show and
+        what the zip holds are one answer.
+        """
+        try:
+            from core.config_manager import get_config
+            raw = (get_config().get("auto_scan_excluded_files", {}) or {}
+                   ).get(game_id) or {}
+        except Exception:
+            return {}
+        out: dict = {}
+        for save_path, rels in raw.items():
+            names = {str(r).replace("\\", "/").casefold() for r in (rels or []) if r}
+            if names:
+                out[str(save_path).casefold()] = names
+        return out
+
+    def orphan_sources_view(self, game_id: str) -> tuple[list[str], list[str]]:
+        """``(recorded, switched off)`` for an archive, straight off the index.
+
+        No deep copy. This is asked once per archive while the Backups page
+        builds its list, and an entry carries a file manifest.
+        """
+        with _index_lock:
+            rows = [(b.created_dt, b.cloud_metadata or {})
+                    for b in self._index if b.game_id == game_id]
+        if not rows:
+            return [], []
+        meta = max(rows, key=lambda r: r[0])[1]
+
+        def _lst(key):
+            raw = meta.get(key)
+            return [str(x) for x in raw if str(x)] if isinstance(raw, list) else []
+
+        return _lst(self.ORPHAN_SOURCES_KEY), _lst(self.ORPHAN_SKIPPED_KEY)
+
     def orphan_source_paths(self, entry: BackupEntry) -> list[str]:
-        """Folders an orphan archive was zipped FROM, newest entry wins.
+        """Every folder an orphan archive is made FROM, newest entry wins.
+
+        A list, and not by accident. One game keeps its saves in more than
+        one place — ``game/save`` beside the install and
+        ``Roaming/<game>`` in the profile are two paths of the SAME game —
+        so an archive is a collection of them rather than a single folder.
+        A drive that is not mounted simply contributes nothing this time
+        round; mount it, or add it again, and it is back in the next
+        backup.
 
         Empty for archives made before this was recorded, and for anything
         that is not an orphan — the caller decides what to do about that
         rather than being handed a plausible-looking wrong path.
         """
-        raw = (entry.cloud_metadata or {}).get("orphan_source_paths")
+        raw = (entry.cloud_metadata or {}).get(self.ORPHAN_SOURCES_KEY)
         return [str(x) for x in raw if str(x)] if isinstance(raw, list) else []
+
+    def orphan_sources_skipped(self, entry: BackupEntry) -> list[str]:
+        """Recorded folders the user has switched OFF for this archive.
+
+        Kept on the archive rather than dropped, because "not this time" and
+        "this was never mine" are different answers and only the second one
+        should lose the path.
+        """
+        raw = (entry.cloud_metadata or {}).get(self.ORPHAN_SKIPPED_KEY)
+        return [str(x) for x in raw if str(x)] if isinstance(raw, list) else []
+
+    def orphan_sources_to_read(self, entry: BackupEntry) -> list[str]:
+        """The folders a backup of this archive would actually walk."""
+        skipped = {p.casefold() for p in self.orphan_sources_skipped(entry)}
+        return [p for p in self.orphan_source_paths(entry)
+                if p.casefold() not in skipped]
+
+    def _write_orphan_meta(self, game_id: str, key: str,
+                           values: list[str]) -> bool:
+        """Put *values* under *key* on every entry of an archive.
+
+        Every entry, so the answer survives the newest backup being pruned
+        by retention.
+        """
+        clean = [str(p) for p in (values or []) if p]
+        touched = False
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                meta = dict(b.cloud_metadata or {})
+                if clean:
+                    if meta.get(key) == clean:
+                        continue
+                    meta[key] = clean
+                else:
+                    if key not in meta:
+                        continue
+                    meta.pop(key)
+                b.cloud_metadata = meta
+                touched = True
+        if touched:
+            self._save_game_index(game_id)
+        return touched
+
+    def add_orphan_sources(self, game_id: str, sources: list[str]) -> bool:
+        """Record another place this archive's saves live. True if written.
+
+        Adds; never replaces. A folder re-added, or picked by hand on the
+        Backups page, is the user naming ONE of this archive's locations —
+        not correcting the others out of existence. An archive taken before
+        origins were recorded carries none at all, and everything that needs
+        one is then stuck: the scheduled check has nothing to read and its
+        option sits greyed out with no way from the interface to supply one.
+        This is that way.
+        """
+        clean = [str(p) for p in (sources or []) if p]
+        if not clean:
+            return False
+        with _index_lock:
+            existing = next((self.orphan_source_paths(b) for b in self._index
+                             if b.game_id == game_id), [])
+        merged = list(existing)
+        seen = {p.casefold() for p in merged}
+        for p in clean:
+            if p.casefold() in seen:
+                continue
+            seen.add(p.casefold())
+            merged.append(p)
+        if merged == existing:
+            return False
+        logger.info("Archive %s now reads %d folder(s)", game_id, len(merged))
+        return self._write_orphan_meta(game_id, self.ORPHAN_SOURCES_KEY, merged)
+
+    def forget_orphan_source(self, game_id: str, path: str) -> bool:
+        """Drop a folder from an archive entirely — it was never its saves."""
+        target = (path or "").casefold()
+        if not target:
+            return False
+        wrote = False
+        for b in list(self._index):
+            if b.game_id != game_id:
+                continue
+            wrote = self._write_orphan_meta(
+                game_id, self.ORPHAN_SOURCES_KEY,
+                [p for p in self.orphan_source_paths(b)
+                 if p.casefold() != target]) or wrote
+            wrote = self._write_orphan_meta(
+                game_id, self.ORPHAN_SKIPPED_KEY,
+                [p for p in self.orphan_sources_skipped(b)
+                 if p.casefold() != target]) or wrote
+            break
+        return wrote
+
+    def set_orphan_source_skipped(self, game_id: str, path: str,
+                                  skipped: bool) -> bool:
+        """Switch one of an archive's folders off, or back on."""
+        target = (path or "").casefold()
+        if not target:
+            return False
+        for b in self._index:
+            if b.game_id != game_id:
+                continue
+            current = self.orphan_sources_skipped(b)
+            rest = [p for p in current if p.casefold() != target]
+            return self._write_orphan_meta(
+                game_id, self.ORPHAN_SKIPPED_KEY,
+                (rest + [path]) if skipped else rest)
+        return False
 
     def set_archive_auto_backup(self, game_id: str, enabled: bool,
                                 interval_minutes: int = 0) -> bool:
@@ -2919,10 +3292,29 @@ class BackupManager(QObject):
             self._save_game_index(game_id)
         return touched
 
+    def has_local_entries(self, game_id: str) -> bool:
+        """Whether this game_id has any backup in the LOCAL index.
+
+        A cloud-only listing is shown from the remote index and has nothing
+        here to write to, so anything offering to change it needs to know.
+        """
+        with _index_lock:
+            return any(b.game_id == game_id for b in self._index)
+
     def archive_auto_backup(self, game_id: str) -> tuple[bool, int]:
-        """``(enabled, interval_minutes)`` for an archive."""
-        for b in self.get_backups_for_game(game_id):
-            meta = b.cloud_metadata or {}
+        """``(enabled, interval_minutes)`` for an archive.
+
+        Read straight off the index rather than through
+        get_backups_for_game, which deep-copies every matching entry — and
+        an entry carries a file manifest. This is asked once per archive
+        while the Backups page is being built, and a collection runs to
+        hundreds of them; copying all of that to read two keys is the kind
+        of cost that only shows up on the machine that has the most saves.
+        """
+        with _index_lock:
+            metas = [(b.created_dt, b.cloud_metadata or {})
+                     for b in self._index if b.game_id == game_id]
+        for _when, meta in sorted(metas, key=lambda x: x[0], reverse=True):
             if self.AUTO_ENABLED_KEY in meta:
                 return (bool(meta.get(self.AUTO_ENABLED_KEY)),
                         int(meta.get(self.AUTO_INTERVAL_KEY)
@@ -2961,7 +3353,8 @@ class BackupManager(QObject):
         return (datetime.now(timezone.utc) - when
                 >= timedelta(minutes=interval_minutes))
 
-    def rebackup_archive(self, game_id: str) -> tuple[bool, str]:
+    def rebackup_archive(self, game_id: str, sources: list[str] | None = None,
+                         recorded: list[str] | None = None) -> tuple[bool, str]:
         """Back the archive's source folders up again, INTO THE SAME archive.
 
         ``(created, detail)``. The existing game_id and backup folder are
@@ -2969,19 +3362,44 @@ class BackupManager(QObject):
         create_orphan_backup does — would leave a separate archive per run,
         so retention would never prune any of them and the Backups page
         would grow an entry a week for one folder.
+
+        *sources* overrides the folders recorded on the archive, for when the
+        same saves turn up somewhere ELSE — a drive back under a different
+        letter, a folder moved. Without it this would read the recorded path,
+        find it gone, and report "source unavailable" while the saves sat
+        readable at the new one: the archive would be neither updated nor
+        duplicated, and nothing would have been captured. The new location is
+        written onto the backup this call creates, so the next run finds it
+        without being told again. *recorded* likewise replaces the restore
+        destination stored on the index.
         """
         existing = self.get_backups_for_game(game_id)
         if not existing:
             return False, "archive not found"
         newest = max(existing, key=lambda b: b.created_dt)
-        sources = self.orphan_source_paths(newest)
-        if not sources:
+        # A place this archive's saves live, learned on the way past: a
+        # folder re-added, or one picked by hand. Recorded BEFORE anything
+        # else is decided, because doing it further down — on the backup
+        # this call creates — loses it in every case where no backup is
+        # created, and a folder moved but not played in since is byte-for-
+        # byte what was archived, so the answer is "unchanged" and the
+        # archive would go on naming only paths that are not there.
+        if sources:
+            self.add_orphan_sources(game_id, [str(p) for p in sources if p])
+            newest = max(self.get_backups_for_game(game_id),
+                         key=lambda b: b.created_dt)
+
+        recorded = self.orphan_source_paths(newest)
+        if not recorded:
             return False, "no source recorded"
 
-        alive = [p for p in sources if Path(p).exists()]
+        # Only the folders the user left switched on, and only the ones that
+        # are here. One game keeps its saves in more than one place and an
+        # external drive is not always mounted; a backup of what IS readable
+        # is the right answer, and the missing half rejoins the next one.
+        alive = [p for p in self.orphan_sources_to_read(newest)
+                 if Path(p).exists()]
         if not alive:
-            # The usual case in practice: an external drive that is not
-            # mounted. Said out loud on the entry rather than passed over.
             return False, "source unavailable"
 
         # return_status, not "did it hand back an entry": create_backup
@@ -2994,7 +3412,8 @@ class BackupManager(QObject):
             computed_folder_name=self._game_folder_for_entry(newest),
             force=False,                      # unchanged folder: no new zip
             orphan=True,
-            recorded_save_paths=list(newest.save_paths) or None,
+            recorded_save_paths=(list(recorded) if recorded
+                                 else (list(newest.save_paths) or None)),
             content_chains_override=list(newest.content_chains) or None,
             save_chains_override=list(newest.save_chains) or None,
             return_status=True,

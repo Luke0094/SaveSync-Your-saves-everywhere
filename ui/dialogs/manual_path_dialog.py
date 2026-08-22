@@ -18,10 +18,10 @@ import logging
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QScrollArea, QWidget, QFrame, QCheckBox, QSizePolicy, QProgressBar,
+    QScrollArea, QWidget, QFrame, QSizePolicy, QProgressBar,
 )
 
 from i18n import t
@@ -31,14 +31,32 @@ from core.manual_paths import (
     save_chain_of, live_save_chain, orphan_index_save_path, profile_destination,
     ACTUAL, RESOLVED, PREDICTED,
 )
-from ui.helpers import ElidedLabel, finalize_adaptive_dialog_size, scaled
+from ui.helpers import (ElidedLabel, center_dialog,
+                        finalize_adaptive_dialog_size, scaled)
+from ui.widgets.windowed_list import WindowedListMixin
 from ui.styles.theme import palette
 from ui.modal_helpers import information_window_modal
 
 logger = logging.getLogger(__name__)
 
-# Visible dialog: keep chunks tiny so ✕/shelve can run between ticks.
-_INSERT_CHUNK = 6
+# Visible dialog: keep the gap between ticks tiny so ✕/shelve can run between
+# them. That used to be spelled as a fixed row count (six), but a COUNT is the
+# wrong unit for the promise. What has to stay
+# small is the time between two chances to press ✕, and one row costs roughly
+# 4-5 ms to build (measured: two QLineEdits, a checkbox, two buttons, two
+# elided labels, three layouts and a stylesheet each — nearly all of it Qt
+# widget construction). Six of those is ~28 ms of work followed by a full
+# event-loop round trip that re-lays-out and repaints the scroll area, so a
+# collection of several hundred folders spent much of its time going round
+# the loop rather than building anything. Rows are built until this budget is
+# spent instead, which keeps the gap between ticks at about a frame — the
+# responsiveness the count was standing in for — while cutting the number of
+# round trips for a big list by an order of magnitude.
+# Both come from core.concurrency, which is where every "how much work per
+# turn" answer in the app is derived from the machine's CPU/RAM tier — the
+# same place the library's own chunk size, the poll rates and the sweep
+# intervals come from. Read per pass rather than at import: the tier is
+# cached there and can change when the machine's free RAM does.
 # Shelved (hidden): no widgets — advance the index in larger steps.
 _INSERT_CHUNK_SHELVED = 80
 _PERSIST_DEBOUNCE_MS = 1200
@@ -92,20 +110,41 @@ class _ManualPathRow(QFrame):
     """One folder: include-toggle, editable name, editable path, live verdict."""
 
     def __init__(self, path_text: str = "", parent=None, name: str = "",
-                 source: str = "", chain: str = "", item=None):
+                 source: str = "", chain: str = "", item=None, index: int = -1):
         super().__init__(parent)
         self._source = source          # folder in the collection, if any
         self._chain = chain            # destination chain read from it
+        # Which entry of the dialog's master list this row is showing. Only a
+        # page of rows exists at a time, so a row is a VIEW of that entry and
+        # everything the user does to it has to be written back there — see
+        # ManualPathDialog._sync_row_to_entry. -1 for the single-add row,
+        # which has no master list behind it.
+        self._entry_index = index
+        # Held directly rather than reached through parent(): adding the row
+        # to the scroll area's layout reparents it to the holder widget, so
+        # by the time anyone asks, parent() is no longer the dialog.
+        self._dialog = parent
         # The reading the collection scan already did. It is kept until the
         # user edits the path, so nothing is re-derived behind their back.
         self._scan_item = item
         self._path_edited = False
-        self._build()
-        if path_text:
-            self._path_edit.setText(path_text)
-        if name:
-            self._name_edit.setText(name)
-            self._name_edited = True   # derived from the game folder, keep it
+        # Populating the fields below fires textChanged, which is wired to
+        # _revalidate — so every row used to validate itself once while it was
+        # still half-built (path set, name not) and again at the end, and each
+        # pass rebuilds a stylesheet string and re-applies it. Rows are listed
+        # by the hundred here, so that doubled work is a visible part of how
+        # long a big collection takes to appear. One validation, once the row
+        # is actually complete.
+        self._building = True
+        try:
+            self._build()
+            if path_text:
+                self._path_edit.setText(path_text)
+            if name:
+                self._name_edit.setText(name)
+                self._name_edited = True   # derived from the game folder, keep it
+        finally:
+            self._building = False
         self._revalidate()
 
     def _build(self):
@@ -116,21 +155,38 @@ class _ManualPathRow(QFrame):
 
         top = QHBoxLayout()
         top.setSpacing(8)
-        self._include = QCheckBox()
-        self._include.setChecked(True)
-        self._include.setToolTip(t("manual_path.include_tooltip"))
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText(t("manual_path.name_placeholder"))
         self._name_edit.setMinimumWidth(scaled(150, self))
         self._name_edited = False
         self._name_edit.textEdited.connect(self._on_name_edited)
-        self._remove_btn = QPushButton("✕")
-        self._remove_btn.setFixedSize(scaled(24, self), scaled(24, self))
+        # One verb, not two. A tick-box and a remove button asked the same
+        # question twice — "is this one going in?" — and answered it in two
+        # places that could disagree, while the unticked rows stayed on
+        # screen taking up room in a list already hundreds long. The row is
+        # in the batch because it is in the list; the bin takes it out.
+        self._remove_btn = QPushButton()
+        _bin = scaled(24, self)
+        self._remove_btn.setFixedSize(_bin, _bin)
+        # A rendered icon, not button text. As TEXT the glyph is at the mercy
+        # of the theme's button padding — in a 24px box there is no room left
+        # to draw it, so the control came out empty while still taking
+        # clicks. See helpers.emoji_icon.
+        from ui.helpers import emoji_icon as _emoji_icon
+        self._remove_btn.setIcon(_emoji_icon("🗑", int(_bin * 0.68),
+                                             self.devicePixelRatioF()))
+        self._remove_btn.setIconSize(QSize(int(_bin * 0.68), int(_bin * 0.68)))
+        # Explicit padding and font size, not the app default. An unstyled
+        # QPushButton inherits the theme's 7px/16px padding, and in a 24px
+        # box that leaves no room at all for the glyph — the button draws as
+        # an empty square that still takes clicks, which is exactly how this
+        # one looked.
         self._remove_btn.setToolTip(t("manual_path.remove_tooltip"))
         self._remove_btn.clicked.connect(self._remove_self)
-        top.addWidget(self._include)
-        top.addWidget(self._name_edit, 1)
+        # First in the row, in the column the tick-box used to hold — see
+        # the same choice in the folder-scan dialog.
         top.addWidget(self._remove_btn)
+        top.addWidget(self._name_edit, 1)
         outer.addLayout(top)
 
         path_row = QHBoxLayout()
@@ -171,21 +227,44 @@ class _ManualPathRow(QFrame):
 
     def _on_name_edited(self, _text: str):
         self._name_edited = True
+        self._write_back()
 
     def _on_path_edited(self, _text: str):
         """Once the user types their own path, the scan's reading no longer
         applies and the text is resolved on its own terms."""
         self._path_edited = True
         self._scan_item = None
+        self._write_back()
+
+    def _write_back(self, *_a) -> None:
+        """Push this row's current state into the entry it is showing.
+
+        A page of rows is destroyed when the user turns to the next one, so a
+        name typed here, a path corrected here or a box unticked here survives
+        only if it is recorded outside the widget. The dialog owns that record.
+        """
+        if getattr(self, "_building", False) or self._entry_index < 0:
+            return
+        sync = getattr(self._dialog, "_sync_row_to_entry", None)
+        if callable(sync):
+            sync(self)
 
     def _remove_self(self):
+        # Recorded before the widget goes, or turning the page would bring it
+        # straight back — the entry, not the row, is what "removed" belongs to.
+        if self._entry_index >= 0:
+            drop = getattr(self._dialog, "_mark_entry_removed", None)
+            if callable(drop):
+                drop(self._entry_index)
         # Hiding takes the row out of the layout just as well, and does not
         # leave it standing as a window of its own in the meantime.
         self.hide()
         self.deleteLater()
 
     def is_included(self) -> bool:
-        return self._include.isChecked()
+        """Every row still on screen is in the batch — the bin is what removes
+        one. Kept as a method because callers ask the question by name."""
+        return True
 
     def resolved(self):
         if self._scan_item is not None and not self._path_edited:
@@ -209,6 +288,8 @@ class _ManualPathRow(QFrame):
             self._path_edit.setText(picked)
 
     def _revalidate(self):
+        if getattr(self, "_building", False):
+            return          # fields still being populated — see __init__
         item = self.resolved()
         if not self._name_edited:
             self._name_edit.setText(item.name)
@@ -243,14 +324,114 @@ class _ManualPathRow(QFrame):
             self._origin.setVisible(True)
 
 
+
+
+def _identity(chain: str, folder_title: str) -> str:
+    """What makes an archive that archive, and nothing else.
+
+    The destination its saves belong to plus the name it carries: a chain
+    relative to the game, or the profile chain that resolves to an absolute
+    path on whatever machine it lands on. Deliberately NOT the folder the
+    zip was read from, and deliberately nothing about the files.
+
+    The folder moves — a drive back under another letter, a collection
+    reorganised — and the files churn, because an archive is detached from
+    the library precisely so the user can go on playing out of it. They
+    delete a save, start a new one, and by the afternoon nothing read off
+    disk resembles what was archived. An identity built on either of those
+    is an identity that stops matching for reasons that are not about
+    identity at all.
+    """
+    clean = (chain or "").replace("\\", "/").strip("/").casefold()
+    return clean + "|" + (folder_title or "").strip().casefold()
+
+
+def _store_key(name, item, chain, raw, from_collection):
+    """``(folder_title, chain, recorded, path_key, identity, origin)``.
+
+    The store and the question asked before it have to agree on which folder
+    an entry IS, down to the spelling. Deriving that twice, in two places,
+    is how they stop agreeing.
+
+    *recorded* / *path_key* is the destination label the index files it
+    under, which restore reads. *identity* is what makes two entries the
+    same archive, and *origin* is the folder actually in front of us — the
+    pair the question is about.
+    """
+    folder_title = (name or "").strip() or (item.name or "").strip()
+    if not (name or "").strip():
+        folder_title = derive_folder_name(item.path) or folder_title
+    folder_title = folder_title or Path(item.path).name
+    chain = (chain or "").strip()
+    if not chain and not from_collection:
+        chain = live_save_chain(item.path)
+    recorded = orphan_index_save_path(
+        item.path, chain, folder_title, from_collection=bool(from_collection))
+    # Dedup on the destination / zip-root label, not the archive origin (two
+    # collections could share a source path spelling).
+    return (folder_title, chain, recorded, (recorded or item.path).casefold(),
+            _identity(chain, folder_title), (item.path or "").casefold())
+
+
+def _archive_index(bm):
+    """``(known_paths, orphan_owner, archives)`` — what identifies an archive.
+
+    By LOCATION, so a folder already archived is recognised as itself, and by
+    IDENTITY, so one reached from somewhere new can be asked about. Nothing
+    is read off disk: every path here comes from the library and the backup
+    index.
+
+    One record per archive, not per backup. An archive with five backups in
+    it used to appear five times, which was harmless while a machine was
+    picking between them and is not once a person is.
+    """
+    from core.library import get_library
+    known_paths = {p.casefold() for g in get_library().all_games()
+                   for p in (g.save_paths or []) if p}
+    orphan_owner: dict = {}
+    by_id: dict = {}
+    for b in bm.get_orphan_backups():
+        locations = {p.casefold() for p in (b.save_paths or []) if p}
+        origins = {p.casefold() for p in bm.orphan_source_paths(b) if p}
+        for p in locations | origins:
+            known_paths.add(p)
+            orphan_owner.setdefault(p, b.game_id)
+        rec = by_id.get(b.game_id)
+        if rec is None:
+            rec = by_id[b.game_id] = {
+                "game_id": b.game_id, "name": "", "identity": "",
+                "locations": set(), "origins": set(), "entry": b,
+            }
+        rec["locations"] |= locations
+        rec["origins"] |= origins
+        if b.created_dt >= rec["entry"].created_dt:
+            rec["entry"] = b
+            rec["name"] = (b.game_name or "").strip().casefold()
+            rec["identity"] = _identity(
+                next((c for c in (b.save_chains or []) if c), "")
+                or next((c for c in (b.content_chains or []) if c), ""),
+                b.game_name or "")
+    return known_paths, orphan_owner, list(by_id.values())
+
+
 class _StoreWorker(QThread):
     """Match + mtime checks off the GUI thread for large batches."""
     progress = Signal(int, int, str)
-    finished_ok = Signal(object)  # (added, updated, skipped, entries, parts_msg)
+    # (added, updated, skipped, entries, cancelled, reindexed). Read by
+    # INDEX at the other end, never unpacked into names: this tuple has
+    # grown twice, and the last time a handler unpacked a fixed count out
+    # of it the whole run finished, wrote its archives, and then raised
+    # before the summary — which read as "it just hangs".
+    finished_ok = Signal(object)
 
-    def __init__(self, pending: list, parent=None):
+    def __init__(self, pending: list, decisions: dict | None = None,
+                 parent=None):
         super().__init__(parent)
         self._pending = pending
+        # path key -> the archive the user said this folder belongs to.
+        # Absent means "its own archive": a merge is the one answer of the
+        # two the user cannot undo afterwards, so it is never the default.
+        self._decisions = dict(decisions or {})
         self._stop = False
         self.setPriority(QThread.Priority.IdlePriority)
 
@@ -259,24 +440,15 @@ class _StoreWorker(QThread):
 
     def run(self):
         from core.backup import get_backup_manager
-        from core.library import get_library
 
-        lib = get_library()
-        games = lib.all_games()
-        known_paths = {
-            p.casefold()
-            for g in games
-            for p in (g.save_paths or [])
-            if p
-        }
-        # Paths already archived as orphans (same absolute path in index)
+        # Where every archive and every library game already lives. Which
+        # folder is which is settled here; whether two folders sharing a
+        # TITLE are one archive was settled before this thread started, by
+        # asking — see ui/dialogs/archive_choice_dialog.py.
         bm = get_backup_manager()
-        for b in bm.get_orphan_backups():
-            for p in (b.save_paths or []):
-                if p:
-                    known_paths.add(p.casefold())
+        known_paths, orphan_owner, _archives = _archive_index(bm)
 
-        added = updated = skipped = 0
+        added = updated = skipped = reindexed = 0
         entries = []
         total = len(self._pending)
         last_emit = 0.0
@@ -300,22 +472,93 @@ class _StoreWorker(QThread):
                 if not item.path or not item.exists:
                     skipped += 1
                     continue
-                folder_title = (name or "").strip() or (item.name or "").strip()
-                if not (name or "").strip():
-                    folder_title = derive_folder_name(item.path) or folder_title
-                folder_title = folder_title or Path(item.path).name
-                chain = (chain or "").strip()
-                if not chain and not from_collection:
-                    chain = live_save_chain(item.path)
-                recorded = orphan_index_save_path(
-                    item.path, chain, folder_title,
-                    from_collection=bool(from_collection),
-                )
-                # Dedup on the destination / zip-root label, not the archive
-                # origin (two collections could share a source path spelling).
-                path_key = (recorded or item.path).casefold()
-                if path_key in known_paths:
-                    skipped += 1
+                (folder_title, chain, recorded,
+                 path_key, ident, origin) = _store_key(
+                    name, item, chain, raw, from_collection)
+                # Same archive, new origin. That was put to the user before
+                # this batch started — see archive_choice_dialog — and
+                # nothing here second-guesses the answer.
+                #
+                # "" is a real answer, meaning "a different game": it has to
+                # override the label match below, because a folder out of a
+                # collection files itself under its own NAME and that label
+                # is exactly the thing the two of them share.
+                answer = self._decisions.get(origin)
+                relocate_to = None
+                if answer:
+                    logger.info(
+                        "Storing %s into archive %s — the user said they are "
+                        "the same saves", item.path, answer)
+                    relocate_to = answer
+                    known_paths.add(path_key)
+                    orphan_owner[path_key] = answer
+                if answer != "" and path_key in known_paths:
+                    # Already archived. Re-adding the same folder is almost
+                    # always "here are this folder's newer saves", not "make
+                    # me a second archive of it" — and a second archive is
+                    # what it used to do, under a name disambiguated from the
+                    # first, so the user ended up with two entries for one
+                    # folder and retention pruning neither.
+                    #
+                    # rebackup_archive is the function built for this: it
+                    # reuses the existing game_id and backup folder, and it
+                    # runs create_backup WITHOUT force, so a folder whose
+                    # contents have not changed since last time writes no new
+                    # zip at all and simply reports "unchanged". That is the
+                    # "is anything actually different?" check that was
+                    # missing — reloading a backup that has not moved on now
+                    # costs nothing and adds nothing.
+                    #
+                    # Only OUR archives. A path belonging to a real library
+                    # game is that game's business; it is reported as skipped
+                    # exactly as before.
+                    owner = relocate_to or orphan_owner.get(path_key)
+                    if not owner:
+                        skipped += 1
+                        continue
+                    # Whether or not anything has changed, this re-add says
+                    # where the folder IS — one of the places, added to the
+                    # ones already recorded rather than replacing them. A
+                    # game keeps its saves in more than one, and an archive
+                    # from before origins were recorded has none at all,
+                    # which is what leaves its recurring check greyed out
+                    # with nothing the user can do about it.
+                    wrote_origin = False
+                    try:
+                        wrote_origin = bm.add_orphan_sources(owner, [item.path])
+                    except Exception:
+                        logger.debug("could not record archive origin", exc_info=True)
+                    try:
+                        # Re-pointed only when the match was made on CONTENT:
+                        # a match on the path is already looking at the right
+                        # folder, and overriding it there would rewrite a
+                        # perfectly good record for no reason.
+                        did, detail = bm.rebackup_archive(
+                            owner,
+                            sources=[item.path] if relocate_to else None,
+                            recorded=[recorded] if (relocate_to and recorded) else None)
+                    except Exception:
+                        logger.exception(
+                            "Archive refresh failed for %s", item.path)
+                        skipped += 1
+                        continue
+                    if not did:
+                        # "unchanged" is the good outcome here, not a failure.
+                        logger.info("Archive %s not rewritten: %s", owner, detail)
+                        # But the archive's own index sits under each backup,
+                        # and a folder named for the first time changes it.
+                        # Reporting that as "skipped" said nothing happened
+                        # to an archive that had just been told where its
+                        # saves live — which is the whole reason for the run.
+                        if wrote_origin:
+                            reindexed += 1
+                        else:
+                            skipped += 1
+                        continue
+                    updated += 1
+                    fresh = bm.get_backup(detail)
+                    if fresh is not None:
+                        entries.append(fresh)
                     continue
                 try:
                     entry = bm.create_orphan_backup(
@@ -339,10 +582,11 @@ class _StoreWorker(QThread):
                 added += 1
         finally:
             pass
-        self.finished_ok.emit((added, updated, skipped, entries, self._stop))
+        self.finished_ok.emit(
+            (added, updated, skipped, entries, self._stop, reindexed))
 
 
-class ManualPathDialog(QDialog):
+class ManualPathDialog(WindowedListMixin, QDialog):
     """Add one save folder, or every folder inside a chosen parent."""
 
     shelved = Signal()
@@ -449,19 +693,49 @@ class ManualPathDialog(QDialog):
         btn_row.addWidget(self._save_btn)
         root.addLayout(btn_row)
 
+        # Sized for the LIST, not for an empty dialog. This measures at build
+        # time, when no rows exist, so the floor IS the answer it lands on —
+        # and 420px left a viewport of 163px against a 75px row, i.e. two
+        # titles on screen at once out of however many were found. The floor
+        # is what has to carry a useful number of rows; the caps in
+        # apply_adaptive_dialog_size still keep it inside the work area on a
+        # small display.
         self._panel_size = finalize_adaptive_dialog_size(
-            self, min_w=560, min_h=420, scroll=self._scroll, list_content=True)
+            self, min_w=720, min_h=660, scroll=self._scroll, list_content=True)
+        # Centred once the size is settled — a panel this large opening
+        # in a corner, or with its title bar off the top of the screen,
+        # is what Qt does when nothing tells it otherwise.
+        center_dialog(self)
 
     # ── Selection ────────────────────────────────────────────────────────────
 
     def _add_single(self):
         from ui.widgets.file_pickers import pick_folder
         picked = pick_folder(self, t("manual_path.pick_folder"))
-        if picked:
-            # Live game save folder: walk UP for the destination chain
-            # (AppData/Roaming/RenPy/… or www/save), not save_chain_of which
-            # descends inside a collection copy.
-            self._add_row(picked, chain=live_save_chain(picked))
+        if not picked:
+            return
+        # Straight into the same master list a collection scan fills, not a
+        # loose row beside it. The list on screen is a WINDOW onto that list
+        # — rows outside the visible span do not exist — so a row that is not
+        # backed by an entry would vanish the next time the user scrolled,
+        # and would not be in the batch at commit either.
+        #
+        # Live game save folder: walk UP for the destination chain
+        # (AppData/Roaming/RenPy/… or www/save), not save_chain_of, which
+        # descends inside a collection copy.
+        chain = live_save_chain(picked)
+        item = resolve_manual_path(picked)
+        self._found_serialized.append({
+            "source": "",
+            "name": derive_folder_name(picked) or Path(picked).name,
+            "chain": chain,
+            "item": {"raw": item.raw, "kind": item.kind, "path": item.path,
+                     "name": item.name, "exists": item.exists},
+        })
+        self._collection_hint.setVisible(False)
+        self._render_list()
+        self._status.setText("")
+        self._persist_state_soon()
 
     def _add_multiple(self):
         """Read a whole save-collection folder.
@@ -524,117 +798,27 @@ class ManualPathDialog(QDialog):
                                      t("manual_path.no_subfolders", path=root_label))
             return
         self._found_serialized = [self._serialize_collected(c) for c in found]
-        self._insert_queue = list(found)
-        self._insert_index = 0
-        self._phase = "inserting"
-        self._progress.setRange(0, max(1, len(found)))
-        self._progress.setValue(0)
-        self._progress.setVisible(True)
-        self._persist_state_now()
-        self._insert_next_chunk()
-
-    def _collected_at(self, index: int):
-        if self._insert_queue and index < len(self._insert_queue):
-            return self._insert_queue[index]
-        if 0 <= index < len(self._found_serialized):
-            return self._deserialize_collected(self._found_serialized[index])
-        return None
-
-    def _materialize_rows_chunk(self, up_to: int) -> bool:
-        """Build missing row widgets up to *up_to*. Returns True if more left."""
-        up_to = min(up_to, len(self._found_serialized))
-        end = min(len(self._rows) + _INSERT_CHUNK, up_to)
-        while len(self._rows) < end:
-            collected = self._collected_at(len(self._rows))
-            if collected is None:
-                break
-            self._add_row(
-                collected.item.path or collected.chain or collected.source,
-                name=collected.name, source=collected.source,
-                chain=collected.chain, item=collected.item,
-            )
-        return len(self._rows) < up_to
-
-    def _insert_next_chunk(self):
-        if self._cancel_op:
-            self._insert_queue = []
-            self._set_idle(t("manual_path.cancelled"))
-            self._clear_persisted()
-            return
-        total = len(self._found_serialized) or len(self._insert_queue)
-        visible = self.isVisible()
-
-        # Catch up widgets skipped while the dialog was shelved.
-        if visible and len(self._rows) < self._insert_index:
-            if self._materialize_rows_chunk(self._insert_index):
-                QTimer.singleShot(0, self._insert_next_chunk)
-                return
-
-        chunk = _INSERT_CHUNK if visible else _INSERT_CHUNK_SHELVED
-        end = min(self._insert_index + chunk, len(self._insert_queue))
-        if visible:
-            for collected in self._insert_queue[self._insert_index:end]:
-                self._add_row(
-                    collected.item.path or collected.chain or collected.source,
-                    name=collected.name, source=collected.source,
-                    chain=collected.chain, item=collected.item,
-                )
-                self._insert_index += 1
-        else:
-            self._insert_index = end
-
-        name = ""
-        if 0 < self._insert_index <= len(self._insert_queue):
-            name = self._insert_queue[self._insert_index - 1].name or ""
-        self._status.setText(t("manual_path.inserting_folder",
-                               current=self._insert_index,
-                               total=total, name=name))
-        self._progress.setValue(self._insert_index)
-        self._persist_state_soon()
-        if not visible:
-            self.shelve_status.emit()
-
-        if self._insert_index < len(self._insert_queue):
-            QTimer.singleShot(0, self._insert_next_chunk)
-            return
-        # Done inserting
+        # No chunk pump any more: only a page is built, and a page is small
+        # enough to appear at once. What used to be inserted here folder by
+        # folder — hundreds of rows, over seconds — is now the master list,
+        # and the rows come and go with the page.
         self._insert_queue = []
+        self._insert_index = len(found)
+        self._progress.setVisible(False)
+        self._render_list()
         self._phase = "ready"
         self._multi_btn.setEnabled(True)
         self._single_btn.setEnabled(True)
         self._save_btn.setEnabled(True)
-        self._progress.setVisible(False)
-        msg = t("manual_path.multiple_added", count=total)
-        if visible and self._rows:
-            unresolved = sum(
-                1 for r in self._rows
-                if not r.isHidden() and getattr(r, "_scan_item", None)
-                and not r._scan_item.backupable)
-            if unresolved:
-                msg += "  " + t("manual_path.multiple_unresolved", count=unresolved)
-        self._status.setText(msg)
-        self._collection_hint.setVisible(True)
-        self._persist_state_now()
-        if not visible:
-            self.shelve_status.emit()
-        elif len(self._rows) < len(self._found_serialized):
-            # Finished index while catching up widgets — keep materializing.
-            QTimer.singleShot(0, self._finish_materialize_rows)
-
-    def _finish_materialize_rows(self):
-        if not self.isVisible() or self._cancel_op:
-            return
-        if self._materialize_rows_chunk(len(self._found_serialized)):
-            QTimer.singleShot(0, self._finish_materialize_rows)
-            return
-        unresolved = sum(
-            1 for r in self._rows
-            if not r.isHidden() and getattr(r, "_scan_item", None)
-            and not r._scan_item.backupable)
-        msg = t("manual_path.multiple_added", count=len(self._found_serialized))
+        msg = t("manual_path.multiple_added", count=len(found))
+        unresolved = sum(1 for c in found if not c.item.backupable)
         if unresolved:
             msg += "  " + t("manual_path.multiple_unresolved", count=unresolved)
         self._status.setText(msg)
+        self._collection_hint.setVisible(True)
+        self._persist_state_now()
+        if not self.isVisible():
+            self.shelve_status.emit()
 
     @staticmethod
     def _serialize_collected(c: CollectedSave) -> dict:
@@ -666,6 +850,12 @@ class ManualPathDialog(QDialog):
             item=item,
         )
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # A taller viewport shows more rows, so the built window has to grow
+        # with it — see WindowedListMixin._wl_update.
+        self._wl_update()
+
     def _set_idle(self, status: str = ""):
         self._phase = "idle"
         self._cancel_op = False
@@ -673,16 +863,140 @@ class ManualPathDialog(QDialog):
         self._multi_btn.setEnabled(True)
         self._single_btn.setEnabled(True)
         self._save_btn.setEnabled(True)
+        # Back to a button that starts work — _mark_finished may have turned
+        # it into the spent "Done" one, and leaving that label on an enabled
+        # button would invite a press that means the opposite of what it says.
+        self._save_btn.setText(t("manual_path.save"))
         if status:
             self._status.setText(status)
+        # The sidebar has to hear about this. Coming to rest — cancelled,
+        # or finished — leaves a put-away entry blinking "running" with a
+        # progress bar frozen where the work stopped, which reads as still
+        # in flight and is the opposite of what just happened.
+        try:
+            self.shelve_status.emit()
+        except RuntimeError:
+            pass
 
-    def _add_row(self, path_text: str, name: str = "", source: str = "",
-                 chain: str = "", item=None):
-        row = _ManualPathRow(path_text, parent=self, name=name,
-                             source=source, chain=chain, item=item)
-        self._rows.append(row)
-        self._rows_layout.insertWidget(self._rows_layout.count() - 1, row)
-        self._empty_lbl.setVisible(False)
+    # ── The master list, and the page showing part of it ────────────────────
+
+    def _sync_row_to_entry(self, row) -> None:
+        """Record a row's current state on the entry it is showing."""
+        i = getattr(row, "_entry_index", -1)
+        if not (0 <= i < len(self._found_serialized)):
+            return
+        entry = self._found_serialized[i]
+        try:
+            entry["name"] = row._name_edit.text()
+            typed = row._path_edit.text()
+            if row._path_edited:
+                # The scan's own reading no longer applies once the path is
+                # typed over, so the entry stops claiming one too.
+                entry["item"] = dict(entry.get("item") or {},
+                                     raw=typed, path=typed)
+                entry["path_edited"] = True
+        except RuntimeError:
+            pass
+
+    def _mark_entry_removed(self, index: int) -> None:
+        """The ✕ on a row takes its entry out of the batch for good."""
+        if 0 <= index < len(self._found_serialized):
+            self._found_serialized[index]["removed"] = True
+            self._persist_state_soon()
+
+    def _kept_entries(self) -> list:
+        """(index, entry) for everything still in the batch, in order."""
+        return [(i, e) for i, e in enumerate(self._found_serialized)
+                if not e.get("removed")]
+
+    def _sync_visible_rows(self) -> None:
+        """Flush every built row into the master list."""
+        self._wl_sync_visible()
+
+    def release_batch(self) -> None:
+        """Drop the batch and every widget showing it.
+
+        A collection of several hundred folders is a large object graph — the
+        scan results, the serialised copies, and a row of widgets each — and
+        the dialog outlives its own usefulness: it is kept for shelving, so
+        without this it went on holding all of it until the app closed. Once
+        the batch is stored, or the user walks away from it, none of it
+        answers any question any more.
+        """
+        self._wl_clear()
+        self._clear_rows()
+        self._found_serialized = []
+        self._insert_queue = []
+        self._insert_index = 0
+        self._collection_root = ""
+        self._pending_for_store = []
+        self._pending_unresolved = []
+        self._empty_lbl.setVisible(True)
+        self._collection_hint.setVisible(False)
+
+    def _clear_rows(self) -> None:
+        """Empty the list. The holder goes with it — see _wl_render, which
+        builds a new one rather than reusing this."""
+        self._rows = []
+        old = self._scroll.takeWidget()
+        holder = QWidget()
+        holder.setObjectName("transparent_bg")
+        from PySide6.QtWidgets import QVBoxLayout as _VBox
+        layout = _VBox(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self._empty_lbl.setParent(None)
+        layout.addWidget(self._empty_lbl)
+        self._empty_lbl.setVisible(True)
+        layout.addStretch()
+        self._rows_layout = layout
+        self._scroll.setWidget(holder)
+        if old is not None:
+            old.deleteLater()
+
+    # ── The windowed list (see ui.widgets.windowed_list) ────────────────────
+
+    def _render_list(self) -> None:
+        """Show the list. Only the rows in view are built."""
+        self._wl_render(self._scroll, self._empty_lbl)
+
+    def _wl_entries(self) -> list:
+        return self._kept_entries()
+
+    def _wl_sync_row(self, row) -> None:
+        self._sync_row_to_entry(row)
+
+    def _wl_row_height(self) -> int:
+        """The TALLEST shape a row can take, measured once.
+
+        Every row in the window is clamped to this one number, so it has to
+        be the largest of them and not the smallest. A folder read out of a
+        collection carries an extra line naming where it came from, and
+        measuring a blank probe cut that line — and the bottom of the path
+        field under it — off every such row: they could be read but not
+        edited, which is exactly the folders a collection scan produces.
+        """
+        h = getattr(self, "_row_h", 0)
+        if not h:
+            for kw in ({"name": "", "index": -1},
+                       {"name": "x", "index": 0, "source": "x", "chain": "x"}):
+                probe = _ManualPathRow("x", parent=self, **kw)
+                h = max(h, probe.sizeHint().height())
+                probe.setParent(None)
+                probe.deleteLater()
+            self._row_h = max(1, h)
+        return h
+
+    def _wl_make_row(self, key, entry):
+        collected = self._deserialize_collected(entry)
+        return _ManualPathRow(
+            collected.item.path or collected.chain or collected.source,
+            parent=self, name=collected.name, source=collected.source,
+            chain=collected.chain, item=collected.item, index=key)
+
+    # How many extra rows to keep built above and below the viewport, so a
+    # scroll does not arrive somewhere blank before the rebuild catches up.
+    _WINDOW_BUFFER = 6
 
     def _live_rows(self) -> list:
         """Rows still on screen — a removed row deletes itself, so the list is
@@ -703,49 +1017,92 @@ class ManualPathDialog(QDialog):
 
     # ── Commit ───────────────────────────────────────────────────────────────
 
-    def _commit(self):
-        # Rows may still be virtual after a shelved insert — materialize first.
-        if (
-            self._found_serialized
-            and len(self._rows) < len(self._found_serialized)
-        ):
-            self._status.setText(t("manual_path.inserting_folder",
-                                   current=len(self._rows),
-                                   total=len(self._found_serialized),
-                                   name=""))
-            self._progress.setRange(0, max(1, len(self._found_serialized)))
-            self._progress.setValue(len(self._rows))
-            self._progress.setVisible(True)
-            self._save_btn.setEnabled(False)
-            QTimer.singleShot(0, self._materialize_then_commit)
-            return
+    def _collision_decisions(self, pending):
+        """Ask about every folder reached from somewhere new.
 
-        rows = self._live_rows()
-        if not rows:
-            self._status.setText(t("manual_path.nothing_selected"))
-            return
+        ``{origin path: archive game_id}`` for the ones the user said are the
+        same saves, and ``{origin path: ""}`` for the ones they kept apart —
+        both are answers, and the second has to be recorded because a folder
+        out of a collection is filed under its own name, which is precisely
+        the label the two of them would otherwise share.
+
+        ``None`` when the user backed out, and then nothing at all is stored:
+        this runs before the first zip is written exactly so that answer
+        costs nothing.
+
+        A folder the archive already knows — same identity, same origin — is
+        not a question and is never asked about. That is the ordinary reload
+        of a collection, and it is the whole batch when nothing has moved.
+        """
+        from core.backup import get_backup_manager
+        from ui.dialogs.archive_choice_dialog import (CANCEL, UPDATE,
+                                                      ArchiveChoiceDialog,
+                                                      archive_card)
+        bm = get_backup_manager()
+        known, _owner, archives = _archive_index(bm)
+        by_identity: dict = {}
+        for a in archives:
+            if a["identity"].strip("|"):
+                by_identity.setdefault(a["identity"], []).append(a)
+        if not by_identity:
+            return {}
+
+        decisions: dict = {}
+        blanket = None
+        for row in pending:
+            name, item, chain, raw, from_collection = row[:5]
+            if not item.path or not item.exists:
+                continue
+            (title, _c, _r, path_key, ident, origin) = _store_key(
+                name, item, chain, raw, from_collection)
+            # Somewhere already accounted for is never a question: an
+            # archive's own folder, or a save path belonging to a real
+            # library game. The second is not hypothetical — a library game
+            # whose title matches an archive would be asked about and then
+            # skipped by the store regardless, which is a question with no
+            # consequence attached to either answer.
+            if path_key in known or origin in known:
+                continue
+            same = by_identity.get(ident)
+            if not same:
+                continue
+            # More than one archive under one identity is the user's own
+            # doing — they answered "keep both" before. The newest is the one
+            # offered; keeping them apart again is always the other button.
+            arch = max(same, key=lambda a: a["entry"].created_dt)
+            if blanket is not None:
+                decisions[origin] = arch["game_id"] if blanket == UPDATE else ""
+                continue
+            dlg = ArchiveChoiceDialog(title, item.path,
+                                      archive_card(arch["entry"], bm),
+                                      parent=self)
+            dlg.exec()
+            answer = dlg.choice()
+            if answer == CANCEL:
+                return None
+            decisions[origin] = arch["game_id"] if answer == UPDATE else ""
+            if dlg.applies_to_all():
+                blanket = answer
+        return decisions
+
+    def _commit(self):
         if self._store_worker is not None and self._store_worker.isRunning():
             return
-
-        pending, unresolved = [], []
-        for row in rows:
-            item = row.resolved()
-            if item.path:
-                from_collection = bool(row._source)
-                if from_collection:
-                    chain = row.chain() or save_chain_of(item.path)
-                else:
-                    chain = row.chain() or live_save_chain(item.path)
-                if row._source:
-                    raw = Path(row._source).name
-                else:
-                    raw = Path(item.path).name if item.path else ""
-                pending.append(
-                    (row.game_name(), item, chain, raw, from_collection))
-            else:
-                unresolved.append(row.game_name() or item.raw)
+        # Everything on screen goes into the master list before anything is
+        # read out of it: only the rows in VIEW exist as widgets, so they are
+        # never the whole batch and must never be treated as it. This is the
+        # difference between storing 570 folders and silently storing twenty.
+        self._sync_visible_rows()
+        pending, unresolved = self._pending_from_entries()
 
         if not pending:
+            self._status.setText(t("manual_path.none_resolved"))
+            return
+
+        # Same-name folders are settled with the user BEFORE anything is
+        # written, so backing out here leaves nothing half-done.
+        decisions = self._collision_decisions(pending)
+        if decisions is None:
             self._status.setText(t("manual_path.none_resolved"))
             return
 
@@ -761,52 +1118,77 @@ class ManualPathDialog(QDialog):
         self._progress.setVisible(True)
         self._status.setText(t("manual_path.storing", current=0, total=len(pending), name=""))
         self._persist_state_now()
-        self._store_worker = _StoreWorker(pending, parent=self)
+        self._store_worker = _StoreWorker(pending, decisions, parent=self)
         self._store_worker.progress.connect(self._on_store_step)
         self._store_worker.finished_ok.connect(self._on_store_done)
         self._store_worker.start()
 
-    def _materialize_then_commit(self):
-        if self._cancel_op:
-            self._save_btn.setEnabled(True)
-            return
-        if self._materialize_rows_chunk(len(self._found_serialized)):
-            self._progress.setValue(len(self._rows))
-            self._status.setText(t("manual_path.inserting_folder",
-                                   current=len(self._rows),
-                                   total=len(self._found_serialized),
-                                   name=""))
-            QTimer.singleShot(0, self._materialize_then_commit)
-            return
-        self._progress.setVisible(False)
-        self._save_btn.setEnabled(True)
-        self._commit()
+    def _pending_from_entries(self):
+        """The batch, read from the master list rather than from widgets."""
+        pending, unresolved = [], []
+        for _i, entry in self._kept_entries():
+            if entry.get("included") is False:
+                continue
+            collected = self._deserialize_collected(entry)
+            item = collected.item
+            if entry.get("path_edited") and item.path:
+                item = resolve_manual_path(item.path)
+            if not item.path:
+                unresolved.append(collected.name or item.raw)
+                continue
+            from_collection = bool(collected.source)
+            chain = collected.chain or (save_chain_of(item.path)
+                                        if from_collection
+                                        else live_save_chain(item.path))
+            raw = (Path(collected.source).name if collected.source
+                   else (Path(item.path).name if item.path else ""))
+            name = (collected.name or "").strip() or derive_folder_name(item.path)
+            pending.append((name, item, chain, raw, from_collection))
+        return pending, unresolved
 
     def _on_store_step(self, current: int, total: int, name: str):
         self._progress.setRange(0, max(1, total))
         self._progress.setValue(current)
+        self._step = (current, total, name)
         self._status.setText(t("manual_path.storing",
                                current=current, total=total, name=name))
         if not self.isVisible():
             self.shelve_status.emit()
 
     def _on_store_done(self, payload):
-        added, updated, skipped, entries, cancelled = payload
+        added, updated, skipped = payload[0], payload[1], payload[2]
+        entries, cancelled = payload[3], payload[4]
+        reindexed = payload[5] if len(payload) > 5 else 0
         self._store_worker = None
+        # Archives that were already written stay reported even on a cancel.
+        # They exist on disk either way, and dropping them here meant a
+        # cancelled batch left backups the Backups page was never told about.
+        self.added_entries.extend(entries or [])
         if cancelled:
             self._set_idle(t("manual_path.cancelled"))
             self._clear_persisted()
             return
-        self.added_entries.extend(entries)
         parts = []
         if added:
             parts.append(t("manual_path.result_added", count=added))
         if updated:
             parts.append(t("manual_path.result_updated", count=updated))
+        if reindexed:
+            parts.append(t("manual_path.result_reindexed", count=reindexed))
         if skipped:
             parts.append(t("manual_path.result_skipped", count=skipped))
         pending = getattr(self, "_pending_for_store", []) or []
-        missing = sum(1 for _n, it, _c, _r in pending if not it.exists)
+        # Index, not unpacking. These rows carry FIVE fields (the fifth,
+        # from_collection, was added later) and unpacking four names out of
+        # them raised ValueError right here — after the archives had been
+        # written and after added_entries was filled, but before
+        # _clear_persisted, the summary and accept(). So a completed run
+        # showed no summary, never closed, never told the Backups page
+        # anything (which is what _on_manual_path_finished hangs off
+        # accept()), left the batch marked as still pending, and left the
+        # buttons disabled mid-run with Cancel unable to resolve — the whole
+        # "it just hangs after loading" report, from one arity mismatch.
+        missing = sum(1 for row in pending if not row[1].exists)
         if missing:
             parts.append(t("manual_path.result_not_yet", count=missing))
         unresolved = getattr(self, "_pending_unresolved", []) or []
@@ -815,31 +1197,96 @@ class ManualPathDialog(QDialog):
                            count=len(unresolved), names=", ".join(unresolved[:5])))
         self._clear_persisted()
         self._force_close = True
-        information_window_modal(self, t("manual_path.title"), "\n".join(parts) or "")
+        self._mark_finished()
+        summary = "\n".join(parts) or ""
+        if not self.isVisible():
+            # Put away in the sidebar. That is the user saying “tell me
+            # later”, so a modal summary arriving over whatever they moved
+            # on to is exactly what they asked not to happen — and it
+            # closes this dialog behind it, which refreshes the Backups
+            # page under their hands. It waits on the sidebar entry, which
+            # now reads done, until they come back for it.
+            # The batch is NOT dropped here. Clicking the notification has
+            # to bring up this panel with its entries AND the confirmation
+            # over it — a summary floating over an empty list says what
+            # happened to nothing you can see.
+            self._pending_summary = summary
+            self.shelve_status.emit()
+            return
+        self.release_batch()
+        information_window_modal(self, t("manual_path.title"), summary)
         self.accept()
+
+    def _mark_finished(self):
+        """Turn the primary button into a spent "Done" before the summary.
+
+        The run is over and there is nothing left to add, so the button that
+        starts it must not still be sitting there looking pressable. It stays
+        disabled and says so.
+        """
+        try:
+            self._phase = "idle"
+            self._progress.setVisible(False)
+            self._save_btn.setEnabled(False)
+            self._save_btn.setText(t("manual_path.done"))
+        except RuntimeError:
+            pass
 
     def _on_cancel_clicked(self):
         """Annulla ferma l'operazione in corso; altrimenti chiude il dialog."""
         if self.has_shelvable_work():
             self._cancel_op = True
-            if self._worker is not None and self._worker.isRunning():
+            scan_running = self._worker is not None and self._worker.isRunning()
+            store_running = (self._store_worker is not None
+                             and self._store_worker.isRunning())
+            if scan_running:
                 self._worker.stop()
-            if self._store_worker is not None and self._store_worker.isRunning():
+            if store_running:
                 self._store_worker.stop()
             if self._phase == "inserting":
                 self._insert_queue = []
                 self._set_idle(t("manual_path.cancelled"))
                 self._clear_persisted()
+                return
+            if not (scan_running or store_running):
+                # Nothing is actually running, so no finished-signal is
+                # coming to clear this up. "Annullamento…" was a message
+                # waiting on a worker that had already gone, and it stayed on
+                # screen for good — with the phase still claiming work in
+                # flight, so the next press did the same thing again.
+                self._set_idle(t("manual_path.cancelled"))
+                self._clear_persisted()
+                return
             self._status.setText(t("manual_path.cancelling"))
             return
         self._force_close = True
         self._clear_persisted()
+        self.release_batch()
         self.reject()
 
     def has_shelvable_work(self) -> bool:
         return self._phase in ("scanning", "inserting", "storing")
 
+    def shelve_progress(self) -> tuple:
+        """``(done, total, name)`` for the sidebar, or ``(0, 0, "")``.
+
+        Work put away is work the user cannot see, so the one thing the
+        sidebar owes them is how far it has got. A blinking dot said
+        something was happening and nothing more, which for a batch of
+        several hundred folders is the same as saying nothing.
+        """
+        if self._phase == "storing":
+            return getattr(self, "_step", (0, 0, ""))
+        if self._phase in ("scanning", "inserting"):
+            return (self._insert_index, len(self._found_serialized), "")
+        return (0, 0, "")
+
     def shelve_nav_label(self) -> str:
+        done, total, name = self.shelve_progress()
+        if total:
+            return t("common.progress_label",
+                     label=name or t("manual_path.shelved_nav"),
+                     done=done, total=total)
         return t("manual_path.shelved_nav")
 
     def shelve_nav_tooltip(self) -> str:
@@ -866,6 +1313,18 @@ class ManualPathDialog(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
+        pending = getattr(self, "_pending_summary", None)
+        if pending is not None:
+            # It finished while this was put away. The list is drawn FIRST
+            # so the confirmation lands on top of the folders it is talking
+            # about, rather than over the empty panel a batch that finished
+            # out of sight would otherwise leave behind.
+            self._pending_summary = None
+            self._render_list()
+            information_window_modal(self, t("manual_path.title"), pending)
+            self.release_batch()
+            self.accept()
+            return
         # Rebuild any row widgets skipped while hidden.
         if (
             self._found_serialized
@@ -906,6 +1365,10 @@ class ManualPathDialog(QDialog):
             # Closing without save — drop resume state unless shelved mid-work
             # (shelve ignores closeEvent above).
             self._clear_persisted()
+        # Whatever route brought us here, the batch is finished with. Shelving
+        # takes its own path out (it ignores closeEvent above), so this only
+        # ever runs when the dialog is genuinely done.
+        self.release_batch()
         super().closeEvent(event)
         from ui.helpers import trim_process_memory
         QTimer.singleShot(250, trim_process_memory)

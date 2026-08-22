@@ -23,8 +23,6 @@ Two rules the whole module is built around:
   every parsing gap without having to enumerate them.
 """
 import logging
-import os
-import re
 import shutil
 from dataclasses import dataclass, field as _field
 from datetime import datetime
@@ -33,30 +31,13 @@ from pathlib import Path
 from core.constants import USER_DATA_DIR
 
 from .base import SaveEditorError, explain  # noqa: F401 — public via this module
+from . import registry as registry_module
+# Only the three this module names directly. Every other reader reaches it
+# through the registry, which is the point of having one: adding a format
+# does not add a line here.
 from .alicesoft_format import AliceSoftFormat
-from .artemis_format import ArtemisFormat
-from .es3_format import Es3Format
-from .gvas_format import GvasFormat, UnrealEncryptedFormat
 from .json_format import JsonFormat
-from .keyvalue_format import KeyValueFormat
-from .kirikiri_format import KirikiriFormat
-from .lcf_format import LcfFormat
-from .naninovel_format import NaninovelFormat
 from .playerprefs_format import PlayerPrefsFormat
-from .qsp_format import QspFormat
-from .rags_format import RagsFormat
-from .renpy_format import RenpyFormat
-from .lzstring_json_format import _LzStringJson
-from .rpgmaker_mv_format import RpgMakerMvFormat
-from .rpgmaker_mz_format import RpgMakerMzFormat
-from .rubymarshal_format import RubyMarshalFormat
-from .sol_format import SolFormat
-from .sqlite_format import SqliteFormat
-from .sugarcube_format import SugarCubeFormat
-from .tads_rec_format import TadsRecFormat
-from .tyrano_format import TyranoFormat
-from .wolf_format import WolfFormat
-from .xml_format import XmlFormat
 
 logger = logging.getLogger(__name__)
 
@@ -116,61 +97,39 @@ _DEFAULT_COPY_DAYS = 7
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
+#
+# What each format is, which extensions point at it, how it recognises itself
+# from its own bytes and which engines prefer it all live in ONE description
+# per format — see core.save_editor.registry. This module consumes that; it
+# no longer carries a table of its own for any of it.
 
-_BY_EXTENSION = {
-    ".json": JsonFormat,
-    # Naninovel writes either a deflate stream or plain text; the deflated
-    # reader is tried first and the JSON one catches the rest.
-    ".nson": NaninovelFormat,
-    ".es3": Es3Format,            # JSON, encrypted or not, in Easy Save's layout
-    ".rpgsave": RpgMakerMvFormat,
-    ".rmmzsave": RpgMakerMzFormat,   # MZ deflates; MV's LZString is tried after
-    ".xml": XmlFormat,            # .NET's serializer, so Unity and Godot too
-    ".ini": KeyValueFormat,
-    ".cfg": KeyValueFormat,
-    ".conf": KeyValueFormat,
-    ".properties": KeyValueFormat,   # common for desktop Java titles
-    ".rec": TadsRecFormat,
-    ".db": SqliteFormat,
-    ".sqlite": SqliteFormat,
-    ".sqlite3": SqliteFormat,
-    ".lsd": LcfFormat,
-    ".sol": SolFormat,
-    ".rsv": RagsFormat,           # RAGS: .NET objects behind fixed AES
-    ".save": RenpyFormat,         # Ren'Py; Unity/Godot .save fall through
-    ".sav": GvasFormat,           # Unreal; other engines' .sav fall through
-    ".rvdata2": RubyMarshalFormat,
-    ".rvdata": RubyMarshalFormat,
-    ".rxdata": RubyMarshalFormat,
-}
+_BY_EXTENSION = registry_module.by_extension()
 
 
-def _in_unreal_save_folder(path: Path) -> bool:
-    """Whether *path* sits where Unreal itself puts a game's saves.
-
-    ``<Game>/Saved/SaveGames`` is the engine's own layout, not something a
-    game chooses, so it identifies an Unreal save even when the file will not
-    identify itself.
-    """
-    parts = [p.lower() for p in Path(path).parts]
-    return "savegames" in parts and "saved" in parts
-
-
-def _looks_encrypted_unreal(data: bytes) -> bool:
-    try:
-        from core.save_editor.crypt.unreal_crypt import looks_encrypted
-        return looks_encrypted(data)
-    except Exception:
-        return False
+# Both live in the registry now — the content tests there need them, and
+# importing them from where they are described keeps one definition. Re-bound
+# here because open_save's error paths below still ask these questions.
+_in_unreal_save_folder = registry_module.in_unreal_save_folder
+_looks_encrypted_unreal = registry_module.looks_encrypted_unreal
 
 
 def _candidates(path: Path, data: bytes, game_dir=None) -> list:
     """Formats worth trying for this file, best guess first.
 
-    When *game_dir* is known, the library's engine detector goes first — a
-    Ren'Py install must not waste the open path on Easy Save / JSON probes.
-    Extension and magic follow for games without a detected engine, and for
-    files whose extension is shared across engines.
+    Four passes, narrowest evidence first, and the order between them is the
+    whole point:
+
+    1. the ENGINE the library detected for the game, when it knows one — a
+       Ren'Py install must not spend the open path on Easy Save / JSON probes;
+    2. the file's EXTENSION;
+    3. what the BYTES say, in registry order (most particular test first), so
+       a file whose extension lies about it is still recognised;
+    4. the generic shapes, which would otherwise claim files that belong to
+       something more specific.
+
+    Every one of those comes from core.save_editor.registry. Adding a format
+    means describing it there — nothing in this function needs to know it
+    exists.
     """
     out = []
     ext = path.suffix.lower()
@@ -183,113 +142,15 @@ def _candidates(path: Path, data: bytes, game_dir=None) -> list:
         except Exception:
             engine = ""
     if engine:
-        from core.engines import game_engine as ge
-        preferred = {
-            ge.RENPY: [RenpyFormat],
-            ge.UNITY: [Es3Format, JsonFormat],
-            ge.GODOT: [JsonFormat, XmlFormat],
-            ge.UNREAL: [GvasFormat],
-            ge.RPGMAKER: [RpgMakerMzFormat, RpgMakerMvFormat, RubyMarshalFormat],
-            ge.WOLFRPG: [WolfFormat],
-            ge.ARTEMIS: [ArtemisFormat],
-            ge.ALICESOFT: [AliceSoftFormat],
-            ge.TYRANO: [TyranoFormat],
-            ge.TADS: [TadsRecFormat],
-            ge.WEBGL: [JsonFormat, SugarCubeFormat],
-            ge.JAVA: [SqliteFormat, JsonFormat],
-        }.get(engine, [])
-        out.extend(preferred)
+        out.extend(registry_module.engine_preferences(engine))
 
     if ext in _BY_EXTENSION:
         out.append(_BY_EXTENSION[ext])
-    # Ruby stamps every Marshal stream with its version, which is as strong
-    # a signal as a magic number — and RPG Maker also writes .dat files this
-    # way, which no extension would have told us.
-    if data[:2] == b"":
-        out.append(RubyMarshalFormat)
-    if data.startswith(b"GVAS"):
-        out.append(GvasFormat)
-    # A .sol carries its magic six bytes in, after the version and length.
-    if data[6:10] == b"TCSO":
-        out.append(SolFormat)
-    # KiriKiri by its extension, and by its compressed marker whatever it is
-    # called. The other two wrappers — plain UTF-16 text, or a thumbnail
-    # bitmap — are far too ordinary to claim a file on their own.
-    if ext == ".ksd" or data.startswith(b"\xfe\xfe\x02\xff\xfe"):
-        out.append(KirikiriFormat)
-    # Wolf hides behind obfuscation, so only unlocking it can tell.
-    if ext == ".sav" and len(data) > 0x20:
-        try:
-            from core.engines.wolf import is_wolf_save
-            if is_wolf_save(data):
-                out.append(WolfFormat)
-        except Exception:
-            pass
-    # AliceSoft names itself in its first four bytes, which is just as well:
-    # it puts the same container behind .asd and behind .sav, and what is
-    # INSIDE decides whether it can be opened at all.
-    if data[:4] in (b"GD\x01\x01", b"PSR\x00"):
-        out.append(AliceSoftFormat)
-    # An Unreal save whose game encrypted it says nothing about itself — the
-    # magic is under the encryption with everything else. Where it SITS says
-    # it instead: "Saved/SaveGames" is Unreal's own folder, written by the
-    # engine and not by the game. Tried last, and only ever with a key that
-    # then has to produce the magic, so a file that merely lives there and is
-    # something else costs one failed decryption.
-    if _in_unreal_save_folder(path) and _looks_encrypted_unreal(data):
-        out.append(UnrealEncryptedFormat)
-    # Artemis writes settings, global data and slots all into a .dat, and all
-    # three name themselves in the first four bytes.
-    if data[:3] == b"BOW":
-        out.append(ArtemisFormat)
-    # TyranoScript also writes .sav, so the extension cannot tell it from
-    # Unreal or Wolf. What can is that its JSON arrives escaped: the opening
-    # brace is on disk as the three characters "%7B", which nothing else here
-    # starts with.
-    if data[:3] in (b"%7B", b"%5B"):
-        out.append(TyranoFormat)
-    # QSP names itself in the clear, in either of the two encodings it uses.
-    if (data.startswith(b"QSPSAVEDGAME")
-            or data.startswith("QSPSAVEDGAME".encode("utf-16-le"))):
-        out.append(QspFormat)
-    # Ren'Py .save is a zip; magic catches Unity/Godot .save fall-throughs
-    # that still happen to be zips, and reinforces the extension hint.
-    if data[:4] == b"PK\x03\x04":
-        out.append(RenpyFormat)
-    # The LCF name is length-prefixed, so an .lsd starts with its length.
-    if data[:1] == bytes([len(b"LcfSaveData")]) and data[1:12] == b"LcfSaveData":
-        out.append(LcfFormat)
-    # TAD-kit record: ASCII integer tokens, usually NUL-padded to 2048.
-    if (ext == ".rec" or (len(data) >= 64 and data[:1] in b"0123456789"
-                          and b"\x00" in data[-32:])):
-        out.append(TadsRecFormat)
-    # SQLite header — Room / Compose Desktop Java games, and others.
-    if data.startswith(b"SQLite format 3\x00"):
-        out.append(SqliteFormat)
-    # Classic TADS 2/3 save signatures — recognised so the UI can say why
-    # they will not open as a value list (see _RECOGNISED_ONLY for .t3v).
-    if data.startswith(b"T3-state-v") or data.startswith(b"TADS2 save"):
-        pass  # fall through to the known-not-editable path via extension/magic
-    head = data[:1].lstrip()
-    if head[:1] in (b"{", b"["):
-        out.append(JsonFormat)
-    # XML, whatever the file is called: a game that saves through .NET's
-    # serializer often names the result .sav or .dat.
-    if data[:200].lstrip()[:1] == b"<":
-        out.append(XmlFormat)
-    # A deflate stream opens with a marker whose two bytes are both under
-    # 0x80, so it survives MZ's text wrapper and can be recognised as it is.
-    if data[:1] == b"x" and len(data) > 8:
-        out.append(RpgMakerMzFormat)
-    # LZString base64: cheap to try and it fails fast. Which engine wrote it
-    # is decided by what comes out, most particular reader first.
-    if data[:1].isalnum() and len(data) > 8 and re.fullmatch(
-            rb"[A-Za-z0-9+/=\s]+", data[:512] or b""):
-        out.append(RpgMakerMvFormat)
-        out.append(SugarCubeFormat)
-        out.append(_LzStringJson)
-    out.append(JsonFormat)
-    out.append(KeyValueFormat)
+
+    out.extend(registry_module.sniffed(path, data, ext))
+    out.extend(registry_module.lzstring_readers(data))
+    out.extend(registry_module.fallback_readers())
+
     seen, uniq = set(), []
     for c in out:
         if c not in seen:
@@ -475,8 +336,7 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         # When the library knows the game's engine, prefer that label for
         # formats that are shared across engines (plain JSON, key/value text)
         # so a WebGL or Java title is not shown as a generic "JSON" save.
-        if game_dir and cls in (JsonFormat, KeyValueFormat, TadsRecFormat,
-                                SqliteFormat, _LzStringJson, SugarCubeFormat):
+        if game_dir and registry_module.shared_across_engines(cls):
             try:
                 from core.engines.game_engine import detect_engine, label as eng_label
                 detected = detect_engine(game_dir=str(game_dir))
@@ -516,7 +376,9 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         logger.info(f"{p.name}: {cls.name} {why} — read-only")
         readonly_doc = doc
 
-    for cls in ([PlayerPrefsFormat] if registry else _candidates(p, data, game_dir)):
+    tried = [PlayerPrefsFormat] if registry else _candidates(p, data, game_dir)
+
+    for cls in tried:
         fmt = prepare(cls)
         try:
             fmt.load(data)
@@ -601,6 +463,135 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         doc = make_doc(cls, fmt, read_only=False)
         if doc is None:
             continue
+        return doc
+
+    # ── Auto-resolution ──────────────────────────────────────────────────
+    # Everything above read each format the way it is written TODAY. A format
+    # whose layout is chosen by an engine version number can be wrong about a
+    # build it has never seen — Unreal has moved the property tag, the GUID
+    # and the version block between releases — and being wrong that way looks
+    # exactly like "this file is not that format". So a game shipping a point
+    # release could put its saves out of reach with nothing actually wrong,
+    # and nothing to do about it until somebody wrote down a new threshold.
+    #
+    # The formats that can be wrong that way offer their other readings here
+    # (see _Format.variants). This runs LAST, only where the answer would
+    # otherwise have been read-only or unreadable, so no file that opens today
+    # can be affected by it.
+    #
+    # Two gates, not one. The byte-exact round trip is the same standard every
+    # reader in this module has to meet — but it is not by itself proof of
+    # understanding, because a reader that carries what it could not parse as
+    # an opaque tail rebuilds the file perfectly while having read almost none
+    # of it. So a variant must ALSO say it genuinely parsed what it rebuilt.
+    # A reading that passes both is as safe as one whose threshold happened to
+    # be right, and is offered for editing on the same terms.
+    def accepted(cls, fmt) -> bool:
+        """The gate an auto-resolved reading has to pass. Two things, not one.
+
+        The byte-exact round trip is the same standard every reader in this
+        module meets — but on its own it is not proof of UNDERSTANDING: a
+        reader that carries what it could not parse as an opaque tail
+        reproduces the file perfectly while having read almost none of it. So
+        the reader is also asked whether it genuinely parsed what it rebuilt.
+        """
+        try:
+            if fmt.dump() != data:
+                return False
+            return bool(fmt.parse_is_plausible())
+        except Exception:
+            return False
+
+    # Pass 1 — the formats already tried, read another way. For layouts chosen
+    # by a version NUMBER: the thresholds are written from an engine's history,
+    # so they are right about every build that existed when they were written
+    # and can be wrong about the next one, and being wrong that way is
+    # indistinguishable from "not that format".
+    costly = registry_module.expensive_readers()
+    for cls in tried:
+        make_variants = getattr(cls, "variants", None)
+        if not callable(make_variants):
+            continue
+        if cls in costly:
+            # A reader that SEARCHES for a key pays that cost on every load,
+            # and a variant list is a load per combination. UnrealEncryptedFormat
+            # inherits GvasFormat's fifteen, and its own load() re-runs the
+            # binary scan each time — one failed search over a game's modules
+            # already runs into minutes, so the set of them would hang for the
+            # best part of an hour. The layout question these variants answer
+            # only arises once the bytes are readable anyway, and reaching that
+            # point means the key was found.
+            logger.debug(f"{p.name}: not retrying {cls.name} layouts — its "
+                         f"reader searches for a key on every attempt")
+            continue
+        try:
+            offered = list(make_variants())
+        except Exception:
+            continue
+        for label, tweak in offered:
+            fmt = prepare(cls)
+            try:
+                tweak(fmt)
+                fmt.load(data)
+            except Exception:
+                continue
+            if not accepted(cls, fmt):
+                continue
+            doc = make_doc(cls, fmt, read_only=False)
+            if doc is None:
+                continue
+            logger.warning(
+                f"{p.name}: read as {cls.name} with a layout its version did "
+                f"not predict ({label}) — rebuilt byte-for-byte, so it is "
+                f"offered for editing. A newer engine build is the usual cause.")
+            return doc
+
+    # Pass 2 — every OTHER reader there is, whatever pointed anywhere.
+    #
+    # Detection above works from what a file says about itself: its extension,
+    # its magic, the engine of the game it belongs to. An engine update can
+    # change any of those — a new container wrapper, a moved header field, a
+    # magic that gained a byte — and then a save stops LOOKING like itself
+    # while the reader that understands it is still sitting right here,
+    # never offered because nothing pointed at it.
+    #
+    # Trying them all is only defensible because the gate does not care how a
+    # reader was reached: it still has to rebuild the file byte-for-byte and
+    # still has to have parsed it, and make_doc still refuses a reading with
+    # no values in it. A reader reached this way is exactly as proven as one
+    # reached by its own magic — which is the whole reason the round trip is
+    # the standard rather than the extension.
+    #
+    # This is what makes version tolerance general rather than a per-format
+    # favour: it applies to every reader in the registry, including ones added
+    # later, with nothing to write down for each. The two that SEARCH for a key
+    # are left out — worth minutes when something points at them, never on the
+    # off-chance (see FormatSpec.expensive).
+    already = set(tried)
+    sweep_limit = registry_module.max_sweep_bytes()
+    sweep = registry_module.all_readers() if len(data) <= sweep_limit else ()
+    if not sweep:
+        logger.debug(
+            f"{p.name}: {len(data) >> 20} MB is past the backup size limit "
+            f"({sweep_limit >> 20} MB) — not trying every reader on it")
+    for cls in sweep:
+        if cls in already:
+            continue
+        fmt = prepare(cls)
+        try:
+            fmt.load(data)
+        except Exception:
+            continue
+        if not accepted(cls, fmt):
+            continue
+        doc = make_doc(cls, fmt, read_only=False)
+        if doc is None:
+            continue
+        logger.warning(
+            f"{p.name}: nothing about this file pointed at {cls.name}, but "
+            f"that reader rebuilt it byte-for-byte and parsed it — offering it "
+            f"for editing. An engine changing its container or header is the "
+            f"usual cause.")
         return doc
 
     if readonly_doc is not None:

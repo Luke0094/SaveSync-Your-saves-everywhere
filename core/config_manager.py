@@ -30,6 +30,10 @@ _DEFAULTS: dict[str, Any] = {
     "window_maximized": False,
     "launch_on_startup": True,
     "minimize_to_tray": True,
+    # Same registration rule: the Settings checkbox wrote this and _load()
+    # dropped it, so "do not hide while I play" was forgotten at every start
+    # and the window went to the tray again regardless.
+    "hide_to_tray_on_game_launch": True,
     "show_overlay_on_launch": True,
     # Popup + hotkey queue when an unknown process looks like a game.
     # Separate from the tracked-game launch toast. Off: no live popup, no
@@ -53,6 +57,7 @@ _DEFAULTS: dict[str, Any] = {
     # which is about whole save folders rather than single edited files.
     "save_edit_copies": 3,
     "save_edit_copy_days": 7,
+    "idle_after_minutes": 10,
     "process_poll_interval": 1,
     "save_scan_debounce": 5,
     # Temporal correlation: claim a save-like write elsewhere on disk when it
@@ -111,6 +116,11 @@ _DEFAULTS: dict[str, Any] = {
     "auto_scan_confirmed_games": [],  # Games where auto-scan was confirmed
     "auto_scan_deselected_paths": {},  # Paths explicitly deselected by user {game_id: [paths]}
     "auto_scan_deleted_paths": {},     # Paths explicitly deleted by user {game_id: [paths]}
+    # Per-file exclusions inside a chosen save path, {game_id: {path: [files]}}.
+    # Registered for the reason stated above: _load() keeps only what is
+    # declared here, so without this the files a user unticked came back on
+    # the next start and had to be unticked again every time.
+    "auto_scan_excluded_files": {},
     # Answers to the "is this process really that game?" prompt, asked when a
     # process matched a library entry by NAME ONLY because its own path was
     # unreadable (elevated process). Keyed by process filename — the path is
@@ -152,6 +162,7 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "save_edit_copies": lambda x: isinstance(x, int) and 1 <= x <= 50,
     "save_edit_copy_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
     "min_kept_backups": lambda x: isinstance(x, int) and 0 <= x <= 50,
+    "idle_after_minutes": lambda x: isinstance(x, int) and 1 <= x <= 240,
     "process_poll_interval": lambda x: isinstance(x, (int, float)) and 1 <= x <= 60,
     "save_scan_debounce": lambda x: isinstance(x, (int, float)) and 1 <= x <= 30,
     "save_correlation_enabled": lambda x: isinstance(x, bool),
@@ -199,6 +210,8 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "window_maximized": lambda x: isinstance(x, bool),
     "launch_on_startup": lambda x: isinstance(x, bool),
     "minimize_to_tray": lambda x: isinstance(x, bool),
+    "hide_to_tray_on_game_launch": lambda x: isinstance(x, bool),
+    "auto_scan_excluded_files": lambda x: isinstance(x, dict),
     "show_overlay_on_launch": lambda x: isinstance(x, bool),
     "show_overlay_on_unknown": lambda x: isinstance(x, bool),
     "show_overlay_on_cloud": lambda x: isinstance(x, bool),

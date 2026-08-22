@@ -201,6 +201,26 @@ class PathRow(QFrame):
             except Exception:
                 pass
         outer.addWidget(self.file_list)
+        # The path's own tick governs its files — see
+        # FileListWidget.set_selectable for why they follow rather than stay
+        # independently editable.
+        self.checkbox.toggled.connect(self._on_path_toggled)
+        self._on_path_toggled(self.checkbox.isChecked())
+
+    def _on_path_toggled(self, checked: bool) -> None:
+        if self.file_list is not None:
+            try:
+                self.file_list.set_selectable(bool(checked))
+            except RuntimeError:
+                pass
+
+    def refresh_files(self) -> None:
+        """Re-read this path's file exclusions from the store and redraw."""
+        if self.file_list is not None:
+            try:
+                self.file_list.refresh_from_store()
+            except RuntimeError:
+                pass
 
     def is_checked(self) -> bool:
         """Return whether this path is checked."""

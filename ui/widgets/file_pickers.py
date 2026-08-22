@@ -150,6 +150,41 @@ class _FileDetailsDelegate(QStyledItemDelegate):
                 option.text = _translate_file_type(raw)
 
 
+# The glyph the user's own folder carries in the sidebar. An emoji rather
+# than a style standard-icon: the standard "home" pixmap is drawn from the
+# same icon theme as every other folder in the list, so at 16px it read as
+# one more pinned folder, which is precisely what it is not.
+_HOME_GLYPH = "🏠"
+
+
+def _emoji_icon(glyph: str, px: int, dpr: float = 1.0):
+    """Render *glyph* into a QIcon, transparent background, centred.
+
+    QIcon has no way to take a character, and pointing a QListView delegate
+    at a text glyph for one row only would mean reimplementing the whole
+    row. Painting it into a pixmap once is both simpler and exactly what the
+    sidebar model wants for DecorationRole. Drawn at the device pixel ratio
+    so it is not a blurred 16px bitmap on a scaled display.
+    """
+    from PySide6.QtGui import QIcon, QPixmap, QPainter, QFont
+    dpr = max(1.0, float(dpr or 1.0))
+    side = max(1, int(round(px * dpr)))
+    pm = QPixmap(side, side)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    try:
+        font = QFont()
+        # Slightly under the box: emoji glyphs carry their own side bearings
+        # and a full-size one clips against the edges.
+        font.setPixelSize(max(1, int(px * 0.84)))
+        painter.setFont(font)
+        painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+    finally:
+        painter.end()
+    return QIcon(pm)
+
+
 def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
     """True ONLY for the 3 fixed places: My Computer / Questo PC, User, Desktop.
 
@@ -324,18 +359,39 @@ class _LnkAwareDialog(QFileDialog):
             pass
 
     def _center_on_parent(self):
+        """Centre on the parent's WINDOW, then clamp onto its screen.
+
+        Not on the parent widget: a picker is routinely opened from a control
+        buried inside a scroll area — the Browse button on one row of the
+        folder-scan list, say — and frameGeometry() on a non-window widget is
+        expressed in ITS parent's coordinates, not the screen's. Feeding that
+        to move(), which takes screen coordinates, sent the window wherever
+        that row happened to sit in the scrolled content: a row far down the
+        list put the picker below the bottom of the display, and a row at the
+        top put it off the top-left corner. The dialog was open, modal and
+        waiting the whole time, with nothing visible anywhere — pressing
+        Browse simply looked like it did nothing and left the list stuck.
+
+        The clamp is the second half of the same problem: a picker taller
+        than the window it belongs to would still hang off the edge.
+        """
+        from PySide6.QtGui import QGuiApplication
         parent = self.parentWidget()
-        if parent is not None and parent.isVisible():
-            geo = self.frameGeometry()
-            geo.moveCenter(parent.frameGeometry().center())
-            self.move(geo.topLeft())
+        anchor = parent.window() if parent is not None else None
+        geo = self.frameGeometry()
+        if anchor is not None and anchor.isVisible():
+            geo.moveCenter(anchor.frameGeometry().center())
+            screen = anchor.screen() or QGuiApplication.primaryScreen()
         else:
-            from PySide6.QtGui import QGuiApplication
             screen = QGuiApplication.primaryScreen()
-            if screen is not None:
-                geo = self.frameGeometry()
-                geo.moveCenter(screen.availableGeometry().center())
-                self.move(geo.topLeft())
+            if screen is None:
+                return
+            geo.moveCenter(screen.availableGeometry().center())
+        if screen is not None:
+            avail = screen.availableGeometry()
+            geo.moveLeft(max(avail.left(), min(geo.left(), avail.right() - geo.width())))
+            geo.moveTop(max(avail.top(), min(geo.top(), avail.bottom() - geo.height())))
+        self.move(geo.topLeft())
 
     def show_settled(self):
         """Map the window at its already-chosen size with zero white flash (identical to AddGameDialog and ReviewsDialog)."""
@@ -344,6 +400,7 @@ class _LnkAwareDialog(QFileDialog):
         if getattr(self, "_sidebar_view", None) is not None:
             sw = scaled(185, self, min_px=165)
             self._sidebar_view.setMinimumWidth(sw)
+        self._apply_sidebar_icons()
         self._center_on_parent()
         self.setWindowOpacity(0.0)
         self.setUpdatesEnabled(False)
@@ -373,6 +430,7 @@ class _LnkAwareDialog(QFileDialog):
         super().showEvent(event)
         self._apply_window_chrome()
         self._localize_labels()
+        self._apply_sidebar_icons()
         if getattr(self, "_sidebar_view", None) is not None:
             sw = scaled(185, self, min_px=165)
             self._sidebar_view.setMinimumWidth(sw)
@@ -525,11 +583,22 @@ class _LnkAwareDialog(QFileDialog):
             self._reasserting_pins = False
 
     def _apply_sidebar_icons(self):
-        """Give the user's home its own glyph.
+        """Give the user's home its own glyph, and keep it.
 
         Qt takes sidebar icons from the filesystem provider, so "User" came
         up with the same plain folder icon as any pinned folder and read as
         one of them rather than as a fixed place it cannot remove.
+
+        Two things were wrong with doing this once at construction. The icon
+        came from the style's standard set, which is where the ordinary
+        folder icon comes from too — so at sidebar size the fixed place still
+        looked like every pinned folder under it. And the sidebar's model
+        keeps a QFileSystemModel behind it that fills each entry's icon in
+        asynchronously, once the directory info arrives: whatever was written
+        here during __init__ was replaced a few milliseconds later, before
+        the window was even on screen. So the glyph is an emoji now, and it
+        is re-asserted whenever the model repaints that row — guarded, since
+        setting it emits the very signal that calls this back.
         """
         sidebar = getattr(self, "_sidebar_view", None)
         if sidebar is None:
@@ -537,30 +606,56 @@ class _LnkAwareDialog(QFileDialog):
         model = sidebar.model()
         if model is None:
             return
+        if getattr(self, "_applying_sidebar_icons", False):
+            return
         try:
-            from PySide6.QtWidgets import QStyle
             home = QStandardPaths.writableLocation(
                 QStandardPaths.StandardLocation.HomeLocation)
             if not home:
                 return
             norm_home = os.path.normcase(os.path.normpath(os.path.abspath(home)))
-            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon)
+            icon = getattr(self, "_home_icon", None)
+            if icon is None:
+                px = sidebar.iconSize().height() or 16
+                icon = _emoji_icon(_HOME_GLYPH, max(16, int(px)),
+                                   self.devicePixelRatioF())
+                self._home_icon = icon
             if icon.isNull():
                 return
-            for row, url in enumerate(self.sidebarUrls()):
-                if row >= model.rowCount():
+            # Re-assert on every repaint of the row, not just now: the
+            # filesystem provider overwrites DecorationRole when it catches up.
+            if not getattr(self, "_sidebar_icons_hooked", False):
+                self._sidebar_icons_hooked = True
+                try:
+                    model.dataChanged.connect(
+                        lambda *_a: self._apply_sidebar_icons())
+                except (AttributeError, RuntimeError):
+                    pass
+            self._applying_sidebar_icons = True
+            try:
+                for row, url in enumerate(self.sidebarUrls()):
+                    if row >= model.rowCount():
+                        break
+                    if not url.isLocalFile():
+                        continue
+                    local = url.toLocalFile()
+                    if not local:
+                        continue
+                    if os.path.normcase(os.path.normpath(os.path.abspath(local))) != norm_home:
+                        continue
+                    idx = model.index(row, 0)
+                    current = model.data(idx, Qt.ItemDataRole.DecorationRole)
+                    # Skip when it is already ours, or the guarded re-entry
+                    # would still repaint the row on every signal it gets.
+                    cache_key = getattr(current, "cacheKey", None)
+                    if callable(cache_key) and cache_key() == icon.cacheKey():
+                        break
+                    model.setData(idx, icon, Qt.ItemDataRole.DecorationRole)
                     break
-                if not url.isLocalFile():
-                    continue
-                local = url.toLocalFile()
-                if not local:
-                    continue
-                if os.path.normcase(os.path.normpath(os.path.abspath(local))) == norm_home:
-                    model.setData(model.index(row, 0), icon,
-                                  Qt.ItemDataRole.DecorationRole)
-                    break
+            finally:
+                self._applying_sidebar_icons = False
         except Exception:
-            pass
+            logger.debug("could not apply the sidebar home glyph", exc_info=True)
 
     def _on_sidebar_context_menu(self, pos) -> None:
         """Right-click on the sidebar: protect system pins, allow removing custom pins."""
@@ -767,6 +862,24 @@ class FolderPickerDialog(_LnkAwareDialog):
         self.setOption(QFileDialog.Option.ShowDirsOnly, True)
 
 
+class SaveFolderPickerDialog(FolderPickerDialog):
+    """Folder picker for choosing WHERE SOMETHING WILL BE WRITTEN.
+
+    Directory-only, exactly like FolderPickerDialog — only the confirm button
+    differs. "Seleziona" is right when the folder itself IS the answer (point
+    at the game's install directory and nothing happens to it); it reads
+    wrong when the folder is a destination and pressing the button starts a
+    write. Restoring an archive that has no game in the library is that case:
+    the user is choosing the place the saves are about to be unpacked into.
+
+    A CLASS attribute for the reason the base class documents — the label is
+    re-applied on every directory change, so anything assigned after
+    construction is overwritten the moment the user navigates anywhere.
+    """
+
+    _ACCEPT_LABEL_KEY = "file_picker.save"
+
+
 class SavePathPickerDialog(_LnkAwareDialog):
     """Pick a save-file path that may be either a folder OR a file.
 
@@ -817,9 +930,16 @@ def pick_executable(parent, caption: str, name_filter: str = "",
     return selected[0] if selected else ""
 
 
-def pick_folder(parent, caption: str, start_dir: str = "") -> str:
-    """Shared folder picker. Returns "" when cancelled."""
-    dialog = FolderPickerDialog(parent, caption)
+def pick_folder(parent, caption: str, start_dir: str = "",
+                save_target: bool = False) -> str:
+    """Shared folder picker. Returns "" when cancelled.
+
+    *save_target*: the chosen folder is a place about to be WRITTEN into, so
+    the confirm button reads "Save" rather than "Select" — see
+    SaveFolderPickerDialog. Everything else is identical.
+    """
+    dialog = (SaveFolderPickerDialog if save_target
+              else FolderPickerDialog)(parent, caption)
     if start_dir:
         try:
             if Path(start_dir).is_dir():

@@ -398,6 +398,20 @@ class DeferredBusy:
         if self._overlay is not None and not self._closed:
             self._overlay.pump()
 
+    def set_on_cancel(self, fn):
+        """What the sheet's Cancel button should actually stop.
+
+        Without one the button sets a flag, says "Cancelling…" and waits
+        for a caller that is not listening — which is a button that does
+        nothing, in front of a sheet that does not go away.
+        """
+        if self._overlay is not None and not self._closed:
+            self._overlay.on_cancel = fn
+
+    def alive(self) -> bool:
+        """Whether there is still a sheet here to reuse."""
+        return self._overlay is not None and not self._closed
+
     def close(self):
         if self._closed:
             return

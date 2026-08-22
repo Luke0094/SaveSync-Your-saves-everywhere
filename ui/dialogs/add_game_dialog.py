@@ -182,6 +182,36 @@ class IgnoredPathsDialog(QDialog):
                 deleted_cfg[self.game_id] = remaining
                 config.set("auto_scan_deleted_paths", deleted_cfg)
 
+        # Taking it off the deleted list is only half of putting it back. A
+        # binned FILE is recorded twice — once as a deleted path, and once as
+        # an exclusion under the save path it lives in — so clearing only the
+        # first left it restored in name and still left out of every backup.
+        # The entry is matched by rejoining each exclusion to its own path,
+        # which is what makes the file return to the path it was binned from
+        # rather than to whichever path happens to share its name.
+        if self.game_id:
+            excl_cfg = dict(config.get("auto_scan_excluded_files", {}))
+            game_excl = dict(excl_cfg.get(self.game_id, {}) or {})
+            changed = False
+            for save_path, rels in list(game_excl.items()):
+                kept = [r for r in (rels or [])
+                        if str(Path(save_path) / r) not in to_restore]
+                if kept != list(rels or []):
+                    changed = True
+                    if kept:
+                        game_excl[save_path] = kept
+                    else:
+                        game_excl.pop(save_path, None)
+            if changed:
+                if game_excl:
+                    excl_cfg[self.game_id] = game_excl
+                else:
+                    excl_cfg.pop(self.game_id, None)
+                config.set("auto_scan_excluded_files", excl_cfg)
+                logger.info(
+                    "Restored %d file exclusion(s) for game %s",
+                    len(to_restore), self.game_id)
+
         # Session-only entries aren't in the store — the caller reads this
         # to un-delete them locally and re-propose the rows.
         self.restored_paths = sorted(to_restore)
@@ -935,11 +965,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._url_left_btn.setVisible(False)
         self._url_left_btn.clicked.connect(self._scroll_urls_left)
 
-        self._URL_CHIP_VIEW_W = scaled(240, self, min_px=160)
         self._url_strip_frame = QFrame()
         self._url_strip_frame.setObjectName("url_strip")
         self._url_strip_frame.setFixedHeight(scaled(28, self))
-        self._url_strip_frame.setFixedWidth(self._URL_CHIP_VIEW_W)
+        # A placeholder until there are chips to measure: the real width is
+        # one chip, set in _rebuild_url_chips. Nothing is on screen until
+        # then — the whole group is hidden while the list is empty.
+        self._url_strip_frame.setFixedWidth(scaled(60, self, min_px=52))
         self._url_strip_frame.setVisible(False)
         _url_strip_lay = QHBoxLayout(self._url_strip_frame)
         _url_strip_lay.setContentsMargins(4, 1, 4, 1)
@@ -1404,6 +1436,29 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if not self._editing_entry and hasattr(self, '_ignored_paths_box'):
             self._ignored_paths_box.setVisible(n > 0)
 
+    def _owning_path_row(self, candidate: str):
+        """The PathRow whose save path CONTAINS *candidate*, if any.
+
+        That is what tells a restored file from a restored folder: a file
+        lives under a path already in the list, a path does not.
+        """
+        from core import is_relative_to
+        best, best_len = None, -1
+        for i in range(self._paths_layout.count()):
+            item = self._paths_layout.itemAt(i)
+            w = item.widget() if item else None
+            if not isinstance(w, PathRow):
+                continue
+            base = w.get_path()
+            if not base or base == candidate:
+                continue
+            try:
+                if is_relative_to(Path(candidate), Path(base)) and len(base) > best_len:
+                    best, best_len = w, len(base)
+            except (OSError, ValueError):
+                continue
+        return best
+
     def _open_ignored_paths_dialog(self):
         gid = self._editing_entry.id if self._editing_entry else ""
         gname = (self._editing_entry.name if self._editing_entry
@@ -1416,11 +1471,24 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # dialog's save-path list as a user path (saved with the entry
             # on confirm), instead of waiting for a future scan to
             # re-propose it.
+            touched_rows = set()
             for p in getattr(dlg, "restored_paths", []) or []:
                 # Undo a not-yet-persisted deletion from this same session.
                 if p in self._removed_paths:
                     self._removed_paths.remove(p)
+                # A binned FILE belongs back in the list it was binned from,
+                # not beside it. Adding it as a save path of its own made a
+                # second entry for something that already had one — the file
+                # would show up as a path next to the folder that contains
+                # it, and the folder's own list still would not have it back.
+                owner = self._owning_path_row(p)
+                if owner is not None:
+                    owner.refresh_files()
+                    touched_rows.add(owner)
+                    continue
                 self._add_path(p)
+            for row in touched_rows:
+                row.set_checked(True)     # a path with a restored file is in
             self._refresh_ignored_paths_count()
 
     # ── Image management ──────────────────────────────────────────────────────
@@ -1948,6 +2016,37 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             return False
         return str(path).startswith(str(_ICON_CACHE_DIR))
 
+    def _image_removal_kind(self, path: str) -> str:
+        """What the trash button can meaningfully do to *path*.
+
+        ``"cache"`` — SaveSync downloaded it into its own icon cache. Ours to
+        delete, and deleting is the only way to be rid of it: a cover left in
+        the cache is picked straight back up into the carousel.
+
+        ``"install"`` — a file that ships WITH THE GAME, found beside its
+        executable. Not ours to delete, and dropping it from the list would
+        not stick either — the next scan of the install folder finds it again
+        and puts it back. There is nothing a trash button could usefully do
+        here, so it is not offered at all.
+
+        ``"user"`` — the person's own file, picked with Browse from anywhere
+        else. Removable from the carousel, never touched on disk.
+        """
+        if not path:
+            return "user"
+        if self._is_downloaded_image(path):
+            return "cache"
+        try:
+            from core import is_relative_to
+            exe = self._exe_edit.text().strip() if hasattr(self, "_exe_edit") else ""
+            if exe:
+                install_dir = Path(exe).parent.resolve()
+                if is_relative_to(Path(path).resolve(), install_dir):
+                    return "install"
+        except (OSError, ValueError):
+            pass
+        return "user"
+
     def _remove_current_image_from_carousel(self):
         """Remove current image from carousel.
 
@@ -1956,17 +2055,27 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         file on disk is never deleted because it belongs to the user.
         Every removal is confirmed via a dialog (even non-cached), so the
         user cannot accidentally lose track of which cover is shown.
+
+        The two cases get their own wording, because they are not the same
+        act and one message could only be right about one of them. The old
+        text announced a permanent deletion for both, which was a plain
+        untruth for the user's own file — the very reassurance a person
+        needs before pressing a trash icon over a photo of their own.
         """
         if not self._image_path:
             return
-        is_cache = self._is_downloaded_image(self._image_path)
+        kind = self._image_removal_kind(self._image_path)
+        if kind == "install":
+            return          # no trash is offered for these — see _update_nav_buttons
+        is_cache = kind == "cache"
         # Confirm ALL removals — previously only cached images got a dialog,
         # so removing a Browse-added image silently dropped it (bug report).
         from PySide6.QtWidgets import QMessageBox
         from ui.modal_helpers import question_window_modal
         reply = question_window_modal(
             self, t("add_game.remove_image_title"),
-            t("add_game.remove_image_confirm"),
+            t("add_game.remove_image_confirm" if is_cache
+              else "add_game.remove_image_confirm_local"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -2001,9 +2110,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._img_counter.setText(f"{idx + 1} / {n}")
         elif n == 1:
             self._img_counter.setText("1 / 1")
-        # Show trash overlay when there is any image (all images are now removable)
+        # Trash only where removing means something. An image that ships
+        # inside the game's own folder is neither ours to delete nor possible
+        # to drop for good — the next scan of that folder re-detects it — so
+        # the button is hidden rather than offered and then ignored.
         current_path = self._detected_images[idx] if 0 <= idx < n else ""
-        show_trash = bool(current_path)
+        show_trash = bool(current_path) and self._image_removal_kind(current_path) != "install"
         if hasattr(self, '_img_trash_overlay'):
             self._img_trash_overlay.setVisible(show_trash)
         else:
@@ -3296,6 +3408,29 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._i18n_hooked = False
         super().reject()
 
+    def cancel_background_work(self):
+        """Stop what is running, and KEEP the dialog.
+
+        reject() does the same stopping on its way out; this is the half
+        that stands on its own, for the sidebar's "stop this" button. The
+        dialog stays exactly as the user left it — nothing they typed is
+        thrown away because a search was called off.
+        """
+        self._cancel_event.set()
+        self._exe_resolve_active = False
+        self._web_search_active = False
+        self._pending_search_payload = None
+        self._cancel_detection()
+        # Cleared again shortly. The flag is what the running loops read
+        # between calls, so it has to stand long enough to be seen — and
+        # it can never STAY set, or the next search in this same dialog
+        # would abort before it began.
+        QTimer.singleShot(2000, self._cancel_event.clear)
+        try:
+            self._emit_bg_status("")
+        except RuntimeError:
+            pass
+
     def _cancel_detection(self):
         """Stop any running detection worker and signal scans to abort."""
         from core.save_detector import cancel_detection
@@ -3892,17 +4027,27 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             return
 
         _m = self._url_chips_layout.contentsMargins()
-        _total = _m.left() + _m.right()
-        for _w in chips:
-            _total += max(_w.sizeHint().width(), _w.minimumWidth())
+        widths = [max(w.sizeHint().width(), w.minimumWidth()) for w in chips]
+        _total = _m.left() + _m.right() + sum(widths)
         if len(chips) > 1:
             _total += self._url_chips_layout.spacing() * (len(chips) - 1)
         self._url_container.setMinimumWidth(max(_total, 1))
-        # Viewport fits 2-3 chips comfortably, scrolling if more exist
-        view_w = min(
-            getattr(self, "_URL_CHIP_VIEW_W", 180),
-            max(_total, 80))
-        self._url_strip_frame.setFixedWidth(max(view_w, 80))
+        # ONE chip at a time — which is what makes the arrows arrows. A
+        # viewport two or three chips wide showed most of a short list at
+        # once and left the arrows with nothing to do until the fourth,
+        # while a long list moved by most-of-a-screenful and skipped past
+        # the chip you were reading. Sized to the WIDEST chip, so none of
+        # them is ever shown half.
+        # The frame is not the viewport: between them sit the strip's own
+        # padding and the scroll area's frame. Leaving those out made the
+        # viewport a few pixels narrower than one chip, so a SINGLE chip
+        # overflowed and offered arrows with nowhere to go.
+        _sm = self._url_strip_frame.layout().contentsMargins()
+        _inset = (_m.left() + _m.right() + _sm.left() + _sm.right()
+                  + self._url_scroll.frameWidth() * 2)
+        view_w = (max(widths) if widths else 0) + _inset
+        self._url_strip_frame.setFixedWidth(
+            max(view_w, scaled(60, self, min_px=52)))
         self._url_scroll.horizontalScrollBar().setValue(0)
         if self.isVisible():
             QTimer.singleShot(0, self._repin_url_strip_width)
@@ -3937,18 +4082,21 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             pass
 
 
+    def _url_chip_stop(self, w) -> int:
+        """Where the strip must sit for chip *w* to be the one on show."""
+        return max(0, w.x() - self._url_chips_layout.contentsMargins().left())
+
     def _scroll_urls_left(self):
+        # One chip back, not one viewport: the strip is a chip wide, and a
+        # step measured in viewports is a step measured in chips only by
+        # coincidence.
         sb = self._url_scroll.horizontalScrollBar()
-        vw = self._url_scroll.viewport().width()
-        step = max(40, int(vw * 0.85))
-        target = sb.value() - step
-        left_edge = sb.value()
-        for w in reversed(self._url_chip_widgets()):
-            if w.x() < left_edge:
-                start_target = w.x() - 8
-                if start_target >= target:
-                    target = start_target
-                break
+        here = sb.value()
+        target = 0
+        for w in self._url_chip_widgets():
+            stop = self._url_chip_stop(w)
+            if stop < here - 1:
+                target = stop
         if target <= self._TAG_SNAP_PX:
             target = 0
         sb.setValue(max(target, 0))
@@ -3956,18 +4104,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
     def _scroll_urls_right(self):
         sb = self._url_scroll.horizontalScrollBar()
-        vw = self._url_scroll.viewport().width()
-        step = max(40, int(vw * 0.85))
-        target = sb.value() + step
-        right_edge = sb.value() + vw
+        here = sb.value()
         for w in self._url_chip_widgets():
-            end = w.x() + w.width()
-            if end > right_edge + 2:
-                end_target = end - vw + 12
-                if end_target <= target:
-                    target = end_target
-                break
-        sb.setValue(min(target, sb.maximum()))
+            stop = self._url_chip_stop(w)
+            if stop > here + 1:
+                sb.setValue(min(stop, sb.maximum()))
+                self._update_url_arrow_states()
+                return
+        sb.setValue(sb.maximum())
         self._update_url_arrow_states()
 
     def _scroll_tags_left(self):

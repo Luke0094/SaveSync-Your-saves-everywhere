@@ -36,7 +36,13 @@ class _AnimatedSplash(QWidget):
     """
 
     def __init__(self, gif_path: str):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # No WindowStaysOnTopHint. That flag is permanent for the life of the
+        # window: the splash would sit above every other program for as long
+        # as it is up, so nothing else on the machine could be used or even
+        # read past it while SaveSync starts. It comes up in FRONT instead —
+        # see showEvent — which is what "on top" is actually asked to mean
+        # here, and anything the user clicks afterwards covers it normally.
+        super().__init__(None, Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
 
         self._movie = QMovie(gif_path)
@@ -67,6 +73,10 @@ class _AnimatedSplash(QWidget):
             sg = screen.geometry()
             self.move((sg.width() - self.width()) // 2,
                       (sg.height() - self.height()) // 2)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _raise_once(self)
 
     # QSplashScreen-compatible API
     def finish(self, _widget=None):
@@ -117,6 +127,35 @@ def _create_static_pixmap() -> QPixmap:
     return pm
 
 
+def _raise_once(widget) -> None:
+    """Bring a splash to the front the moment it appears — once, not forever.
+
+    The splash used to carry WindowStaysOnTopHint, which pins it above every
+    window on the machine until it closes: for the whole of startup nothing
+    else could be used, because the splash was in the way of all of it. What
+    is actually wanted is that it OPENS in front. That is a one-off act, so
+    it happens on show and never again, and any window the user brings up
+    afterwards covers it like any other.
+    """
+    try:
+        from ui.helpers import force_foreground
+        force_foreground(widget)
+    except Exception:
+        try:
+            widget.raise_()
+            widget.activateWindow()
+        except Exception:
+            pass
+
+
+class _StaticSplash(QSplashScreen):
+    """QSplashScreen that comes up in front without staying there."""
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _raise_once(self)
+
+
 # ── Public factory ─────────────────────────────────────────────────────────────
 
 def create_splash():
@@ -135,6 +174,6 @@ def create_splash():
             pass   # fall through to static
 
     pixmap = _create_static_pixmap()
-    splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    splash = _StaticSplash(pixmap)
     splash.setWindowFlag(Qt.FramelessWindowHint)
     return splash

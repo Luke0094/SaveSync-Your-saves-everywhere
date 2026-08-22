@@ -91,6 +91,29 @@ _SYSTEM_STEMS: frozenset[str] = _NEVER_A_GAME_PROCESS_STEMS | frozenset({
 _MIN_EXE_BYTES = 64 * 1024    # < 64 KB → almost certainly not a game
 _MIN_RUNTIME_SECONDS = 6    # Process must run at least 6 seconds to be considered a game (avoid borderline 10s cases)
 
+# Bounds for the tracked-process watchdog (see _tracked_watchdog). The
+# interval itself is DERIVED from the user's own "Process scan interval"
+# rather than fixed, for the reason process_poll_multiplier documents about
+# that setting: it is applied on top of their choice, never instead of it.
+# Somebody who sets 60 seconds is asking SaveSync to be quiet, and a fixed
+# 700 ms timer would be waking the process eighty times more often than they
+# asked, however little each wake does.
+#
+# The floor keeps it useful (there is no point being slower than the poll it
+# exists to pre-empt) and the ceiling keeps a very slow setting from turning
+# exit detection back into minutes.
+_WATCHDOG_MIN_MS = 500
+_WATCHDOG_MAX_MS = 5000
+
+
+def _watchdog_interval_ms() -> int:
+    """How often to ask whether the tracked pids are still alive."""
+    try:
+        base = float(get_config().get("process_poll_interval", 1)) * 1000.0
+    except Exception:
+        base = 1000.0
+    return int(max(_WATCHDOG_MIN_MS, min(_WATCHDOG_MAX_MS, base / 2.0)))
+
 # Identity of a process = (pid, create_time_rounded)
 ProcessKey = tuple[int, float]
 
@@ -329,6 +352,12 @@ class ProcessMonitor(QObject):
         super().__init__(parent)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
+        # Cheap liveness probe over the tracked pids only — see
+        # _tracked_watchdog. Separate from _timer because the whole point is
+        # that it runs at its own fast rate while _timer is throttled down.
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(_watchdog_interval_ms())
+        self._watchdog.timeout.connect(self._tracked_watchdog)
         self._snapshot_in_flight = False
         self._snapshot_ready.connect(self._on_snapshot_ready)
         # Process→entry matching caches (see _find_entry): library lookups
@@ -1032,6 +1061,8 @@ class ProcessMonitor(QObject):
         self._last_activity_time = time.time()
         interval = 500  # Start with 500ms for fast detection
         self._timer.start(interval)
+        self._watchdog.setInterval(_watchdog_interval_ms())
+        self._watchdog.start()
         self._active = True
         logger.info(f"Process monitor started ({interval}ms interval with adaptive polling)")
 
@@ -1075,6 +1106,71 @@ class ProcessMonitor(QObject):
         else:
             return base * 4
 
+    def _tracked_watchdog(self):
+        """Notice a tracked game exiting NOW, not at the next throttled poll.
+
+        The main poll is deliberately slowed to base*4 during a session:
+        it walks the entire process table and resolves executables, and that
+        CPU belongs to the game. The consequence was that the one event that
+        matters most during a session — the game closing — waited out that
+        whole interval before anything downstream (final backup, save scan,
+        restoring the window from the tray) even started.
+
+        This costs nothing to do properly, because the tracked processes are
+        already known by pid: asking the OS whether a pid still exists is a
+        single syscall per tracked process, a couple of them per tick, versus
+        hundreds of process inspections. When one is gone the real poll is
+        armed for the next event-loop turn and does the authoritative work —
+        session accounting, signals, cleanup — exactly as it always did.
+
+        A recycled pid can only make this MISS an early trigger (the normal
+        poll still catches it a moment later), never fabricate an exit: this
+        method decides nothing on its own, it only asks the poll to run.
+        """
+        if not (self._active and PSUTIL_AVAILABLE):
+            return
+        with self._data_lock:
+            pids = {key[0] for key in self._tracked}
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                alive = psutil.pid_exists(pid)
+            except Exception:
+                continue        # unreadable — leave it to the real poll
+            if not alive:
+                logger.debug(
+                    f"Watchdog: tracked pid {pid} is gone — polling immediately")
+                self.nudge()
+                return
+
+    def nudge(self):
+        """Poll on the next event-loop turn, and treat now as fresh activity.
+
+        For the moments the app already KNOWS something happened and should
+        not have to rediscover it on a timer: the user pressing Play, a
+        tracked process vanishing. Without this, launching a game from
+        SaveSync after a quiet spell waited out the idle interval (base*4)
+        before the process was even looked for, and only then started the
+        runtime threshold — the delay was self-inflicted, not inherent.
+        """
+        if not self._active:
+            return
+        self._last_activity_time = time.time()
+        # A ONE-OFF poll, deliberately not self._timer.start(0).
+        #
+        # _timer repeats, and _poll returns early whenever a snapshot is
+        # already in flight — without ever reaching _update_polling_interval,
+        # which is what would put a sane interval back. Re-arming it at zero
+        # would therefore spin: fire, see the in-flight guard, return, fire
+        # again, for as long as the background process walk takes (tens to
+        # hundreds of milliseconds), while the watchdog kept re-nudging
+        # because _tracked is not cleared until that walk lands. A singleShot
+        # gets the immediate poll with no interval to restore, and the
+        # scheduled timer keeps its own cadence untouched — the freshly reset
+        # activity time above is what makes the NEXT interval the fast one.
+        QTimer.singleShot(0, self._poll)
+
     def _update_polling_interval(self):
         """Update timer interval based on activity"""
         if self._active:
@@ -1086,10 +1182,15 @@ class ProcessMonitor(QObject):
 
     def stop(self):
         self._timer.stop()
+        self._watchdog.stop()
         self._active = False
 
     def restart_with_new_interval(self):
         if self._active:
+            # The watchdog is derived from the same setting, so it moves with
+            # it — otherwise changing "Process scan interval" would leave the
+            # cheaper timer still running at the old rate.
+            self._watchdog.setInterval(_watchdog_interval_ms())
             self._timer.stop()
             self._refresh_ignored_cache()
             # Reset adaptive polling so it recalculates from current activity
@@ -1359,6 +1460,15 @@ class ProcessMonitor(QObject):
                             logger.warning(f"Game {entry.name} was removed from library during play, skipping playtime update")
                     if live is not None:
                         lib._schedule_save()
+                        # Tell the UI, not just the disk. The block above is
+                        # an in-place mutation under lib._lock (deliberately —
+                        # add_playtime ACCUMULATES and a read-modify-write via
+                        # update_game would drop a concurrent writer's change),
+                        # and in-place means no game_updated goes out. The card
+                        # therefore kept showing the playtime and "last played"
+                        # from BEFORE the session that had just ended, until
+                        # some unrelated rebuild happened to refresh it.
+                        lib.notify_updated(entry.id)
                     logger.info(f"Added {playtime_seconds}s playtime to {entry.name} (session: {session_seconds}s)")
 
                 self.game_exited.emit(entry)

@@ -137,6 +137,47 @@ def library_insert_chunk_size() -> int:
     return 6
 
 
+def dialog_insert_budget_s() -> float:
+    """How long a dialog may spend building list rows before it yields.
+
+    A TIME budget rather than a row count, because what a row COSTS is a
+    property of the machine: the same six rows are a blink on one PC and a
+    visible stall on another, so a fixed count promises responsiveness on the
+    machine it was tuned on and nothing on any other.
+
+    The tier still matters on top of that, and not in the direction it first
+    looks. A time budget already holds the stall itself constant — what it
+    does not hold constant is the cost AROUND it, and that is what differs: a
+    weak machine spends longer servicing the event loop between turns and
+    repaints the list more slowly, so its budget is cut to keep the gap
+    between two chances to press ✕ near the same place. A capable machine has
+    the opposite problem — its round trips are nearly free and its rows are
+    cheap, so a small budget spends most of the work going round the loop
+    rather than building anything.
+    """
+    tier = _tier()
+    if tier == "high":
+        return 0.060
+    if tier == "mid":
+        return 0.040
+    return 0.024
+
+
+def dialog_insert_min_rows() -> int:
+    """Rows to build per turn regardless of the budget above.
+
+    A floor, so a machine slow enough that one row outlasts the whole budget
+    still makes visible progress instead of inching forward one row per
+    event-loop turn.
+    """
+    tier = _tier()
+    if tier == "high":
+        return 24
+    if tier == "mid":
+        return 8
+    return 3
+
+
 def config_write_debounce_ms() -> int:
     """Debounce for config.json / library.json writes."""
     tier = _tier()

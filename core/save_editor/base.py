@@ -48,6 +48,38 @@ class _Format:
     # compression) and prove themselves by decoding to the same VALUES.
     verify_exact = True
 
+    @classmethod
+    def variants(cls):
+        """Other ways this same reader could read a file. Empty by default.
+
+        For formats whose layout is chosen by an engine VERSION NUMBER. A
+        point release that moves a field leaves the reader looking at the
+        right file with the wrong shape in mind, and the failure is
+        indistinguishable from "this is not that format" — so a game updating
+        can take its saves out of reach with nothing wrong but a number, and
+        nothing to do about it until somebody ships a new threshold.
+
+        A format that can be wrong that way yields ``(label, tweak)`` pairs
+        here, where *tweak* is called with a fresh reader and overrides
+        whatever the version would have decided. open_save tries them only
+        AFTER reading the file as written has failed, and accepts one only if
+        it passes the byte-exact round trip AND parse_is_plausible below.
+        """
+        return ()
+
+    def parse_is_plausible(self) -> bool:
+        """Whether this reader genuinely parsed the file it just rebuilt.
+
+        Rebuilding a file byte-for-byte is the standard for writing to it, but
+        it is not on its own proof of UNDERSTANDING: a reader that keeps
+        whatever it could not parse as an opaque tail and writes it back
+        unchanged reproduces the file exactly while having read almost none of
+        it. That is harmless when the reader is right about the format and
+        fatal when it is guessing, so an alternative reading has to answer
+        this as well. Formats that never guess return True and are unaffected.
+        """
+        return True
+
     def load(self, data: bytes) -> None:
         raise NotImplementedError
 

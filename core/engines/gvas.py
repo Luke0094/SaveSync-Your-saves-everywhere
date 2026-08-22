@@ -149,36 +149,56 @@ class GvasSave:
         self.tail = b""
         self.engine = (0, 0)
         self.new_tag = False     # UE 5.4+ writes the tag differently
+        self.raw_len = 0         # what load() was given, for plausibility
+        # Version-driven layout decisions, forced. None = work it out from the
+        # version in the file, which is what every normal read does. A caller
+        # sets one of these only to try a shape the version did not predict —
+        # see _Format.variants and open_save's auto-resolution pass. Unreal
+        # has moved each of these between releases, and a build that moves one
+        # again reads as "not a GVAS file" rather than as a newer one.
+        self.force_ue5_field = None
+        self.force_custom_versions = None
+        self.force_new_tag = None
+        self.force_guid = None
 
     # ── reading ──────────────────────────────────────────────────────────────
 
     def load(self, data: bytes) -> None:
         if not data.startswith(MAGIC):
             raise GvasError("not a GVAS file")
+        self.raw_len = len(data)
         r = _Reader(data)
         r.take(4)
         save_version = r.u32()
         r.u32()                                   # package version UE4
         # 34 is a game-specific version that does NOT carry the UE5 field.
-        if save_version >= 3 and save_version != 34:
+        ue5_field = (save_version >= 3 and save_version != 34)
+        if self.force_ue5_field is not None:
+            ue5_field = bool(self.force_ue5_field)
+        if ue5_field:
             r.u32()                               # package version UE5
         major, minor = r.u16(), r.u16()
         r.u16(); r.u32()                          # patch, build
         r.string()                                # engine version name
         self.engine = (major, minor)
-        if (major, minor) >= _CUSTOM_VERSIONS_FROM:
+        custom_versions = (major, minor) >= _CUSTOM_VERSIONS_FROM
+        if self.force_custom_versions is not None:
+            custom_versions = bool(self.force_custom_versions)
+        if custom_versions:
             r.u32()                               # custom format version
             for _ in range(r.u32()):
                 r.take(16); r.i32()               # guid + version
         self.save_type = r.string()
         self.header = data[:r.pos]
 
-        self.new_tag = (major, minor) >= _NEW_TAG_FROM
+        self.new_tag = ((major, minor) >= _NEW_TAG_FROM
+                        if self.force_new_tag is None else bool(self.force_new_tag))
         if self.new_tag:
             self._read_new_props(r, data)
             return
 
-        has_guid = (major, minor) >= _GUID_FROM
+        has_guid = ((major, minor) >= _GUID_FROM
+                    if self.force_guid is None else bool(self.force_guid))
         while True:
             name = r.string()
             if name == "None":

@@ -1056,7 +1056,7 @@ class SyncOrchestrator(QObject):
         backup zip.
 
         Two genuinely different games sharing a title land in same-named folders
-        (``Alpha``, ``Alpha_2``, …). Counting them lets the unknown-game prompt
+        (``Alpha``, ``Alpha~7f31c0``, …). Counting them lets the unknown-game prompt
         tell "one cloud copy → offer download" from "several same-named copies →
         a real conflict to resolve". Best-effort: returns [] when no provider is
         connected or the provider can't enumerate folders."""
@@ -1065,8 +1065,15 @@ class SyncOrchestrator(QObject):
             return []
 
         def _base(f: str) -> str:
-            # Mirror unique_folder_name's output: it only ever appends _2, _3, …
-            return re.sub(r'_\d+$', '', f).casefold()
+            # Undo whatever unique_folder_name appended. Shared with the
+            # function that appends it (core.constants) rather than spelled
+            # out here: this used to strip _2/_3 with its own regex, and when
+            # the distinguishing tag stopped being a number — because "_2" is
+            # indistinguishable from a sequel — a local copy of the rule would
+            # simply have stopped matching, silently, and same-named cloud
+            # folders would no longer have been recognised as related.
+            from core.constants import strip_disambiguation_tag
+            return strip_disambiguation_tag(f).casefold()
 
         target = _base(base_folder)
         found: list[str] = []
@@ -1086,9 +1093,10 @@ class SyncOrchestrator(QObject):
 
         Used ONLY when the user explicitly confirms a same-name game is a
         different one (homonymy), so the new game gets its own cloud folder
-        (``Alpha_2``) instead of syncing into — and contaminating — the other
-        game's ``Alpha``. Never call this automatically: a legitimately identical
-        game on a second machine must keep ``Alpha`` to find its own saves."""
+        (``Alpha~7f31c0``) instead of syncing into — and contaminating — the
+        other game's ``Alpha``. Never call this automatically: a legitimately
+        identical game on a second machine must keep ``Alpha`` to find its own
+        saves."""
         from core.library import get_library
         cloud = self.cloud_name_folders(base)
         return get_library().unique_folder_name(base, exclude_id, also_taken=cloud)

@@ -72,12 +72,27 @@ def expand_stems(names) -> frozenset[str]:
 def stem_in(name: str, stems) -> bool:
     """True when *name* is listed in *stems* under any spelling.
 
-    Tests the name as written and then normalized, so a set built with
-    expand_stems matches even a spelling the combinator did not emit
-    (``"Game.Update"``, ``"GAME  UPDATE"``).
+    Tests the name as written, then normalized, then normalized with dots
+    treated as a word break too — so a set built with expand_stems matches
+    even a spelling the combinator did not emit (``"GAME  UPDATE"``,
+    ``"Game.Update"``).
+
+    The dot is handled HERE and not in normalize_stem, and the distinction
+    is the whole point. normalize_stem is the module's canonical form: it
+    is what stems are grouped and compared by, and folding dots into it
+    would genuinely merge unrelated names, which is why the separator
+    class deliberately leaves the dot out (``nvdisplay.container``).
+    A membership question is narrower than a canonical form — it asks only
+    "is this one of the names we listed", and every listed name is itself
+    dot-free, so the extra probe can add a match but can never merge two
+    entries. Without it ``"Game.Update"`` fell through both tests (the dot
+    survives normalization, and no generated variant contains one) and
+    stem_in returned False for the very example this docstring cites.
     """
     s = (name or "").strip().lower()
-    return s in stems or normalize_stem(s) in stems
+    if s in stems or normalize_stem(s) in stems:
+        return True
+    return "." in s and normalize_stem(s.replace(".", " ")) in stems
 
 
 # ── Families ────────────────────────────────────────────────────────────────

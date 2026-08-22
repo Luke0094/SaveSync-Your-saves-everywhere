@@ -117,6 +117,23 @@ _MAX_SAVE_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 # Lock for thread-safe access to module-level caches
 _CACHE_LOCK = threading.Lock()
 
+# watch_game calls currently setting a game up, guarded by _CACHE_LOCK.
+#
+# prune_watcher_caches decides whether the heavy per-file indices may be
+# dropped by asking "is anything being watched", and a watch does not become
+# visible in _watcher._handlers until partway through watch_game — AFTER
+# _learn_save_patterns has already filled _SEED_PATTERNS/_SAVE_PATTERNS for
+# it. Between those two points the answer is "nothing is watched" while a
+# game is in fact arming, and a prune landing there would wipe the patterns
+# just learned and leave _KNOWN_FILES empty, so every file that already
+# existed would look newly created to the session about to start.
+#
+# Today every caller of both runs on the GUI thread, so that window cannot
+# actually open — this is the structure being made to match what the
+# docstring already claims, not a live failure. It stops mattering which
+# thread a future sweep runs on.
+_WATCH_ARMING = 0
+
 # Persistent memory of files that have been backed up (never forget)
 _BACKED_UP_FILES = _BoundedSet()    # Files that have been backed up at least once
 # Cache for pending files waiting to be backed up, keyed by game_id
@@ -180,14 +197,16 @@ def prune_watcher_caches() -> int:
     watched, which is exactly the idle case this runs in. While a game IS
     watched the file indices are kept and only the rebuildable buffers go.
     """
-    watching = False
-    try:
-        w = _watcher
-        watching = bool(w is not None and w._handlers)
-    except Exception:
-        watching = True          # unsure → keep the semantic state
-
     with _CACHE_LOCK:
+        # Read INSIDE the lock, together with the clearing it gates. Read
+        # outside it, this answered for a moment that no longer existed by
+        # the time the caches went — see _WATCH_ARMING.
+        try:
+            w = _watcher
+            watching = bool(_WATCH_ARMING > 0
+                            or (w is not None and w._handlers))
+        except Exception:
+            watching = True      # unsure → keep the semantic state
         # Always safe: rebuilt on the next event, or bounded scratch space.
         dropped = len(_UNATTRIBUTED_EVENTS) + len(_LAST_ANCHOR_TS)
         _UNATTRIBUTED_EVENTS.clear()
@@ -556,10 +575,17 @@ def _record_unattributed(src_path: str, game_id: str, inner_handler=None):
                 pass
 
 
-def _claim_event_for_game(game_id: str, file_key: str, reason: str):
+def _claim_event_for_game(game_id: str, file_key: str, reason: str) -> bool:
+    """Claim *file_key* for *game_id*. True when this call is what claimed it.
+
+    The return value is what lets a caller count NEW claims correctly: the
+    _CLAIMED_EVENTS check below is the single place that knows whether a
+    claim was new, and it is inside the lock, so no caller can work it out
+    from the outside without racing.
+    """
     with _CACHE_LOCK:
         if file_key in _CLAIMED_EVENTS:
-            return
+            return False
         _CLAIMED_EVENTS.add(file_key)
         _PENDING_FILES.setdefault(game_id, set()).add(file_key)
         _DISCOVERED_SAVE_FILES.add(file_key)
@@ -568,15 +594,28 @@ def _claim_event_for_game(game_id: str, file_key: str, reason: str):
     except Exception:
         pass
     logger.info(f"Correlated save claimed for {game_id} ({reason}): {file_key}")
+    return True
 
 
 def _claim_correlated_for_anchor(game_id: str, anchor_ts: float) -> int:
     """A game-linked anchor event just landed: sweep the buffer for events
     whose timestamps fall inside the window, in BOTH directions. Returns
-    the number of NEW claims."""
+    the number of NEW claims.
+
+    One entry per FILE, not per event. _UNATTRIBUTED_EVENTS is a buffer of
+    events and does not deduplicate: a file written twice in quick succession
+    before anything claimed it sits in there twice, and the same file can
+    appear once as a strong match and once as a weak one. Counting the list
+    lengths therefore overstated the answer, and the weak cap was applied to
+    a list that could hold the same file more than once — so a run of repeat
+    writes to one file could crowd genuinely different files out of the cap.
+    Keeping the closest event per file fixes both, and the count comes from
+    what _claim_event_for_game actually claimed rather than from what was
+    offered to it.
+    """
     _enabled, strong_s, weak_s = correlation_settings()
-    strong: list = []
-    weak: list = []
+    best_strong: dict = {}      # file_key → smallest delta seen
+    best_weak: dict = {}
     with _CACHE_LOCK:
         snapshot = list(_UNATTRIBUTED_EVENTS)
         already = {fk for _, fk, _s in snapshot if fk in _CLAIMED_EVENTS}
@@ -585,16 +624,24 @@ def _claim_correlated_for_anchor(game_id: str, anchor_ts: float) -> int:
             continue
         delta = abs(anchor_ts - ts)
         if is_strong and delta <= strong_s:
-            strong.append((delta, file_key))
+            if delta < best_strong.get(file_key, float("inf")):
+                best_strong[file_key] = delta
         elif not is_strong and delta <= weak_s:
-            weak.append((delta, file_key))
-    for delta, file_key in strong:
-        _claim_event_for_game(game_id, file_key,
-                              f"Δ={delta * 1000:.0f}ms from anchor")
-    for delta, file_key in sorted(weak)[:_CORR_WEAK_CAP]:
-        _claim_event_for_game(game_id, file_key,
-                              f"Δ={delta * 1000:.0f}ms from anchor, weak")
-    return len(strong) + min(len(weak), _CORR_WEAK_CAP)
+            if delta < best_weak.get(file_key, float("inf")):
+                best_weak[file_key] = delta
+    claimed = 0
+    for file_key, delta in best_strong.items():
+        if _claim_event_for_game(game_id, file_key,
+                                 f"Δ={delta * 1000:.0f}ms from anchor"):
+            claimed += 1
+    # A file already taken as a strong match must not spend a weak slot too.
+    weak_items = sorted((d, fk) for fk, d in best_weak.items()
+                        if fk not in best_strong)
+    for delta, file_key in weak_items[:_CORR_WEAK_CAP]:
+        if _claim_event_for_game(game_id, file_key,
+                                 f"Δ={delta * 1000:.0f}ms from anchor, weak"):
+            claimed += 1
+    return claimed
 
 
 def _extract_save_pattern(file_path: Path) -> str:
@@ -1485,6 +1532,20 @@ class SaveWatcher(QObject):
     def watch_game(self, game_id: str, save_paths: list[str], game_name: str = ""):
         if not self._available or not self._observer:
             return
+        global _WATCH_ARMING
+        # Claim "a watch is being set up" for the whole of this call. The
+        # handler only lands in self._handlers further down, and the patterns
+        # this game needs are learned before that — see _WATCH_ARMING.
+        with _CACHE_LOCK:
+            _WATCH_ARMING += 1
+        try:
+            self._watch_game_inner(game_id, save_paths, game_name)
+        finally:
+            with _CACHE_LOCK:
+                _WATCH_ARMING -= 1
+
+    def _watch_game_inner(self, game_id: str, save_paths: list[str],
+                          game_name: str = ""):
         # Virtual registry entries can't be watched by watchdog — their
         # change detection runs in the live-tracking poll (last-write gate).
         from core.registry_saves import is_registry_path

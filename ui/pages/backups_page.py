@@ -379,6 +379,9 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # Collapsible per-title sections: which titles are expanded, and the
         # current page of the paginated title list (PAGE_SIZE per page).
         self._expanded_titles: set = set()
+        # One "fold yourself up" per title group on screen, so leaving the
+        # page can close them without going through their headers.
+        self._group_collapsers: list = []
         self._backups_page_num: int = 1
         # Dynamic children tracked for in-place theme restyle (reset on every
         # _refresh_list). Group-header buttons register on THIS page's own
@@ -422,8 +425,20 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             QTimer.singleShot(0, self._load_games)
 
     def on_page_leave(self):
-        """Stop any deferred busy on leaving page."""
+        """Stop any deferred busy on leaving page, and fold the list back up.
+
+        Really fold it: the page is NOT rebuilt when it is next entered, so
+        forgetting which titles were open changed nothing on screen and freed
+        nothing — the groups came back exactly as they were left, rows and
+        all, and a row per backup is not a cheap widget.
+        """
         self._stop_list_busy()
+        for fold in list(getattr(self, "_group_collapsers", ())):
+            try:
+                fold(free=True)
+            except RuntimeError:
+                pass              # the group's widgets are already gone
+        self._expanded_titles = set()
 
     def wipe_and_reload(self):
         """Re-arm the initial load and immediately wipe off-screen widgets
@@ -1648,8 +1663,71 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._pending_initial_load = False
         self._refresh_gen = getattr(self, "_refresh_gen", 0) + 1
         gen = self._refresh_gen
-        self._stop_list_busy()
+        # The sheet goes up NOW, not one event-loop turn later in the
+        # deferred half: closing it here and building a fresh one there left
+        # the page uncovered across the hop and restarted the countdown from
+        # zero on what is, from where the user sits, a single wait.
+        self._ensure_list_busy()
         QTimer.singleShot(0, lambda g=gen: self._refresh_list_deferred(g))
+
+    def _ensure_list_busy(self):
+        """One please-wait for the whole refresh — created once, pumped after.
+
+        Same reasoning as LibraryPage._ensure_deferred_busy: a BusyOverlay
+        starts its countdown when it is constructed, so replacing it partway
+        through one wait reports "(0s)" again and strands the old sheet with
+        its countdown still running for the deferred delete to collect. The
+        seconds are advanced by the event loop turning, which is what pump()
+        does — not by the object being new.
+        """
+        if not self.isVisible():
+            self._stop_list_busy()      # nothing on screen to cover
+            return
+        # Stamped with the refresh that owns it. Every step of a rebuild
+        # bails out when a NEWER one has started, on the understanding that
+        # the newer one will take the sheet down — and that is true only
+        # while a newer one exists. A chain that ends with nobody having
+        # claimed the sheet used to leave it up for good, with a countdown
+        # still running and no way to dismiss it.
+        self._list_busy_gen = getattr(self, "_refresh_gen", 0)
+        busy = getattr(self, "_list_busy", None)
+        # alive(), not "is not None": a sheet that has already been closed
+        # is not one to reuse, and keeping the dead handle meant the next
+        # rebuild pumped a corpse and put a SECOND sheet on the page behind
+        # it — two please-waits over one list, each wanting dismissing.
+        if busy is not None and busy.alive():
+            busy.pump()
+            return
+        if busy is not None:
+            self._stop_list_busy()
+        from ui.widgets.busy_overlay import DeferredBusy
+        self._list_busy = DeferredBusy(self, t("common.please_wait"), delay_ms=0)
+        # Its Cancel has to end the rebuild, not just say so. Bumping the
+        # generation is what every step of the chain already watches for.
+        self._list_busy.set_on_cancel(self._cancel_list_build)
+
+    def _cancel_list_build(self):
+        """Stop the rebuild in progress — the sheet's Cancel means this.
+
+        The list keeps whatever it managed to draw. Nothing is lost by
+        stopping: it is a rendering of an index that has not moved, and the
+        next visit builds it again.
+        """
+        self._refresh_gen = getattr(self, "_refresh_gen", 0) + 1
+        self._group_insert_queue = []
+        self._group_insert_bottom_pager = None
+        self._stop_list_busy()
+
+    def _abandon_list_busy(self, gen: int):
+        """Close the sheet if *gen* still owns it, and nobody else does.
+
+        Called from every "a newer refresh is running, stand down" branch:
+        if a newer one really is running it has re-stamped the sheet and
+        this does nothing, and if it is not, this is the last chance anyone
+        has to take it down.
+        """
+        if getattr(self, "_list_busy_gen", None) == gen:
+            self._stop_list_busy()
 
     def _stop_list_busy(self):
         busy = getattr(self, "_list_busy", None)
@@ -1662,15 +1740,15 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _refresh_list_deferred(self, gen: int):
         if gen != getattr(self, "_refresh_gen", 0):
+            self._abandon_list_busy(gen)
             return
         if not _safe(self._list_layout):
             return
-        from ui.widgets.busy_overlay import DeferredBusy
         from ui.widgets.page_size import guarded_render, SCOPE_BACKUPS
-        # Cover wipe + async group insert (same idea as library cards).
-        if self.isVisible():
-            self._list_busy = DeferredBusy(
-                self, t("common.please_wait"), delay_ms=0)
+        # Cover wipe + async group insert (same idea as library cards). This
+        # assigned straight over _list_busy, so any sheet already up was
+        # dropped on the floor still counting rather than closed.
+        self._ensure_list_busy()
         try:
             with guarded_render(SCOPE_BACKUPS):
                 self._refresh_list_inner(gen)
@@ -1687,6 +1765,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # widgets like summary/empty stay — they're always live) so it can't
         # grow unbounded across refreshes.
         self._backup_rows = []
+        # The groups these belonged to are about to be thrown away; keeping
+        # their fold callbacks would hold closures over dead widgets and
+        # grow the list by a whole listing on every rebuild.
+        self._group_collapsers = []
         # The listing below is re-read from the index, which verify_backup
         # already wrote the results into — nothing left to patch by hand.
         self._verify_fresh.clear()
@@ -1984,6 +2066,12 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         page_keys = order[start:start + per_page]
 
         def _go_page(n: int):
+            # Turning the page is a different set of titles, so nothing
+            # carries over. Without this, a title expanded on page one came
+            # back expanded every time its page did — rebuilding a row per
+            # backup for a section the user had long since moved past, and
+            # holding them all for as long as the listing lived.
+            self._expanded_titles = set()
             self._backups_page_num = n
             self._refresh_list()
 
@@ -2025,6 +2113,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _async_group_insert_step(self, gen: int):
         if gen != getattr(self, "_refresh_gen", 0):
+            self._abandon_list_busy(gen)
             return
         if not _safe(self._list_layout):
             self._stop_list_busy()
@@ -2039,6 +2128,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._group_insert_queue = queue
         for make in chunk:
             if gen != getattr(self, "_refresh_gen", 0):
+                self._abandon_list_busy(gen)
                 return
             try:
                 self._list_layout.addWidget(make())
@@ -2052,6 +2142,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _finish_group_insert(self, gen: int):
         if gen != getattr(self, "_refresh_gen", 0):
+            self._abandon_list_busy(gen)
             return
         if not _safe(self._list_layout):
             self._stop_list_busy()
@@ -2069,16 +2160,20 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _archive_auto_widget(self, entries: list):
         """Per-archive scheduled-backup control, or None when not applicable.
 
-        Shown only for a LOCAL archive: a cloud-only listing has nothing on
-        this machine to re-read, and a library game already has its own
-        auto-backup setting in Add/Edit Game.
+        Shown for an archive with no library game — a library game already
+        has its own auto-backup setting in Add/Edit Game.
+
+        Whether the check can RUN is decided below, by whether the folder it
+        would re-read is here. ``origin`` used to stand in for that and made
+        a poor one: it names where a backup arrived from, which says nothing
+        about the folder the backup was taken of, so an archive that had
+        been synced was refused the control outright while an archive whose
+        folder had been moved was offered it and failed on every run.
         """
         from core.backup import get_backup_manager
         if not entries:
             return None
         newest = max(entries, key=lambda b: b.created_dt)
-        if getattr(newest, "origin", "local") != "local":
-            return None
         mgr = get_backup_manager()
         if not (newest.cloud_metadata or {}).get("orphan"):
             return None
@@ -2086,7 +2181,6 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         if not game_id or game_id in mgr.library_game_ids():
             return None
 
-        sources = mgr.orphan_source_paths(newest)
         enabled, interval = mgr.archive_auto_backup(game_id)
 
         from PySide6.QtWidgets import QCheckBox, QSpinBox
@@ -2115,39 +2209,84 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         row.addWidget(every)
         row.addWidget(spin)
         row.addStretch()
+        # Added BELOW the paths row, further down: the folders come first
+        # because the schedule is a question about them. Whether to re-read
+        # something on a timer only means anything once there is a something.
+
+        from pathlib import Path as _P
+
+        # One line, small, and out of the way. It was word-wrapped from when
+        # it ran the full width of the row; on the right-hand end of a short
+        # row that turned a remark into a paragraph. The longer of its three
+        # messages elides instead of wrapping, with the whole of it on hover.
+        from ui.helpers import ElidedLabel as _Elided
+        hint = _Elided("", own_tooltip=True)
+        hint.setObjectName("settings_hint")
+        hint.setSizePolicy(QSizePolicy.Policy.Maximum,
+                           QSizePolicy.Policy.Fixed)
+        # setFont, not a stylesheet: an inline rule here would take the
+        # themed colour off settings_hint with it.
+        _hf = hint.font()
+        _hf.setPixelSize(scaled(10, self, min_px=9))
+        hint.setFont(_hf)
+
+        # Which folders this archive is made of, and which files inside them,
+        # is a question with its own panel — see archive_paths_dialog. Out
+        # here is the backup itself: whether to re-read on a schedule, and
+        # how often. Putting the folder list in this row meant the Backups
+        # page rebuilt one per archive while it drew its list, which is the
+        # one place it can least afford the work.
+        paths_btn = QPushButton(t("backups.archive_paths_btn"))
+        paths_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.setSpacing(8)
+        # The way in on the left, the state of it far right: the button is
+        # the thing to press, and a line of prose in front of it reads as
+        # the label of something that has already happened. Pushed apart
+        # rather than sat next to each other, so the note reads as a remark
+        # about the row and not as part of the button.
+        hint_row.addWidget(paths_btn, 0, Qt.AlignmentFlag.AlignTop)
+        hint_row.addStretch(1)
+        hint_row.addWidget(hint, 0, Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter)
+        outer.addLayout(hint_row)
         outer.addLayout(row)
 
-        hint = QLabel()
-        hint.setObjectName("settings_hint")
-        hint.setWordWrap(True)
-        outer.addWidget(hint)
-
-        def _refresh_hint():
-            if not sources:
-                hint.setText(t("backups.archive_auto_no_source"))
-                return
-            src = sources[0]
-            from pathlib import Path as _P
-            if not _P(src).is_dir():
-                hint.setText(t("backups.archive_auto_source_missing"))
-                return
-            hint.setText(t("backups.archive_auto_source", path=src))
+        def _sync_state():
+            recorded, skipped = mgr.orphan_sources_view(game_id)
+            off = {p.casefold() for p in skipped}
+            usable = [p for p in recorded
+                      if p.casefold() not in off and _P(p).exists()]
+            cb.setEnabled(bool(usable))
+            spin.setEnabled(bool(usable) and cb.isChecked())
+            if not recorded:
+                hint.setFullText(t("backups.archive_auto_no_source"))
+            elif not usable:
+                hint.setFullText(t("backups.archive_auto_source_missing"))
+            else:
+                hint.setFullText(t("backups.archive_sources_count",
+                                   count=len(usable)))
 
         def _apply(*_):
             mgr.set_archive_auto_backup(game_id, cb.isChecked(), spin.value())
-            spin.setEnabled(cb.isChecked())
-            _refresh_hint()
+            _sync_state()
 
-        # No source recorded means nothing to re-read: the control would
-        # promise a backup that can never happen.
-        if not sources:
-            cb.setEnabled(False)
-            spin.setEnabled(False)
-        else:
-            spin.setEnabled(cb.isChecked())
-            cb.toggled.connect(_apply)
-            spin.valueChanged.connect(_apply)
-        _refresh_hint()
+        def _open_paths():
+            from ui.dialogs.archive_paths_dialog import ArchivePathsDialog
+            ArchivePathsDialog(game_id, newest.game_name or game_id,
+                               parent=self).exec()
+            _sync_state()
+
+        # Connected whatever the current state: the panel can make an archive
+        # usable while this row is on screen, and a control wired up only in
+        # the branch that was enabled at build time would take the tick
+        # afterwards and write nothing.
+        cb.toggled.connect(_apply)
+        spin.valueChanged.connect(_apply)
+        paths_btn.clicked.connect(_open_paths)
+        paths_btn.setVisible(mgr.has_local_entries(game_id))
+        _sync_state()
         return box
 
     def _build_backup_group(self, key: str, title: str, entries: list,
@@ -2231,6 +2370,36 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 if tick is not None and i % 20 == 19:
                     tick(i + 1)
 
+        def _collapse(free: bool = False):
+            """Fold this title up. *free* throws away the rows inside it too.
+
+            Collapsing by hand keeps them: reopening a title you just closed
+            should be instant. Leaving the page frees them, because a row per
+            backup is not a cheap widget and the page is not rebuilt on the
+            way back in — which is why clearing the expanded-titles set on
+            its own changed nothing anybody could see.
+            """
+            if free and built["done"]:
+                for i in reversed(range(body_lay.count())):
+                    item = body_lay.itemAt(i)
+                    w = item.widget() if item is not None else None
+                    if not isinstance(w, BackupRow):
+                        continue          # the archive control stays
+                    body_lay.takeAt(i)
+                    try:
+                        self._backup_rows.remove(w)
+                    except ValueError:
+                        pass
+                    w.setParent(None)
+                    w.deleteLater()
+                built["done"] = False
+            self._expanded_titles.discard(key)
+            body.setVisible(False)
+            arrow_lbl.setText("▶")
+            header.setToolTip(t("backups.show_saves"))
+
+        self._group_collapsers.append(_collapse)
+
         def _toggle():
             now_open = not body.isVisible()
             if now_open:
@@ -2241,10 +2410,11 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                     _build_rows()
                 self._expanded_titles.add(key)
             else:
-                self._expanded_titles.discard(key)
+                _collapse()
+                return
             body.setVisible(now_open)
-            arrow_lbl.setText("▼" if now_open else "▶")
-            header.setToolTip(t("backups.hide_saves") if now_open else t("backups.show_saves"))
+            arrow_lbl.setText("▼")
+            header.setToolTip(t("backups.hide_saves"))
 
         header.clicked.connect(_toggle)
 

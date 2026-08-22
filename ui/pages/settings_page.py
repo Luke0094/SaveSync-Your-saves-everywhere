@@ -190,13 +190,6 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._section_jobs = []
         self._pending_initial_load = True
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        if getattr(self, "_pending_initial_load", False):
-            self._pending_initial_load = False
-            self._section_jobs = self._section_job_list()
-            self._pump_sections()
-
     def ensure_loaded(self):
         """Kick section build lazily when user navigates to settings."""
         if getattr(self, "_pending_initial_load", False):
@@ -450,6 +443,14 @@ class SettingsPage(PageScrollMixin, QWidget):
         beh_form.addRow(self._auto_scan_cb)
         self._updates_cb = WrappedCheckBox(t("settings.check_for_updates"), t("settings.check_for_updates_tooltip"))
         beh_form.addRow(self._updates_cb)
+
+        # How long SaveSync must go unused before it does its heavier upkeep.
+        self._idle_after_spin = QSpinBox()
+        self._idle_after_spin.setRange(1, 240)
+        self._idle_after_spin.setSuffix(f" {t('backups.archive_auto_minutes')}")
+        self._idle_after_spin.setToolTip(t("settings.idle_after_minutes_tooltip"))
+        self._idle_after_lbl = QLabel(t("settings.idle_after_minutes"))
+        beh_form.addRow(self._idle_after_lbl, self._idle_after_spin)
         
         # Diagnostic self-checks + periodic backup integrity verification
         self._self_checks_cb = WrappedCheckBox(t("settings.self_checks"), t("settings.self_checks_tooltip"))
@@ -841,6 +842,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             getattr(self, "_edit_copies_spin", None),
             getattr(self, "_edit_copy_days_spin", None),
             getattr(self, "_poll_spin", None),
+            getattr(self, "_idle_after_spin", None),
             getattr(self, "_correlation_spin", None),
             getattr(self, "_self_checks_freq_spin", None),
             getattr(self, "_auto_export_days_spin", None),
@@ -1079,6 +1081,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._min_kept_spin.valueChanged.connect(self._mark_dirty)
         self._max_size_spin.valueChanged.connect(self._mark_dirty)
         self._poll_spin.valueChanged.connect(self._mark_dirty)
+        self._idle_after_spin.valueChanged.connect(self._mark_dirty)
         self._auto_export_cb.stateChanged.connect(self._mark_dirty)
         self._auto_export_days_spin.valueChanged.connect(self._mark_dirty)
         self._correlation_cb.stateChanged.connect(self._mark_dirty)
@@ -1362,6 +1365,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             "min_kept": self._min_kept_spin.value(),
             "max_size": self._max_size_spin.value(),
             "poll": self._poll_spin.value(),
+            "idle_after": self._idle_after_spin.value(),
             "auto_export": self._auto_export_cb.isChecked(),
             "auto_export_days": self._auto_export_days_spin.value(),
             "correlation": self._correlation_cb.isChecked(),
@@ -1430,6 +1434,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._min_kept_spin.setValue(config.get("min_kept_backups", 3))
         self._max_size_spin.setValue(config.get("max_backup_size_mb", 512))
         self._poll_spin.setValue(config.get("process_poll_interval", 1))
+        self._idle_after_spin.setValue(config.get("idle_after_minutes", 10))
         # Backup integrity verification was merged into the self-checks toggle:
         # the checkbox is ON when either legacy flag was on, and the interval
         # follows the self-checks frequency.
@@ -1549,6 +1554,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("min_kept_backups",       self._min_kept_spin.value())
         config.set("max_backup_size_mb",     self._max_size_spin.value())
         config.set("process_poll_interval",  self._poll_spin.value())
+        config.set("idle_after_minutes",     self._idle_after_spin.value())
         config.set("auto_export_config_enabled", self._auto_export_cb.isChecked())
         config.set("auto_export_config_interval_days",
                    self._auto_export_days_spin.value())
@@ -1740,6 +1746,16 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._load_suppression_list()
         except Exception as e:
             logger.debug(f"Settings lists refresh on show failed: {e}")
+
+        # Recovered from a second showEvent that used to sit further up this
+        # class and never ran. The page is normally built by ensure_loaded when
+        # the user navigates to it, so this was not visible — but showing the
+        # page any other way left it empty, which is exactly what the dead
+        # definition was there to prevent.
+        if getattr(self, "_pending_initial_load", False):
+            self._pending_initial_load = False
+            self._section_jobs = self._section_job_list()
+            self._pump_sections()
 
     def _on_config_changed(self, key: str, _value):
         """Live refresh while the page IS visible. Hidden pages skip (the
@@ -2040,6 +2056,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             "min_kept_backups":       3,
             "max_backup_size_mb":     512,
             "process_poll_interval":  1,
+            "idle_after_minutes":     10,
             "backup_verify_enabled":      True,
             "backup_verify_interval_days": 7,
             "auto_export_config_enabled": False,
@@ -2120,6 +2137,18 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._hotkey_edit._set_idle_style()
 
     def update_locale(self):
+        """Re-translate every static label when the language changes.
+
+        ONE definition. There used to be two, and Python keeps the last:
+        the earlier body — the page header, every group title, the theme
+        combo's own items, and most of the Behaviour, Overlay and backup
+        policy controls — was dead code, so switching language left half
+        this page in the language it started in. Anything added here has
+        to stay in this one method.
+        """
+        if not getattr(self, "_built", False):
+            self._locale_pending = True
+            return
         self._header.setText(t("settings.title"))
         for grp, key in self._group_title_keys:
             grp.setTitle(t(key))
@@ -2180,6 +2209,9 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._max_size_lbl.setText(t("settings.max_size_mb"))
         self._poll_lbl.setText(t("settings.poll_interval"))
         self._poll_spin.setToolTip(t("settings.poll_interval"))
+        self._idle_after_lbl.setText(t("settings.idle_after_minutes"))
+        self._idle_after_spin.setToolTip(t("settings.idle_after_minutes_tooltip"))
+        self._idle_after_spin.setSuffix(f" {t('backups.archive_auto_minutes')}")
         self._ignored_lbl.setText(t("settings.ignored_processes_section"))
         self._ignored_hint.setText(t("settings.ignored_processes_hint"))
         self._unblock_btn.setText(t("settings.unblock_selected"))
@@ -2208,6 +2240,19 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._excluded_paths_search.setPlaceholderText(t("settings.search_list"))
         self._suppression_search.setPlaceholderText(t("settings.search_list"))
         self._suppressed_search.setPlaceholderText(t("settings.search_list"))
+
+        # Formerly the second definition's own work.
+        # Re-fill both preference lists so their placeholder rows ("no game
+        # preferences saved", "no excluded paths") and the per-item
+        # suppression-kind labels pick up the new locale.
+        self._load_suppression_list()
+        self._inline_save.setText(t("settings.save"))
+        self._inline_cancel.setText(t("common.cancel"))
+        self._inline_reset.setText(t("buttons.reset"))
+        self._inline_reset.setToolTip(t("tooltips.reset_defaults"))
+        self._save_btn.setText(t("settings.save"))
+        self._cancel_btn.setText(t("common.cancel"))
+        self._hotkey_edit.update_locale()
         # Re-fill both preference lists so their placeholder rows ("no game
         # preferences saved", "no excluded paths") and the per-item
         # suppression-kind labels pick up the new locale.
@@ -2289,56 +2334,4 @@ class SettingsPage(PageScrollMixin, QWidget):
         except Exception:
             pass
 
-    def update_locale(self):
-        """Re-translate all static labels when the language changes."""
-        if not getattr(self, "_built", False):
-            self._locale_pending = True
-            return
-        self._theme_lbl.setText(t("settings.theme"))
-        self._lang_lbl.setText(t("settings.language"))
-        self._ui_scale_lbl.setText(t("settings.ui_scale"))
-        self._ui_scale_auto_cb.setText(t("settings.ui_scale_auto"))
-        self._ui_scale_auto_cb.setToolTip(t("settings.ui_scale_auto_tooltip"))
-        self._min_kept_lbl.setText(t("settings.min_kept_backups"))
-        self._min_kept_spin.setToolTip(t("settings.min_kept_backups_tooltip"))
-        self._max_size_lbl.setText(t("settings.max_size_mb"))
-        self._poll_lbl.setText(t("settings.poll_interval"))
-        self._poll_spin.setToolTip(t("settings.poll_interval"))
-        self._ignored_lbl.setText(t("settings.ignored_processes_section"))
-        self._ignored_hint.setText(t("settings.ignored_processes_hint"))
-        self._unblock_btn.setText(t("settings.unblock_selected"))
-        self._suppression_group.setTitle(t("settings.game_suppressions_title"))
-        self._supp_hint.setText(t("settings.game_suppressions_hint"))
-        self._unblock_game_btn.setText(t("settings.unblock_selected"))
-        self._exp_hint.setText(t("settings.excluded_paths_hint"))
-        self._restore_paths_btn.setText(t("settings.restore_selected"))
-        self._export_btn.setText(t("settings.export_config"))
-        self._import_btn.setText(t("settings.import_config"))
-        self._history_btn.setText(t("settings.config_history"))
-        self._hints_lbl.setText(t("settings.save_hints"))
-        self._hints_edit.setPlaceholderText(t("settings.save_hints_desc"))
-        self._auto_export_cb.setText(t("settings.auto_export_config"))
-        self._auto_export_cb.setToolTip(t("settings.auto_export_config_tooltip"))
-        self._auto_export_days_lbl.setText(t("settings.auto_export_config_interval"))
-        self._auto_export_days_spin.setSuffix(" " + t("settings.days_suffix"))
-        self._auto_export_days_spin.setToolTip(
-            t("settings.auto_export_config_interval_tooltip"))
-        self._correlation_cb.setText(t("settings.save_correlation"))
-        self._correlation_cb.setToolTip(t("settings.save_correlation_tooltip"))
-        self._correlation_lbl.setText(t("settings.save_correlation_window"))
-        self._correlation_spin.setToolTip(t("settings.save_correlation_window_tooltip"))
-        self._excluded_paths_group.setTitle(t("settings.excluded_paths_title"))
-        self._excluded_paths_search.setPlaceholderText(t("settings.search_list"))
-        self._suppression_search.setPlaceholderText(t("settings.search_list"))
-        self._suppressed_search.setPlaceholderText(t("settings.search_list"))
-        # Re-fill both preference lists so their placeholder rows ("no game
-        # preferences saved", "no excluded paths") and the per-item
-        # suppression-kind labels pick up the new locale.
-        self._load_suppression_list()
-        self._inline_save.setText(t("settings.save"))
-        self._inline_cancel.setText(t("common.cancel"))
-        self._inline_reset.setText(t("buttons.reset"))
-        self._inline_reset.setToolTip(t("tooltips.reset_defaults"))
-        self._save_btn.setText(t("settings.save"))
-        self._cancel_btn.setText(t("common.cancel"))
-        self._hotkey_edit.update_locale()
+    

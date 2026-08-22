@@ -52,6 +52,8 @@ class NavButton(QPushButton):
         self._icon  = icon
         self._label = text
         self._status = ""          # "" | "running" | "done" | "failed"
+        self._done = 0
+        self._total = 0
         self._blink_on = True
         self._update_text()
         self.setObjectName("nav_btn")
@@ -73,6 +75,25 @@ class NavButton(QPushButton):
     def update_label(self, text: str):
         self._label = text
         self._update_text()
+
+    def set_progress(self, done: int, total: int):
+        """How far the put-away work has got, as a bar along the bottom.
+
+        A blinking dot says something is happening and nothing else; work
+        the user deliberately put in the sidebar is work they cannot see, so
+        "how much is left" is the one thing the sidebar has to answer. Zero
+        or an unknown total clears it — an indeterminate bar would say less
+        than no bar at all.
+        """
+        try:
+            total = max(0, int(total))
+            done = max(0, min(int(done), total))
+        except (TypeError, ValueError):
+            total = done = 0
+        if (done, total) == (self._done, self._total):
+            return
+        self._done, self._total = done, total
+        self.update()
 
     def set_status(self, status: str):
         """Show a trailing status indicator (running / done / failed / clear)."""
@@ -98,6 +119,18 @@ class NavButton(QPushButton):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        if self._total > 0:
+            bar = QPainter(self)
+            bar.setPen(Qt.PenStyle.NoPen)
+            h = 3
+            y = self.height() - h
+            track = QColor(palette("bg_elevated"))
+            bar.setBrush(QBrush(track))
+            bar.drawRect(0, y, self.width(), h)
+            fill = QColor(palette("accent"))
+            bar.setBrush(QBrush(fill))
+            bar.drawRect(0, y, int(self.width() * self._done / self._total), h)
+            bar.end()
         if not self._status:
             return
         if self._status == "running" and not self._blink_on:
@@ -119,6 +152,58 @@ class NavButton(QPushButton):
         painter.end()
 
 
+class ShelfCancelButton(QPushButton):
+    """"Stop this" for work put away in the sidebar.
+
+    Its own button under the notice, not a mark ON it: the notice is what
+    you press to bring the work back, and putting a second meaning inside
+    the same rectangle makes both of them a gamble. Smaller than the notice
+    and outlined in the colour of an action you cannot undo.
+
+    It appears only once the work has run long enough to be worth calling
+    off — the same thirty seconds the please-wait sheet waits before
+    offering the same thing, for the same reason: a button that flickers
+    past on work that was always going to be quick is noise.
+    """
+
+    OFFER_AFTER_MS = 30_000
+
+    def __init__(self, parent=None):
+        super().__init__(t("common.cancel"), parent)
+        self.setObjectName("shelf_cancel_btn")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(scaled(24, self))
+        self.setStyleSheet(
+            "QPushButton#shelf_cancel_btn {"
+            " background: transparent; border: 1px solid %s;"
+            " border-radius: 4px; color: %s; margin: 2px 12px 6px 12px;"
+            " font-size: %dpx; }"
+            "QPushButton#shelf_cancel_btn:hover { background: %s22; }"
+            % (palette("error"), palette("error"), scaled(11, self),
+               palette("error")))
+        self.hide()
+        self._armed = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.OFFER_AFTER_MS)
+        self._timer.timeout.connect(self._offer)
+
+    def watch(self, running: bool):
+        """Follow the work: start the clock, or take the offer back."""
+        if running:
+            if not self._armed:
+                self._armed = True
+                self._timer.start()
+            return
+        self._armed = False
+        self._timer.stop()
+        self.hide()
+
+    def _offer(self):
+        if self._armed:
+            self.show()
+
+
 class MainWindow(CloudFlowsMixin, QMainWindow):
     # Emitted from the integrity-sweep worker thread; the slot that shows the
     # notice must run on the GUI thread, which a signal guarantees.
@@ -135,6 +220,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     launcher_exe_resolved = Signal(str, str, str)  # game_id, url, exe_path ("" if none)
     # GitHub Releases check finished off the GUI thread.
     update_available = Signal(object)  # ReleaseInfo
+    # A scheduled archive re-backup wrote something. Same reason as the two
+    # above: the archive scheduler works on its own thread and the
+    # notification has to be raised on the GUI one.
+    archive_backup_done = Signal(str)  # archive (game) name
 
     def __init__(self):
         super().__init__()
@@ -281,6 +370,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._setup_cleanup()
         self.backup_verify_problems.connect(self._on_backup_verify_problems)
         self.save_regression_found.connect(self._on_save_regression)
+        self.archive_backup_done.connect(self._on_archive_backup_done)
+        # Starting the app counts as using it — see _is_unattended.
+        import time as _time_mod
+        self._last_active_mono = _time_mod.monotonic()
         # Index zip-existence sweep. It runs as one of the scheduled/manual
         # checks now, never on its own at startup, so there is no longer a
         # result that can land before this connect.
@@ -378,8 +471,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         QApplication.processEvents(
             QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         self.setWindowOpacity(1.0)
-        self.raise_()
-        self.activateWindow()
+        self._ever_shown = True
+        # In front on open, not merely shown. raise_/activateWindow alone are
+        # advisory on Windows when the foreground belongs to another process,
+        # which is the normal case for a program starting up.
+        from ui.helpers import force_foreground
+        force_foreground(self)
 
     def show(self):
         self.show_settled()
@@ -519,7 +616,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Wire library page signals
         self._library_page.add_game_requested.connect(self._show_add_game)
         self._library_page.scan_folder_requested.connect(self._show_scan_folder)
-        self._library_page.folder_dropped.connect(self._show_scan_folder_at)
         self._library_page.cheats_requested.connect(self._open_cheats_for)
         self._library_page.backup_requested.connect(self._backup_game)
         self._library_page.restore_requested.connect(self._restore_game_latest)
@@ -533,6 +629,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overview_page.backup_requested.connect(self._backup_game)
         self._overview_page.backup_all_requested.connect(self._start_backup_all)
         self._overview_page.open_library.connect(lambda: self._switch_page(1))
+        # Raised when the Overview has nothing to sync TO — see its _sync_all
+        # and the provider label.
         self._overview_page.open_sync.connect(lambda: self._switch_page(2))
         self._overview_page.refresh_all_requested.connect(self._on_refresh_all_pages)
 
@@ -677,6 +775,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         def _work():
             done = 0
             for game_id in due:
+                # Read the name BEFORE the backup: the notification needs it,
+                # and asking afterwards is one more index read per archive.
+                name = ""
+                try:
+                    existing = mgr.get_backups_for_game(game_id)
+                    if existing:
+                        name = max(existing, key=lambda b: b.created_dt).game_name
+                except Exception:
+                    pass
                 try:
                     created, detail = mgr.rebackup_archive(game_id)
                 except Exception as e:
@@ -689,11 +796,29 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 mgr._mark_archive_checked(game_id, error="" if created else detail)
                 if created:
                     done += 1
+                    # Say so, exactly as a backup started by hand does. A
+                    # backup this scheduler writes is a real backup: it is
+                    # the only kind the user never sees happen, so silence
+                    # here meant the recurring check gave no sign it was
+                    # working at all. Nothing is announced when the folder
+                    # was unchanged or unreachable — those are not backups.
+                    self.archive_backup_done.emit(name or game_id)
             if done:
                 logger.info("Archive scheduler: %d archive(s) backed up", done)
 
         threading.Thread(target=_work, name="savesync-archive-backup",
                          daemon=True).start()
+
+    def _on_archive_backup_done(self, name: str):
+        """A scheduled archive re-backup wrote a new backup — announce it the
+        same way a manual one is announced, and honour the same setting."""
+        try:
+            self._status_bar.showMessage(
+                t("notifications.backup_created", game=name), 5000)
+            if self._overlay and get_config().get("show_overlay_on_backup", True):
+                self._overlay.show_backup_done(name)
+        except RuntimeError:
+            pass
 
     def _heavy_work_in_flight(self) -> bool:
         """True while the app is doing work that WANTS the memory it holds.
@@ -809,7 +934,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
 
         self._sweeps_since_deep = getattr(self, "_sweeps_since_deep", 0) + 1
+        # Nobody is using the app: the expensive sweep costs the user nothing
+        # right now, so take it instead of waiting out the counter. Being ON
+        # SCREEN is not a reason to hold back — see _is_unattended, which asks
+        # about the person rather than about the window.
+        unattended = self._is_unattended()
         deep = (pressure != "ok"
+                or unattended
                 or self._sweeps_since_deep >= deep_sweep_after_sweeps())
         try:
             if deep:
@@ -817,8 +948,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 trim_process_memory()
                 # A loaded save is the single largest thing the app holds on
                 # to by choice; under real pressure it goes now rather than
-                # waiting out its own idle timer.
-                if pressure == "critical":
+                # waiting out its own idle timer — and likewise when there is
+                # nobody in front of the app to notice it being reloaded.
+                if pressure == "critical" or unattended:
                     self._release_idle_documents()
                 # Deep sweeps always earn the floor: their return value says
                 # nothing about the working set they just released.
@@ -829,6 +961,79 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 _set_interval(floor_ms if reclaimed else timer.interval() * 2)
         except Exception:
             logger.debug("Background memory sweep failed", exc_info=True)
+
+    # Fallback for "how long counts as not working with SaveSync". The real
+    # value is the user's own idle_after_minutes — this is only what answers
+    # while the config cannot be read.
+    _UNATTENDED_FALLBACK_S = 600
+
+    @property
+    def _UNATTENDED_AFTER_S(self) -> float:
+        """Seconds of not using SaveSync before its upkeep may run.
+
+        A setting rather than a constant, because the cost of getting it wrong
+        falls on the user and nobody else can weigh it: the deep sweep hands
+        back the loaded save and the decoded covers, so being called idle too
+        eagerly means putting SaveSync aside for a minute to look something up
+        and coming back to a page that has to build itself again. Ten minutes
+        by default — long enough that a quick detour is not mistaken for
+        leaving, short enough that a real absence is noticed while it lasts.
+        """
+        try:
+            return max(1, int(get_config().get("idle_after_minutes", 10))) * 60.0
+        except Exception:
+            return float(self._UNATTENDED_FALLBACK_S)
+
+    def _is_unattended(self) -> bool:
+        """True when the person is not working with SaveSync right now.
+
+        Idle used to mean, in effect, "the window is out of sight" — the deep
+        sweeps were hung off minimising and off closing to the tray. That is
+        the wrong question. Whether a window is on screen says nothing about
+        whether anybody is looking at it: SaveSync can sit visible on a second
+        monitor untouched all evening, which is the best possible moment to do
+        the expensive upkeep, and it can be tucked in the tray while the user
+        is actively waiting on a backup it is running.
+
+        So the test is about the PERSON, in three ways, any of which is enough:
+
+        1. Nobody has touched the machine at all for _UNATTENDED_AFTER_S.
+           They are not at the PC. This is the case the old rule missed
+           entirely, and the one the window state can never detect.
+        2. The window is hidden or minimised — kept, because it is still a
+           perfectly good signal, just no longer a required one.
+        3. On screen, but no window of ours has been the active one for
+           _UNATTENDED_AFTER_S: they are working in something else. The delay
+           is what keeps a glance at the browser and back from counting.
+        """
+        import time as _time
+        from ui.helpers import system_idle_seconds
+        idle = system_idle_seconds()
+        if idle >= 0.0 and idle >= self._UNATTENDED_AFTER_S:
+            return True
+        try:
+            if not getattr(self, "_ever_shown", False):
+                # Still starting up: the window has never been on screen yet,
+                # so "not visible" here does not mean put away, it means not
+                # arrived. Reading it as idle would aim the expensive sweep at
+                # precisely the moment the covers and caches are being FILLED,
+                # and throw them out from under the pages building them.
+                return False
+            if not self.isVisible() or self.isMinimized():
+                return True
+            if QApplication.activeWindow() is not None:
+                return False        # a window of ours is in use right now
+        except RuntimeError:
+            return False
+        # Seeded in __init__, so "we have only just started" counts as
+        # attended for the first _UNATTENDED_AFTER_S rather than as idle.
+        # Treating it as idle was worse than wrong: startup is exactly when
+        # the covers and caches are being filled, and an upkeep tick landing
+        # in that window would have thrown them straight back out again.
+        last = getattr(self, "_last_active_mono", None)
+        if last is None:
+            return False
+        return (_time.monotonic() - last) >= self._UNATTENDED_AFTER_S
 
     def _release_idle_documents(self):
         """Ask any page holding a big document to let it go."""
@@ -1260,6 +1465,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 btn.set_status("running" if dlg.has_shelvable_work() else "done")
                 btn.update_label(dlg.shelve_nav_label())
                 btn.setToolTip(dlg.shelve_nav_tooltip())
+                done, total, _name = dlg.shelve_progress()
+                btn.set_progress(done, total)
+                self._tick_shelf_cancel(e, dlg.has_shelvable_work())
             except RuntimeError:
                 pass
             return
@@ -1276,6 +1484,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._shelved_adds_layout.addWidget(btn)
             entry = {"dlg": dlg, "btn": btn, "kind": "manual_path"}
             self._shelved_add_entries.append(entry)
+            self._attach_shelf_cancel(entry, dlg)
             self._shelved_adds_host.setVisible(True)
         self._refresh_manual_path_shelf(dlg)
         QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
@@ -1303,10 +1512,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         keep = []
         for e in self._shelved_add_entries:
             if e.get("dlg") is dlg:
-                btn = e.get("btn")
-                if btn is not None:
-                    self._shelved_adds_layout.removeWidget(btn)
-                    btn.deleteLater()
+                self._drop_shelf_entry(e)
             else:
                 keep.append(e)
         self._shelved_add_entries = keep
@@ -1359,13 +1565,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._overlay.show_manual(stats)
 
     def show_and_raise(self):
-        """Show and bring to front from any state including minimised."""
+        """Show and bring to front from any state including minimised.
+
+        Coming back from the tray after a game is exactly the case
+        raise_/activateWindow does not cover on Windows: the foreground still
+        belongs to the game that is closing (or to whatever was behind it), so
+        the request is downgraded to a flashing taskbar button and SaveSync
+        reappears UNDER whatever the user had open. force_foreground does the
+        rest — transiently, without pinning the window above everything.
+        """
         if self.isMinimized():
             self.showNormal()
         elif not self.isVisible():
             self.show()
-        self.raise_()
-        self.activateWindow()
+        from ui.helpers import force_foreground
+        force_foreground(self)
 
     def _hide_to_tray_for_game(self):
         """Minimise SaveSync to the system tray when a game starts, so it stays
@@ -1410,7 +1624,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def changeEvent(self, event):
         super().changeEvent(event)
-        if event.type() == QEvent.Type.WindowStateChange:
+        etype = event.type()
+        if etype == QEvent.Type.ActivationChange and self.isActiveWindow():
+            # The clock _is_unattended reads for its third test.
+            import time as _time
+            self._last_active_mono = _time.monotonic()
+        if etype == QEvent.Type.WindowStateChange:
             if self.isMinimized():
                 from ui.helpers import trim_process_memory
                 QTimer.singleShot(150, trim_process_memory)
@@ -4479,28 +4698,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
-    def _show_scan_folder_at(self, folder_path: str):
-        """A whole folder was dropped on the library — same flow as 🔍,
-        with the scan started on the dropped folder immediately."""
-        from ui.dialogs.exe_scan_dialog import ExeScanDialog
-        existing = getattr(self, "_exe_scan_dlg", None)
-        if existing is not None:
-            try:
-                existing.unshelve()
-                return
-            except RuntimeError:
-                self._exe_scan_dlg = None
-        dlg = ExeScanDialog(self)
-        self._exe_scan_dlg = dlg
-        dlg.search_requested.connect(self._start_batch_game_search)
-        dlg.shelved.connect(lambda: self._on_exe_scan_shelved(dlg))
-        dlg.shelve_status.connect(lambda: self._refresh_exe_scan_shelf(dlg))
-        dlg.finished.connect(lambda _r: self._on_exe_scan_finished(dlg))
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
-        dlg.start_folder(folder_path)
-
     def _refresh_exe_scan_shelf(self, dlg):
         for e in self._shelved_add_entries:
             if e.get("dlg") is not dlg:
@@ -4512,6 +4709,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 btn.set_status("running" if dlg.has_shelvable_work() else "done")
                 btn.update_label(dlg.shelve_nav_label())
                 btn.setToolTip(dlg.shelve_nav_tooltip())
+                done, total, _name = dlg.shelve_progress()
+                btn.set_progress(done, total)
+                self._tick_shelf_cancel(e, dlg.has_shelvable_work())
             except RuntimeError:
                 pass
             return
@@ -4528,6 +4728,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._shelved_adds_layout.addWidget(btn)
             entry = {"dlg": dlg, "btn": btn, "kind": "exe_scan"}
             self._shelved_add_entries.append(entry)
+            self._attach_shelf_cancel(entry, dlg)
             self._shelved_adds_host.setVisible(True)
         self._refresh_exe_scan_shelf(dlg)
         QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
@@ -4554,10 +4755,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         keep = []
         for e in self._shelved_add_entries:
             if e.get("dlg") is dlg:
-                btn = e.get("btn")
-                if btn is not None:
-                    self._shelved_adds_layout.removeWidget(btn)
-                    btn.deleteLater()
+                self._drop_shelf_entry(e)
             else:
                 keep.append(e)
         self._shelved_add_entries = keep
@@ -4734,6 +4932,65 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._start_ingame_backup_timer(entry)
                 logger.info(f"In-game backup timer updated for {entry.name} (interval={entry.backup_interval_sec}s)")
 
+    # ── Stopping put-away work from the sidebar ──────────────────────────────
+
+    def _attach_shelf_cancel(self, entry: dict, dlg):
+        """Give a sidebar notice its own "stop this" button, just below it.
+
+        Every notice gets one, whatever put it there: work the user cannot
+        see is exactly the work they have no other way to call off, and
+        fetching a panel back just to press its Cancel is a detour.
+        """
+        if entry.get("cancel") is not None:
+            return
+        btn = entry.get("btn")
+        cancel = ShelfCancelButton(self._shelved_adds_host)
+        cancel.clicked.connect(lambda _=False, d=dlg: self._confirm_shelf_cancel(d))
+        at = self._shelved_adds_layout.indexOf(btn) if btn is not None else -1
+        if at < 0:
+            self._shelved_adds_layout.addWidget(cancel)
+        else:
+            self._shelved_adds_layout.insertWidget(at + 1, cancel)
+        entry["cancel"] = cancel
+
+    def _tick_shelf_cancel(self, entry: dict, running: bool):
+        cancel = entry.get("cancel")
+        if cancel is not None:
+            try:
+                cancel.watch(bool(running))
+            except RuntimeError:
+                pass
+
+    def _confirm_shelf_cancel(self, dlg):
+        """Ask, then stop. Half a batch stored is not something to undo by
+        accident, and the button sits one press away from a notice the user
+        reaches for to OPEN the thing."""
+        reply = question_window_modal(
+            self, t("common.cancel_work_title"), t("common.cancel_work_body"))
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for name in ("_on_cancel_clicked", "cancel_background_work"):
+            fn = getattr(dlg, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except RuntimeError:
+                    pass
+                return
+        logger.debug("Shelved dialog %s offers no way to stop", type(dlg).__name__)
+
+    def _drop_shelf_entry(self, entry: dict):
+        """Take a notice and its button off the sidebar together."""
+        for key in ("btn", "cancel"):
+            w = entry.get(key)
+            if w is None:
+                continue
+            try:
+                self._shelved_adds_layout.removeWidget(w)
+                w.deleteLater()
+            except RuntimeError:
+                pass
+
     def _shelved_entry_for(self, dlg) -> dict | None:
         for entry in self._shelved_add_entries:
             if entry.get("dlg") is dlg:
@@ -4748,6 +5005,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._shelved_adds_layout.addWidget(btn)
             entry = {"dlg": dlg, "btn": btn}
             self._shelved_add_entries.append(entry)
+            self._attach_shelf_cancel(entry, dlg)
             self._shelved_adds_host.setVisible(True)
         try:
             status = dlg._bg_notice_status or (
@@ -4755,6 +5013,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except RuntimeError:
             status = "running"
         entry["btn"].set_status(status)
+        self._tick_shelf_cancel(entry, status == "running")
         self._sync_add_dlg_nav_tip(dlg)
         # Next tick: clear any phantom modal still grabbing the main window.
         QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
@@ -5320,8 +5579,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     if _src and Path(_src).is_dir():
                         start_dir = _src
                         break
+            # save_target: this folder is where the archive is about to be
+            # UNPACKED, so the confirm button says "Save", not "Select".
             target_dir = pick_folder(
-                self, t("backup.select_restore_destination"), start_dir)
+                self, t("backup.select_restore_destination"), start_dir,
+                save_target=True)
             if not target_dir:
                 return
 
@@ -5574,6 +5836,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             except Exception as e:
                 self._status_bar.showMessage(f"{t('core.launch_failed')}: {e}", 5000)
                 logger.warning(f"Launch failed for {entry.exe_path}: {e}")
+                return
+
+        # We know a game is starting — the monitor should not have to
+        # rediscover that on an idle-rate timer. After a quiet spell its
+        # interval has backed off to four times the base, so the process was
+        # not even looked for until seconds after the user pressed Play, and
+        # only then did the runtime threshold start counting.
+        try:
+            get_monitor().nudge()
+        except Exception:
+            logger.debug("could not nudge the process monitor", exc_info=True)
 
     def _on_folder_appeared(self, game_id: str):
         """Save folder just appeared for the first time.

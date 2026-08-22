@@ -296,7 +296,8 @@ class SyncDonutChart(QWidget, ThemedMixin):
 
         w, h = self.width(), self.height()
         item_spacing = scaled(17, self, min_px=14)
-        legend_h = len(self._data) * item_spacing
+        legend_cols = self._legend_columns()
+        legend_h = self._legend_rows(legend_cols) * item_spacing
         gap = scaled(8, self, min_px=4)
         # Responsive in BOTH directions: the ceiling is a share of the
         # widget's own width, so the ring keeps growing as the window does
@@ -309,7 +310,8 @@ class SyncDonutChart(QWidget, ThemedMixin):
 
         if ring_room < scaled(35, self) or (h - legend_h < scaled(35, self)):
             self._ring_hit = None          # no ring to point at
-            self._draw_legend_only(painter, h, legend_h, item_spacing)
+            self._draw_legend_only(painter, h, legend_h, item_spacing,
+                                   legend_cols)
             painter.end()
             return
 
@@ -353,56 +355,96 @@ class SyncDonutChart(QWidget, ThemedMixin):
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, t('overview.chart_total'))
 
         # Legend: positioned directly below the donut ring and follows it dynamically
-        self._draw_legend(painter, top_y + chart_size + gap, h, item_spacing)
+        self._draw_legend(painter, top_y + chart_size + gap, h, item_spacing,
+                          legend_cols)
         painter.end()
 
-    def _draw_legend(self, painter, ly: float, h: int, item_spacing: int):
-        """Colour dot, label, then the label's OWN number right after it.
+    # Narrowest a legend column may get before a label is elided down to
+    # nothing useful: dot, a few words, a space, the number.
+    _LEGEND_MIN_COL_W = 118
+
+    def _legend_columns(self) -> int:
+        """How many columns the legend gets — 2 when they genuinely fit, else 1.
+
+        Stacking every entry in one column wastes the whole right half of the
+        card and pushes the ring smaller to make room for a tall list, so the
+        entries pair up across two columns when there is width for it. The
+        decision is made from the CURRENT width on every paint, which is what
+        makes it reflow: narrow the window and the columns fall back to the
+        single stack this always drew, with no state to keep in sync.
+        """
+        if len(self._data) < 2:
+            return 1
+        usable = self.width() - scaled(8, self) - scaled(10, self)
+        return 2 if usable >= 2 * scaled(self._LEGEND_MIN_COL_W, self) else 1
+
+    def _legend_rows(self, cols: int) -> int:
+        return -(-len(self._data) // max(1, cols))     # ceil division
+
+    def _draw_legend(self, painter, ly: float, h: int, item_spacing: int,
+                     cols: int = 1):
+        """Colour dot, label, then the label's OWN number right after it,
+        laid out across *cols* columns and filled row by row.
 
         The count used to be right-aligned to the widget edge, which put it
         on the far side of the chart from the label it belonged to — reading
         a row meant crossing the whole donut to find its number. Keeping the
-        pair together is the whole point of a legend, so the number now
-        follows its label with one space of separation, and the block sits
-        clear of the ring above it.
+        pair together is the whole point of a legend, so the number follows
+        its label with one space of separation.
+
+        Row-major fill, so the reading order is the order the entries are in:
+        the first goes top-left, the second top-right, the third starts the
+        next row on the left again. Column-major would put the second entry
+        below the first, which reads as two separate lists rather than one
+        list in two columns.
         """
         w = self.width()
         font = QFont()
         font.setPixelSize(scaled(11, self, min_px=10))
         painter.setFont(font)
         fm = painter.fontMetrics()
-        dot_x = scaled(8, self)
-        text_x = scaled(22, self)
+        cols = max(1, int(cols))
+        left_pad = scaled(8, self)
+        right_pad = scaled(10, self)
+        col_w = (w - left_pad - right_pad) / cols
+        dot_to_text = scaled(14, self)
         pair_gap = scaled(6, self, min_px=4)
-        for label, count, color_key in self._data:
-            if ly + scaled(12, self) > h:
+        for i, (label, count, color_key) in enumerate(self._data):
+            row, col = divmod(i, cols)
+            row_y = ly + row * item_spacing
+            if row_y + scaled(12, self) > h:
                 break
+            dot_x = left_pad + col * col_w
+            text_x = dot_x + dot_to_text
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(palette(color_key)))
-            painter.drawEllipse(int(dot_x), int(ly + scaled(3, self)),
+            painter.drawEllipse(int(dot_x), int(row_y + scaled(3, self)),
                                 scaled(8, self), scaled(8, self))
             count_str = str(count)
             count_w = fm.horizontalAdvance(count_str)
-            # Room for label + gap + count on one line, inside the widget.
-            avail_w = w - text_x - scaled(10, self)
+            # Room for label + gap + count on one line, inside THIS column —
+            # a two-column legend has to elide against its own share of the
+            # width, not the whole widget, or the columns overlap.
+            avail_w = col_w - dot_to_text - (right_pad if cols == 1 else scaled(6, self))
             label_max_w = max(20, avail_w - count_w - pair_gap)
             elided_label = fm.elidedText(
                 label, Qt.TextElideMode.ElideRight, int(label_max_w))
-            baseline = int(ly + scaled(11, self))
+            baseline = int(row_y + scaled(11, self))
             painter.setPen(QColor(palette('text_secondary')))
             painter.drawText(int(text_x), baseline, elided_label)
             painter.setPen(QColor(palette('text')))
             painter.drawText(
                 int(text_x + fm.horizontalAdvance(elided_label) + pair_gap),
                 baseline, count_str)
-            ly += item_spacing
 
-    def _draw_legend_only(self, painter, h: int, legend_h: int, item_spacing: int = 17):
+    def _draw_legend_only(self, painter, h: int, legend_h: int,
+                          item_spacing: int = 17, cols: int = 1):
         """Fallback when the ring cannot fit: just the legend."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if legend_h > h - 4:
             painter.setClipRect(self.rect())
-        self._draw_legend(painter, max(4, h - legend_h + 4), h, item_spacing)
+        self._draw_legend(painter, max(4, h - legend_h + 4), h, item_spacing,
+                          cols)
 
 
 class BackupBarChart(QWidget, ThemedMixin):
@@ -535,6 +577,10 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
     backup_requested = Signal(str)
     backup_all_requested = Signal(object)  # list[str] game ids
     open_library     = Signal()
+    # "Take me where I can fix this." Raised from the two places that are a
+    # dead end with no provider connected — see _sync_all and the provider
+    # label. Connecting a page has nothing to do with the Overview, so the
+    # page it belongs to is where the user is sent.
     open_sync        = Signal()
     refresh_all_requested = Signal()  # wipe + re-pump every open page
 
@@ -568,39 +614,6 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         self._connect_signals()
         # Warm data while hidden; the visible enter refresh is deferred so the
         # page can paint first.
-        self.refresh()
-
-    def update_locale(self):
-        """Re-translate all static and dynamic text when application language changes."""
-        if _safe(self._header):
-            self._header.setText(t("overview.title"))
-        if _safe(self._refresh_btn):
-            self._refresh_btn.setToolTip(
-                t("tooltips.refresh_in_game" if self._in_game else "tooltips.refresh"))
-        if _safe(self._card_games):
-            self._card_games.set_stat_label(t("overview.stat_games"))
-        if _safe(self._card_backups):
-            self._card_backups.set_stat_label(t("overview.stat_backups"))
-        if _safe(self._card_synced):
-            self._card_synced.set_stat_label(t("overview.stat_synced"))
-        if _safe(self._card_playtime):
-            self._card_playtime.set_stat_label(t("overview.stat_playtime"))
-        if _safe(self._activity_header):
-            self._activity_header.setText(t("overview.recent_activity"))
-        if _safe(self._activity_empty):
-            self._activity_empty.setText(t("overview.no_activity"))
-        if _safe(self._donut_header):
-            self._donut_header.setText(t("overview.sync_distribution"))
-        if _safe(self._actions_header):
-            self._actions_header.setText(t("overview.quick_actions"))
-        if _safe(self._bar_header):
-            self._bar_header.setText(t("overview.backup_activity"))
-        for btn, label_key in getattr(self, "_action_btns", []):
-            if _safe(btn):
-                btn.setText(t(label_key))
-        if _safe(self._active_backup_btn):
-            self._active_backup_btn.setText(t("buttons.backup_now"))
-        self._activity_cache_key = None
         self.refresh()
 
     def schedule_refresh(self):
@@ -779,6 +792,15 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         """Nothing to do: #active_banner (gradient, border, accent edge) is
         defined per theme in DARK_THEME/LIGHT_THEME."""
 
+    def _on_provider_clicked(self, event):
+        """Offer the Sync page, but only while there is nothing connected."""
+        from PySide6.QtCore import Qt as _Qt
+        if not self._provider_online and event.button() == _Qt.MouseButton.LeftButton:
+            event.accept()
+            self.open_sync.emit()
+            return
+        event.ignore()
+
     def _provider_style(self) -> str:
         """Provider-label style — colour depends on the current online state."""
         key = 'accent' if self._provider_online else 'text_muted'
@@ -944,6 +966,11 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         self._provider_lbl = QLabel()
         self._provider_lbl.setMinimumWidth(scaled(135, self, min_px=120))
         self._sty(self._provider_lbl, self._provider_style)
+        # "No provider connected" is the one line on this page that names a
+        # problem the user can fix, so it is also the way to fix it. Only
+        # while it says that: once something IS connected the label is a
+        # status, and a status that navigates when clicked is a surprise.
+        self._provider_lbl.mousePressEvent = self._on_provider_clicked
 
         self._provider_lbl.setWordWrap(True)
         actions_col.addWidget(self._provider_lbl)
@@ -1195,6 +1222,14 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         else:
             self._provider_lbl.setText(t('overview.no_provider_connected'))
             self._provider_online = False
+        # The cursor and the tooltip follow the state, because the label is
+        # only clickable in one of them — a hand over something inert is a
+        # promise the page does not keep.
+        self._provider_lbl.setCursor(
+            Qt.CursorShape.ArrowCursor if self._provider_online
+            else Qt.CursorShape.PointingHandCursor)
+        self._provider_lbl.setToolTip(
+            "" if self._provider_online else t("overview.open_sync_to_connect"))
         self._provider_lbl.setStyleSheet(self._provider_style())
 
         self._rebuild_activity(games, bk_rows)
@@ -1348,6 +1383,12 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         """
         orch = get_orchestrator()
         if not orch.is_online():
+            # Nothing to sync TO. This used to return in silence, so the
+            # button was simply inert for anyone who had not set up a
+            # provider yet — pressed, nothing happened, nothing said why.
+            # The answer to "sync all" when there is nowhere to sync is the
+            # page where somewhere gets chosen.
+            self.open_sync.emit()
             return
         from time import monotonic
         now = monotonic()
@@ -1526,6 +1567,34 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         # minute tick or data change.
         self._activity_cache_key = None
         self.refresh()
+
+        # Recovered from a SECOND update_locale that used to sit further up this
+        # class. Python keeps the last definition, so none of the below ran: the
+        # header, the refresh tooltip, the four stat-card labels, the section
+        # headers and the action buttons all stayed in the language the page was
+        # built in. Anything added here has to stay in this one method.
+        if _safe(self._header):
+            self._header.setText(t("overview.title"))
+        if _safe(self._refresh_btn):
+            self._refresh_btn.setToolTip(
+                t("tooltips.refresh_in_game" if self._in_game else "tooltips.refresh"))
+        if _safe(self._card_games):
+            self._card_games.set_stat_label(t("overview.stat_games"))
+        if _safe(self._card_backups):
+            self._card_backups.set_stat_label(t("overview.stat_backups"))
+        if _safe(self._card_synced):
+            self._card_synced.set_stat_label(t("overview.stat_synced"))
+        if _safe(self._card_playtime):
+            self._card_playtime.set_stat_label(t("overview.stat_playtime"))
+        if _safe(self._activity_header):
+            self._activity_header.setText(t("overview.recent_activity"))
+        if _safe(self._actions_header):
+            self._actions_header.setText(t("overview.quick_actions"))
+        for btn, label_key in getattr(self, "_action_btns", []):
+            if _safe(btn):
+                btn.setText(t(label_key))
+        if _safe(self._active_backup_btn):
+            self._active_backup_btn.setText(t("buttons.backup_now"))
 
     # ── Stats for overlay ─────────────────────────────────────────────────────
 

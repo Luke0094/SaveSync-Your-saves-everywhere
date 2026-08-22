@@ -175,18 +175,24 @@ savesync/
 ├── main.py                        # Entry point, single-instance lock, startup tracing
 ├── runtime_splash_hook.py         # Bootloader-time single-instance mutex
 ├── savesync.spec                  # PyInstaller build (animated Tcl splash)
+├── requirements.txt               # Pinned runtime dependencies
+├── install_offline_deps.bat/.sh   # Install from a downloaded wheel cache
+├── download_offline_deps.bat/.sh  # Fetch that cache on a connected machine
 ├── core/
 │   ├── constants.py               # App identity, paths, folder-name rules
+│   ├── concurrency.py             # Adaptive limits (poll rates, chunk sizes, sweeps)
 │   ├── config_manager.py          # JSON config with debounced writes and validation
 │   ├── config_transfer.py         # Config export / import, cloud config history
 │   ├── library.py                 # Game library CRUD, tag canonicalization
 │   ├── monitor.py                 # Process monitor (cached snapshots, adaptive polling)
 │   ├── watcher.py                 # Real-time filesystem watcher, debounced events
 │   ├── save_detector.py           # Heuristic save folder detection and scoring
+│   ├── exe_stems.py               # Shared executable-name vocabulary (one list, three passes)
 │   ├── engines/                   # Engine recognition + binary/format readers
 │   │   ├── game_engine.py         # Which engine a game was built with
 │   │   ├── gvas.py                # Unreal Engine .sav (GVAS)
 │   │   ├── renpy.py               # Ren'Py .save (pickle, read never run)
+│   │   ├── renpy_save.py          # Back-compat shim re-exporting renpy.py
 │   │   ├── lcf.py                 # RPG Maker 2000/2003 .lsd (LCF chunks)
 │   │   ├── rpgmaker.py            # RPG Maker MV/MZ save packing
 │   │   ├── lzstring.py            # LZString codec (used by MV / HTML games)
@@ -207,6 +213,7 @@ savesync/
 │   │   └── xml_save.py            # Plain XML saves
 │   ├── save_editor/               # Save-file editor: orchestration + adapters
 │   │   ├── save_editor.py         # open_save, detection, backups of edits
+│   │   ├── registry.py            # One description per format: extension, magic, engine
 │   │   ├── save_hold.py           # Holds chosen values against the game
 │   │   ├── base.py                # SaveField, errors, shared walk helpers
 │   │   ├── json_format.py         # Plain JSON
@@ -252,10 +259,13 @@ savesync/
 │   ├── net.py                     # Shared HTTP session and retry policy
 │   ├── credentials.py             # Secure credential store (keyring + AES fallback)
 │   ├── machine.py                 # Machine fingerprint for cross-machine detection
+│   ├── self_checks.py             # Data-integrity checks (one list, two callers)
+│   ├── update_check.py            # GitHub Releases check for a newer build
 │   └── startup.py                 # Autostart, directory setup, migrations
 ├── sync/
 │   ├── __init__.py                # Provider registry, orchestrator, conflict detection
 │   ├── base.py                    # Abstract SyncProvider
+│   ├── app_credentials.py         # Default OAuth client IDs for zero-config setup
 │   ├── local_provider.py          # Local / NAS folder
 │   ├── google_drive.py            # Google Drive (OAuth, Service Account, Desktop)
 │   ├── onedrive_provider.py       # OneDrive (MSAL device flow)
@@ -276,7 +286,11 @@ savesync/
     ├── backup_labels.py           # Human-readable backup names and timestamps
     ├── game_search_runner.py      # Background web-search worker for the UI
     ├── splash_screen.py           # Startup splash
-    ├── styles/theme.py            # Dark/Light QSS theme manager
+    ├── styles/                    # Theming
+    │   ├── theme.py               # Dark/Light QSS theme manager
+    │   ├── dark.py                # Dark theme (QSS + palette)
+    │   ├── light.py               # Light theme (QSS + palette)
+    │   └── arrow_icons.py         # SVG chevrons for stylesheets (Fusion-safe)
     ├── pages/                     # Overview, Library, Sync, Backups, Settings,
     │                              # Save editor
     ├── widgets/                   # Game cards/rows, path rows, folder tree, file
@@ -285,7 +299,18 @@ savesync/
     └── dialogs/                   # Add/edit game, auto-scan, restore, conflicts,
                                    # exe scan, manual paths, game search, cloud
                                    # verify, config import, credits
+└── tools/
+    ├── generate_icon.py           # Build the multi-size app .ico
+    ├── generate_splash.py         # Build the static splash PNG
+    ├── splash_animated.py         # Build the animated splash GIF
+    └── signature.py               # Animated splash variant with the 3D flip reveal
 ```
+
+The four directories shown as a single line — `core/game_sources/`, `ui/pages/`,
+`ui/widgets/` and `ui/dialogs/` — hold one module per source, page, widget and
+dialog respectively; they are summarised rather than listed because their
+contents are exactly what their names say and the list would be longer than
+the rest of the tree put together.
 
 ---
 
@@ -445,6 +470,105 @@ Two rules it is built around:
 | `key = value` text (`.ini`, `.cfg`, `.conf`, `.properties`) | |
 | TADS record (`system.rec`) — whitespace tokens, NUL-padded | Classic MJR TADS 3 VM state (`.t3v`) — a snapshot, not a named value list |
 | SQLite (`.db`, `.sqlite`) — Room / Compose Desktop Java progress | |
+
+### Where the format knowledge comes from
+
+Two things keep that table from turning into a maintenance treadmill, and both
+are worth stating because they are what a hand-written parser per engine would
+have cost.
+
+**The game is the schema.** Where a save's own layout or its key lives in the
+game rather than in a table here, SaveSync reads it out of the game at the
+moment the save is opened, instead of shipping a constant that a patch can
+invalidate:
+
+- **Unity Easy Save 3.** Encryption is AES-128-CBC with a password the
+  developer chose and the build carries. Easy Save leaves it in an
+  `ES3Defaults` object, so the password is read from the game's own asset
+  files — `resources.assets`, `globalgamemanagers.assets`, the shared and
+  level assets, and, when those do not answer, inside `.unity3d` / `.bundle`
+  archives, which are unpacked for the purpose (`core/save_editor/crypt/`,
+  `es3.py` and `unityfs.py`).
+- **Encrypted Unreal saves.** Nothing in the engine names the key, so it is
+  not looked up but looked *for*: the game's own binaries are scanned at
+  16-, 8- and 4-byte strides for AES key material (`unreal_crypt.py`).
+- **Wolf RPG.** The field layout of the variable database is stored *in the
+  save* — a run of field codes — so the values are read from the file's own
+  structure. The game's `CDataBase.project` is consulted only to put names on
+  them, and is optional (`crypt/wolf.py`).
+
+Nothing is guessed in any of these. A candidate key is accepted only when what
+comes out decrypts to the format's own magic — `GVAS` for Unreal, valid JSON
+for Easy Save — so a wrong answer fails instead of quietly producing rubbish.
+Whatever is worked out is written down against that game (`crypt/game_keys.py`)
+and never worked out twice. All of it reads **files at rest**; SaveSync never
+attaches to a running game.
+
+**Detection is layered, not a lookup.** `open_save` does not ask an extension
+what a file is and stop there. It builds an ordered list of candidate readers:
+the engine detected from the *install* folder first (`core/engines/game_engine.py`
+reads the fingerprints an engine leaves beside its executable), then the
+extension, then magic bytes and container markers — and each candidate must
+decode *and* re-encode the file before it is accepted. A file whose extension
+lies about it is still recognised.
+
+All four of those tables come from one description per format in
+`core/save_editor/registry.py`: which extensions point at a reader, how it
+recognises a file from its own bytes, which engines should try it first, and
+whether the engine's name is the better label for it. Adding a format is a
+module plus one `FormatSpec` — it used to mean editing three separate places
+in `save_editor.py`, where missing one made the format work for files named
+the way you tested and silently not for the rest. (Two tables stay out of the
+registry on purpose: the lists of formats that are *recognised and not
+editable*, which answer "why will this not open" rather than "what is this".)
+
+**A point release must not take your saves away.** Some formats decide their
+layout from an engine version number in the file. Those thresholds are written
+down from the engine's history, so they are right about every build that
+existed when they were written and can be wrong about the next one — and being
+wrong that way is indistinguishable from "this is not that format". A game
+updating could put its saves out of reach with nothing actually wrong.
+
+So a format that can be wrong that way offers alternative readings, and
+SaveSync tries them **after** reading the file as written has failed — never
+before, so nothing that opens today is affected. An alternative reading has to
+earn acceptance twice:
+
+1. the byte-exact round trip every reader here must pass, and
+2. proof that it actually *parsed* what it rebuilt. Byte-equality alone is not
+   enough: a reader that carries what it could not parse as an opaque tail
+   rebuilds the file perfectly while having understood almost none of it. A
+   reading that found no values, or left most of the file unaccounted for, is
+   refused however exact its output.
+
+This runs in two passes, and the second is what makes it general:
+
+1. **Other readings of the formats that were tried.** For layouts chosen by a
+   version number. Unreal (GVAS) enumerates the four switches its header
+   drives — UE5 package version, custom version block, property GUID, and the
+   5.4 property-tag shape — so a build that moves one of them is one of
+   sixteen shapes rather than an unknown file.
+2. **Every other reader there is.** Detection works from what a file says
+   about itself: extension, magic, the engine of the game it belongs to. An
+   engine update can change any of those, and then a save stops *looking* like
+   itself while the reader that understands it is still sitting right there,
+   never offered because nothing pointed at it. Trying them all is safe for
+   exactly one reason: the gate does not care how a reader was reached. This
+   is what makes version tolerance apply to **every** format, including ones
+   added later, with nothing to write down for each.
+
+The two readers that *search* for a key — unpacking a game's archives, or
+scanning its binaries — are left out of the second pass. They are worth
+minutes when something points at them, never on the off-chance.
+
+When auto-resolution fires it says so in the log, naming the reader and the
+layout it used.
+
+What this deliberately is **not**: there is no inspection of a running process
+and no execution of game code, and nothing is ever written back on a reading
+that did not reproduce the original exactly. Formats that hide their layout
+somewhere neither the save nor the game's files expose plainly stay in the
+right-hand column of the table above, named rather than mangled.
 
 <details>
 <summary><strong>How the editor reads and writes these formats</strong></summary>

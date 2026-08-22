@@ -8,7 +8,7 @@ import platform
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
@@ -264,6 +264,73 @@ def version_insensitive_slug(name: str) -> str:
     comparison — so widening it matches more without stranding anything.
     """
     return match_slug(strip_version_tokens(name or ''))
+
+
+# Separator between a name and the tag that distinguishes it from another
+# name spelled the same way. Survives _normalize_folder_name (which only
+# rewrites <>:"/\|?* ) and is dropped by match_slug, so a tagged name shares
+# no comparison key with anything else.
+_DISAMBIGUATION_MARK = "~"
+
+
+def disambiguate_name(base: str, taken, hint: str = "") -> str:
+    """*base*, or *base* plus a generic tag when *taken* already holds it.
+
+    Explicitly NOT ``base_2``. A trailing number is how a sequel is written,
+    and the comparison key this whole codebase matches names by cannot tell
+    the two apart: strip_version_tokens deliberately KEEPS bare numbers, so
+    that "Example Game 3" stays a different game from "Example Game" — which
+    means the ``MyGame_2`` minted for a mere name collision reduces to
+    exactly the slug a genuine "MyGame 2" reduces to. A disambiguator that
+    collides with a real sequel is not doing its job, and to the person
+    reading a list of folders it simply looks like the second chapter of
+    something. ``MyGame~4f2a91`` can be neither.
+
+    The tag comes from *hint* — the thing being named, normally its source
+    path — rather than from a counter, which makes it STABLE as well as
+    generic: naming the same thing twice lands on the same name instead of
+    climbing _2, _3, _4 on every attempt. Without a hint, or if the derived
+    tag is somehow taken too, it falls back to random; still generic, just
+    not repeatable.
+
+    *taken* is any container of already-used names; the comparison is
+    case-insensitive, so pass casefolded values.
+    """
+    import hashlib
+    import uuid
+    if not base:
+        return base
+    used = {str(x).casefold() for x in (taken or ())}
+    if base.casefold() not in used:
+        return base
+    if hint:
+        token = hashlib.sha1(str(hint).casefold().encode("utf-8", "replace")).hexdigest()[:6]
+        candidate = f"{base}{_DISAMBIGUATION_MARK}{token}"
+        if candidate.casefold() not in used:
+            return candidate
+    while True:
+        candidate = f"{base}{_DISAMBIGUATION_MARK}{uuid.uuid4().hex[:6]}"
+        if candidate.casefold() not in used:
+            return candidate
+
+
+def strip_disambiguation_tag(name: str) -> str:
+    """*name* with a tag disambiguate_name may have appended taken back off.
+
+    The inverse of disambiguate_name, and it has to exist as a pair with it:
+    anything that GROUPS names spelled the same way — "how many cloud folders
+    are there for this title" — has to undo the distinguishing tag first, and
+    doing that with an inline regex somewhere else is how the two drift apart.
+
+    Both spellings are accepted, because both exist on disk: the ``~<hex>``
+    this mints now, and the historical ``_2`` / ``_3`` that folders created by
+    earlier versions still carry.
+    """
+    import re
+    if not name:
+        return name
+    return re.sub(r"(?:" + re.escape(_DISAMBIGUATION_MARK) + r"[0-9a-f]{4,12}|_\d+)$",
+                  "", str(name))
 
 
 def _normalize_folder_name(name: str) -> str:

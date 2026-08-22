@@ -15,15 +15,77 @@ class GvasFormat(_Format):
     name = "Unreal Engine"
     engine = "Unreal Engine (GVAS)"
 
+    # The four layout decisions the GVAS header's version numbers drive. Each
+    # has moved at least once in Unreal's history, and each is a plain
+    # yes/no, so a build that moves one again is one of sixteen shapes rather
+    # than an unknown. See variants().
+    _VERSION_SWITCHES = ("force_ue5_field", "force_custom_versions",
+                         "force_new_tag", "force_guid")
+
     def __init__(self):
         self._save = None
+        self._overrides = {}
 
     def load(self, data: bytes) -> None:
-        from core.engines.gvas import GvasError, loads
+        from core.engines.gvas import GvasError, GvasSave
+        save = GvasSave()
+        for key, value in self._overrides.items():
+            setattr(save, key, value)
         try:
-            self._save = loads(data)
+            save.load(data)
         except GvasError as e:
             raise SaveEditorError(str(e)) from e
+        self._save = save
+
+    @classmethod
+    def variants(cls):
+        """Every combination of the four version-driven layout switches.
+
+        Unreal decides where the UE5 package version sits, whether a custom
+        version block follows, whether property tags carry a GUID, and (since
+        5.4) which property-tag shape is used — all from version numbers in
+        the header. Those thresholds are written down from the engine's own
+        history, so they are right about every build that existed when they
+        were written and can be wrong about the next one. When that happens
+        the reader walks off into the middle of a property and the save reads
+        as unopenable, which is a poor answer for a file that is a perfectly
+        ordinary GVAS save one field out of step.
+
+        Sixteen combinations, minus the one already tried as written. Each is
+        cheap (a header re-read plus a property walk), each has to rebuild the
+        file byte-for-byte, and each has to have parsed it — see
+        parse_is_plausible. So this widens what can be OPENED without widening
+        what can be written wrongly.
+        """
+        for mask in range(1, 1 << len(cls._VERSION_SWITCHES)):
+            overrides = {}
+            label = []
+            for bit, key in enumerate(cls._VERSION_SWITCHES):
+                value = bool(mask & (1 << bit))
+                overrides[key] = value
+                label.append("%s=%d" % (key[len("force_"):], value))
+
+            def tweak(fmt, _o=overrides):
+                fmt._overrides = dict(_o)
+
+            yield ", ".join(label), tweak
+
+    def parse_is_plausible(self) -> bool:
+        """Did this reading actually account for the file?
+
+        GvasSave keeps whatever follows the property list as an opaque tail
+        and writes it back untouched, which is right — it is how a property
+        type this reader has never met survives a round trip. But it means a
+        WRONG reading that stumbles onto an early "None" can rebuild the file
+        perfectly while having parsed almost nothing, and byte-equality would
+        call that a success. A real parse reaches the end of the properties:
+        it finds some, and it leaves a few bytes behind, not most of the file.
+        """
+        save = self._save
+        if save is None or not save.props:
+            return False
+        body = max(1, (save.raw_len or len(save.header) + len(save.tail)) - len(save.header))
+        return len(save.tail) <= max(64, body // 8)
 
     def dump(self) -> bytes:
         return self._save.dump()

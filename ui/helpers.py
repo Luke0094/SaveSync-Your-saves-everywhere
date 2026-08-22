@@ -557,6 +557,108 @@ def force_topmost(widget) -> None:
             pass
 
 
+def system_idle_seconds() -> float:
+    """Seconds since the last keyboard or mouse input ANYWHERE on this machine.
+
+    Machine-wide on purpose, not app-wide: the question being asked is "is the
+    person here", and someone typing in another program is just as present as
+    someone typing in SaveSync. Returns -1.0 where the platform cannot say, so
+    callers can tell "not idle" from "no idea" and fall back rather than
+    treating an unknown as an answer.
+    """
+    if platform.system() != "Windows":
+        return -1.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return -1.0
+        ctypes.windll.kernel32.GetTickCount.restype = wintypes.DWORD
+        now = ctypes.windll.kernel32.GetTickCount()
+        # Both are 32-bit millisecond counters that wrap every ~49 days.
+        # Masking the difference back to 32 bits makes the wrap cancel out
+        # instead of producing a wildly negative idle time once a month.
+        return ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return -1.0
+
+
+def force_foreground(widget) -> None:
+    """Put *widget*'s window in front of everything and give it focus.
+
+    raise_() plus activateWindow() is the portable half and is all that is
+    needed while the app already owns the foreground. It is NOT enough for
+    the two moments that matter here — coming back from the tray when a game
+    exits, and a second launch handing over to the running instance —
+    because in both the request comes from a process that does not currently
+    own the foreground, and Windows answers those by flashing the taskbar
+    button instead of raising the window. The result was finding SaveSync
+    behind whatever had been left open.
+
+    Two mechanisms, both deliberately transient:
+
+    - a topmost/not-topmost round trip, which reorders the window without
+      leaving WindowStaysOnTopHint on it. Pinning a window above everything
+      permanently is a different behaviour, and not one anybody asked for;
+    - AttachThreadInput to the thread that owns the foreground for the
+      duration of one SetForegroundWindow call. That call obeys a process
+      already sharing the foreground queue, which is exactly what attaching
+      arranges, and detaching immediately puts the input queues back.
+
+    Safe to call on any platform and at any time — everything below is
+    best-effort and a failure leaves the portable half already done.
+    """
+    if widget is None:
+        return
+    try:
+        widget.raise_()
+        widget.activateWindow()
+    except RuntimeError:
+        return
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+
+        hwnd = wintypes.HWND(int(widget.winId()))
+        HWND_TOPMOST, HWND_NOTOPMOST = wintypes.HWND(-1), wintypes.HWND(-2)
+        # NOMOVE|NOSIZE|NOACTIVATE — reorder only, do not touch geometry.
+        swp = 0x0002 | 0x0001 | 0x0010
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, swp)
+        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, swp)
+
+        fg = user32.GetForegroundWindow()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        own_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_tid and fg_tid != own_tid:
+            attached = bool(user32.AttachThreadInput(fg_tid, own_tid, True))
+        try:
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(fg_tid, own_tid, False)
+    except Exception:
+        logger.debug("could not force the window to the foreground",
+                     exc_info=True)
+
+
 def set_dark_title_bar(widget, dark: bool | None = None) -> None:
     """Ensure native Windows 10/11 title bar and HWND frame match current dark/light mode and eliminate white flash."""
     if platform.system() != "Windows":
@@ -1990,6 +2092,68 @@ def finalize_adaptive_dialog_size(
 
 
 
+def emoji_icon(glyph: str, px: int = 16, dpr: float = 1.0):
+    """Render *glyph* into a QIcon, transparent background, centred.
+
+    For buttons that want an emoji. Setting one as button TEXT is at the
+    mercy of the widget's padding and of whether the button's font has the
+    glyph — a 24px button with the theme's default padding has no room to
+    draw it at all, and the result is a control that looks empty but still
+    takes clicks. Painted into a pixmap it is an icon like any other, sized
+    by setIconSize and unaffected by either.
+    """
+    from PySide6.QtGui import QIcon, QPixmap, QPainter, QFont
+    dpr = max(1.0, float(dpr or 1.0))
+    side = max(1, int(round(px * dpr)))
+    pm = QPixmap(side, side)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    try:
+        font = QFont()
+        # Emoji carry their own side bearings; a full-size glyph clips.
+        font.setPixelSize(max(1, int(px * 0.84)))
+        painter.setFont(font)
+        painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+    finally:
+        painter.end()
+    return QIcon(pm)
+
+
+def center_dialog(dialog: QWidget) -> None:
+    """Put *dialog* in the middle of the window it belongs to.
+
+    Qt places a dialog wherever the window manager feels like unless it is
+    told, which for a large panel means it can open with its title bar off
+    the top of the screen or hugging a corner. Centred on the parent window
+    when there is one, on the screen when there is not, and clamped to the
+    work area either way so no edge of it lands outside.
+
+    Call AFTER the size is settled; centring a dialog that then grows leaves
+    it off-centre by half the growth.
+    """
+    from PySide6.QtGui import QGuiApplication
+    try:
+        parent = dialog.parentWidget()
+        anchor = parent.window() if parent is not None else None
+        geo = dialog.frameGeometry()
+        if anchor is not None and anchor.isVisible():
+            geo.moveCenter(anchor.frameGeometry().center())
+            screen = anchor.screen() or QGuiApplication.primaryScreen()
+        else:
+            screen = dialog.screen() or QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            geo.moveCenter(screen.availableGeometry().center())
+        if screen is not None:
+            avail = screen.availableGeometry()
+            geo.moveLeft(max(avail.left(), min(geo.left(), avail.right() - geo.width())))
+            geo.moveTop(max(avail.top(), min(geo.top(), avail.bottom() - geo.height())))
+        dialog.move(geo.topLeft())
+    except (RuntimeError, AttributeError):
+        pass
+
+
 def hook_dialog_geometry_save(dialog: QWidget) -> None:
     """Remember size/pos when a QDialog finishes (after manual resize)."""
     if getattr(dialog, "_geom_save_hooked", False):
@@ -2279,6 +2443,18 @@ class ElidedLabel(QLabel):
         return QSize(40, metrics.height())
 
     def _apply_elide(self):
+        # Re-eliding is measuring text, and a resize is a STREAM of events —
+        # a window drag sends one per step, and a list of a few hundred rows
+        # holds a thousand of these labels. Nothing about a middle-elide
+        # changes unless the WIDTH does, yet a vertical drag, or a relayout
+        # that moved the row without resizing it, sends the event all the
+        # same. So the measuring is skipped when the width and the text are
+        # the pair already measured.
+        if (getattr(self, "_elided_w", None) == self.width()
+                and getattr(self, "_elided_for", None) == self._full):
+            return
+        self._elided_w = self.width()
+        self._elided_for = self._full
         metrics = QFontMetrics(self.font())
         # Before the first layout pass width is 0. Using a fake 40px budget
         # here made short names elide (file2→file2....mzsave) while a longer
@@ -2316,7 +2492,18 @@ class ElidedLabel(QLabel):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._apply_elide()
+        # Marked, not measured. Eliding is measuring text, and a resize is a
+        # stream of events that reaches EVERY row of a list — including the
+        # several hundred scrolled out of sight, whose elision nobody can
+        # see. Qt only paints what is visible, so the measuring is deferred
+        # to paintEvent and the off-screen rows simply never pay it.
+        self._elide_dirty = True
+
+    def paintEvent(self, event):
+        if getattr(self, "_elide_dirty", False):
+            self._elide_dirty = False
+            self._apply_elide()
+        super().paintEvent(event)
 
 
 class ElidedCheckBox(QCheckBox):
@@ -2360,6 +2547,18 @@ class ElidedCheckBox(QCheckBox):
                 + 4)
 
     def _apply_elide(self):
+        # Re-eliding is measuring text, and a resize is a STREAM of events —
+        # a window drag sends one per step, and a list of a few hundred rows
+        # holds a thousand of these labels. Nothing about a middle-elide
+        # changes unless the WIDTH does, yet a vertical drag, or a relayout
+        # that moved the row without resizing it, sends the event all the
+        # same. So the measuring is skipped when the width and the text are
+        # the pair already measured.
+        if (getattr(self, "_elided_w", None) == self.width()
+                and getattr(self, "_elided_for", None) == self._full):
+            return
+        self._elided_w = self.width()
+        self._elided_for = self._full
         metrics = QFontMetrics(self.font())
         if self.width() <= 0:
             super().setText(self._full)
@@ -2379,4 +2578,15 @@ class ElidedCheckBox(QCheckBox):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._apply_elide()
+        # Marked, not measured. Eliding is measuring text, and a resize is a
+        # stream of events that reaches EVERY row of a list — including the
+        # several hundred scrolled out of sight, whose elision nobody can
+        # see. Qt only paints what is visible, so the measuring is deferred
+        # to paintEvent and the off-screen rows simply never pay it.
+        self._elide_dirty = True
+
+    def paintEvent(self, event):
+        if getattr(self, "_elide_dirty", False):
+            self._elide_dirty = False
+            self._apply_elide()
+        super().paintEvent(event)

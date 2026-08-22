@@ -137,7 +137,6 @@ def build_pager(current: int, total: int, on_page,
 class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
     add_game_requested = Signal(str, str)  # name, exe_path
     scan_folder_requested = Signal()       # 🔍 — scan a folder for games
-    folder_dropped = Signal(str)           # drag&drop of a whole folder
     backup_requested   = Signal(str)
     restore_requested  = Signal(str)
     remove_requested   = Signal(str)
@@ -445,9 +444,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         if not self._pending_initial_load or self._initial_load_scheduled:
             return
         self._initial_load_scheduled = True
-        if self.isVisible() and getattr(self, "_deferred_busy", None) is None:
-            from ui.widgets.busy_overlay import DeferredBusy
-            self._deferred_busy = DeferredBusy(self, t("common.please_wait"), delay_ms=0)
+        self._ensure_deferred_busy()
         # Let the page paint empty first, then fill in the background.
         QTimer.singleShot(0, self._load_library)
 
@@ -477,9 +474,14 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         self._cards.clear()
         self._pending_initial_load = True
         self._initial_load_scheduled = False
-        self._stop_deferred_busy()
+        # The wipe and the reload it triggers are ONE wait from where the user
+        # sits, so the sheet carries across instead of being closed and built
+        # again — see _ensure_deferred_busy. With nothing on screen to cover
+        # there is no sheet to keep.
         if self.isVisible():
             self._load_library()
+        else:
+            self._stop_deferred_busy()
 
     def _set_view(self, mode: str):
         if mode == self._view_mode and self._cards:
@@ -505,16 +507,27 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         cards build.
         """
         from ui.widgets.page_size import guarded_render, SCOPE_LIBRARY
-        from ui.widgets.busy_overlay import DeferredBusy
-        self._pending_initial_load = False
-        # Cover wipe + async insert; recreate so reveal is fresh each rebuild.
-        self._stop_deferred_busy()
-        if self.isVisible():
-            self._deferred_busy = DeferredBusy(
-                self, t("common.please_wait"), delay_ms=0)
-        with guarded_render(SCOPE_LIBRARY):
-
-            self._rebuild_view_inner()
+        # Re-entrancy guard. Showing/pumping the sheet runs the event loop,
+        # and a queued resizeEvent that changes the column count calls this
+        # very method — which would tear the layout down underneath the
+        # rebuild already walking it.
+        if getattr(self, "_rebuilding", False):
+            return
+        self._rebuilding = True
+        try:
+            self._pending_initial_load = False
+            # Invalidate any in-flight chunk insert BEFORE the sheet runs the
+            # event loop, not only inside _rebuild_view_inner further down: a
+            # pending _async_insert_step still carrying the current generation
+            # would otherwise fire during that pump and append cards to the
+            # layout that is about to be destroyed.
+            self._insert_gen = getattr(self, "_insert_gen", 0) + 1
+            self._insert_queue = []
+            self._ensure_deferred_busy()
+            with guarded_render(SCOPE_LIBRARY):
+                self._rebuild_view_inner()
+        finally:
+            self._rebuilding = False
 
     def _on_page_size_changed(self, _size: int):
         """Page 1 is the only sane place to land: every item has just moved to
@@ -681,12 +694,34 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
             self._stop_deferred_busy()
             self._finish_page_insert(gen)
             return
-        if getattr(self, "_deferred_busy", None) is None and self.isVisible():
-            from ui.widgets.busy_overlay import DeferredBusy
-            self._deferred_busy = DeferredBusy(
-                self, t("common.please_wait"), delay_ms=0)
+        self._ensure_deferred_busy()
         QTimer.singleShot(0, lambda g=gen: self._async_insert_step(g))
 
+
+    def _ensure_deferred_busy(self):
+        """One please-wait sheet for the whole load — created once, PUMPED
+        after that.
+
+        A first load runs as three stages (schedule -> _rebuild_view ->
+        chunk pump) and a wipe-and-reload adds a fourth, and each stage used
+        to close the sheet and build a replacement. Every BusyOverlay starts
+        its own countdown from zero, so one uninterrupted wait was reported
+        as "(0s)" two or three times over and never showed how long the user
+        had actually been waiting; the closed one was also left mid-countdown
+        for the deferred delete to collect, which is a revealed sheet nobody
+        can reach and nobody stops. Keeping the SAME overlay and pumping it
+        is what advances the seconds — the counter is driven by the event
+        loop turning, not by the object being new.
+        """
+        if not self.isVisible():
+            return
+        busy = getattr(self, "_deferred_busy", None)
+        if busy is not None:
+            busy.pump()
+            return
+        from ui.widgets.busy_overlay import DeferredBusy
+        self._deferred_busy = DeferredBusy(
+            self, t("common.please_wait"), delay_ms=0)
 
     def _stop_deferred_busy(self):
         busy = getattr(self, "_deferred_busy", None)
@@ -802,10 +837,17 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
     def _on_monitor_launched(self, entry, _):
         if entry:
             self._set_playing_badge(entry.id, True)
+            # The badge was the only thing this touched, so "last played" —
+            # which the monitor has just written for this very launch — kept
+            # showing the PREVIOUS session until something else rebuilt the
+            # card. Re-render it from the library, the same way the playtime
+            # figures are refreshed at the end of a session.
+            self.refresh_game_status(entry.id)
 
     def _on_monitor_exited(self, entry):
         if entry:
             self._set_playing_badge(entry.id, False)
+            self.refresh_game_status(entry.id)
 
     def disconnect_signals(self):
         try:

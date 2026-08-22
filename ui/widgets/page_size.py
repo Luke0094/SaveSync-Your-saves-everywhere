@@ -50,18 +50,27 @@ SCOPE_BACKUPS = "backups"
 SCOPE_CHEATS_GAMES = "cheats_games"
 SCOPE_CHEATS_SAVES = "cheats_saves"
 SCOPE_REVIEWS = "reviews"
+SCOPE_MANUAL_PATHS = "manual_paths"
 
 # Per-scope ceilings and preset lists. The generic maximum is NOT offered as
 # a preset — that is what put "500" in every dropdown. Reviews are denser
 # than a row of cards, so they get their own smaller ladder.
 SCOPE_MAXIMUM = {
     SCOPE_REVIEWS: 50,
+    # A manual-path row is five widgets tall and carries two editable fields,
+    # so it costs far more than a card to build, lay out and repaint. Several
+    # hundred of them at once is what made that dialog crawl, drop rows out
+    # of the paint and freeze on a window resize; the ceiling is what stops
+    # the size control offering a number that brings all of it back.
+    SCOPE_MANUAL_PATHS: 100,
 }
 SCOPE_PRESETS = {
     SCOPE_REVIEWS: (5, 10, 20),
+    SCOPE_MANUAL_PATHS: (25, 50, 100),
 }
 SCOPE_DEFAULT = {
     SCOPE_REVIEWS: 10,
+    SCOPE_MANUAL_PATHS: 25,
 }
 
 
