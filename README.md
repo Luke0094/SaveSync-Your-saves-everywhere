@@ -1124,7 +1124,7 @@ timestamped backup of the index file it changes.
 
 ```
 python maintenance/repair_archives.py                  # diagnose everything
-python maintenance/repair_archives.py --game TomieWGM  # one archive
+python maintenance/repair_archives.py --game GameName # one archive
 python maintenance/repair_archives.py --apply --fix injected-source,lost-chain
 ```
 
