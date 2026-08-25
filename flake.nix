@@ -25,12 +25,8 @@
       perSystem = pkgs:
         let
 
-        # X11/XCB libraries live in the `xorg` package set, NOT at the top
-        # level: `pkgs.libX11` does not exist, so `with pkgs; [ libX11 ... ]`
-        # falls through to the enclosing scope and evaluation dies with
-        # "undefined variable 'libX11'". runtimeLibs is forced by BOTH the
-        # package's installPhase and the devShell's shellHook, so every output
-        # of this flake failed — `nix build` and `nix develop` alike.
+        # Runtime shared libraries needed by PySide6 / Qt / X11 / Wayland.
+        # Top-level pkgs is used directly since pkgs.xorg is deprecated in modern nixpkgs.
         runtimeLibs = with pkgs; [
           stdenv.cc.cc.lib
           zstd
@@ -46,7 +42,6 @@
           freetype
           dbus
           wayland
-        ] ++ (with pkgs.xorg; [
           libX11
           libxcb
           libXext
@@ -63,7 +58,7 @@
           xcbutilkeysyms
           xcbutilrenderutil
           xcbutilwm
-        ]);
+        ];
         # wayland-protocols is XML/headers only — it ships no shared object, so
         # it belongs in a build input, never on LD_LIBRARY_PATH.
 
@@ -85,16 +80,13 @@
           pillow
           langdetect
           pyyaml
-          # Optional at runtime (add_game_dialog imports it inside a
-          # try/except) but not optional in practice: without it, cover art
-          # served as AVIF by attachment CDNs silently fails to decode.
-          # requirements.txt has always listed it; the Nix package did not.
-          pillow-avif-plugin
+          # Note: pillow-avif-plugin was removed in nixpkgs because
+          # pillow >= 11.3 includes native AVIF support.
         ];
 
         savesyncPkg = pkgs.python312Packages.buildPythonApplication {
           pname = "savesync";
-          version = "1.3.3";
+          version = "1.3.4";
           format = "other";
 
           # `./.` on its own drags offline_deps/, dist/ and build/ — about
@@ -183,7 +175,8 @@
               freetype
               dbus
               wayland
-            ] ++ [ pkgs.xorg.xcbutilcursor ];
+              xcbutilcursor
+            ];
 
             shellHook = ''
               export C_INCLUDE_PATH="${pkgs.linuxHeaders}/include:$C_INCLUDE_PATH"
