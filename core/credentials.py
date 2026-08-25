@@ -127,10 +127,12 @@ def _unwrap_secret(blob: bytes) -> str:
 def _persist_salt(salt: str) -> None:
     """Write salt wrapped; migrate away from legacy plaintext when possible."""
     from core import atomic_replace as _atomic_replace
+    from core import restrict_to_owner as _restrict_to_owner
     wrapped = _wrap_secret(salt)
     tmp = _SALT_PROTECTED_PATH.with_name(_SALT_PROTECTED_PATH.name + ".tmp")
     tmp.write_bytes(wrapped)
     _atomic_replace(tmp, _SALT_PROTECTED_PATH)
+    _restrict_to_owner(_SALT_PROTECTED_PATH)
     # Drop legacy plaintext salt once the protected copy is in place —
     # unless wrap fell back to PLAIN (then the plaintext file is the store).
     if wrapped.startswith(_SALT_FILE_MAGIC + b"PLAIN:"):
@@ -190,12 +192,14 @@ def _get_or_create_salt() -> str:
                 pass
 
         import secrets
+        from core import restrict_to_owner as _restrict_to_owner
         salt = secrets.token_hex(16)
         try:
             _persist_salt(salt)
         except Exception:
             try:
                 _SALT_PATH.write_text(salt, encoding="utf-8")
+                _restrict_to_owner(_SALT_PATH)
                 logger.warning(
                     "Could not OS-protect encryption salt; wrote plaintext salt "
                     "(file-fallback credentials remain obfuscation-only if the "
@@ -475,17 +479,20 @@ class CredentialStore:
     def _write_fallback_files(self, raw: bytes) -> None:
         """Write credentials.enc + same-key redundancy copy (not a weaker key)."""
         from core import atomic_replace as _atomic_replace
+        from core import restrict_to_owner as _restrict_to_owner
         key = _derive_encryption_key()
         encoded = base64.b64encode(encrypt_data(raw, key))
         tmp_fallback = _FALLBACK_PATH.with_suffix(".tmp")
         tmp_fallback.write_bytes(encoded)
         _atomic_replace(tmp_fallback, _FALLBACK_PATH)
+        _restrict_to_owner(_FALLBACK_PATH)
         try:
             # Same ciphertext material / same primary key — survives a
             # half-written primary without opening the old weak-key shortcut.
             tmp_backup = _BACKUP_PATH.with_suffix(".tmp")
             tmp_backup.write_bytes(encoded)
             _atomic_replace(tmp_backup, _BACKUP_PATH)
+            _restrict_to_owner(_BACKUP_PATH)
         except Exception as e:
             logger.debug(f"Could not create same-key credential backup: {e}")
 

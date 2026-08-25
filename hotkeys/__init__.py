@@ -65,6 +65,18 @@ def normalize_hotkey(hotkey: str) -> str:
     return "+".join(mods + keys)
 
 
+def _wayland_without_x() -> bool:
+    """True on a Wayland session with no X display to fall back on."""
+    import os
+    import sys
+    if sys.platform in ("win32", "darwin"):
+        return False
+    on_wayland = bool(os.environ.get("WAYLAND_DISPLAY")
+                      or os.environ.get("XDG_SESSION_TYPE", "").lower()
+                      == "wayland")
+    return on_wayland and not os.environ.get("DISPLAY")
+
+
 def _to_pynput_combo(hotkey: str) -> str:
     parts = [p.strip().lower() for p in hotkey.split("+") if p.strip()]
     if not parts:
@@ -217,7 +229,21 @@ class HotkeyManager(QObject):
                 self._combos[hotkey] = combo
                 self._mods[hotkey] = _split_hotkey(hotkey)[0]
                 self._rebuild_listener_locked()
-            logger.info(f"Hotkey registered: {hotkey} (pynput: {combo})")
+            if _wayland_without_x():
+                # Registered, and it will never fire. Only the compositor
+                # sees a key that is not addressed to a focused window, and
+                # Wayland has no protocol for a client to ask for one — so
+                # pynput's X backend has nothing to listen to. Said out
+                # loud, because "Hotkey registered" on its own reads as
+                # working and the user is left wondering why nothing
+                # happens. XWayland gives it back.
+                logger.warning(
+                    "Hotkey %s registered but a Wayland session with no X "
+                    "display cannot deliver it — global shortcuts need "
+                    "XWayland, or the overlay can be opened from the tray "
+                    "and the window.", hotkey)
+            else:
+                logger.info(f"Hotkey registered: {hotkey} (pynput: {combo})")
             return True
         except Exception as e:
             logger.error(f"Hotkey register error ({hotkey}): {e}")

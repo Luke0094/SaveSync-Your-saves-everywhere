@@ -1,0 +1,41 @@
+#!/bin/sh
+# AppImage entry point.
+#
+# Two things have to be right here and nowhere else.
+#
+# 1. $HERE, not the working directory. An AppImage is launched from
+#    wherever the user happens to be, and $0 is the mount point; resolving
+#    relative to the cwd starts the wrong binary or none at all.
+#
+# 2. The bundled Qt must not be mixed with the host's. A desktop with its
+#    own PySide6 installed exports QT_PLUGIN_PATH, and Qt then loads the
+#    host's platform plugin against our libQt6Core — which fails with
+#    "could not load the Qt platform plugin", the single most common way
+#    a bundled Qt application dies on someone else's machine.
+set -eu
+
+HERE="$(dirname "$(readlink -f "$0")")"
+APPDIR_BIN="${HERE}/usr/bin"
+
+# Ours wins, the host's is not consulted.
+export QT_PLUGIN_PATH="${APPDIR_BIN}/_internal/PySide6/Qt/plugins"
+export QML2_IMPORT_PATH="${APPDIR_BIN}/_internal/PySide6/Qt/qml"
+unset QT_QPA_PLATFORM_PLUGIN_PATH || true
+export LD_LIBRARY_PATH="${APPDIR_BIN}/_internal:${LD_LIBRARY_PATH:-}"
+
+# Fonts bundled with the build, if any. Appended rather than prepended, so
+# a system that HAS these fonts keeps using its own copies and only a system
+# missing them falls back to ours — which is the difference between filling
+# a gap and overriding someone's font configuration.
+if [ -d "${HERE}/usr/share/fonts" ]; then
+    export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:${HERE}/usr/share"
+fi
+
+# Wayland sessions that have no XCB fallback installed still start under
+# the Wayland plugin; Qt picks it up on its own when this is left unset.
+# Set SAVESYNC_QT_PLATFORM to force one.
+if [ -n "${SAVESYNC_QT_PLATFORM:-}" ]; then
+    export QT_QPA_PLATFORM="${SAVESYNC_QT_PLATFORM}"
+fi
+
+exec "${APPDIR_BIN}/savesync" "$@"

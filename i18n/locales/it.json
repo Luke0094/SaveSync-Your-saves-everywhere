@@ -2,7 +2,8 @@
   "app": {
     "name": "SaveSync",
     "tagline": "I tuoi salvataggi, ovunque.",
-    "game_save_manager": "gestione salvataggi giochi"
+    "game_save_manager": "gestione salvataggi giochi",
+    "already_running": "SaveSync è già in esecuzione.\nControlla la system tray."
   },
   "dates": {
     "jan": "gen",
@@ -168,7 +169,8 @@
     "no_games_match_search_dev": "Nessuno sviluppatore corrisponde alla tua ricerca.",
     "last_session": "Ultima sessione",
     "cover_zoom_in": "Aumenta zoom",
-    "cover_zoom_out": "Riduci zoom"
+    "cover_zoom_out": "Riduci zoom",
+    "status_playing": "In gioco"
   },
   "unknown_history": {
     "badge_tooltip": "Giochi rilevati in attesa — mostra la coda",
@@ -326,7 +328,10 @@
     "restore_fallback_warning": "Non è stato possibile trovare automaticamente la cartella salvataggi su questo PC. I file sono stati esportati in:\n{path}\n\nApri Modifica Gioco e imposta manualmente il percorso corretto, poi ripristina di nuovo.",
     "select_restore_destination": "Seleziona cartella di destinazione per il ripristino",
     "restore_orphan_success": "Salvataggi ripristinati nella cartella selezionata: {path}",
-    "resumed_frozen_game": "Un gioco rimasto congelato da una sessione precedente è stato riattivato."
+    "resumed_frozen_game": "Un gioco rimasto congelato da una sessione precedente è stato riattivato.",
+    "restore_which_path": "Quale cartella ripristinare?",
+    "restore_all_paths": "Tutte le cartelle",
+    "restore_source_missing": "non presente su questo PC"
   },
   "settings": {
     "title": "Impostazioni",
@@ -450,7 +455,8 @@
     "save_edit_copy_days_tooltip": "Le copie più vecchie di così vengono rimosse. La più recente resta sempre, qualunque età abbia, così c'è sempre qualcosa con cui annullare.",
     "diagnostics_running": "Esecuzione controlli diagnostici in corso...",
     "backup_archives_too": "Includi gli archivi in “backup di tutto” e “sincronizza tutto”",
-    "backup_archives_too_tooltip": "Gli archivi sono cartelle di salvataggi che hai consegnato senza aggiungere il gioco alla libreria. Attivo, una passata li copre come qualsiasi gioco. Disattivo, le passate restano alla libreria e un archivio si aggiorna con i suoi pulsanti o col suo controllo ricorrente."
+    "backup_archives_too_tooltip": "Gli archivi sono cartelle di salvataggi che hai consegnato senza aggiungere il gioco alla libreria. Attivo, una passata li copre come qualsiasi gioco. Disattivo, le passate restano alla libreria e un archivio si aggiorna con i suoi pulsanti o col suo controllo ricorrente.",
+    "export_error_io": "impossibile scrivere il file"
   },
   "config_transfer": {
     "preview_title": "Anteprima Importazione Configurazione",
@@ -635,7 +641,9 @@
     "remove_image_tooltip": "Rimuovi immagine dalla lista",
     "appid_placeholder": "Appid Steam, o incolla un URL launcher (battlenet://, epic://, ecc.)",
     "remove_url_tooltip": "Rimuovi URL",
-    "open_cache_folder": "Apri la cartella cache delle immagini"
+    "open_cache_folder": "Apri la cartella cache delle immagini",
+    "ignored_section_session": "Rimossi in questa conferma",
+    "ignored_section_saved": "Le tue cartelle salvataggi"
   },
   "auto_scan": {
     "window_title": "SaveSync - Scansione Automatica Salvataggi",
@@ -659,7 +667,12 @@
     "games_updated": "✅ {games} giochi aggiornati con {paths} percorsi trovati",
     "background_paths_found": "✅ {count} percorsi trovati da scansione in background",
     "extended_scan_btn": "Scansione Estesa",
-    "registry_key_tooltip": "Chiave di registro: i suoi valori vengono esportati nel backup e ripristinati al bisogno (PlayerPrefs di Unity e simili)."
+    "registry_key_tooltip": "Chiave di registro: i suoi valori vengono esportati nel backup e ripristinati al bisogno (PlayerPrefs di Unity e simili).",
+    "previously_removed": "Rimosso da te in precedenza — spuntalo per rimetterlo",
+    "existing_paths_title": "📁  Le tue cartelle salvataggi",
+    "existing_path_excluded": "(saltata nel backup)",
+    "removed_tag": "(rimosso)",
+    "removed_paths_count": "Percorsi rimossi: {count}"
   },
   "restore": {
     "window_title": "Ripristina — {game}",
@@ -676,7 +689,10 @@
     "backup_before_download_note": "backup pre-download",
     "online": "● Online",
     "offline": "● Offline",
-    "save_folder_detected": "📂 Cartella salvataggi rilevata per {name} — apri Libreria per scansionare e confermare"
+    "save_folder_detected": "📂 Cartella salvataggi rilevata per {name} — apri Libreria per scansionare e confermare",
+    "no_tray_title": "Chiudi SaveSync",
+    "no_tray_body": "Questo desktop non ha un'area di notifica, quindi SaveSync non ha dove nascondersi.\n\nMinimizzarlo nella barra delle applicazioni o uscire?",
+    "no_tray_quit": "Esci"
   },
   "providers": {
     "google_drive": "Google Drive",
@@ -701,8 +717,7 @@
   "notifications": {
     "backup_created": "Backup creato per {game}",
     "backup_unchanged": "Nessuna modifica rilevata per {game} — backup saltato",
-    "cooldown_active": "Questa operazione è stata temporaneamente disabilitata, riprova tra {seconds}s",
-    "sync_no_changes": "Nessuna modifica da sincronizzare"
+    "cooldown_active": "Questa operazione è stata temporaneamente disabilitata, riprova tra {seconds}s"
   },
   "backups": {
     "game_running": "Gioco in esecuzione",
@@ -727,7 +742,6 @@
     "verify_unchecked": "Non ancora verificato",
     "verify_click": "Clicca per verificare questo backup",
     "verify_checked_at": "verificato {when}",
-    "verify_all": "Verifica backup",
     "verify_all_tooltip": "Verifica backup: apre ogni backup e conferma che sia ancora leggibile e completo.",
     "verify_game_tooltip": "Verifica backup: apre ogni backup del gioco selezionato e conferma che sia ancora leggibile e completo.",
     "backup_now_tooltip": "Esegue subito un backup del gioco selezionato, o di tutti i giochi se nessuno è selezionato.",
@@ -750,8 +764,6 @@
     "archive_paths_empty": "Nessun path — aggiungi la cartella dove stanno i salvataggi di questo archivio",
     "archive_paths_btn": "I tuoi paths utente…",
     "archive_auto_no_source": "Questo archivio non ha una cartella di origine registrata, quindi il backup ricorrente è disattivato. Riaggiungi di nuovo l'archivio per indicarne una qui.",
-    "archive_auto_last": "Ultimo controllo: {when}",
-    "archive_auto_never": "Mai controllato",
     "archive_auto_minutes": "minuti"
   },
   "errors": {
@@ -837,7 +849,6 @@
     "please_wait": "Attendi prego..",
     "cancel_search": "Interrompi la ricerca",
     "cancelling": "Interruzione…",
-    "to_sidebar": "Minimizza",
     "minimize": "Minimizza",
     "open": "Apri",
     "progress_label": "{label}  {done}/{total}",
@@ -984,7 +995,6 @@
   },
   "buttons": {
     "restore": "Ripristina",
-    "delete": "✕",
     "open_folder": "📂  Apri Cartella",
     "backup_now": "💾  Backup Ora",
     "play": "▶  Gioca",
@@ -1031,18 +1041,14 @@
     "empty": "Nessuna cartella ancora. Usa Aggiunta singola o Aggiunta multipla.",
     "name_placeholder": "Nome gioco",
     "path_placeholder": "Percorso salvataggi",
-    "include_tooltip": "Includi questa cartella nel salvataggio",
     "remove_tooltip": "Rimuovi questa riga",
-    "verdict_actual": "✓  Percorso effettivo: {path}",
     "verdict_actual_missing": "⚠  Percorso effettivo, ma non esiste ancora: {path}",
     "verdict_dest_known": "✓  Destinazione: {path}",
     "verdict_dest_relative": "↪  Destinazione relativa al gioco: {chain}",
     "verdict_dest_here": "✓  I salvataggi sono in questa cartella",
-    "verdict_resolved": "✓  Trovato tra le posizioni dei giochi: {path}",
     "verdict_predicted": "⚠  Destinazione relativa al gioco, non ancora individuata sul disco. Viene registrata e agganciata da sola quando il gioco compare.",
     "save": "Salva cartelle",
     "done": "Completato",
-    "nothing_selected": "Nessuna riga selezionata.",
     "none_resolved": "Nessun percorso risolto in una cartella esistente: correggi i percorsi o usa Sfoglia.",
     "result_added": "{count} backup archiviati (senza titolo in libreria).",
     "result_updated": "{count} percorsi aggiunti a giochi esistenti.",
@@ -1051,7 +1057,6 @@
     "result_unresolved": "{count} non risolti e ignorati: {names}",
     "reading": "Lettura cartelle in corso…",
     "reading_folder": "Lettura {current}/{total} — {name}",
-    "inserting_folder": "Aggiunta {current}/{total} — {name}",
     "storing": "Salvataggio {current}/{total} — {name}",
     "cancelled": "Operazione annullata.",
     "cancelling": "Annullamento in corso…",
@@ -1070,7 +1075,9 @@
     "same_name_never": "nessuna origine registrata",
     "same_name_update": "Stessi salvataggi — aggiorna",
     "same_name_separate": "Gioco diverso — tieni entrambi",
-    "same_name_all": "Rispondi allo stesso modo per gli altri"
+    "same_name_all": "Rispondi allo stesso modo per gli altri",
+    "all_known": "Tutte le cartelle qui sono già salvate ({count}).",
+    "found_with_known": "{count} cartelle su {total} — {known} già salvate"
   },
   "batch": {
     "backup_label": "Backup",
@@ -1103,8 +1110,6 @@
     "all_known": "Trovati {count} giochi, ma sono già tutti in libreria.",
     "found": "{count} giochi trovati — controlla nome e percorso di ciascuno.",
     "found_with_known": "{total} giochi trovati — {known} già in libreria, esclusi. Controlla nome e percorso dei restanti {count}.",
-    "skipped_known": "({count} già in libreria, esclusi.)",
-    "include_tooltip": "Includi questo titolo",
     "remove_tooltip": "Rimuovi questo titolo",
     "name_placeholder": "Nome gioco",
     "path_placeholder": "Percorso eseguibile",
@@ -1133,7 +1138,6 @@
   "game_search": {
     "title": "Ricerca online titoli",
     "running_hint": "I titoli vengono cercati uno alla volta. SaveSync resta utilizzabile; il progresso è anche nella barra laterale. Minimizza solo se vuoi: la ricerca continua e si riapre da lì.",
-    "nav": "Ricerca online",
     "nav_tooltip_done": "Ricerca online terminata — clicca la barra laterale per rivedere.",
     "nav_tooltip_failed": "Ricerca online annullata — clicca la barra laterale per vedere cosa è stato fatto.",
     "sidebar_tooltip_running": "Ricerca online in corso — clicca per aprire i dettagli. Minimizzare non interrompe.",
@@ -1165,7 +1169,6 @@
     "save_filter": "File di testo",
     "save_filter_image": "Immagini",
     "save_title": "Salva la nota",
-    "title": "Fissato",
     "unreadable": "Impossibile leggere questo file.",
     "write_failed": "Impossibile scrivere questo file — usa 💾 per mettere la nota altrove.",
     "unsaved_hint": "Non ancora salvata — usa 💾 per scegliere dove",
@@ -1257,14 +1260,8 @@
     "file_type": "Tipo file:",
     "add_to_sidebar": "Aggiungi alla barra laterale",
     "remove_from_sidebar": "Rimuovi dalla barra laterale",
-    "all_files": "Tutti i file",
-    "executables": "Eseguibili",
-    "folders": "Cartelle",
-    "save_files": "File di salvataggio",
-    "folders_and_files": "Cartelle e file",
     "select": "Seleziona",
     "save": "Salva",
-    "open": "Apri",
     "filter_all_files": "Tutti i file (*.*)",
     "filter_folders": "Cartelle",
     "back": "Indietro",
@@ -1277,7 +1274,6 @@
     "delete": "Elimina",
     "show_hidden": "Mostra file nascosti",
     "cannot_remove_system_pin": "Gli elementi di sistema non possono essere rimossi",
-    "remove": "Rimuovi",
     "col_name": "Nome",
     "col_size": "Dimensione",
     "col_type": "Tipo",
@@ -1285,8 +1281,6 @@
     "my_computer": "Questo PC",
     "user_home": "Cartella utente",
     "desktop": "Desktop",
-    "documents": "Documenti",
-    "downloads": "Download",
     "type_folder": "Cartella di file",
     "type_app": "Applicazione",
     "type_text": "Documento di testo",
@@ -1295,6 +1289,8 @@
     "type_image": "File di immagine",
     "type_audio": "File audio",
     "type_video": "File video",
-    "type_shortcut": "Collegamento"
+    "type_shortcut": "Collegamento",
+    "filter_executables": "Eseguibili",
+    "filter_any_file": "Tutti i file"
   }
 }

@@ -16,7 +16,7 @@ from PySide6.QtGui import (
     QPolygon,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QLabel, QSizePolicy, QStyle, QWidget,
+    QApplication, QCheckBox, QLabel, QScrollArea, QSizePolicy, QStyle, QWidget,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,15 +90,90 @@ def safe_widget(w) -> bool:
         return w is not None
 
 
+#: The interface font, in order of preference. Segoe UI is Windows',
+#: SF Pro is macOS', and the three after them are what a Linux desktop
+#: actually ships — GNOME installs Cantarell, Ubuntu installs Ubuntu, and
+#: DejaVu Sans is on essentially every distribution. Named rather than
+#: left to `sans-serif` because that resolves through fontconfig to
+#: whatever the system decided, and the metrics differ enough to change
+#: every measured width in the interface.
+UI_FONT_STACK = ("Segoe UI", "SF Pro Display", "Inter", "Noto Sans",
+                 "Cantarell", "Ubuntu", "DejaVu Sans")
+_ui_font_family_cache: list = []
+
+
+def ui_font_family() -> str:
+    """The first family from UI_FONT_STACK this machine actually has.
+
+    Resolved once. QFont("Segoe UI") on Linux does not fail — it silently
+    substitutes, and the substitute is chosen by fontconfig rather than by
+    us, so a hardcoded family means a different typeface AND different
+    metrics on every system that lacks it.
+    """
+    if _ui_font_family_cache:
+        return _ui_font_family_cache[0]
+    family = UI_FONT_STACK[-1]
+    try:
+        from PySide6.QtGui import QFontDatabase
+        available = set(QFontDatabase.families())
+        for candidate in UI_FONT_STACK:
+            if candidate in available:
+                family = candidate
+                break
+    except Exception:
+        pass
+    _ui_font_family_cache.append(family)
+    return family
+
+
+#: Openers to try on Unix, in order. xdg-open is the convention and is the
+#: first choice; it is also a script from the xdg-utils package, which is
+#: NOT installed everywhere — on a minimal system, in a container, in some
+#: distributions' server images it simply is not there, and every
+#: "open folder" button in the interface then does nothing at all with no
+#: sign of why. The rest are what the desktops themselves ship.
+_UNIX_OPENERS = (
+    # The desktop's own file manager first. The generic openers delegate to
+    # whatever is registered for inode/directory, and on a system where
+    # nothing is — a minimal install, a container, a broken mimeapps.list —
+    # `gio open` prints "failed to find default application" and STILL
+    # exits 0, so the caller cannot even tell. Naming the managers means
+    # the common case never depends on that registration being right.
+    ("nautilus", ()),
+    ("dolphin", ()),
+    ("nemo", ()),
+    ("thunar", ()),
+    ("pcmanfm", ()),
+    ("caja", ()),
+    ("xdg-open", ()),
+    ("gio", ("open",)),
+    ("gnome-open", ()),
+    ("kde-open5", ()),
+    ("kde-open", ()),
+    ("exo-open", ()),
+)
+
+
 def open_in_file_manager(target) -> None:
     """Open a folder (or a file's location) in the system file manager."""
     try:
         if platform.system() == "Windows":
             os.startfile(str(target))
-        elif platform.system() == "Darwin":
+            return
+        if platform.system() == "Darwin":
             subprocess.Popen(["open", str(target)])
-        else:
-            subprocess.Popen(["xdg-open", str(target)])
+            return
+        import shutil as _shutil
+        for name, prefix in _UNIX_OPENERS:
+            path = _shutil.which(name)
+            if not path:
+                continue
+            subprocess.Popen([path, *prefix, str(target)])
+            return
+        logger.warning(
+            "Could not open '%s': none of %s is installed. Install "
+            "xdg-utils, or the file manager of your desktop.",
+            target, ", ".join(n for n, _ in _UNIX_OPENERS))
     except Exception as e:
         logger.warning(f"Could not open folder '{target}': {e}")
 
@@ -251,8 +326,14 @@ class SystemCursor:
         # Windows: only draw when GetCursorInfo says the OS pointer is gone
         # (games that already show their own cursor keep it). Elsewhere there
         # is no equivalent probe — Proton/Wine can hide the pointer with no
-        # Win32 API to ask — so while a holder is active we always draw.
-        need_soft = platform.system() != "Windows"
+        # Win32 API to ask — so a game running is the only evidence there is.
+        #
+        # "A game is running" is the condition, not "a holder is active".
+        # Unconditional off Windows meant a second, hand-drawn arrow on top
+        # of the perfectly good system one every time the overlay opened on
+        # the desktop — two cursors, the drawn one sized from a DPI the
+        # desktop is not using, which is what a giant cursor looks like.
+        need_soft = platform.system() != "Windows" and game_is_running()
         if platform.system() == "Windows":
             try:
                 import ctypes
@@ -659,9 +740,64 @@ def force_foreground(widget) -> None:
                      exc_info=True)
 
 
+def _set_x11_dark_frame(widget, dark: bool | None = None) -> None:
+    """Ask an X11 window manager for a dark decoration on *widget*.
+
+    ``_GTK_THEME_VARIANT`` is the only cross-desktop way to say it: GTK
+    reads it, and the managers built on GTK draw their title bar from it.
+    Set before the window is mapped where possible, so the frame is never
+    drawn light first.
+    """
+    if platform.system() == "Windows":
+        return
+    try:
+        if dark is None:
+            from ui.styles.theme import get_theme_manager
+            dark = get_theme_manager().is_dark()
+        from PySide6.QtGui import QGuiApplication
+        native = QGuiApplication.platformNativeInterface()
+        if native is None:
+            return
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library("X11")
+        if not name:
+            return
+        xlib = ctypes.cdll.LoadLibrary(name)
+        display = native.nativeResourceForIntegration(b"display")
+        if not display:
+            return
+        display = ctypes.c_void_p(int(display))
+        window = int(widget.winId())
+        if not window:
+            return
+        prop = xlib.XInternAtom(display, b"_GTK_THEME_VARIANT", False)
+        utf8 = xlib.XInternAtom(display, b"UTF8_STRING", False)
+        value = b"dark" if dark else b"light"
+        buf = ctypes.create_string_buffer(value)
+        xlib.XChangeProperty(display, window, prop, utf8, 8, 0,  # PropModeReplace
+                             buf, len(value))
+        xlib.XFlush(display)
+    except Exception:
+        logger.debug("Could not ask the window manager for a dark frame",
+                     exc_info=True)
+
+
 def set_dark_title_bar(widget, dark: bool | None = None) -> None:
-    """Ensure native Windows 10/11 title bar and HWND frame match current dark/light mode and eliminate white flash."""
+    """Make the window's own frame follow the theme.
+
+    Two mechanisms for one intent. Windows has DWM attributes; X11 has a
+    property, ``_GTK_THEME_VARIANT``, which is what GTK-based window
+    managers (GNOME/Mutter, XFWM, Cinnamon) read to decide whether to draw
+    a dark title bar. Neither is a stylesheet's business — the frame is
+    drawn by the system, not by the application, which is why a dark
+    application kept a pale bar and border around it on Linux.
+
+    A manager that does not read the property simply keeps its own
+    decoration; nothing here can fail loudly.
+    """
     if platform.system() != "Windows":
+        _set_x11_dark_frame(widget, dark)
         return
     try:
         if dark is None:
@@ -1897,7 +2033,7 @@ def apply_adaptive_dialog_size(
 
 
 def mediate_panel_scroll(
-    scroll: "QScrollArea",
+    scroll: QScrollArea,
     size: DialogSizeResult | None = None,
     *,
     capped_w: bool = False,
@@ -1930,7 +2066,7 @@ def mediate_panel_scroll(
             else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
 
-def page_scroll_caps(scroll: "QScrollArea") -> tuple[bool, bool]:
+def page_scroll_caps(scroll: QScrollArea) -> tuple[bool, bool]:
     """Whether page content *must* scroll (viewport cannot hold the minimum).
 
     Uses ``minimumSizeHint`` / ``minimumWidth|Height``, not preferred
@@ -1963,7 +2099,7 @@ def page_scroll_caps(scroll: "QScrollArea") -> tuple[bool, bool]:
 
 
 def mediate_page_scroll(
-    scroll: "QScrollArea",
+    scroll: QScrollArea,
     *,
     list_content: bool = False,
 ) -> None:
@@ -2400,6 +2536,90 @@ class TopmostPinMixin:
                 timer.stop()
             except RuntimeError:
                 pass
+
+
+def swap_scroll_widget(scroll, new_widget):
+    """Put *new_widget* into *scroll*, disposing of the previous one safely.
+
+    ``takeWidget()`` hands the old widget back with NO parent, and an
+    unparented widget that is still visible is a TOP-LEVEL one — Qt gives it
+    a real window. For a virtual list the holder is as tall as the WHOLE
+    list (570 rows is ~116 000 px), so Windows was asked for a window that
+    size, clamped it to 32767, and logged the failure once per relayout:
+
+        QWindowsWindow::setGeometry: Unable to set geometry 1020x116352
+        ... Resulting geometry: 1020x32767
+
+    That clamp is not cosmetic. The layout goes on placing rows at their
+    real offsets while the window ends at 32767, so every row past the clamp
+    is drawn somewhere its clicks never arrive — which is what "only the
+    first title responds" was.
+
+    Hidden while it still has a parent, and given one again immediately, it
+    never becomes a window. Destruction still goes through deleteLater, so
+    a row the caller is mid-way through reading stays alive to the end of
+    the turn.
+    """
+    old = scroll.widget()
+    if old is not None:
+        # Before takeWidget, while it is still a child of something.
+        try:
+            old.hide()
+        except RuntimeError:
+            old = None
+    taken = scroll.takeWidget()
+    if taken is not None:
+        # Re-parented BEFORE setWidget, not after: setWidget lays the area
+        # out, and any turn spent parentless is a turn Qt may decide this
+        # thing is a window.
+        try:
+            taken.hide()
+            taken.setParent(scroll)
+        except RuntimeError:
+            taken = None
+    scroll.setWidget(new_widget)
+    if taken is not None:
+        try:
+            taken.deleteLater()
+        except RuntimeError:
+            pass
+    return taken
+
+
+def pin_window_topmost(widget, interval_ms: int = 1000):
+    """Re-assert HWND_TOPMOST for *widget* while it exists (Windows only).
+
+    The standalone form of TopmostPinMixin, for a dialog that is opened FROM
+    a pinned one and cannot subclass it. Without this such a child loses the
+    race: its parent re-pins itself every second and the child — modal,
+    waiting for an answer — disappears behind it a moment after opening.
+
+    Returns the timer so the caller can stop it; it is parented to *widget*,
+    so it also dies with the dialog.
+    """
+    import platform
+    from PySide6.QtCore import QTimer
+    if platform.system() != "Windows":
+        return None
+
+    def _repin():
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            SWP_NOSIZE, SWP_NOMOVE = 0x0001, 0x0002
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER = 0x0010, 0x0200
+            user32.SetWindowPos(int(widget.winId()), -1, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE
+                                | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+        except Exception:
+            pass
+
+    timer = QTimer(widget)
+    timer.setInterval(int(interval_ms))
+    timer.timeout.connect(_repin)
+    timer.start()
+    _repin()
+    return timer
 
 
 def apply_game_friendly_flags(dialog):

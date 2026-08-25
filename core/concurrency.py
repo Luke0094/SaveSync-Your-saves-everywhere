@@ -45,6 +45,85 @@ def _clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
+# How busy the machine IS, as opposed to how big it is. Sampled from
+# cpu_times deltas rather than psutil.cpu_percent(interval=None): that call
+# measures since the last call ANYWHERE in the process, so a second caller
+# silently shortens our window. These are our own counters.
+_LOAD_CACHE_S = 3.0
+_LOAD_MIN_WINDOW_S = 0.8
+_load_prev: "tuple[float, float] | None" = None
+_load_prev_at: float = 0.0
+_load_value: float = -1.0
+_load_until: float = 0.0
+
+
+def _cpu_freq_mhz() -> float:
+    """Nominal max clock in MHz, 0 when unknown."""
+    try:
+        import psutil
+        f = psutil.cpu_freq()
+        return float(getattr(f, "max", 0) or getattr(f, "current", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def cpu_load_pct() -> float:
+    """Recent CPU utilisation across all cores, 0-100. ``-1`` when unknown.
+
+    Core COUNT says how many things can run at once; it says nothing about
+    whether they already are. A machine with a game on it is exactly the one
+    that must not be given eight parallel backups, and it looks identical to
+    an idle one through os.cpu_count().
+    """
+    global _load_prev, _load_prev_at, _load_value, _load_until
+    now = time.monotonic()
+    if _load_until and now < _load_until:
+        return _load_value
+    try:
+        import psutil
+        t = psutil.cpu_times()
+    except Exception:
+        return -1.0
+    busy = 0.0
+    for name in ("user", "system", "nice", "irq", "softirq", "steal"):
+        busy += float(getattr(t, name, 0.0) or 0.0)
+    idle = float(getattr(t, "idle", 0.0) or 0.0) + float(
+        getattr(t, "iowait", 0.0) or 0.0)
+    prev, prev_at = _load_prev, _load_prev_at
+    if prev is None or (now - prev_at) < _LOAD_MIN_WINDOW_S:
+        if prev is None:
+            _load_prev, _load_prev_at = (busy, idle), now
+        return _load_value            # -1 until there is a real window
+    d_busy = busy - prev[0]
+    d_idle = idle - prev[1]
+    _load_prev, _load_prev_at = (busy, idle), now
+    total = d_busy + d_idle
+    if total <= 0:
+        return _load_value
+    _load_value = max(0.0, min(100.0, 100.0 * d_busy / total))
+    _load_until = now + _LOAD_CACHE_S
+    return _load_value
+
+
+def _load_penalty(n: int) -> int:
+    """Cut *n* back when the machine is already working.
+
+    Deliberately coarse and one-directional: this only ever REDUCES the
+    ceiling the tier worked out, so a bad reading costs throughput and never
+    correctness. Unknown load leaves the answer alone.
+    """
+    load = cpu_load_pct()
+    if load < 0:
+        return n
+    if load >= 85.0:
+        return 1
+    if load >= 70.0:
+        return max(1, n // 2)
+    if load >= 55.0:
+        return max(1, int(n * 2 / 3))
+    return n
+
+
 def _compute_stable_tier() -> str:
     """Capability band from CPU + total RAM only (not free RAM)."""
     cpu = _cpu_count()
@@ -57,7 +136,13 @@ def _compute_stable_tier() -> str:
         return "low"
     if total_gb <= 8.0:
         return "low" if cpu < 4 else "mid"
-    if cpu >= 8 and total_gb >= 12.0:
+    # Cores alone over-rate an old machine: a 2013 eight-core at 2.1GHz is
+    # not the "high" tier a modern eight-core is, and it is the one that
+    # stutters when eight things start at once. Clock is a coarse proxy for
+    # generation, and it only ever demotes.
+    mhz = _cpu_freq_mhz()
+    slow = 0.0 < mhz < 2600.0
+    if cpu >= 8 and total_gb >= 12.0 and not slow:
         return "high"
     if cpu >= 4:
         return "mid"
@@ -95,7 +180,7 @@ def backup_max_inflight() -> int:
         n = 1
     elif total_gb and total_gb <= 8.0:
         n = min(n, 2)
-    return n
+    return max(1, _load_penalty(n))
 
 
 def sync_max_inflight() -> int:
@@ -110,7 +195,7 @@ def sync_max_inflight() -> int:
         n = 1
     elif total_gb and total_gb <= 8.0:
         n = min(n, 1)
-    return n
+    return max(1, _load_penalty(n))
 
 
 def verify_throttle_s() -> float:

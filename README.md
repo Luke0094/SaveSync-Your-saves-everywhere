@@ -149,6 +149,175 @@ Output: `dist/SaveSync.exe` (single file, animated splash, no console).
 Always pass `--clean` — the spec injects custom Tcl into the splash and stale
 build caches would ship the old version.
 
+### Building the Linux AppImage
+
+```bash
+pip install pyinstaller
+./packaging/build_appimage.sh
+```
+
+Output: `dist/SaveSync-<version>-<arch>.AppImage` — one file, executable,
+no installation. `appimagetool` is fetched into `build/` if it is not on
+PATH; nothing is installed system-wide.
+
+It is a **separate spec** (`packaging/savesync-linux.spec`), not the
+Windows one with flags. That one carries a `.ico` and hidden imports
+naming `pynput.*._win32` and `keyring.backends.Windows` — none of which
+exist here — so bending it into shape would have left the working Windows
+build one edit away from breaking. The Linux spec collects its modules by
+*package* instead of listing them, which reaches the same lazily-imported
+format handlers and cannot fall out of date when one is added.
+
+The splash is the one thing the two builds genuinely share, so they share
+it properly: both import `packaging/splash_frames.py`.
+
+**The splash animates, and it is sized for the display it lands on.**
+PyInstaller's `Splash()` draws one still image, so every frame of
+`assets/splash_animated.gif` is decoded at build time with Pillow —
+`seek()` composes an optimised GIF's deltas, where Tk's own `-index N`
+hands back a misaligned patch — embedded as base64 PNG in the Tcl script
+the bootloader runs, and swapped there on a timer. The frames are prepared
+at three scales (0.75x, 1.0x, 1.5x) and the one that fits is picked at run
+time from `monitor width / 2560`, the same rule the rest of the UI scales
+by. **All of that is Tcl**: it happens before Python exists, which is the
+only reason there is anything on screen while the interpreter loads.
+
+The one thing Tcl cannot work out for itself is *which* monitor. X reports
+a single screen even when it is two side by side, so "the centre" lands on
+the seam — and on a session with a virtual second output, well off to one
+side. The app writes the primary monitor's rectangle to
+`$XDG_DATA_HOME/SaveSync/.screen` each time it starts and the next splash
+reads it; with no file it falls back to the X screen, which is correct on
+a single monitor and wrong for exactly one launch on a desk with two.
+
+Under a Wayland compositor's X bridge the splash is mapped
+override-redirect, set before the window is first mapped. Without it the
+compositor reparents and places the window itself: measured on WSLg, a
+splash asked to sit at `+1040+570` arrived at `+2326+1316`, inside a frame
+it did not ask for.
+
+**A second launch is answered before the splash appears.** The same Tcl
+that draws it first reads `$XDG_DATA_HOME/SaveSync/.savesync.running`,
+which names a pid; `/proc/<pid>` says whether that process is still there
+and `comm` says whether it is still SaveSync rather than a stranger who
+inherited the number. If it is, the same message box Windows shows goes up
+and the launch ends. The Windows test — "can this file be deleted" — is
+not portable: POSIX unlinks a file that is open, so it would both always
+answer "not running" and delete the live instance's sentinel on the way
+past.
+
+Two details that decide whether a bundled Qt application starts on someone
+else's desktop, both handled in `packaging/AppRun`:
+
+- **the bundled Qt must win.** A machine with its own PySide6 exports
+  `QT_PLUGIN_PATH`, and Qt then loads the host's platform plugin against
+  our `libQt6Core` — which fails with *"could not load the Qt platform
+  plugin"*, the most common way this goes wrong. AppRun points it at the
+  bundled plugins and unsets the host's.
+- **onedir, not onefile.** A onefile build unpacks itself into `/tmp` on
+  every launch, which the AppImage then does a second time: two
+  extractions for one start. The AppImage *is* the single file.
+
+Qt picks Wayland or X11 by itself; `SAVESYNC_QT_PLATFORM=xcb` forces one.
+
+### Linux and macOS
+
+The application itself is portable: nothing imports a Windows module at
+module level, the data directory follows XDG (`$XDG_DATA_HOME/SaveSync`,
+`~/Library/Application Support/SaveSync` on macOS), single-instance uses
+`flock` where there is no named mutex, launch-at-login writes an XDG
+`.desktop` or a LaunchAgent, folders open through `xdg-open` / `open`, and
+the global hotkey goes through pynput rather than a Windows hook.
+
+Four things are Windows-only **by nature**, and degrade rather than fail:
+
+| | On Windows | Elsewhere |
+|---|---|---|
+| Saves kept in the registry | read and restored (`registry:` save paths) | not offered; a game that stores saves there has none to find |
+| `.lnk` shortcut targets | resolved | the shortcut is treated as an ordinary file |
+| Credential protection | DPAPI, tied to the account | the OS keyring when one answers, otherwise a key derived from a salt file — with the salt, the credential blob and its copy all written **0600** |
+| Token file hardening | `icacls`, ACL narrowed to the user | `chmod 0600` |
+
+**Windows games run through Wine or Proton.** A `.exe` is not something a
+Linux kernel can execute, so off Windows SaveSync launches it through the
+runtime it belongs to: Proton when the executable lives inside a Proton
+prefix (`steamapps/compatdata/<appid>/pfx`), with `STEAM_COMPAT_DATA_PATH`
+pointed at that prefix; Wine otherwise, with `WINEPREFIX` set to whichever
+prefix the executable sits in. That last part decides where the game's
+saves go — run with the wrong prefix it finds no registry, no runtime, and
+writes its saves somewhere new.
+
+**No system tray?** GNOME ships without one, and so does a bare
+compositor. SaveSync notices at startup and stops pretending: closing the
+window **asks** whether to minimise or quit instead of deciding (with
+minimize-to-tray off it still quits without asking), **Ctrl+Q** quits
+(everywhere — it is simply the only way out where there is no tray menu), and starting a game minimises
+the window rather than hiding it into a tray that is not there — the same
+setting, the same restore when the game exits.
+
+**Cursor size.** A session that configures no cursor size — a bare
+compositor, a login without a desktop environment — leaves libXcursor to
+guess one from the display and Qt to fall back to a bitmap of its own:
+measured, 64 px inside the application against the desktop's own 24 px
+pointer. SaveSync sets `XCURSOR_SIZE` from the primary monitor and its own
+UI scale, and **only** when nothing else has — a settings daemon, an
+`Xcursor.size` X resource or `XCURSOR_SIZE` in the environment each win
+outright.
+
+**The window opens centred**, at the size that was saved. The position is
+not restored: a remembered place is worth less than it looks once the
+monitor arrangement has changed, and a compositor that positions windows
+itself ignores the request anyway, so the same config meant a different
+place on every machine.
+
+**Save locations searched on Linux:** `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`,
+`~/.renpy` (Ren'Py writes there, outside XDG entirely), `~/Documents`,
+`~/snap`, `~/.var/app` (Flatpak), Steam's `userdata` under both `~/.steam`
+and `~/.local/share/Steam`, and the user directories inside every Wine and
+Proton prefix it can find — plain `~/.wine`, `$WINEPREFIX`, Bottles,
+Heroic, Lutris.
+
+### What Linux needs installed
+
+Three packages decide whether SaveSync looks right, and none of them is a
+hard dependency — the application starts without them and misbehaves in
+ways that look like bugs. The AppImage bundles the fonts; from source they
+have to be there.
+
+| Package (Debian/Ubuntu names) | Without it |
+|---|---|
+| `libxcb-cursor0` | Qt cannot load its xcb platform plugin and the app does not start at all |
+| `fonts-noto-color-emoji` | every emoji in the interface — folder, disk, bin, refresh — is an empty box |
+| `fonts-noto-cjk` | Japanese, Chinese and Korean titles and paths are empty boxes |
+| `xdg-utils` | every "open folder" button does nothing (SaveSync falls back to `gio`, `kde-open` or `exo-open` when one of those is present) |
+
+**Wayland.** SaveSync asks for `xcb` when a Wayland session also offers an
+X display, because Wayland allows neither of the two things the overlay is
+built on: a client cannot position its own window, and it cannot grab a
+global shortcut.
+
+XWayland gives both of them back, and the overlay needs help with only
+one. A compositor's X window manager does not honour a client's placement
+either — measured on WSLg, the overlay was mapped, viewable, correctly
+sized and parked at `-32768,-32768`, which is why nothing on it could be
+hovered, clicked or closed — so on a Wayland session the overlay is
+created override-redirect, taking that window manager out of the loop. It
+gives up nothing by it: the panel is frameless, always on top, driven with
+the mouse and asks for no keyboard focus. On a plain X11 desktop the
+window manager places it correctly and it stays managed, which is the
+better neighbour.
+
+The hotkey needs nothing: the grab is taken on the X server, and every
+key that reaches an X client passes through it. What it cannot see is a
+key addressed to a **Wayland** client — so on a desktop where SaveSync is
+the X application among Wayland ones, the shortcut works while an X window
+has the keyboard and not otherwise.
+
+`QT_QPA_PLATFORM=wayland` overrides the platform choice and gives up both:
+the overlay is then placed by the compositor and the hotkey never fires.
+Same on a Wayland session with no XWayland at all. The log says which of
+the two SaveSync ended up with, at startup.
+
 ### Dependencies
 
 | Package | Purpose |
@@ -299,11 +468,13 @@ savesync/
     └── dialogs/                   # Add/edit game, auto-scan, restore, conflicts,
                                    # exe scan, manual paths, game search, cloud
                                    # verify, config import, credits
-└── tools/
-    ├── generate_icon.py           # Build the multi-size app .ico
-    ├── generate_splash.py         # Build the static splash PNG
-    ├── splash_animated.py         # Build the animated splash GIF
-    └── signature.py               # Animated splash variant with the 3D flip reveal
+├── tools/                        # Build-time asset generation, nothing else
+│   ├── generate_icon.py           # Build the multi-size app .ico
+│   ├── generate_splash.py         # Build the static splash PNG
+│   ├── splash_animated.py         # Build the animated splash GIF
+│   └── signature.py               # Animated splash variant with the 3D flip reveal
+└── maintenance/                  # Offline repair of stored data — see below
+    └── repair_archives.py         # Diagnose, and only on request repair, archive indexes
 ```
 
 The four directories shown as a single line — `core/game_sources/`, `ui/pages/`,
@@ -875,11 +1046,41 @@ machine so capable PCs are not artificially slowed and weaker ones stay usable.
 ### How adaptive limits work
 
 At runtime SaveSync classifies the host into a coarse tier from **logical CPU
-count** and **total RAM** (via `psutil` when present). That tier is **cached
-~45 s** so a brief free-RAM dip (game launch, antivirus) does not flip library
-chunking / verify pacing on and off. **Currently available RAM** is still read
-live for Backup All / Sync All: under ~1.5 GB free, those queues drop to one
-job so they do not fight the game for memory.
+count**, **nominal CPU clock** and **total RAM** (via `psutil` when present).
+That tier is **cached ~45 s** so a brief free-RAM dip (game launch, antivirus)
+does not flip library chunking / verify pacing on and off. **Currently
+available RAM** is still read live for Backup All / Sync All: under ~1.5 GB
+free, those queues drop to one job so they do not fight the game for memory.
+
+**Cores are not the whole story, in either direction.**
+
+*How big the machine is.* Core count alone over-rates an old CPU: a 2013
+eight-core is not the machine a modern eight-core is, and it is the one that
+stutters when eight things start at once. A nominal clock below ~2.6 GHz
+therefore **demotes** the tier. Only ever downwards, and an unknown clock
+(some platforms do not report one) changes nothing.
+
+*How busy it is right now.* Core count says how many things **can** run, not
+whether they already are — and a PC with a game on it looks identical to an
+idle one through `os.cpu_count()`. So Backup All and Sync All also read
+**live CPU utilisation** and cut their ceiling back:
+
+| Recent CPU load | Parallel backup / sync jobs |
+|-----------------|------------------------------|
+| under ~55 % | the tier's full ceiling |
+| ~55 – 70 % | two thirds |
+| ~70 – 85 % | half |
+| over ~85 % | one at a time |
+| unknown | unchanged |
+
+The reading is sampled from `cpu_times` deltas over at least 0.8 s and cached
+~3 s — deliberately **not** `cpu_percent(interval=None)`, which measures since
+its own last call *anywhere in the process*, so a second caller would silently
+shorten the window. It only ever **lowers** the ceiling, so a bad reading
+costs throughput and never correctness, and both queues re-ask on **every**
+job: a sweep over a large library outlives the conditions it began in, and a
+ceiling fixed at the start never came down when a game launched half-way
+through.
 
 | Tier | Rough signal | Throughput | CPU & memory upkeep |
 |------|--------------|------------|---------------------|
@@ -947,6 +1148,8 @@ Other automatic I/O habits worth knowing:
 | `save_edit_copies` | 3 | Copies the save editor keeps of one save before writing to it |
 | `save_edit_copy_days` | 7 | Days before those copies are dropped. The newest is never dropped for age, and the rule also runs at startup, so it reaches saves nobody has opened since |
 | `process_poll_interval` | 1s | Base scan interval (auto-slows in game / when idle) |
+| `idle_after_minutes` | 10 | How long SaveSync must go **unused** before its heavier upkeep may run — releasing the loaded save and the decoded cover art back to the system. A setting rather than a constant because the cost of getting it wrong falls on you: called idle too eagerly, putting SaveSync aside for a minute means coming back to a page that has to build itself again |
+| `save_scan_debounce` | 5s | How long the filesystem watcher waits for a save burst to settle before it triggers a backup. Raised by 3s while many files are still pending, and clamped to 1–30s |
 | `backup_on_exit` | true | Auto-backup when a game closes |
 | `backup_during_game` | false | Periodic in-game backups while playing (interval in Settings) |
 | `auto_scan_on_exit` | true | Scan for save paths when a game exits |
@@ -960,6 +1163,25 @@ Other automatic I/O habits worth knowing:
 | `auto_export_config_enabled` | false | Periodically upload an encrypted config pack to the connected sync provider |
 | `auto_export_config_interval_days` | 7 | How often that cloud config export runs |
 | `page_sizes` | per list | Items per page for library, backups, save editor, reviews (presets 10 / 20 / 50, or custom) |
+| `backup_archives_too` | true | Include archives — save folders added by hand, with no game in the library — in Backup All and Sync All |
+| `sync_timeout` | 120s | How long a single cloud operation may take before it is abandoned (10–600) |
+| `auto_backup` | false | Back up on a timer regardless of what is running |
+| `minimize_to_tray` | true | Closing the window leaves SaveSync in the tray instead of quitting |
+| `hide_to_tray_on_game_launch` | true | Get out of the way when a game starts |
+| `launch_on_startup` | true | Register for launch at login — HKCU `Run` on Windows, an XDG `.desktop` in `~/.config/autostart` on Linux, a LaunchAgent on macOS |
+| `overlay_hotkey` | `alt+ctrl+s` | Global shortcut that opens the in-game overlay |
+| `show_overlay_on_launch` / `_backup` / `_cloud` / `_unknown` | true | Which events the overlay speaks up for |
+| `check_for_updates` | true | Look for a newer release (`update_check_interval_sec`, 0 = at startup only) |
+| `extra_watch_paths` | [] | Additional folders the filesystem watcher should keep an eye on |
+| `theme` / `language` | `dark` / `en` | Appearance and tool language |
+| `ui_scale_auto` / `ui_scale_factor` | true / 1.0 | Follow the screen's DPI, or pin a factor by hand |
+
+Everything else in `config.json` is remembered state rather than a
+setting — window geometry, which pins are open, the machine id, the
+timestamps that say when a scheduled job last ran. It is listed by
+`--vocab-help`-style validation rather than here: all 80 keys are
+shape-checked on load, and one that fails goes back to its default
+instead of taking a page down with it.
 
 ### Config export & history
 
@@ -990,6 +1212,36 @@ backup row gets its colour.
 
 The sweep does **not** run at startup on its own — it is scheduled work, so a
 launch never pays for it.
+
+### Offline repair
+
+`maintenance/repair_archives.py` is the one thing that can rewrite an archive
+index, and it is deliberately outside the app: nothing in SaveSync repairs
+these on its own, because each finding has more than one plausible repair and
+the wrong one deletes the only path an archive can be read from.
+
+It is **read-only by default** — `--apply` is the only way to write anything,
+`--fix` names which kinds to touch, and every write is preceded by a
+timestamped backup of the index file it changes.
+
+```
+python maintenance/repair_archives.py                  # diagnose everything
+python maintenance/repair_archives.py --game TomieWGM  # one archive
+python maintenance/repair_archives.py --apply --fix injected-source,lost-chain
+```
+
+| Finding | What it means |
+|---------|---------------|
+| `injected-source` | the recorded **origin** list contains the archive's own restore **destination** — a re-backup then reads the same saves twice |
+| `clobbered-dest` | the recorded destination is really one of the sources, written over the real one |
+| `lost-chain` | chains went empty while an older entry still carries them, so a restore has nothing to rebuild the destination from |
+| `doubled-zip` | the zip holds a root that came from the destination: the same saves stored a second time. Not repairable in place — delete the entry and take a fresh backup |
+| `empty-folder` | a backup folder with no zip and no index, debris that pushes the next attempt onto a `_2` name |
+| `orphan-dup` | two archives with the same identity built from different source folders |
+| `not-published` / `index-drift` | with `--remote-dir`: entries the provider never received, and drift between the local folders and the master index |
+
+Only `injected-source`, `lost-chain` and `empty-folder` have a repair; the
+rest are reported so the decision stays with you.
 
 ### Diagnostics
 

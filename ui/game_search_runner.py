@@ -27,9 +27,14 @@ class _SearchWorker(QThread):
         super().__init__(parent)
         self._game_ids = list(game_ids)
         self._cancel = cancel_event
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         from core.library import get_library
         from core.game_api import search_game_info_multi
         from core.enrichment import apply_game_info

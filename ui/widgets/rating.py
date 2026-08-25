@@ -84,7 +84,21 @@ class StarRating(QWidget):
 
     def __init__(self, value: float = 0.0, star_size: int = 11,
                  spacing: int = 1, font_size: int = 11, parent=None):
+        """Sizes are DESIGN units at 100%, scaled here like every other one.
+
+        They used to be taken as literal pixels. Every other measurement in
+        a card goes through ``scaled()`` — the row height, the paddings, the
+        stylesheet's font-size — so at any UI scale other than 1.0 the stars
+        and their number stayed at their design size inside a row that had
+        grown around them, which is why the rating read as tiny next to the
+        playtime beside it. Scaling here rather than at each call site so a
+        new one cannot forget.
+        """
         super().__init__(parent)
+        from ui.helpers import scaled as _scaled
+        star_size = max(6, _scaled(star_size, parent))
+        spacing = max(0, _scaled(spacing, parent)) if spacing else spacing
+        font_size = max(7, _scaled(font_size, parent))
         self._value = quantize_rating(value)
         self._star_size = star_size
         self._spacing = spacing
@@ -144,7 +158,11 @@ class StarRatingInput(QWidget):
 
     def __init__(self, value: float = 0.0, star_size: int = 22,
                  spacing: int = 4, parent=None):
+        # Design units, scaled — see StarRating.__init__.
         super().__init__(parent)
+        from ui.helpers import scaled as _scaled
+        star_size = max(10, _scaled(star_size, parent))
+        spacing = max(1, _scaled(spacing, parent))
         self._value = quantize_rating(value)
         self._preview = None       # what the pointer is over, while hovering
         self._star_size = star_size

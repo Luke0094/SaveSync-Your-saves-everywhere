@@ -12,11 +12,18 @@ from i18n import t
 
 
 def restrict_file_acl(path) -> None:
-    """On Windows, restrict a credential/token file's ACL to the current
-    user only. os.open() with 0o600 has no effect on Windows, so icacls.
-    Shared by every provider that persists tokens to disk."""
+    """Restrict a credential/token file to the current user.
+
+    Two mechanisms, one intent. os.open() with 0o600 has no effect on
+    Windows, so the ACL is set with icacls; a chmod has no effect there
+    either. Off Windows the chmod IS the answer, and returning early left
+    a token written by a provider that did not pass its own mode at the
+    umask — 0644 on a normal desktop.
+    """
     import platform
     if platform.system() != "Windows":
+        from core import restrict_to_owner
+        restrict_to_owner(path)
         return
     try:
         import os

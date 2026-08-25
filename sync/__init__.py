@@ -250,25 +250,54 @@ class SyncWorker(QThread):
             # mtime preflight here; if already current, skip create_backup
             # entirely (avoids a second identical walk inside create_backup).
             if self._direction in ("auto", "up"):
-                save_paths = [str(p) for p in self._save_paths]
-                if bm.is_backup_current(
-                    self._game_id, save_paths,
-                    excluded_paths=self._excluded_paths,
-                ):
-                    logger.debug(
-                        "Sync skip local backup for %r — mtime already current",
-                        self._game_name,
-                    )
+                if self._orphan:
+                    # An archive is read from the folders the USER handed
+                    # over and recorded on it, which are not the same list
+                    # as the destinations its index carries — a collection
+                    # copy on D:\ restores into the profile, and a relative
+                    # chain like "www/save" restores under a game that may
+                    # not exist yet. Backing one up from save_paths meant
+                    # zipping the DESTINATION: the archive's contents
+                    # silently became the live folder, the zip root lost the
+                    # source folder's name, the chains came back empty
+                    # because an archive has no library row to derive them
+                    # from, and the destination was merged into the source
+                    # list — so the next re-backup read both and produced a
+                    # zip holding two copies of the same saves.
+                    #
+                    # rebackup_archive is the one function that knows the
+                    # difference. It runs the same mtime preflight (force=
+                    # False) and reports "unchanged" without writing a zip,
+                    # which is the skip this branch was reaching for.
+                    try:
+                        created, detail = bm.rebackup_archive(self._game_id)
+                        if not created:
+                            logger.debug(
+                                "Sync: archive %r not re-backed up: %s",
+                                self._game_name, detail)
+                    except Exception:
+                        logger.exception(
+                            "Sync: pre-sync archive backup failed for %r",
+                            self._game_name)
                 else:
-                    bm.create_backup(
-                        self._game_id, self._game_name, save_paths,
-                        exe_path=self._exe_path,
-                        computed_folder_name=self._computed_folder_name,
-                        name_history=self._name_history,
+                    save_paths = [str(p) for p in self._save_paths]
+                    if bm.is_backup_current(
+                        self._game_id, save_paths,
                         excluded_paths=self._excluded_paths,
-                        skip_mtime_preflight=True,
-                        orphan=self._orphan,
-                    )
+                    ):
+                        logger.debug(
+                            "Sync skip local backup for %r — mtime already current",
+                            self._game_name,
+                        )
+                    else:
+                        bm.create_backup(
+                            self._game_id, self._game_name, save_paths,
+                            exe_path=self._exe_path,
+                            computed_folder_name=self._computed_folder_name,
+                            name_history=self._name_history,
+                            excluded_paths=self._excluded_paths,
+                            skip_mtime_preflight=True,
+                        )
 
             # Migrate remote folders for old names before sync
             if self._name_history:
@@ -692,7 +721,11 @@ class SyncOrchestrator(QObject):
 
     def _pump_sync_queue(self):
         from core.concurrency import sync_max_inflight
-        cap = self._sync_max_inflight or sync_max_inflight()
+        # Re-asked each pass rather than frozen at the start of the batch —
+        # see the note on _pump_backup_queue. A sync job carries a backup
+        # AND a network transfer, so it is the one most worth backing off.
+        cap = sync_max_inflight()
+        self._sync_max_inflight = cap
         while True:
             with self._sync_lock:
                 inflight = len(self._syncing_games)

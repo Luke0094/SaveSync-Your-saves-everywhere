@@ -48,7 +48,7 @@ def library_card_size(host=None) -> tuple[int, int]:
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".ico", ".avif"}
 
-STATUS_ICONS  = {"synced":"✓","pending":"⟳","conflict":"⚠","local_only":"💾","cloud_only":"☁","no_saves":"—","provisional":"◌"}
+STATUS_ICONS  = {"synced":"✓","pending":"⟳","conflict":"⚠","local_only":"💾","cloud_only":"☁","no_saves":"—","provisional":"◌","playing":"▶"}
 
 # Each sort criterion's own "natural" direction — what its underlying
 # comparison already produces before any user-chosen reversal. Newest/most
@@ -59,6 +59,9 @@ _STATUS_PALETTE_KEY = {
     "synced": "success", "pending": "warning", "conflict": "error",
     "local_only": "info", "cloud_only": "cloud", "no_saves": "text_hint",
     "provisional": "provisional",
+    # Not a sync state: it REPLACES one for as long as a game is running.
+    # See _display_sync_status.
+    "playing": "accent",
 }
 
 def _status_color(status: str) -> str:
@@ -66,8 +69,18 @@ def _status_color(status: str) -> str:
     key = _STATUS_PALETTE_KEY.get(status, "text_hint")
     return palette(key)
 
-def _display_sync_status(entry) -> str:
+def _display_sync_status(entry, playing: bool = False) -> str:
     """Sync-status bucket for display purposes (card badge, filters, sort).
+
+    *playing* wins over everything. While a game is running the sync status
+    is not actionable — a sync cannot run against saves the game has open,
+    and mark_played() flips a synced game to "pending" the moment it starts,
+    so the card sat there reading "Sync in attesa" for the whole session
+    about work that was deliberately not being done. It goes back to the
+    real state the moment the game exits, which is also when the sync it was
+    talking about actually happens.
+    Filters and sorting do NOT pass this: "playing" is a thing the card
+    shows, not a bucket a game belongs to.
 
     Identical to entry.sync_status/"local_only" whenever the game has
     confirmed save_paths. When it doesn't, "no_saves" is upgraded to
@@ -77,6 +90,8 @@ def _display_sync_status(entry) -> str:
     A genuinely untouched game (nothing detected at all) still reads
     "no_saves".
     """
+    if playing:
+        return "playing"
     if entry.save_paths:
         return entry.sync_status or "local_only"
     try:
@@ -1163,8 +1178,18 @@ class _GameItemMixin:
         dialog.accept()
 
     def set_playing(self, is_playing: bool):
-        if hasattr(self, "_playing_badge"):
-            self._playing_badge.setVisible(is_playing)
+        self._is_playing = bool(is_playing)
+        badge = getattr(self, "_playing_badge", None)
+        if badge is not None:
+            badge.setVisible(is_playing)
+        # The status label is the other half of "this game is running", and
+        # it used to be left saying whatever the sync state was.
+        apply_status = getattr(self, "_apply_status", None)
+        if callable(apply_status):
+            try:
+                apply_status()
+            except RuntimeError:
+                pass
 
 
 
@@ -1652,8 +1677,17 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         """(Re)compute the sync-status label's text + palette-derived styles
         from the current entry. Used at build, on refresh(entry) and on a
         theme switch so the badge colour always matches state AND theme."""
-        status = _display_sync_status(self._entry)
-        _st_hover, _st_hover_style = _sync_hover(self._entry, "10px")
+        status = _display_sync_status(
+            self._entry, playing=bool(getattr(self, "_is_playing", False)))
+        # The scaled size, not a literal one. The NORMAL text below
+        # already uses scaled(10) — but this style is set inline on
+        # the widget, and inline sheets never pass through
+        # scale_stylesheet_fonts, which only rewrites the theme QSS
+        # at apply time. So the hover text stayed at its design size
+        # inside a row that had grown around it, and read as tiny
+        # next to the label it replaces.
+        _st_hover, _st_hover_style = _sync_hover(
+            self._entry, f"{scaled(10, self)}px")
         self._status_lbl.set_texts(
             f"{STATUS_ICONS.get(status,'?')}  {t(f'library.status_{status}')}",
             f"color:{_status_color(status)};font-size:{scaled(10, self)}px;font-weight:500;background:transparent;",
@@ -1886,7 +1920,8 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
     def _apply_status(self):
         """(Re)compute the status label's text + palette-derived colour from
         the current entry (state + theme dependent)."""
-        status = _display_sync_status(self._entry)
+        status = _display_sync_status(
+            self._entry, playing=bool(getattr(self, "_is_playing", False)))
         self._status_lbl.setText(f"{STATUS_ICONS.get(status,'?')} {t(f'library.status_{status}')}")
         style = f"color:{_status_color(status)};font-size:{scaled(11, self)}px;font-weight:600;min-width:90px;background:transparent;"
         self._status_lbl.setStyleSheet(style)
@@ -1894,7 +1929,9 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
     def _apply_playtime(self):
         """(Re)compute the hover-swap playtime label from the current entry."""
         pt = self._entry.get_playtime_formatted()
-        _pt_hover, _pt_hover_style = _session_hover(self._entry, "11px")
+        # Scaled, for the same reason as the sync hover above.
+        _pt_hover, _pt_hover_style = _session_hover(
+            self._entry, f"{scaled(11, self)}px")
         self._playtime_lbl.set_texts(
             f"🕐 {pt}" if self._entry.playtime_seconds > 0 else "",
             f"color:{palette('text_muted')};font-size:{scaled(11, self)}px;",

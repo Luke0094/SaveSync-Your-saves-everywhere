@@ -650,6 +650,24 @@ class ProcessMonitor(QObject):
                     "/lib/",
                     "/system/",
                     "/usr/libexec/",
+                    # The rest of the Unix system tree. Without these, a
+                    # daemon starting after SaveSync did looks exactly like
+                    # a game that has just been launched: measured on a
+                    # Linux run, /init was picked up as a game, live
+                    # tracking ran for it, and /usr/share/icons/hicolor was
+                    # offered as its save folder.
+                    "/usr/sbin/",
+                    "/usr/local/sbin/",
+                    "/proc/",
+                    "/sys/",
+                    "/dev/",
+                    "/run/",
+                    "/etc/",
+                    "/init",
+                    "/lib64/",
+                    "/usr/lib64/",
+                    "/snap/core",
+                    "/snap/snapd",
                 )
             if any(el.startswith(d) for d in ProcessMonitor._CACHED_SYSTEM_DIRS):
                 return False
@@ -1647,17 +1665,82 @@ class ProcessMonitor(QObject):
         with self._data_lock:
             return {k: copy.deepcopy(v) for k, v in self._tracked.items()}
 
+    def is_playing(self, game_id: str) -> bool:
+        """Whether *game_id* has a tracked process right now.
+
+        A dict scan comparing ids, and nothing else. The callers that only
+        need this answer were going through currently_playing(), which
+        DEEP-COPIES every tracked GameEntry — save paths, tags, history — to
+        build a list they then reduced back to a set of ids. Cheap enough to
+        be asked on the GUI thread, which currently_playing() was not.
+        """
+        if not game_id:
+            return False
+        with self._data_lock:
+            return any(e is not None and e.id == game_id
+                       for e in self._tracked.values())
+
+    def tracked_pid_for(self, game_id: str) -> int:
+        """A pid tracked for *game_id*, or 0. No process-table walk.
+
+        The fallback find_game_process falls back to; kept separate so a
+        caller that already knows the game is tracked never pays for the
+        launcher/child search.
+        """
+        if not game_id:
+            return 0
+        with self._data_lock:
+            for key, entry in self._tracked.items():
+                if entry is not None and entry.id == game_id:
+                    return key[0]
+        return 0
+
     def start_tracking(self, entry, exe_path: str):
-        """Add a game to tracked processes (thread-safe public API)."""
+        """Add a game to tracked processes (thread-safe public API).
+
+        A game added while it is ALREADY RUNNING — the overlay's "add this
+        to my library" during a session — has, from everything downstream's
+        point of view, just been launched: nothing has watched its saves,
+        nothing has started its in-game backup timer, and nothing has
+        recorded that it is being played. This used to register the pid and
+        stop there, on the assumption that refresh_tracked (fired by the
+        library's game_added signal) had already done the launch half.
+
+        That assumption holds only while the process is sitting in _tracked
+        as an unknown AND _match_process verifies it — and when it does not,
+        the failure is completely silent: the game is tracked, so nothing
+        looks wrong, but no watcher is armed, live tracking never runs, no
+        saves are discovered during the session or offered at exit, and
+        last_played is never written. So the launch half is done HERE, where
+        the registration actually happens, and refresh_tracked's own emit is
+        left alone — whichever gets there first wins and the other sees the
+        entry already registered and does nothing.
+        """
         current_processes = self._snapshot()
         for key, info in current_processes.items():
-            if info["exe"] == exe_path:
-                with self._data_lock:
-                    self._register_tracked_locked(key, entry)
-                    if key not in self._running:
-                        self._running[key] = info
-                logger.info(f"Started tracking game: {entry.name} (pid={key[0]})")
-                return
+            if info["exe"] != exe_path:
+                continue
+            with self._data_lock:
+                previous = self._tracked.get(key)
+                self._register_tracked_locked(key, entry)
+                if key not in self._running:
+                    self._running[key] = info
+            logger.info(f"Started tracking game: {entry.name} (pid={key[0]})")
+            already_launched = (previous is not None
+                                and getattr(previous, "id", None) == entry.id)
+            if not already_launched:
+                try:
+                    entry.mark_played()
+                    get_library().update_game(entry)
+                except Exception:
+                    logger.debug("Could not stamp last_played on %s",
+                                 entry.name, exc_info=True)
+                # Same guard refresh_tracked uses: a launcher already
+                # tracked for this game owns the session, and emitting for
+                # its child would run every subscriber a second time.
+                if not self._has_tracked_ancestor(key[0], entry.id):
+                    self.game_launched.emit(entry, exe_path)
+            return
 
 
 _monitor: ProcessMonitor | None = None

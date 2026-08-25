@@ -31,9 +31,38 @@ from core import is_relative_to as _is_relative_to_compat
 
 # Quiet games settle quickly; busy writers (many files in a short burst)
 # get a longer coalesce window so one backup absorbs the whole save wave.
+#
+# The BASE is the user's ``save_scan_debounce`` setting, which until now was
+# declared, validated and saved in config.json and read by nobody — these two
+# constants were hard-coded and the setting had no effect at all. Defaults
+# match what was hard-coded (5 s / 8 s), so anyone who has never touched it
+# gets byte-identical timing.
 _DEBOUNCE_SEC = 5.0
-_DEBOUNCE_SEC_BUSY = 8.0
+# Not a second setting: the busy window is derived from the base, keeping the
+# +3 s the pair has always had. Collapsing the two into one number would lose
+# the coalescing the busy path exists for.
+_DEBOUNCE_BUSY_EXTRA_SEC = 3.0
+_DEBOUNCE_SEC_BUSY = _DEBOUNCE_SEC + _DEBOUNCE_BUSY_EXTRA_SEC
 _BUSY_PENDING_THRESHOLD = 8
+
+
+def _debounce_seconds() -> tuple[float, float]:
+    """``(quiet, busy)`` coalesce windows, from the user's setting.
+
+    Read per use rather than cached at import: the setting is changeable
+    while the app runs, and a watcher armed for a session that may last
+    hours would otherwise hold whatever the value was at startup.
+    """
+    try:
+        from core.config_manager import get_config
+        base = float(get_config().get("save_scan_debounce", _DEBOUNCE_SEC))
+    except Exception:
+        base = _DEBOUNCE_SEC
+    # Same bounds the config validator enforces, applied again here so a
+    # value that reached the file some other way still cannot arm a timer
+    # for zero seconds (a backup per keystroke) or for minutes.
+    base = max(1.0, min(30.0, base))
+    return base, base + _DEBOUNCE_BUSY_EXTRA_SEC
 _MAX_CACHE_SIZE = 50000  # Cap on _BACKED_UP_FILES / _KNOWN_FILES to prevent memory leaks
 
 # Words too generic to identify WHICH game a common-root (AppData/…) event
@@ -1095,9 +1124,8 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 self._timer.cancel()
             with _CACHE_LOCK:
                 pending_n = len(_PENDING_FILES.get(self._game_id, set()))
-            delay = (_DEBOUNCE_SEC_BUSY
-                     if pending_n >= _BUSY_PENDING_THRESHOLD
-                     else _DEBOUNCE_SEC)
+            _quiet, _busy = _debounce_seconds()
+            delay = _busy if pending_n >= _BUSY_PENDING_THRESHOLD else _quiet
             self._timer = threading.Timer(delay, self._fire_all_pending)
             self._timer.daemon = True
             self._timer.start()

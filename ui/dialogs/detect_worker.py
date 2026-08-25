@@ -25,7 +25,6 @@ class DetectWorker(QThread):
         self._tracked_snapshot = tracked_snapshot or {}
         self._appid = appid
         self._should_stop = False
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._should_stop = True
@@ -34,6 +33,12 @@ class DetectWorker(QThread):
 
     def run(self):
         """Enhanced detection with live tracking priority and optional general scan"""
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         try:
             if self._should_stop:
                 self.found.emit([], False)

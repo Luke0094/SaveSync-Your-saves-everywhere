@@ -45,6 +45,31 @@ def fmt_size(n) -> str:
     return f"{n/1024**4:.2f} TB"
 
 
+def restrict_to_owner(path) -> None:
+    """Make *path* readable by its owner and nobody else.
+
+    Two different mechanisms for the same intent. On Unix a chmod is the
+    whole answer, and it was missing: a credential blob and the salt that
+    protects it were written through Path.write_bytes, which obeys the
+    umask — 0644 on a normal desktop, so every local account could read
+    them. On Windows the mode bits do nothing and the ACL is what counts;
+    that is handled where the providers already do it (sync.base).
+
+    Best effort by design: a filesystem with no permission bits (a FAT
+    stick, a network share) must not stop a credential from being saved.
+    """
+    import os
+    import platform
+    if platform.system() == "Windows":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        import logging
+        logging.getLogger(__name__).debug(
+            "Could not restrict %s to its owner: %s", path, exc)
+
+
 def atomic_replace(src: Path, dst: Path, retries: int = 3, delay: float = 0.1) -> None:
     """Replace *dst* with *src* atomically, retrying on Windows lock errors.
 

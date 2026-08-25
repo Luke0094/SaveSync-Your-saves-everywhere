@@ -201,6 +201,65 @@ def _chain_parts(chain: str) -> list:
     return [s for s in (chain or "").replace("\\", "/").split("/") if s and s != "."]
 
 
+def restore_arc_prefix(chosen: str, root: str, interior: str = "") -> list:
+    """The leading archive components *chosen* already stands for.
+
+    An archive unpacks ``<root>/<interior>/file``, where *root* is the name
+    of the folder it was made from and *interior* is the structure inside
+    it. A restore with no game in the library asks the user where to put
+    that, and the picker opens ON the source folder — so the plainest
+    gesture, pressing Save straight away, produced ``<source>/<source>/...``:
+    a path inside a path.
+
+    Returned is what to DROP, never a place to write:
+
+      * *chosen* ends with the start of ``<root>/<interior>`` — it already
+        IS that much of the tree, so drop what it names.
+      * *chosen* ends with the start of *interior* alone: the user went to
+        where the files belong rather than to a copy of the collection
+        folder (``game_folder/www/saves``). Drop the root and that much,
+        and a partial answer (``.../www``) completes to the rest.
+      * neither — drop nothing. The whole folder lands inside, which is
+        right for a Desktop and for any folder whose name says nothing
+        about this archive. Guessing that it is the game's own directory is
+        exactly the invention this must not make.
+
+    Root-anchored is tried first, and the order carries weight: an archive
+    whose interior is ``Save`` and whose source sits under a parent also
+    called ``Save`` has to restore in place, not one level above it.
+    """
+    chosen_parts = _chain_parts(chosen)
+    root_parts = _chain_parts(root)
+    inner = _chain_parts(interior)
+    if not chosen_parts or not root_parts:
+        return []
+    low = [c.casefold() for c in chosen_parts]
+    for cand, whole in ((root_parts + inner, True), (inner, False)):
+        if not cand:
+            continue
+        folded = [c.casefold() for c in cand]
+        for k in range(min(len(low), len(folded)), 0, -1):
+            if low[-k:] == folded[:k]:
+                return cand[:k] if whole else root_parts + inner[:k]
+    return []
+
+
+def strip_arc_prefix(arc_name: str, prefix: list) -> str:
+    """*arc_name* with as much of *prefix* as it genuinely starts with cut.
+
+    Matched per member and not per archive: a zip root can hold a file that
+    does not follow the recorded chain, and cutting a fixed number of
+    components off that one would take its folders with it. The file name
+    itself is never a candidate, however far the prefix reaches.
+    """
+    parts = _chain_parts(arc_name)
+    i = 0
+    while (i < len(prefix) and i < len(parts) - 1
+           and parts[i].casefold() == prefix[i].casefold()):
+        i += 1
+    return "/".join(parts[i:])
+
+
 def _content_chains(save_paths: list, game_id: str) -> list:
     """For each save path, the declared chain when it really is INSIDE it.
 
@@ -966,21 +1025,24 @@ class BackupManager(QObject):
             logger.error(f"Failed to write imported backup {entry.backup_id}: {e}")
             return False
 
-        # Update entry with local path and size
-        imported = BackupEntry(
-            game_id=entry.game_id,
-            game_name=entry.game_name,
-            backup_id=entry.backup_id,
-            created_at=entry.created_at,
-            machine_id=entry.machine_id,
-            save_paths=entry.save_paths,
-            zip_path=str(dest_path),
-            size_bytes=dest_path.stat().st_size,
-            note=entry.note,
-            cloud_metadata=entry.cloud_metadata,
-            origin=entry.origin,
-            exe_path=entry.exe_path,
-        )
+        # Every field, and not a list of them. save_chains and
+        # content_chains were absent from that list, so an archive that
+        # arrived by sync lost its DESTINATION on the way in: its source
+        # folders survived, because those ride in cloud_metadata, and where
+        # the files go back did not — and an archive whose entry predates
+        # orphan_dest_map is read positionally off exactly those two fields.
+        # A synced archive with no trace of its destination is what that
+        # looks like from the outside. Enumerating is how it rotted, and
+        # the next field added would have gone the same way.
+        imported = BackupEntry.from_dict(entry.to_dict())
+        imported.zip_path = str(dest_path)
+        imported.size_bytes = dest_path.stat().st_size
+        # The one thing deliberately NOT carried over: an integrity result
+        # describes a file on the machine that ran the check, and this is a
+        # different file. Unchecked is the truth about it until it is.
+        imported.verify_state = ""
+        imported.verify_at = ""
+        imported.verify_detail = ""
         migrated = False
         with _index_lock:
             existing = next((b for b in self._index
@@ -1438,6 +1500,7 @@ class BackupManager(QObject):
         save_chains_override: list[str] | None = None,
         orphan: bool = False,
         recorded_save_paths: list[str] | None = None,
+        orphan_dest_map: dict | None = None,
     ) -> "Optional[BackupEntry] | tuple[Optional[BackupEntry], bool]":
         """Create a zip backup of all save paths for a game.
         Skips silently if nothing changed since last backup (unless force=True).
@@ -1474,6 +1537,14 @@ class BackupManager(QObject):
             recorded_save_paths: When set, stored on the index instead of the
                 zip source paths (collection archives: zip from the copy,
                 record the destination / zip-root label).
+            orphan_dest_map: ``{source path: {"path", "chain", "content"}}`` —
+                the restore destination each SOURCE folder rebuilds to, kept
+                per source rather than by list position. save_paths on an
+                orphan entry is positional against the sources that were
+                READABLE when it was taken, so an unplugged drive used to
+                shift every destination one slot to the left and hand the
+                next backup somebody else's chain. Keyed by the source, it
+                cannot drift. Merged with what the archive already knows.
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -1524,10 +1595,33 @@ class BackupManager(QObject):
         # current folder yet. Safe when there's nothing to do.
         self._migrate_stale_backup_folders(game_id, game_folder)
 
+        # NOT created yet. Every early return below this point — the mtime
+        # preflight, "no files found", the unchanged-hash gate, the 30s
+        # debounce, the size limit — used to leave an empty directory
+        # standing, and _unique_backup_folder counts any directory as a name
+        # already taken. So the next attempt at the same title landed on
+        # "<title>_2", left another empty one, and the run after that on
+        # "<title>~<tag>": four folders, no zips, no index, one archive. The
+        # folder is minted where the zip is written and nowhere else.
         game_backup_dir = BACKUP_DIR / game_folder
-        game_backup_dir.mkdir(parents=True, exist_ok=True)
 
         backup_id = f"{game_id}_{now.strftime('%Y%m%d_%H%M%S')}"
+        # A backup id is only precise to the second, and two backups of one
+        # game CAN land inside the same one: force=True skips the 30s
+        # debounce that otherwise keeps them apart (a pre-restore safety
+        # copy, an archive minted by hand). When that happened the second
+        # zip overwrote the first at the same path and the index gained a
+        # second row pointing at it — one backup on disk, two in the list,
+        # and whichever the user picked restored the same bytes. Take the
+        # next free id instead.
+        _taken = {b.backup_id for b in self.get_backups_for_game(game_id)}
+        if backup_id in _taken or (game_backup_dir / f"{backup_id}.zip").exists():
+            _stem = backup_id
+            for _n in range(2, 100):
+                backup_id = f"{_stem}_{_n}"
+                if (backup_id not in _taken
+                        and not (game_backup_dir / f"{backup_id}.zip").exists()):
+                    break
         zip_path = game_backup_dir / f"{backup_id}.zip"
         # Build set of recently modified files for selective mode
         recent_file_set: set[str] | None = None
@@ -1638,6 +1732,7 @@ class BackupManager(QObject):
             # Write ALL files to .tmp first, then atomic rename.
             # Every backup is a complete snapshot so any single backup can
             # be restored without depending on previous ones.
+            game_backup_dir.mkdir(parents=True, exist_ok=True)
             zip_path_tmp = zip_path.with_suffix(".tmp")
             zf = None
             try:
@@ -1699,6 +1794,25 @@ class BackupManager(QObject):
                 _skipped = self.orphan_sources_skipped(_prev) if _prev else []
                 if _skipped:
                     metadata[self.ORPHAN_SKIPPED_KEY] = _skipped
+                # Where each SOURCE rebuilds to, kept against the source
+                # rather than by list position — see the parameter's note.
+                # Three shapes, and telling them apart is the whole point:
+                # a profile chain resolves to an absolute path on this
+                # machine, an install-relative chain ("www/save") cannot be
+                # resolved until there is a game to anchor it, and a live
+                # folder IS its own destination. None of the three is the
+                # archive's stripped title, which names the backup FOLDER
+                # and nothing else.
+                _dmap = dict(self.orphan_dest_map(_prev) if _prev else {})
+                for _src, _rec in (orphan_dest_map or {}).items():
+                    if _src and isinstance(_rec, dict):
+                        _dmap[str(_src).casefold()] = {
+                            "path": str(_rec.get("path") or ""),
+                            "chain": str(_rec.get("chain") or ""),
+                            "content": str(_rec.get("content") or ""),
+                        }
+                if _dmap:
+                    metadata[self.ORPHAN_DEST_KEY] = _dmap
 
             _recorded_paths = [str(p) for p in valid_paths] + valid_reg
             if recorded_save_paths is not None:
@@ -2196,7 +2310,8 @@ class BackupManager(QObject):
                        freeze_pid: int = 0,
                        only_files: set[str] | None = None,
                        lib_game_id: str = "",
-                       target_dir: str = "") -> RestoreResult:
+                       target_dir: str = "",
+                       only_roots: set | None = None) -> RestoreResult:
         """Restore a backup zip to its original save locations or target_dir.
 
         Files whose content matches the backup are skipped.  Files that
@@ -2212,6 +2327,12 @@ class BackupManager(QObject):
             lib_game_id: Optional matching library game ID.
             target_dir:  Optional custom target directory to extract files into
                          (used for orphan backups without library game entry).
+            only_roots:  Restore only these zip roots (case-insensitive) —
+                         an archive holds one per source folder, and one
+                         chosen destination answers for one of them. Applies
+                         to the *target_dir* restore, where the user picked
+                         the place; a library restore resolves each save
+                         path on its own and has nothing to choose between.
 
         Returns:
             RestoreResult with per-file detail.
@@ -2234,17 +2355,54 @@ class BackupManager(QObject):
         # the same folder NAME as often as not, and it is the chain that tells
         # their archive members apart.
         redirects: dict = {}
+
+        def _add_redirect(key: str, chain: str, dest) -> None:
+            if not key or not chain or dest is None:
+                return
+            parts = _chain_parts(chain)
+            if not parts:
+                return
+            bucket = redirects.setdefault(key, [])
+            if any(p == parts and d == dest for p, d in bucket):
+                return
+            bucket.append((parts, dest))
+            logger.info(f"Restore: '{key}' carries {chain} — "
+                        f"restoring it to {dest}")
+
         for _sp in entry.save_paths:
             _chain = entry.content_chain_for(_sp)
             if not _chain:
                 continue
-            _dest = chain_destination(_chain, lib_game_id or entry.game_id)
-            if _dest is None:
-                continue
-            redirects.setdefault(Path(_sp).name, []).append(
-                (_chain_parts(_chain), _dest))
-            logger.info(f"Restore: '{Path(_sp).name}' carries {_chain} — "
-                        f"restoring it to {_dest}")
+            _add_redirect(Path(_sp).name, _chain,
+                          chain_destination(_chain, lib_game_id or entry.game_id))
+
+        # An archive's zip is rooted on the name of the folder it was READ
+        # from — the user's own shelf name, version and release tags and all
+        # ("TomieWGM v0.760"). save_paths above carries the DESTINATION,
+        # whose last component is a different word entirely, so keying the
+        # redirect on it alone meant no archive member ever matched one: the
+        # extraction fell through to the "single directory" remap and
+        # rebuilt the whole recorded chain a second time INSIDE the
+        # destination. Key it on what the zip actually says.
+        if self.is_orphan_entry(entry):
+            _srcs = self.orphan_source_paths(entry)
+            if _srcs:
+                _dests, _schains, _cchains = self._orphan_targets(entry, _srcs)
+                for _src, _dpath, _sch, _cch in zip(_srcs, _dests,
+                                                    _schains, _cchains):
+                    _ch = _cch or _sch
+                    if not _ch:
+                        continue
+                    _target = chain_destination(_ch, lib_game_id or entry.game_id)
+                    if _target is None and _dpath:
+                        # A relative chain ("www/save") has no anchor until
+                        # there is a game; an absolute destination recorded
+                        # on the archive is one. A bare folder NAME is not,
+                        # and is never promoted to a path here.
+                        _dp = Path(_dpath)
+                        if _dp.is_absolute():
+                            _target = _dp
+                    _add_redirect(Path(_src).name, _ch, _target)
         # Longest chain first: "data/www/save" must be tried before "data".
         for _name in redirects:
             redirects[_name].sort(key=lambda pair: len(pair[0]), reverse=True)
@@ -2401,11 +2559,35 @@ class BackupManager(QObject):
                 if target_dir:
                     target_path = Path(target_dir)
                     target_path.mkdir(parents=True, exist_ok=True)
+                    # The chosen folder may already BE part of the tree the
+                    # archive reproduces — the picker opens on the source
+                    # folder, so the plainest gesture used to write
+                    # <source>/<source>/... Worked out per zip root: one
+                    # archive holds one per source folder, and a target that
+                    # continues one of them says nothing about the others.
+                    _interiors = self._orphan_interiors(entry)
+                    _prefixes: dict = {}
+
+                    def _prefix_for(_root: str) -> list:
+                        _key = _root.casefold()
+                        if _key not in _prefixes:
+                            _prefixes[_key] = restore_arc_prefix(
+                                target_dir, _root, _interiors.get(_key, ""))
+                        return _prefixes[_key]
+
+                    _want = ({str(r).casefold() for r in only_roots}
+                             if only_roots else None)
                     _target_files = [a for a in zf.namelist()
                                      if not a.endswith('/')
-                                     and not arc_name_is_registry(a)]
+                                     and not arc_name_is_registry(a)
+                                     and (_want is None
+                                          or (_chain_parts(a)[:1] or [""])[0]
+                                          .casefold() in _want)]
                     for arc_name in _target_files:
-                        dest = target_path / arc_name
+                        _parts = _chain_parts(arc_name)
+                        _rel = (strip_arc_prefix(arc_name, _prefix_for(_parts[0]))
+                                if len(_parts) > 1 else arc_name)
+                        dest = target_path / _rel
                         if not _is_relative_to(dest.resolve(), target_path.resolve()):
                             continue
                         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2892,6 +3074,66 @@ class BackupManager(QObject):
             )
         return len(temp_ids)
 
+    def anchor_destinations(self, entry: BackupEntry, game_id: str) -> bool:
+        """Turn a relative destination into this machine's real one. True on change.
+
+        An archive whose saves belong under a game — RPG Maker's ``www/save``,
+        Ren'Py's ``game/saves`` — has no absolute destination to record: there
+        is no answer until a game anchors it, and inventing one is the damage
+        this whole area exists to avoid. So it keeps the CHAIN and a folder
+        name, and waits.
+
+        A game arriving is that anchor, and it knows far more than the archive
+        does — where it is installed, which executable is its own. Once it is
+        here the answer exists, and leaving the archive on its placeholder
+        means the stub is carried into every backup taken afterwards.
+
+        Only what is genuinely unanchored is touched:
+
+          * an absolute destination already IS an answer and is left alone;
+          * a registry path is not a folder at all;
+          * a chain that does not resolve on this machine changes nothing.
+
+        The chain stays either way — it is the portable half, and the half
+        another machine anchors for itself.
+        """
+        from core.registry_saves import is_registry_path as _is_reg
+
+        paths = list(entry.save_paths or [])
+        if not paths:
+            return False
+        dmap = dict(self.orphan_dest_map(entry))
+        changed = False
+        for i, p in enumerate(paths):
+            if not p or _is_reg(p):
+                continue
+            try:
+                if Path(p).is_absolute():
+                    continue
+            except (OSError, ValueError):
+                continue
+            chain = (entry.content_chain_for(p) or entry.chain_for(p) or "").strip()
+            if not chain:
+                continue
+            resolved = chain_destination(chain, game_id)
+            if resolved is None:
+                continue
+            paths[i] = str(resolved)
+            changed = True
+            # The per-source map answers "where does THIS folder go back?" —
+            # the same question, so it learns the same answer.
+            for src, rec in dmap.items():
+                if (rec.get("path") or "").casefold() == p.casefold():
+                    dmap[src] = dict(rec, path=str(resolved))
+        if not changed:
+            return False
+        entry.save_paths = paths
+        if dmap:
+            meta = dict(entry.cloud_metadata or {})
+            meta[self.ORPHAN_DEST_KEY] = dmap
+            entry.cloud_metadata = meta
+        return True
+
     def adopt_backups(self, from_game_id: str, to_game_id: str,
                       to_game_name: str, to_exe_path: str = "",
                       to_folder_name: str = "") -> int:
@@ -2948,6 +3190,17 @@ class BackupManager(QObject):
                         b.game_id = to_game_id
                         b.game_name = to_game_name or b.game_name
                         b.zip_path = str(dest)
+                        # What the game knows and the archive did not. The
+                        # executable is what anchors an install-relative
+                        # chain, so without it on the row the destination
+                        # can only be worked out again from the library.
+                        if not b.exe_path and to_exe_path:
+                            b.exe_path = to_exe_path
+                        # A placeholder destination becomes the real one now
+                        # that there is a game to measure it from — see
+                        # anchor_destinations. Left alone, the stub is copied
+                        # into every backup taken after this.
+                        self.anchor_destinations(b, to_game_id)
                         if b.cloud_metadata and b.cloud_metadata.get("orphan"):
                             b.cloud_metadata = dict(b.cloud_metadata)
                             b.cloud_metadata.pop("orphan", None)
@@ -3039,7 +3292,12 @@ class BackupManager(QObject):
         taken = set()
         try:
             if BACKUP_DIR.is_dir():
-                taken = {p.name.casefold() for p in BACKUP_DIR.iterdir() if p.is_dir()}
+                # Only folders that actually hold an archive. An empty one is
+                # debris from a run that decided not to write anything, and
+                # treating it as a name in use is what turned one archive
+                # into "<title>", "<title>_2" and two "<title>~<tag>"s.
+                taken = {p.name.casefold() for p in BACKUP_DIR.iterdir()
+                         if p.is_dir() and any(p.iterdir())}
         except OSError:
             pass
         try:
@@ -3085,6 +3343,17 @@ class BackupManager(QObject):
             recorded = recorded + [recorded[-1]] * (n - len(recorded))
         cc = [content_chain or ""] * n if n else None
         sc = [save_chain or ""] * n if n else None
+        # Source → destination, written down at the one moment both are known
+        # for certain. `folder` is NOT a candidate for either: it is the
+        # backup directory's name, already stripped of version noise, and it
+        # names no location on disk.
+        dest_map = {
+            src: {"path": (recorded[i] if recorded and i < len(recorded)
+                           else str(src)),
+                  "chain": save_chain or "",
+                  "content": content_chain or ""}
+            for i, src in enumerate(sources)
+        }
         return self.create_backup(
             game_id=game_id,
             game_name=game_name or base or "Unknown",
@@ -3095,6 +3364,7 @@ class BackupManager(QObject):
             save_chains_override=sc,
             orphan=True,
             recorded_save_paths=recorded,
+            orphan_dest_map=dest_map,
         )
 
     # ── Archive auto-backup ─────────────────────────────────────────────
@@ -3122,6 +3392,11 @@ class BackupManager(QObject):
     INDEX_PUBLISH_KEY = "index_needs_publish"
     ORPHAN_SOURCES_KEY = "orphan_source_paths"
     ORPHAN_SKIPPED_KEY = "orphan_sources_skipped"
+    # source path (casefolded) -> {"path", "chain", "content"}: where THAT
+    # folder's saves belong when they are put back. Separate from the source
+    # on purpose — an archive is a copy of a destination as often as it is
+    # the destination itself, and the two are not required to match.
+    ORPHAN_DEST_KEY = "orphan_dest_map"
     # "The index says something new about this archive that the provider has
     # not been told." Set whenever the metadata is edited, cleared when a
     # sync publishes it. Without it a sweep decides what to sync from the
@@ -3151,6 +3426,77 @@ class BackupManager(QObject):
                 out[str(save_path).casefold()] = names
         return out
 
+    def archive_roots(self, entry: BackupEntry) -> list:
+        """One record per folder this archive holds, in the zip's own order.
+
+        ``root`` is the zip's top-level name — the source folder's real
+        name, version noise and all — with ``source`` the folder it was read
+        from, ``interior`` the chain inside it and ``exists`` whether that
+        source is on this machine right now.
+
+        The ZIP is the authority on what can be restored: a root it does not
+        contain cannot be, however much the index says about it, and a root
+        the index knows nothing about still can. Anything unmatched simply
+        comes back with an empty source.
+        """
+        out: list = []
+        try:
+            from core.registry_saves import arc_name_is_registry
+        except Exception:
+            def arc_name_is_registry(_a):
+                return False
+        try:
+            with zipfile.ZipFile(entry.zip_path) as zf:
+                names = zf.namelist()
+        except Exception:
+            logger.debug("archive_roots: %s unreadable", entry.zip_path,
+                         exc_info=True)
+            return out
+        interiors = self._orphan_interiors(entry)
+        by_root = {}
+        for src in self.orphan_source_paths(entry):
+            name = Path(src).name
+            if name:
+                by_root.setdefault(name.casefold(), src)
+        seen: set = set()
+        for arc in names:
+            if arc.endswith("/") or arc_name_is_registry(arc):
+                continue
+            parts = _chain_parts(arc)
+            if len(parts) < 2:
+                continue                  # a bare file has no folder to pick
+            root = parts[0]
+            key = root.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            src = by_root.get(key, "")
+            out.append({
+                "root": root,
+                "source": src,
+                "interior": interiors.get(key, ""),
+                "exists": bool(src) and Path(src).is_dir(),
+            })
+        return out
+
+    def newest_archive_row(self, rows: list) -> Optional[BackupEntry]:
+        """The newest of *rows* that describes the ARCHIVE itself.
+
+        A backup filed under an archive's game_id is not necessarily a
+        backup OF the archive: a restore writes a pre-restore safety copy of
+        the destination under the same id, and that row has no sources, no
+        destination map and no chains. Treating it as the archive's current
+        state is how one restore could leave an archive with no trace of
+        where it came from or where it goes back.
+        """
+        best = None
+        for b in rows or []:
+            if self.ORPHAN_SOURCES_KEY not in (b.cloud_metadata or {}):
+                continue
+            if best is None or b.created_dt > best.created_dt:
+                best = b
+        return best
+
     def orphan_sources_view(self, game_id: str) -> tuple[list[str], list[str]]:
         """``(recorded, switched off)`` for an archive, straight off the index.
 
@@ -3160,15 +3506,22 @@ class BackupManager(QObject):
         with _index_lock:
             rows = [(b.created_dt, b.cloud_metadata or {})
                     for b in self._index if b.game_id == game_id]
-        if not rows:
-            return [], []
-        meta = max(rows, key=lambda r: r[0])[1]
 
-        def _lst(key):
+        def _lst(meta, key):
             raw = meta.get(key)
             return [str(x) for x in raw if str(x)] if isinstance(raw, list) else []
 
-        return _lst(self.ORPHAN_SOURCES_KEY), _lst(self.ORPHAN_SKIPPED_KEY)
+        # Newest row that actually SAYS something about the archive, not
+        # newest row full stop. A restore files a pre-restore safety copy
+        # under the same game_id, and that copy is a snapshot of a
+        # destination — it carries no sources, and reading it as the current
+        # state wiped every folder the archive was made from. One restore
+        # and the archive had no trace of where it came from.
+        for _when, meta in sorted(rows, key=lambda r: r[0], reverse=True):
+            if self.ORPHAN_SOURCES_KEY in meta:
+                return (_lst(meta, self.ORPHAN_SOURCES_KEY),
+                        _lst(meta, self.ORPHAN_SKIPPED_KEY))
+        return [], []
 
     def orphan_source_paths(self, entry: BackupEntry) -> list[str]:
         """Every folder an orphan archive is made FROM, newest entry wins.
@@ -3203,6 +3556,110 @@ class BackupManager(QObject):
         skipped = {p.casefold() for p in self.orphan_sources_skipped(entry)}
         return [p for p in self.orphan_source_paths(entry)
                 if p.casefold() not in skipped]
+
+    def orphan_dest_map(self, entry: BackupEntry) -> dict:
+        """``{source (casefolded): {"path", "chain", "content"}}``, or {}.
+
+        The restore destination recorded for each of an archive's source
+        folders. Empty for archives taken before this was written, and for
+        anything that is not an orphan — see _orphan_targets, which falls
+        back to reading the destinations positionally in that case.
+        """
+        raw = (entry.cloud_metadata or {}).get(self.ORPHAN_DEST_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        for src, rec in raw.items():
+            if not src or not isinstance(rec, dict):
+                continue
+            out[str(src).casefold()] = {
+                "path": str(rec.get("path") or ""),
+                "chain": str(rec.get("chain") or ""),
+                "content": str(rec.get("content") or ""),
+            }
+        return out
+
+    def _orphan_interiors(self, entry: BackupEntry) -> dict:
+        """``{zip root (casefolded): the chain INSIDE it}`` for an archive.
+
+        The root is the source folder's own name — which is what the zip is
+        rooted on — and never the archive's title: the title names the
+        backup folder, has had its version noise stripped, and describes no
+        location on any disk.
+
+        Empty for anything with no sources on file. A root nothing is known
+        about simply gets no interior, and the caller falls back to matching
+        on the root alone, which is still enough to stop a folder nesting
+        inside itself.
+        """
+        srcs = self.orphan_source_paths(entry)
+        if not srcs:
+            return {}
+        try:
+            _, _, contents = self._orphan_targets(entry, srcs)
+        except Exception:
+            logger.debug("orphan interiors unavailable for %s",
+                         entry.backup_id, exc_info=True)
+            return {}
+        out: dict = {}
+        for src, inner in zip(srcs, contents):
+            root = Path(src).name
+            if root:
+                out[root.casefold()] = inner or ""
+        return out
+
+    def _orphan_targets(self, entry: BackupEntry,
+                        sources: list[str]) -> tuple[list, list, list]:
+        """``(destinations, save_chains, content_chains)`` parallel to *sources*.
+
+        The map is consulted first, because it answers per source and cannot
+        be knocked out of step by a folder that was not readable this time.
+        An archive written before the map existed is read positionally
+        against the sources it recorded — the same pairing that produced its
+        index — and only then, for a source nothing knows about, is the
+        destination derived from the folder itself.
+
+        A destination is never invented from the archive's TITLE: the title
+        names the backup folder, has had its version/release noise stripped,
+        and describes no location on any disk.
+        """
+        dmap = self.orphan_dest_map(entry)
+        recorded_sources = self.orphan_source_paths(entry)
+        by_pos: dict = {}
+        if not dmap and recorded_sources:
+            # Pre-map archive: save_paths / chains were written against the
+            # sources readable at the time, in order.
+            dests = list(entry.save_paths or [])
+            scs = list(entry.save_chains or [])
+            ccs = list(entry.content_chains or [])
+            for i, src in enumerate(recorded_sources):
+                if i >= len(dests):
+                    break
+                by_pos[src.casefold()] = {
+                    "path": dests[i],
+                    "chain": scs[i] if i < len(scs) else "",
+                    "content": ccs[i] if i < len(ccs) else "",
+                }
+        out_d: list = []
+        out_s: list = []
+        out_c: list = []
+        for src in sources:
+            rec = dmap.get(str(src).casefold()) or by_pos.get(str(src).casefold())
+            if rec is None:
+                # Nothing on file for this folder. Read the destination off
+                # the folder itself rather than off the archive's name.
+                chain = ""
+                try:
+                    from core.manual_paths import live_save_chain, orphan_index_save_path
+                    chain = live_save_chain(src) or ""
+                    dest = orphan_index_save_path(src, chain, entry.game_name or "")
+                except Exception:
+                    dest = str(src)
+                rec = {"path": dest or str(src), "chain": chain, "content": chain}
+            out_d.append(rec.get("path") or str(src))
+            out_s.append(rec.get("chain") or "")
+            out_c.append(rec.get("content") or "")
+        return out_d, out_s, out_c
 
     def publishable_dict(self, entry: BackupEntry) -> dict:
         """*entry* as it should appear in a remote index.
@@ -3283,7 +3740,44 @@ class BackupManager(QObject):
             self._save_game_index(game_id)
         return touched
 
-    def add_orphan_sources(self, game_id: str, sources: list[str]) -> bool:
+    def _write_orphan_dest_map(self, game_id: str, dest_map: dict) -> bool:
+        """Merge ``{source: {"path", "chain", "content"}}`` onto an archive.
+
+        Merged, never replaced: a folder named again says where THAT folder
+        belongs and has no opinion about the others.
+        """
+        clean: dict = {}
+        for src, rec in (dest_map or {}).items():
+            if not src or not isinstance(rec, dict):
+                continue
+            clean[str(src).casefold()] = {
+                "path": str(rec.get("path") or ""),
+                "chain": str(rec.get("chain") or ""),
+                "content": str(rec.get("content") or ""),
+            }
+        if not clean:
+            return False
+        touched = False
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                meta = dict(b.cloud_metadata or {})
+                current = meta.get(self.ORPHAN_DEST_KEY)
+                merged = dict(current) if isinstance(current, dict) else {}
+                merged.update(clean)
+                if merged == current:
+                    continue
+                meta[self.ORPHAN_DEST_KEY] = merged
+                meta[self.INDEX_PUBLISH_KEY] = True
+                b.cloud_metadata = meta
+                touched = True
+        if touched:
+            self._save_game_index(game_id)
+        return touched
+
+    def add_orphan_sources(self, game_id: str, sources: list[str],
+                           dest_map: dict | None = None) -> bool:
         """Record another place this archive's saves live. True if written.
 
         Adds; never replaces. A folder re-added, or picked by hand on the
@@ -3293,10 +3787,14 @@ class BackupManager(QObject):
         one is then stuck: the scheduled check has nothing to read and its
         option sits greyed out with no way from the interface to supply one.
         This is that way.
+
+        *dest_map* carries where those folders put their files BACK, which is
+        a different question from where they are read from and is not
+        answerable from the archive's name — see ORPHAN_DEST_KEY.
         """
         clean = [str(p) for p in (sources or []) if p]
         if not clean:
-            return False
+            return self._write_orphan_dest_map(game_id, dest_map or {})
         with _index_lock:
             existing = next((self.orphan_source_paths(b) for b in self._index
                              if b.game_id == game_id), [])
@@ -3307,10 +3805,12 @@ class BackupManager(QObject):
                 continue
             seen.add(p.casefold())
             merged.append(p)
+        wrote_map = self._write_orphan_dest_map(game_id, dest_map or {})
         if merged == existing:
-            return False
+            return wrote_map
         logger.info("Archive %s now reads %d folder(s)", game_id, len(merged))
-        return self._write_orphan_meta(game_id, self.ORPHAN_SOURCES_KEY, merged)
+        return self._write_orphan_meta(
+            game_id, self.ORPHAN_SOURCES_KEY, merged) or wrote_map
 
     def forget_orphan_source(self, game_id: str, path: str) -> bool:
         """Drop a folder from an archive entirely — it was never its saves."""
@@ -3454,7 +3954,11 @@ class BackupManager(QObject):
         existing = self.get_backups_for_game(game_id)
         if not existing:
             return False, "archive not found"
-        newest = max(existing, key=lambda b: b.created_dt)
+        # The newest row that describes the ARCHIVE, falling back to the
+        # newest row at all — an archive made before sources were recorded
+        # has none, and it still has a name and a folder.
+        newest = (self.newest_archive_row(existing)
+                  or max(existing, key=lambda b: b.created_dt))
         # A place this archive's saves live, learned on the way past: a
         # folder re-added, or one picked by hand. Recorded BEFORE anything
         # else is decided, because doing it further down — on the backup
@@ -3463,12 +3967,40 @@ class BackupManager(QObject):
         # byte what was archived, so the answer is "unchanged" and the
         # archive would go on naming only paths that are not there.
         if sources:
-            self.add_orphan_sources(game_id, [str(p) for p in sources if p])
-            newest = max(self.get_backups_for_game(game_id),
-                         key=lambda b: b.created_dt)
+            _new = [str(p) for p in sources if p]
+            # A relocation names the same saves in a new place, so the
+            # destination the archive already carries is the one that
+            # follows them there — the new folder is a source, and nothing
+            # about it says where its files belong.
+            _old_src = self.orphan_source_paths(newest)
+            if _old_src:
+                _td, _ts, _tc = self._orphan_targets(newest, _old_src[:1])
+                _inherit = [_td[0]] * len(_new)
+                _isc = [_ts[0]] * len(_new)
+                _icc = [_tc[0]] * len(_new)
+            else:
+                _inherit, _isc, _icc = self._orphan_targets(newest, _new)
+            if recorded:
+                _r = [str(x) for x in recorded if x]
+                if _r:
+                    while len(_r) < len(_new):
+                        _r.append(_r[-1])
+                    _inherit = _r[:len(_new)]
+            self.add_orphan_sources(game_id, _new, dest_map={
+                src: {"path": d, "chain": sc, "content": cc}
+                for src, d, sc, cc in zip(_new, _inherit, _isc, _icc)
+            })
+            newest = (self.newest_archive_row(
+                self.get_backups_for_game(game_id)) or newest)
 
-        recorded = self.orphan_source_paths(newest)
-        if not recorded:
+        # The SOURCES — the folders the zip is read FROM. Deliberately not
+        # written back over the destinations below: *recorded* is the
+        # caller's override for where the saves BELONG, and assigning the
+        # sources to that name is what silently turned every re-backup of a
+        # collection archive into "the archive restores to the shelf it was
+        # copied from" — one call, and the destination was gone for good.
+        src_paths = self.orphan_source_paths(newest)
+        if not src_paths:
             return False, "no source recorded"
 
         # Only the folders the user left switched on, and only the ones that
@@ -3480,6 +4012,17 @@ class BackupManager(QObject):
         if not alive:
             return False, "source unavailable"
 
+        # Where each of those folders puts its files back, looked up per
+        # source so a drive that is off its cable this time cannot shift the
+        # rest along by one. An explicit override from the caller wins.
+        dests, save_chains, content_chains = self._orphan_targets(newest, alive)
+        if recorded:
+            _rec = [str(p) for p in recorded if p]
+            if _rec:
+                while len(_rec) < len(alive):
+                    _rec.append(_rec[-1])
+                dests = _rec[:len(alive)]
+
         # return_status, not "did it hand back an entry": create_backup
         # returns the EXISTING entry when the folder has not changed, so a
         # truthy result says nothing about whether anything was written.
@@ -3490,10 +4033,14 @@ class BackupManager(QObject):
             computed_folder_name=self._game_folder_for_entry(newest),
             force=False,                      # unchanged folder: no new zip
             orphan=True,
-            recorded_save_paths=(list(recorded) if recorded
-                                 else (list(newest.save_paths) or None)),
-            content_chains_override=list(newest.content_chains) or None,
-            save_chains_override=list(newest.save_chains) or None,
+            recorded_save_paths=list(dests) or None,
+            content_chains_override=list(content_chains),
+            save_chains_override=list(save_chains),
+            orphan_dest_map={
+                src: {"path": d, "chain": sc, "content": cc}
+                for src, d, sc, cc in zip(alive, dests, save_chains,
+                                          content_chains)
+            },
             return_status=True,
         )
         if entry is None:
@@ -3654,13 +4201,19 @@ class BackupManager(QObject):
         Fields: game_id, game_name, save_paths, folder, save_hash, synced_to,
         needs_sync (True when not yet uploaded to any provider).
         """
-        by_id: dict[str, BackupEntry] = {}
+        rows: dict[str, list] = {}
         for b in self.get_orphan_backups():
-            if not b.game_id:
-                continue
-            cur = by_id.get(b.game_id)
-            if cur is None or b.created_dt > cur.created_dt:
-                by_id[b.game_id] = b
+            if b.game_id:
+                rows.setdefault(b.game_id, []).append(b)
+        # The newest row that IS the archive. A pre-restore safety copy is
+        # filed under the same game_id and is newer than everything else the
+        # moment it is written; read as the unit, an archive would be synced
+        # from the destination it had just been restored to.
+        by_id: dict[str, BackupEntry] = {}
+        for gid, group in rows.items():
+            pick = (self.newest_archive_row(group)
+                    or max(group, key=lambda b: b.created_dt))
+            by_id[gid] = pick
         units = []
         for gid, b in by_id.items():
             meta = b.cloud_metadata or {}
@@ -3772,7 +4325,17 @@ class BackupManager(QObject):
                 logger.debug("mark_orphan_synced save failed", exc_info=True)
 
     def flush_orphan_indexes(self, game_ids: list[str] | None = None) -> None:
-        """Write index.json for orphan game_ids (after a deferred batch stamp)."""
+        """Write index.json for orphan game_ids (after a deferred batch stamp).
+
+        mark_unpublished=False, because this IS the bookkeeping that records
+        publication — Sync Tutti defers the "synced" stamp to the end of the
+        batch and this is where it lands. With the default the write set
+        INDEX_PUBLISH_KEY again on every archive that had just been synced,
+        immediately after sync_backups had cleared it: needs_sync came back
+        True for all of them, so the NEXT sweep re-uploaded and republished
+        the entire collection, and the one after that, for ever. Nothing was
+        ever skipped and every Sync Tutti did the same full round of work.
+        """
         ids = list(game_ids or [])
         if not ids:
             return
@@ -3782,7 +4345,7 @@ class BackupManager(QObject):
                 continue
             seen.add(gid)
             try:
-                self._save_game_index(gid)
+                self._save_game_index(gid, mark_unpublished=False)
             except Exception:
                 logger.debug("flush_orphan_indexes failed for %s", gid, exc_info=True)
 

@@ -2187,9 +2187,18 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         from core.backup import get_backup_manager
         if not entries:
             return None
-        newest = max(entries, key=lambda b: b.created_dt)
         mgr = get_backup_manager()
-        if not (newest.cloud_metadata or {}).get("orphan"):
+        # The newest row that IS the archive. A restore files a pre-restore
+        # safety copy of the destination under the same game_id, and that
+        # row is not an archive row — reading it as the newest took this
+        # whole control off the page after a single restore.
+        newest = None
+        for b in entries:
+            if not (b.cloud_metadata or {}).get("orphan"):
+                continue
+            if newest is None or b.created_dt > newest.created_dt:
+                newest = b
+        if newest is None:
             return None
         game_id = newest.game_id
         if not game_id or game_id in mgr.library_game_ids():
@@ -2223,6 +2232,11 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         row.addWidget(every)
         row.addWidget(spin)
         row.addStretch()
+        # The two buttons live at the end of THIS row — under the line that
+        # says what the archive is made of, and level with the schedule.
+        # On the row above they sat in front of that line and read as its
+        # label, which is not what they are: the note describes the archive,
+        # the buttons act on it.
         # Added BELOW the paths row, further down: the folders come first
         # because the schedule is a question about them. Whether to re-read
         # something on a timer only means anything once there is a something.
@@ -2257,6 +2271,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # An archive could be backed up and sent up only by the recurring
         # check or a sweep over everything — there was no way to say "this
         # one, now", which is the plainest thing to want from a row.
+        #
+        # Backup only appears when there IS a folder to read: see _sync_state.
+        # Under a provider filter the listing is the cloud's, and an archive
+        # from another machine has no source here at all — the button offered
+        # to re-read a folder that does not exist and could only report
+        # failure. Sync stays (that is how the zip comes down) and so does
+        # Restore, which asks the user where to put it.
         from ui.helpers import lock_min_size as _lock
         _bw = scaled(26, self, min_px=24)
         backup_btn = QPushButton(t("buttons.backup"))
@@ -2281,17 +2302,16 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         hint_row = QHBoxLayout()
         hint_row.setContentsMargins(0, 0, 0, 0)
         hint_row.setSpacing(8)
-        # The way in on the left, the state of it far right: the button is
-        # the thing to press, and a line of prose in front of it reads as
-        # the label of something that has already happened. Pushed apart
+        # The way in on the left, the state of it far right: pushed apart
         # rather than sat next to each other, so the note reads as a remark
-        # about the row and not as part of the button.
+        # about the archive and not as the label of the button beside it.
         hint_row.addWidget(paths_btn, 0, Qt.AlignmentFlag.AlignTop)
-        hint_row.addWidget(backup_btn, 0, Qt.AlignmentFlag.AlignTop)
-        hint_row.addWidget(sync_btn, 0, Qt.AlignmentFlag.AlignTop)
         hint_row.addStretch(1)
         hint_row.addWidget(hint, 0, Qt.AlignmentFlag.AlignRight
                            | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(backup_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(sync_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
         outer.addLayout(hint_row)
         outer.addLayout(row)
 
@@ -2302,6 +2322,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                       if p.casefold() not in off and _P(p).exists()]
             cb.setEnabled(bool(usable))
             spin.setEnabled(bool(usable) and cb.isChecked())
+            # Nothing to read means nothing to back up. Set here rather than
+            # at build time because the paths panel can hand this archive a
+            # folder while the row is on screen.
+            backup_btn.setVisible(bool(usable))
             if not recorded:
                 hint.setFullText(t("backups.archive_auto_no_source"))
             elif not usable:

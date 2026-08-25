@@ -129,9 +129,15 @@ class ArchivePathsDialog(QDialog):
                 pass
         self._rows = {}
         try:
+            # setParent(None) on a visible holder makes it a top-level
+            # widget — see ui.helpers.swap_scroll_widget. Hidden first, and
+            # given a parent again, it never becomes a window.
+            old = self._scroll.widget()
+            if old is not None:
+                old.hide()
             old = self._scroll.takeWidget()
             if old is not None:
-                old.setParent(None)
+                old.setParent(self._scroll)
                 old.deleteLater()
         except RuntimeError:
             pass
@@ -228,7 +234,7 @@ class ArchivePathsDialog(QDialog):
         recorded, skipped = self._mgr.orphan_sources_view(self._game_id)
         off = {p.casefold() for p in skipped}
 
-        holder = QWidget()
+        holder = QWidget(self._scroll)
         holder.setObjectName("transparent_bg")
         lay = QVBoxLayout(holder)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -251,10 +257,8 @@ class ArchivePathsDialog(QDialog):
         if not recorded:
             lay.addWidget(self._empty)
         lay.addStretch()
-        old = self._scroll.takeWidget()
-        self._scroll.setWidget(holder)
-        if old is not None:
-            old.deleteLater()
+        from ui.helpers import swap_scroll_widget
+        swap_scroll_widget(self._scroll, holder)
         self._refresh_ignored_count()
 
     def _forget(self, path: str):

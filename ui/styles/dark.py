@@ -16,7 +16,7 @@ THEME = """
 QWidget {
     background-color: #111114;
     color: #e8e8ea;
-    font-family: "Segoe UI", "SF Pro Display", sans-serif;
+    font-family: "Segoe UI", "SF Pro Display", "Inter", "Noto Sans", "Cantarell", "Ubuntu", "DejaVu Sans", sans-serif;
     font-size: 13px;
     border: none;
     outline: none;

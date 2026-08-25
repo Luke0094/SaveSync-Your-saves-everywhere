@@ -81,6 +81,9 @@ class IgnoredPathsDialog(QDialog):
         self._extra_paths: list = list(extra_paths or [])
         self._session_only = session_only
         self.restored_paths: list = []
+        self.restored_session: list = []   # were proposals, removed just now
+        self.restored_saved: list = []     # were save folders, removed before
+        self._session_set: set = set(extra_paths or [])
         self.setWindowTitle(t("add_game.ignored_paths_dialog_title"))
         self._checkboxes: list[tuple[QCheckBox, str]] = []  # (cb, path)
         self._build()
@@ -107,24 +110,43 @@ class IgnoredPathsDialog(QDialog):
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(0, 8, 0, 8)
 
+        # Two sections, not one flat list — the same shape the scan panel
+        # uses. Where a path came from decides where restoring puts it back:
+        # one removed a moment ago was a PROPOSAL and goes back among the
+        # proposals, while one removed in an earlier session was a save
+        # folder and goes back to being one. Merged into a single list, the
+        # user could not see which was which, and neither could the caller.
+        session = [p for p in self._extra_paths if p]
+        self._session_set = set(session)
         if self._session_only:
-            deleted = list(self._extra_paths)
+            saved = []
         else:
             config = get_config()
-            deleted = list(config.get("auto_scan_deleted_paths", {}).get(self.game_id, []))
-            for p in self._extra_paths:      # session-only deletions
-                if p not in deleted:
-                    deleted.append(p)
+            saved = [p for p in config.get(
+                "auto_scan_deleted_paths", {}).get(self.game_id, [])
+                if p and p not in self._session_set]
 
-        if not deleted:
+        if not session and not saved:
             empty_lbl = QLabel(t("add_game.session_ignored_none" if self._session_only
                                  else "add_game.ignored_paths_none"))
             empty_lbl.setObjectName("dialog_empty")
             inner_layout.addWidget(empty_lbl)
         else:
-            for path in deleted:
-                row = self._make_row(path)
-                inner_layout.addLayout(row)
+            for title, group in (
+                ("add_game.ignored_section_session", session),
+                ("add_game.ignored_section_saved", saved),
+            ):
+                if not group:
+                    continue
+                # A heading only when there is something to head, and only
+                # when both kinds can appear — a session-only dialog has
+                # nothing to tell apart.
+                if not self._session_only and (session and saved):
+                    head = QLabel(t(title))
+                    head.setObjectName("form_section_lbl")
+                    inner_layout.addWidget(head)
+                for path in group:
+                    inner_layout.addLayout(self._make_row(path))
 
         inner_layout.addStretch()
         scroll.setWidget(inner)
@@ -214,6 +236,14 @@ class IgnoredPathsDialog(QDialog):
 
         # Session-only entries aren't in the store — the caller reads this
         # to un-delete them locally and re-propose the rows.
+        #
+        # Split as well as merged: the caller has to send a restored
+        # proposal and a restored save folder to two different places, and
+        # only this dialog knows which list a path was drawn from.
+        session_set = getattr(self, "_session_set", set())
+        self.restored_session = sorted(p for p in to_restore if p in session_set)
+        self.restored_saved = sorted(p for p in to_restore
+                                     if p not in session_set)
         self.restored_paths = sorted(to_restore)
         logger.info(f"Restored {len(to_restore)} previously deleted path(s) for game {self.game_id}")
         self.accept()

@@ -10,7 +10,7 @@ from typing import List, Dict, Optional
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QWidget, QFrame, QCheckBox, QProgressBar,
+    QScrollArea, QWidget, QFrame, QCheckBox, QProgressBar, QSizePolicy,
 )
 
 from core.save_detector import detect_save_paths
@@ -19,17 +19,104 @@ from core.monitor import get_monitor
 from core.config_manager import get_config
 from i18n import t
 from ui.styles.theme import palette
-from ui.helpers import ElidedCheckBox, TopmostPinMixin, apply_game_friendly_flags, finalize_adaptive_dialog_size, lock_min_size, scaled
+from ui.helpers import (ElidedCheckBox, TopmostPinMixin,
+                        apply_game_friendly_flags, center_dialog,
+                        finalize_adaptive_dialog_size, lock_min_size,
+                        pin_window_topmost, scaled)
 
 logger = logging.getLogger(__name__)
 
 
-def filter_selectable_paths(game_id: str, paths: List[str]) -> List[str]:
+def rejected_paths_for(game_id: str) -> set:
+    """Identities of the paths the user trashed for *game_id*, ever.
+
+    Same identity rule the filter uses, so a path re-detected with different
+    casing is recognised as the one that was rejected.
+    """
+    from core.save_detector import path_identity
+    try:
+        raw = (get_config().get("auto_scan_deleted_paths", {}) or {}
+               ).get(game_id) or []
+    except Exception:
+        return set()
+    return {path_identity(p) for p in raw if p}
+
+
+def _run_over_pinned_parent(host, dlg, prepared: bool = False) -> int:
+    """exec *dlg* so it stays above *host*, then give *host* its pin back.
+
+    The panel re-asserts HWND_TOPMOST once a second (TopmostPinMixin), so a
+    child that merely carried the on-top FLAG was shoved back underneath a
+    moment after opening. Two windows both re-asserting do not settle
+    either — they alternate. So exactly one of them pins at a time, and
+    while a modal child is up it is the child; the panel keeps the topmost
+    style it already has and simply stops fighting for it.
+    """
+    if not prepared:
+        apply_game_friendly_flags(dlg)
+        # …except the focus part: that recipe is for a panel that must not
+        # steal focus from a running game, and this is a dialog the user
+        # just asked for and has to type in.
+        dlg.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        center_dialog(dlg)
+    pin = None
+    try:
+        if hasattr(host, "stop_topmost_pin"):
+            host.stop_topmost_pin()
+        pin = pin_window_topmost(dlg)
+    except Exception:
+        logger.debug("could not hand the topmost pin over", exc_info=True)
+    try:
+        return dlg.exec()
+    finally:
+        try:
+            if pin is not None:
+                pin.stop()
+        except RuntimeError:
+            pass
+        if hasattr(host, "start_topmost_pin"):
+            host.start_topmost_pin()
+
+
+def open_path_for_inspection(parent, path_str: str) -> None:
+    """Open a save path for inspection — same behaviour as the Add/Edit Game
+    rows: registry keys go to regedit, folders to the system file manager,
+    and a path that does not exist (yet) says so instead of failing
+    silently. Shared so the read-only "your save folders" rows behave
+    exactly like the ones being proposed.
+    """
+    from core.registry_saves import is_registry_path, open_in_regedit
+    from ui.helpers import open_in_file_manager
+    from ui.modal_helpers import information_window_modal
+    if is_registry_path(path_str):
+        open_in_regedit(path_str)
+        return
+    target = Path(path_str)
+    if not target.exists():
+        information_window_modal(
+            parent, t('add_game.folder_not_found'),
+            t('add_game.folder_not_exist', path=path_str))
+        return
+    open_in_file_manager(target)
+
+
+def filter_selectable_paths(game_id: str, paths: List[str],
+                            include_rejected: bool = False) -> List[str]:
     """Return only the paths that would actually be shown as selectable
     entries in the confirmation dialog for *game_id*.
 
+    *include_rejected* keeps the paths the user trashed in an earlier
+    session. False everywhere the app decides on its own what to propose —
+    a rejection is an answer and the at-exit flow must go on honouring it.
+    True only when the user OPENED this panel themselves: a game whose only
+    save folder was rejected has no other surface on which to change their
+    mind, and with the folder filtered out the panel came up empty, without
+    even the "manage ignored paths" control, so the rejection could not be
+    undone from anywhere.
+
     Drops:
-    - paths the user permanently deleted in a previous session,
+    - paths the user permanently deleted in a previous session
+      (unless *include_rejected*),
     - paths whose entire content is excluded by extension/dir bans
       (nothing selectable would appear in the file browser — see the
       shared save_detector.path_has_backup_content helper).
@@ -62,7 +149,7 @@ def filter_selectable_paths(game_id: str, paths: List[str]) -> List[str]:
 
     result: List[str] = []
     for path in paths:
-        if path_identity(path) in deleted_paths:
+        if path_identity(path) in deleted_paths and not include_rejected:
             logger.debug(f"Skipping previously deleted path: {path}")
             continue
         if not path_has_backup_content(path, engine=engine):
@@ -148,12 +235,17 @@ class ScanWorkerThread(QThread):
         # exactly the case the plain "already has paths, skip it" rule
         # (meant for broad library-wide sweeps) would otherwise discard.
         self.force = force
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._should_stop = True
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         try:
             total_games = len(self.games)
             
@@ -247,6 +339,17 @@ class ScanWorkerThread(QThread):
             self.error.emit(str(e))
 
 
+class _GameRef:
+    """Stand-in for a game with no library row (an archive, or one still
+    being added). Carries only what the ignored-paths flow reads."""
+
+    def __init__(self, game_id: str, name: str):
+        self.id = game_id
+        self.name = name
+        self.save_paths: List[str] = []
+        self.excluded_save_paths: List[str] = []
+
+
 class SavePathItem(QWidget):
     """Widget for displaying a single save path option"""
     
@@ -324,30 +427,28 @@ class SavePathItem(QWidget):
             self._ignored_count_lbl.setText(t("add_game.session_ignored_none"))
 
     def _open_ignored_dialog(self):
-        """Review and restore the paths trashed during this confirmation.
+        """Review and restore removed paths. Delegates to the panel.
 
-        Restoring lives here rather than on a button of its own: the rows
-        already carry an open and a delete button, and a third one competing
-        with them for a width the paths themselves need was the wrong trade.
-
-        add_paths() refuses anything still listed in _locally_deleted_paths
-        (an in-session deletion must survive a later scan pass re-finding the
-        path), so a restored path is dropped from that list FIRST — otherwise
-        it would silently fail to come back.
+        Both entry points opened their own dialog before, with different
+        contents and different restore destinations — two controls named
+        Manage that did two different things. The panel owns the one
+        behaviour now; this stays because the row is where the user is
+        looking when they want it.
         """
-        from PySide6.QtWidgets import QDialog
-        from ui.dialogs.add_game_dialog import IgnoredPathsDialog
-        dlg = IgnoredPathsDialog(self.game_id, self.game_name, parent=self,
-                                 extra_paths=list(self._locally_deleted_paths),
-                                 session_only=True)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            restored = list(getattr(dlg, "restored_paths", []) or [])
-            for p in restored:
-                if p in self._locally_deleted_paths:
-                    self._locally_deleted_paths.remove(p)
-            if restored:
-                self.add_paths(restored)
-                logger.info(f"Restored {len(restored)} just-deleted path(s) for {self.game_name}")
+        panel = self.window()
+        handler = getattr(panel, "_open_ignored_dialog_for", None)
+        if not callable(handler):
+            return
+        game = None
+        try:
+            game = get_library().get_by_id(self.game_id)
+        except Exception:
+            game = None
+        if game is None:
+            # No library row: the dialog still needs an id and a name to
+            # read the store and to title itself.
+            game = _GameRef(self.game_id, self.game_name)
+        handler(game)
         self._refresh_ignored_count()
 
     def _build_path_row(self, path: str):
@@ -507,23 +608,8 @@ class SavePathItem(QWidget):
             self._refresh_ignored_count()
 
     def _open_path(self, path_str: str, checked=False):
-        """Open a proposed path for inspection — same behaviour as the
-        Add/Edit Game rows: registry keys go to regedit, folders to the
-        system file manager, and a path that doesn't exist (yet) says so
-        instead of failing silently."""
-        from core.registry_saves import is_registry_path, open_in_regedit
-        from ui.helpers import open_in_file_manager
-        from ui.modal_helpers import information_window_modal
-        if is_registry_path(path_str):
-            open_in_regedit(path_str)
-            return
-        target = Path(path_str)
-        if not target.exists():
-            information_window_modal(
-                self, t('add_game.folder_not_found'),
-                t('add_game.folder_not_exist', path=path_str))
-            return
-        open_in_file_manager(target)
+        """Open a proposed path for inspection."""
+        open_path_for_inspection(self, path_str)
 
     def _on_delete_clicked(self, idx, checked=False):
         """Stable callback for delete buttons — avoids lambda closure leaks.
@@ -646,6 +732,37 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.results_widget = QWidget()
         self.results_widget.setObjectName("transparent_bg")
         self.results_layout = QVBoxLayout(self.results_widget)
+
+        # "Your save folders" — the ones the game ALREADY has, listed for
+        # reference and nothing else. They are filtered out of the proposals
+        # below on purpose (a folder already saved is not a discovery, and
+        # this panel must not be a place to edit or delete one), which used
+        # to mean a panel opened by hand on a fully-configured game came up
+        # blank and looked broken. Read-only, and only on a panel the user
+        # opened themselves — at game exit the question is "is this new
+        # folder yours?", and answering it with a list of folders that are
+        # already settled is noise.
+        self._existing_box = QWidget()
+        self._existing_box.setObjectName("transparent_bg")
+        self._existing_layout = QVBoxLayout(self._existing_box)
+        self._existing_layout.setContentsMargins(0, 0, 0, 0)
+        self._existing_box.setVisible(False)
+        self.results_layout.addWidget(self._existing_box)
+
+        # "Paths you removed" — at PANEL level, not inside a per-game group.
+        # It used to live in the group, so with nothing proposed there was no
+        # group, and with no group there was no way to reach the one control
+        # that undoes a removal. It also counted only removals made in THIS
+        # session, which meant a path removed and saved earlier could not be
+        # found without waiting for a scan to re-propose it — and a removed
+        # path is exactly what a scan will not re-propose.
+        self._manage_box = QWidget()
+        self._manage_box.setObjectName("transparent_bg")
+        self._manage_layout = QHBoxLayout(self._manage_box)
+        self._manage_layout.setContentsMargins(20, 0, 2, 6)
+        self._manage_box.setVisible(False)
+        self.results_layout.addWidget(self._manage_box)
+
         self.results_area.setWidget(self.results_widget)
         
         layout.addWidget(self.results_area, 1)
@@ -777,12 +894,23 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         # be re-detected in a later session; its checkbox is just
         # initialised unchecked below to match, rather than the path being
         # hidden from the dialog entirely.
-        filtered_paths = filter_selectable_paths(game_id, paths)
+        # A panel the USER opened is a management surface, not a proposal:
+        # it has to show what is there, including what they rejected before,
+        # or there is no way back from a rejection. Every other caller keeps
+        # today's behaviour.
+        _mine = bool(getattr(self, "_user_initiated", False))
+        filtered_paths = filter_selectable_paths(
+            game_id, paths, include_rejected=_mine)
 
         # For games with already-confirmed paths, also drop re-detections
         # covered by the confirmed list (same rule as the automatic at-exit
         # flow) — this is the single choke point for everything the dialog
         # shows, including live detections pushed while the panel is open.
+        #
+        # This applies to a user-opened panel too. A folder already among the
+        # game's saves is not a proposal and must not be offered for editing
+        # or deletion here; it is shown, read-only, in its own section — see
+        # _show_existing_paths.
         _game = get_library().get_by_id(game_id)
         if _game is not None and _game.save_paths_confirmed and not _game.requires_confirmation:
             filtered_paths = filter_uncovered_paths(filtered_paths, _game.save_paths or [])
@@ -816,6 +944,258 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.path_items.append(item)
         self.results_layout.addWidget(item)
 
+    def show_existing_paths(self, game) -> int:
+        """List the game's already-saved folders, read-only. Returns how many.
+
+        Built out of the same parts as a proposed row — the same indent, the
+        same elided label, the same open button, the same collapsible file
+        browser — because a section that looks like a different kind of thing
+        reads like one. The first version used plain labels with padding
+        spaces, which sat at a different level from every other row and left
+        a gap between the heading and the paths.
+
+        Read-only, deliberately: these folders are already settled and this
+        panel is not where they are edited. The tick shows whether a folder
+        is currently skipped at backup time, and the file browser opens (Qt
+        keeps "looking" enabled while selection is off) so the contents can
+        still be inspected.
+        """
+        if getattr(self, "_existing_box", None) is None:
+            return 0
+        while self._existing_layout.count():
+            entry = self._existing_layout.takeAt(0)
+            w = entry.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+                continue
+            sub = entry.layout()
+            if sub is not None:
+                while sub.count():
+                    sw = sub.takeAt(0).widget()
+                    if sw is not None:
+                        sw.setParent(None)
+                        sw.deleteLater()
+                sub.deleteLater()
+
+        paths = [p for p in ((getattr(game, "save_paths", None) or []) if game
+                             else []) if p]
+        if not paths:
+            self._existing_box.setVisible(False)
+            return 0
+
+        from functools import partial
+        from core.registry_saves import is_registry_path, registry_display
+        from ui.widgets.file_list_widget import FileListWidget
+
+        excluded = set(getattr(game, "excluded_save_paths", None) or [])
+        game_id = getattr(game, "id", "") or ""
+
+        header = QLabel(t("auto_scan.existing_paths_title"))
+        header.setObjectName("auto_scan_game_header")
+        self._existing_layout.addWidget(header)
+
+        for path in paths:
+            row = QHBoxLayout()
+            row.setContentsMargins(20, 2, 2, 2)
+
+            cb = ElidedCheckBox()
+            cb.setObjectName("list_cb_sm")
+            if is_registry_path(path):
+                cb.setTooltipSuffix(t('auto_scan.registry_key_tooltip'))
+                cb.setFullText(f"\U0001f5dd {registry_display(path)}")
+            else:
+                cb.setFullText(f"\U0001f4c1 {path}")
+            # Ticked = backed up. Unticked = in save_paths but skipped, which
+            # is a real state the user set and has to be able to see.
+            cb.setChecked(path not in excluded)
+            if path in excluded:
+                cb.setTooltipSuffix(t("auto_scan.existing_path_excluded"))
+            cb.setEnabled(False)
+            row.addWidget(cb, 1)
+
+            open_btn = QPushButton("\U0001f4c2")
+            open_btn.setFixedSize(scaled(24, self), scaled(24, self))
+            open_btn.setObjectName("auto_scan_icon_btn")
+            open_btn.setToolTip(t('add_game.open_folder'))
+            open_btn.clicked.connect(
+                partial(open_path_for_inspection, self, path))
+            row.addWidget(open_btn)
+
+            self._existing_layout.addLayout(row)
+
+            file_list = FileListWidget(path, game_id)
+            file_list.set_selectable(False)
+            self._existing_layout.addWidget(file_list)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        self._existing_layout.addWidget(sep)
+        self._existing_box.setVisible(True)
+        # The results area starts hidden and is normally revealed by the
+        # first proposal. There may be none — that is the whole case this
+        # section exists for — so revealing it is this method's job too.
+        self.results_area.setVisible(True)
+        return len(paths)
+
+    def show_manage_row(self, game) -> int:
+        """The panel-level "paths you removed" row. Returns how many there are.
+
+        Read from the PERSISTED store, so a path removed in an earlier
+        session is reachable straight away rather than after a scan that, by
+        definition, will never propose it again.
+        """
+        box = getattr(self, "_manage_box", None)
+        if box is None:
+            return 0
+        while self._manage_layout.count():
+            w = self._manage_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        game_id = getattr(game, "id", "") or ""
+        removed = rejected_paths_for(game_id) if game_id else set()
+        if not removed:
+            box.setVisible(False)
+            return 0
+
+        # Its own string: the per-group counter says "deleted in this
+        # confirmation", and this one is about every session.
+        lbl = QLabel(t("auto_scan.removed_paths_count", count=len(removed)))
+        lbl.setObjectName("auto_scan_muted")
+        btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
+        lock_min_size(
+            btn, scaled(88, self, min_px=72), scaled(24, self, min_px=22),
+            policy_h=QSizePolicy.Policy.Minimum,
+            policy_v=QSizePolicy.Policy.Fixed)
+        btn.setObjectName("auto_scan_sm_btn")
+        btn.clicked.connect(
+            lambda: self._open_ignored_dialog_for(game))
+        self._manage_layout.addWidget(lbl, 1)
+        self._manage_layout.addWidget(btn)
+        box.setVisible(True)
+        self.results_area.setVisible(True)
+        return len(removed)
+
+    def refit_to_content(self) -> None:
+        """Re-fit the panel after sections were added AFTER _build ran.
+
+        finalize_adaptive_dialog_size measures the content once, at the end
+        of _build — when the "your save folders" list and the removed-paths
+        row are both still empty and hidden. Filling them afterwards grew
+        the content inside a panel that had already settled on a height for
+        an empty one.
+
+        Deliberately NOT finalize_adaptive_dialog_size again: that also
+        restores the remembered geometry and installs the save hook, and
+        neither should happen twice. Only the measure-and-fit half runs.
+        """
+        from ui.helpers import (apply_adaptive_dialog_size,
+                                dialog_host_geometry, measure_dialog_prefer,
+                                mediate_panel_scroll)
+        try:
+            # A QScrollArea's own size hint does not grow with its contents —
+            # that is what a scroll area is FOR — so measuring the dialog
+            # found the same 560x420 floor whether the section held nothing
+            # or six folders, and the panel never made room for it. Asking
+            # the scrolled WIDGET how tall it wants to be, and making that
+            # the area's minimum, puts the requirement where the dialog's
+            # layout can see it.
+            want = self.results_widget.sizeHint().height()
+            host = dialog_host_geometry(self)
+            # Bounded: one section must not be able to eat the screen, and
+            # list_content keeps the vertical bar available past the cap.
+            cap = int(host.height() * 0.55) if host is not None else 600
+            self.results_area.setMinimumHeight(
+                max(int(scaled(140, self)), min(want, cap)))
+
+            prefer_w, prefer_h = measure_dialog_prefer(
+                self, min_w=560, min_h=420)
+            size = apply_adaptive_dialog_size(
+                self, min_w=560, min_h=420,
+                prefer_w=prefer_w, prefer_h=prefer_h)
+            self._panel_size = size
+            mediate_panel_scroll(self.results_area, size, list_content=True)
+        except Exception:
+            logger.debug("could not re-fit the panel", exc_info=True)
+
+    def _open_ignored_dialog_for(self, game):
+        """Review and restore removed paths — from either section.
+
+        The dialog shows two: paths removed a moment ago, which were
+        PROPOSALS, and paths removed in an earlier session, which were save
+        folders. Restoring has to put each back where it came from, and only
+        the dialog knows which list a row was drawn from — see
+        IgnoredPathsDialog.restored_session / restored_saved.
+
+        A restored save folder is written to the library immediately, the
+        way Add/Edit Game does it. Leaving it as a proposal was what lost
+        saves: the dialog clears the removal from the store on accept, so a
+        path that only became a proposal was in neither place, and closing
+        the panel without applying dropped it for good.
+        """
+        from ui.dialogs.add_game_dialog import IgnoredPathsDialog
+        game_id = getattr(game, "id", "") or ""
+        game_name = getattr(game, "name", "") or ""
+
+        session: list = []
+        for item in self.path_items:
+            session.extend(getattr(item, "_locally_deleted_paths", None) or [])
+
+        dlg = IgnoredPathsDialog(game_id, game_name, parent=self,
+                                 extra_paths=session, session_only=False)
+        _run_over_pinned_parent(self, dlg)
+
+        # ── back among the proposals they were removed from ─────────────
+        for path in list(getattr(dlg, "restored_session", []) or []):
+            for item in self.path_items:
+                pending = getattr(item, "_locally_deleted_paths", None)
+                if pending is not None and path in pending:
+                    pending.remove(path)
+                    item.add_paths([path])
+                    break
+            else:
+                self.add_found_paths(game_id, game_name, [path])
+
+        # ── back to being save folders ──────────────────────────────────
+        restored_saved = [p for p in (getattr(dlg, "restored_saved", []) or [])
+                          if p]
+        entry = None
+        if restored_saved and game_id:
+            library = get_library()
+            entry = library.get_by_id(game_id)
+        if entry is not None:
+            from core.save_detector import path_identity as _pid
+            known = {_pid(p) for p in (entry.save_paths or [])}
+            added = [p for p in restored_saved if _pid(p) not in known]
+            for p in added:
+                entry.save_paths.append(p)
+            # Asking for a path back is not also asking to skip it.
+            drop = {_pid(p) for p in restored_saved}
+            entry.excluded_save_paths = [
+                p for p in (entry.excluded_save_paths or [])
+                if _pid(p) not in drop]
+            library.update_game(entry)
+            if added:
+                logger.info("Restored %d removed path(s) into %s's save "
+                            "folders", len(added), game_name or game_id)
+            game = entry
+        elif restored_saved:
+            # No library row to write to (an archive, or a game still being
+            # added): the removal is already cleared, so at least propose it
+            # rather than letting it vanish.
+            self.add_found_paths(game_id, game_name, restored_saved)
+
+        self.show_existing_paths(game)
+        self.show_manage_row(game)
+        self.refit_to_content()
+        for item in self.path_items:
+            try:
+                item._refresh_ignored_count()
+            except (AttributeError, RuntimeError):
+                pass
+
     def _apply_saved_path_state(self, game_id: str, item: "SavePathItem", paths_to_apply: List[str]):
         """Restore excluded/checked state and per-file exclusions for the
         given (newly shown) paths on *item* — shared by the fresh-item and
@@ -834,6 +1214,35 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             for i, path in enumerate(item.paths):
                 if path in paths_to_apply and path in already_excluded and i < len(item.checkboxes):
                     item.checkboxes[i].setChecked(False)
+
+        # A path only on screen because the user opened the panel themselves
+        # (they had trashed it before) starts UNTICKED and says so. Ticking
+        # it is the affirmative act that takes the rejection back — pressing
+        # Apply without touching it must leave the rejection exactly as it
+        # was, which is what _previously_rejected below is read for.
+        from core.save_detector import path_identity as _pid
+        rejected = rejected_paths_for(game_id)
+        if rejected:
+            marked = getattr(item, "_previously_rejected", None)
+            if marked is None:
+                marked = item._previously_rejected = set()
+            for i, path in enumerate(item.paths):
+                if path not in paths_to_apply or _pid(path) not in rejected:
+                    continue
+                marked.add(path)
+                if i < len(item.checkboxes):
+                    cb = item.checkboxes[i]
+                    cb.setChecked(False)
+                    # A bin, not a folder. Unticked and a tooltip were too
+                    # quiet: the row still read as something just found, and
+                    # a path the user threw away must say so on its face.
+                    try:
+                        cb.setFullText(
+                            f"\U0001f5d1 {path}   "
+                            + t("auto_scan.removed_tag"))
+                        cb.setTooltipSuffix(t("auto_scan.previously_removed"))
+                    except Exception:
+                        cb.setToolTip(t("auto_scan.previously_removed"))
 
         # Restore per-file exclusions saved in a previous session
         saved_excl = config.get("auto_scan_excluded_files", {}).get(game_id, {})
@@ -981,8 +1390,25 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
                     # the ENTIRE list with only this round's subset, so
                     # deleting even a single new false-positive here silently
                     # wiped out every previously-confirmed path too.)
+                    # Paths on screen ONLY because the user opened the panel
+                    # to review what they had already rejected. Leaving one
+                    # unticked is not a new decision — it is the old one,
+                    # unchanged — so it must not slip back into save_paths as
+                    # a merely "deselected" entry. Ticking it is what takes
+                    # the rejection back, and that is handled below.
+                    previously_rejected = set(
+                        getattr(item, "_previously_rejected", None) or ())
+                    still_rejected = [p for p in all_detected_paths
+                                      if p in previously_rejected
+                                      and p not in selected_paths]
+                    un_rejected = [p for p in all_detected_paths
+                                   if p in previously_rejected
+                                   and p in selected_paths]
+
                     preserved_untouched = [p for p in old_paths if p not in all_detected_paths]
-                    kept_from_this_round = [p for p in all_detected_paths if p not in locally_deleted]
+                    kept_from_this_round = [p for p in all_detected_paths
+                                            if p not in locally_deleted
+                                            and p not in still_rejected]
                     game.save_paths = preserved_untouched + kept_from_this_round
 
                     # excluded_save_paths tracks deselected-but-kept paths —
@@ -1010,6 +1436,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
                     self._save_user_path_preferences(
                         game.id, all_detected_paths, selected_paths,
                         locally_deleted_paths=locally_deleted,
+                        un_rejected_paths=un_rejected,
                     )
 
                     # The user just confirmed this game's paths: the temporary
@@ -1179,7 +1606,8 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             logger.warning(f"Could not discard pre-confirmation backups on skip: {e}")
 
     def _save_user_path_preferences(self, game_id: str, all_detected_paths: list[str], selected_paths: list[str],
-                                     locally_deleted_paths: list[str] | None = None):
+                                     locally_deleted_paths: list[str] | None = None,
+                                     un_rejected_paths: list[str] | None = None):
         """Persist a *deletion* (trash icon) so the scanner never proposes
         that path again, and clean up any existing backup content for it.
 
@@ -1194,6 +1622,28 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         purges/strips it from existing backups.
         """
         config = get_config()
+
+        # A rejection the user has just taken back, by ticking a path that
+        # was only on screen because they opened the panel to review it.
+        # BEFORE the early return below: taking a rejection back writes
+        # nothing else, and returning first left the tombstone in place —
+        # the path would be filtered straight out again on the next scan and
+        # the user's change of mind would not survive the session.
+        if un_rejected_paths:
+            from core.save_detector import path_identity as _pid
+            _store = dict(config.get("auto_scan_deleted_paths", {}))
+            _keep = {_pid(p) for p in un_rejected_paths if p}
+            _left = [p for p in (_store.get(game_id) or [])
+                     if _pid(p) not in _keep]
+            if _left != (_store.get(game_id) or []):
+                if _left:
+                    _store[game_id] = _left
+                else:
+                    _store.pop(game_id, None)
+                config.set("auto_scan_deleted_paths", _store)
+                logger.info(
+                    "Un-rejected %d path(s) for %s — the user put them back",
+                    len(un_rejected_paths), game_id)
 
         if not locally_deleted_paths:
             return
@@ -1410,7 +1860,9 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
 
         # Pre-filter BEFORE any UI is prepared: only genuinely selectable
         # paths count toward the "paths found" number the user sees.
-        selectable = filter_selectable_paths(game.id, pre_scanned_paths)
+        _mine = bool(getattr(self, "_user_initiated", False))
+        selectable = filter_selectable_paths(
+            game.id, pre_scanned_paths, include_rejected=_mine)
 
         # Paths already covered by confirmed save paths are not news — same
         # rule the automatic at-exit flow applies. Skipped while the game
@@ -1600,6 +2052,27 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
             # had nothing usable to hand over) — open empty instead;
             # Extended Scan stays a conscious, opt-in action for the user.
             dialog.show_idle_empty_state()
+
+    # Only on a panel the user opened: at game exit the question is about
+    # the folder that just changed, and a list of settled ones is noise.
+    if user_initiated and game_id:
+        try:
+            _g = get_library().get_by_id(game_id)
+            dialog.show_existing_paths(_g)
+            dialog.show_manage_row(_g)
+            # Both were empty when _build measured the panel; it has to be
+            # measured again now that they hold something.
+            dialog.refit_to_content()
+        except Exception:
+            logger.debug("could not list the game's existing save folders",
+                         exc_info=True)
+
+    # Centred before it is shown. finalize_adaptive_dialog_size restores a
+    # remembered SIZE, but position is left to the window manager, which for
+    # a panel opened over a fullscreen game means it can land in a corner or
+    # with its title bar off the top. center_dialog only moves — the
+    # remembered size is kept.
+    center_dialog(dialog)
 
     dialog.show()
     dialog.raise_()

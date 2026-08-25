@@ -50,6 +50,12 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus)  # Linux support
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        # An explicit arrow, the same one the overlay asks for. A window
+        # that sets no cursor inherits its parent's, and the parent of a
+        # top level is the root: the pointer changed size the moment the
+        # vignette covered the screen, because it stopped being the
+        # application's cursor and became the desktop's.
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         # Set to cover entire virtual desktop (all screens)
         self._update_geometry()
@@ -151,13 +157,17 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         self._fade_anim.setEndValue(0.0)
         # Use a one-shot callback that checks widget validity before hiding.
         # Prevents use-after-free if widget is destroyed before animation finishes.
+        # shiboken6 is a TOP-LEVEL module, which is how every other file
+        # here imports it. The old form asked PySide6 for a `shiboken6`
+        # attribute from inside an `except ImportError:` handler, and an
+        # exception raised in a handler is not caught by its own siblings —
+        # so this method raised ImportError every time it was called, on
+        # every install, and the vignette never faded out.
         try:
-            import sip as _sip
-            _has_sip = True
-        except ImportError:
-            from PySide6 import shiboken6 as _sip
+            import shiboken6 as _sip
             _has_sip = True
         except Exception:
+            _sip = None
             _has_sip = False
 
         def _on_fade_out_done():

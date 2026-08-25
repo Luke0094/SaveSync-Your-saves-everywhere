@@ -1234,7 +1234,17 @@ def _resolve_watch_paths(config=None) -> list[Path]:
         xdg_data = Path(os.getenv("XDG_DATA_HOME", str(home/".local"/"share")))
         xdg_cfg  = Path(os.getenv("XDG_CONFIG_HOME", str(home/".config")))
         for d in [xdg_data, xdg_cfg, home/".steam"/"steam"/"userdata",
-                  home/"snap", home/".var"/"app"]:
+                  home/"snap", home/".var"/"app",
+                  # NATIVE Linux builds, which the XDG roots above do not
+                  # all reach. Ren'Py is the one that matters most here:
+                  # on Linux it writes to ~/.renpy, outside XDG entirely,
+                  # and a library of visual novels would have had none of
+                  # its saves found. Steam's newer layout puts userdata
+                  # under ~/.local/share/Steam rather than ~/.steam, and
+                  # plenty of native ports still use ~/Documents.
+                  home/".renpy",
+                  xdg_data/"Steam"/"userdata",
+                  home/"Documents"]:
             if d.exists(): paths.append(d)
         # Windows games under Proton/Wine save inside their prefix, which no
         # XDG path covers. Without an appid here every prefix is offered; the

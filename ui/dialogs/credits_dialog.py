@@ -57,7 +57,8 @@ def _logo_pixmap(logical: int = _LOGO_PX) -> QPixmap:
     p.drawRoundedRect(margin, margin, size - margin * 2, size - margin * 2,
                       radius, radius)
 
-    font = QFont("Segoe UI", int(size * 0.52), QFont.Weight.Bold)
+    from ui.helpers import ui_font_family
+    font = QFont(ui_font_family(), int(size * 0.52), QFont.Weight.Bold)
     p.setFont(font)
     p.setPen(QColor("#76b900"))
     p.drawText(QRectF(0, -size * 0.02, size, size),

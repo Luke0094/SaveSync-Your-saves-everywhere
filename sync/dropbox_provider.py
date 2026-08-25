@@ -237,10 +237,28 @@ class DropboxProvider(SyncProvider):
         import threading
 
         _bg, _fg, _accent = theme_bg, theme_fg, theme_accent
-        _lbl_success = label_success or "✓ Authorization successful!"
-        _lbl_close = label_close or "You can close this tab and return to SaveSync."
-        _lbl_failed = label_failed or "✗ Authorization failed"
-        _lbl_retry = label_retry or "Please try again in SaveSync."
+        # These reach a page in the user's browser. The caller passes them
+        # already translated; when it does not — a direct call, a test — the
+        # fallback goes through i18n rather than being English on the way
+        # out, which is what made this the only user-visible text in the
+        # project written into the code.
+        def _lbl(passed: str, key: str, last_resort: str) -> str:
+            if passed:
+                return passed
+            try:
+                from i18n import t as _t
+                return _t(key) or last_resort
+            except Exception:
+                return last_resort      # no app around it: source language
+
+        _lbl_success = _lbl(label_success, "dropbox.oauth_callback_success",
+                            "Authorization successful")
+        _lbl_close = _lbl(label_close, "dropbox.oauth_callback_close",
+                          "You can close this tab.")
+        _lbl_failed = _lbl(label_failed, "dropbox.oauth_callback_failed",
+                           "Authorization failed")
+        _lbl_retry = _lbl(label_retry, "dropbox.oauth_callback_retry",
+                          "Please try again.")
         import urllib.parse
         import webbrowser
 

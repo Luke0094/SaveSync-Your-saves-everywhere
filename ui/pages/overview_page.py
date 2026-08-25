@@ -298,7 +298,10 @@ class SyncDonutChart(QWidget, ThemedMixin):
         item_spacing = scaled(17, self, min_px=14)
         legend_cols = self._legend_columns()
         legend_h = self._legend_rows(legend_cols) * item_spacing
-        gap = scaled(8, self, min_px=4)
+        # The ring and its legend read as one block when they touch;
+        # a little air between them is what separates the picture from
+        # the key to it. Scaled, like every other spacing here.
+        gap = scaled(16, self, min_px=9)
         # Responsive in BOTH directions: the ceiling is a share of the
         # widget's own width, so the ring keeps growing as the window does
         # instead of stopping at a fixed pixel size it reaches immediately.
@@ -1494,8 +1497,12 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                 return
         except Exception:
             pass
-        # Fallback to inline label
-        self._show_sync_feedback(f"Riprova tra {seconds}s")
+        # Fallback to inline label. Same sentence as the overlay above:
+        # this branch was written in Italian, so an English or Spanish user
+        # whose overlay happened to be unavailable read Italian.
+        from i18n import t as _t
+        self._show_sync_feedback(
+            _t("notifications.cooldown_active", seconds=seconds))
 
     def _show_sync_feedback(self, msg: str):
         """Flash a short message under the quick actions (auto-hides)."""

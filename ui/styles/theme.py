@@ -188,6 +188,41 @@ class ThemeManager(QObject):
         pal.setColor(QPalette.ColorRole.Text, fg)
         pal.setColor(QPalette.ColorRole.Button, bg)
         pal.setColor(QPalette.ColorRole.ButtonText, fg)
+        # The roles Fusion uses to draw FRAMES rather than fills: the ridges
+        # and grooves around views, group boxes, splitters and its own window
+        # decoration. Left at their defaults they are derived from a light
+        # base, which on a dark theme comes out as a pale lattice around and
+        # between everything the stylesheet did not paint itself. On Windows
+        # the OS draws the frame and none of this ever showed.
+        border = QColor(colors.get("border", colors["bg_hover"]))
+        pal.setColor(QPalette.ColorRole.Light, border)
+        pal.setColor(QPalette.ColorRole.Midlight, border)
+        pal.setColor(QPalette.ColorRole.Mid, border)
+        pal.setColor(QPalette.ColorRole.Dark, bg)
+        pal.setColor(QPalette.ColorRole.Shadow, bg)
+        # Tooltips, placeholders and selection: same reason, different
+        # widgets. Each is painted by the style, not by the sheet.
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(colors["bg_hover"]))
+        pal.setColor(QPalette.ColorRole.ToolTipText, fg)
+        pal.setColor(QPalette.ColorRole.PlaceholderText,
+                     QColor(colors.get("text_hint", colors["text_muted"])))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(colors["accent"]))
+        pal.setColor(QPalette.ColorRole.HighlightedText,
+                     QColor(colors.get("accent_text", "#000000")))
+        pal.setColor(QPalette.ColorRole.BrightText, fg)
+        pal.setColor(QPalette.ColorRole.Link, QColor(colors["accent"]))
+        pal.setColor(QPalette.ColorRole.LinkVisited, QColor(colors["accent"]))
+        # Disabled widgets are painted from their own group, which is NOT
+        # touched by the calls above: a greyed-out button kept Fusion's light
+        # default while everything around it went dark.
+        muted = QColor(colors.get("text_muted", colors["text"]))
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                     QPalette.ColorRole.ButtonText,
+                     QPalette.ColorRole.HighlightedText):
+            pal.setColor(QPalette.ColorGroup.Disabled, role, muted)
+        for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                     QPalette.ColorRole.Button):
+            pal.setColor(QPalette.ColorGroup.Disabled, role, bg)
         app.setPalette(pal)
         if overlay is not None:
             overlay.pump()

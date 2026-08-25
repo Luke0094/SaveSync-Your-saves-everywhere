@@ -86,6 +86,19 @@ class _AnimatedSplash(QWidget):
 
 # ── Fallback static pixmap (programmatic) ─────────────────────────────────────
 
+def _ui_family() -> str:
+    """The interface family, without importing ui.helpers at module load.
+
+    The splash is drawn before the rest of the UI exists, so this stays a
+    late import — a cycle here would cost the splash entirely.
+    """
+    try:
+        from ui.helpers import ui_font_family
+        return ui_font_family()
+    except Exception:
+        return "sans-serif"
+
+
 def _create_static_pixmap() -> QPixmap:
     """Load splash.png, or draw one in-memory as last-resort fallback."""
     path = _resolve_static_png()
@@ -109,15 +122,15 @@ def _create_static_pixmap() -> QPixmap:
     p.setPen(QPen(accent, 3))
     p.drawLine(0, 0, w, 0)
 
-    p.setFont(QFont("Segoe UI", 28, QFont.Bold))
+    p.setFont(QFont(_ui_family(), 28, QFont.Bold))
     p.setPen(QColor("#e8e8ea"))
     p.drawText(QRectF(0, h * 0.28, w, 50), Qt.AlignCenter, APP_NAME)
 
-    p.setFont(QFont("Segoe UI", 11))
+    p.setFont(QFont(_ui_family(), 11))
     p.setPen(accent)
     p.drawText(QRectF(0, h * 0.28 + 46, w, 24), Qt.AlignCenter, f"v{APP_VERSION}")
 
-    p.setFont(QFont("Segoe UI", 10))
+    p.setFont(QFont(_ui_family(), 10))
     p.setPen(QColor("#4a4a5a"))
     p.drawText(QRectF(0, h - 50, w, 30), Qt.AlignCenter, "Loading...")
 

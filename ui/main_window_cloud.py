@@ -217,7 +217,12 @@ class CloudFlowsMixin:
 
             paths: list[str] = []
             for oid, backs in by_oid.items():
-                newest = backs[0]
+                # The newest row that describes the ARCHIVE. backs[0] is
+                # simply the newest, and after a restore that is the safety
+                # copy of the destination — which carries no chains, so the
+                # destination would be rebuilt from whatever it happened to
+                # hold rather than from what the archive recorded.
+                newest = bm.newest_archive_row(backs) or backs[0]
                 for p in (newest.save_paths or []):
                     chain = (
                         newest.content_chain_for(p)

@@ -277,11 +277,61 @@ class _LnkAwareDialog(QFileDialog):
         self._hook_folder_context_menu()
         self._localize_labels()
 
+        self._size_to_screen()
+        self._stretch_columns()
+
         from PySide6.QtWidgets import QFileSystemModel
         model = self.findChild(QFileSystemModel)
         if model is not None:
             model.rootPathChanged.connect(self._redirect_lnk_directory)
             model.directoryLoaded.connect(lambda *_: self._localize_labels())
+
+    def _size_to_screen(self):
+        """Open at a size that fits the screen, not at Qt's fixed default.
+
+        QFileDialog's own default is a small fixed box measured in pixels,
+        which was reasonable when screens were 1024 wide. On anything
+        larger it opens as a stamp in the corner and every column in the
+        detail view is too narrow to read its own heading.
+        """
+        try:
+            from PySide6.QtWidgets import QApplication
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen is None:
+                return
+            avail = screen.availableGeometry()
+            width = max(720, min(1100, int(avail.width() * 0.55)))
+            height = max(460, min(760, int(avail.height() * 0.60)))
+            self.resize(width, height)
+        except Exception:
+            logger.debug("Could not size the picker to the screen",
+                         exc_info=True)
+
+    def _stretch_columns(self):
+        """Let the detail view's columns follow the dialog's width.
+
+        Qt sizes them once, from the contents at the moment the view is
+        built, and never again — so resizing the dialog left "Nome",
+        "Dimensione" and "Ultima modifica" clipped in place with empty
+        space beside them. Name takes the slack; the rest keep the width
+        their contents ask for.
+        """
+        try:
+            from PySide6.QtWidgets import QHeaderView, QTreeView
+            for view in self.findChildren(QTreeView):
+                header = view.header()
+                if header is None:
+                    continue
+                header.setStretchLastSection(False)
+                header.setSectionResizeMode(
+                    0, QHeaderView.ResizeMode.Stretch)
+                for column in range(1, header.count()):
+                    header.setSectionResizeMode(
+                        column, QHeaderView.ResizeMode.ResizeToContents)
+                header.setMinimumSectionSize(60)
+        except Exception:
+            logger.debug("Could not stretch the picker columns",
+                         exc_info=True)
 
     def eventFilter(self, watched, event):
         """Own the sidebar's context menu and block Delete on fixed places.
@@ -340,6 +390,25 @@ class _LnkAwareDialog(QFileDialog):
         pal.setColor(QPalette.ColorRole.ButtonText, fg)
         pal.setColor(QPalette.ColorRole.Highlight, QColor(accent))
         pal.setColor(QPalette.ColorRole.HighlightedText, QColor(accent_text))
+        # The roles the STYLE draws frames with, as opposed to the ones it
+        # fills with. Left at their light defaults, every ridge Fusion puts
+        # around the sidebar list, the file view and the splitter comes out
+        # pale — a grey lattice through a dark dialog. The stylesheet below
+        # cannot reach them: they are painted by QStyle, not by CSS.
+        frame = QColor(border)
+        pal.setColor(QPalette.ColorRole.Light, frame)
+        pal.setColor(QPalette.ColorRole.Midlight, frame)
+        pal.setColor(QPalette.ColorRole.Mid, frame)
+        pal.setColor(QPalette.ColorRole.Dark, bg)
+        pal.setColor(QPalette.ColorRole.Shadow, bg)
+        pal.setColor(QPalette.ColorRole.ToolTipBase, card)
+        pal.setColor(QPalette.ColorRole.ToolTipText, fg)
+        pal.setColor(QPalette.ColorRole.PlaceholderText,
+                     QColor(palette("text_muted")))
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                     QPalette.ColorRole.ButtonText):
+            pal.setColor(QPalette.ColorGroup.Disabled, role,
+                         QColor(palette("text_muted")))
         self.setPalette(pal)
         self.setAutoFillBackground(True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -515,8 +584,13 @@ class _LnkAwareDialog(QFileDialog):
     def _add_common_places(self):
         """Desktop and Home in the sidebar."""
         urls = list(self.sidebarUrls())
-        for location in (QStandardPaths.StandardLocation.DesktopLocation,
-                         QStandardPaths.StandardLocation.HomeLocation):
+        # Home first. Qt's own default sidebar already carries it on
+        # Windows, so only Desktop was ever appended there and the order
+        # read Computer / Home / Desktop. On Linux Qt supplies neither, both
+        # get appended, and the loop order became the visible order — the
+        # same dialog listing its places differently on the two systems.
+        for location in (QStandardPaths.StandardLocation.HomeLocation,
+                         QStandardPaths.StandardLocation.DesktopLocation):
             path = QStandardPaths.writableLocation(location)
             if path:
                 url = QUrl.fromLocalFile(path)

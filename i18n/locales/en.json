@@ -2,7 +2,8 @@
   "app": {
     "name": "SaveSync",
     "tagline": "Your saves, everywhere.",
-    "game_save_manager": "game save manager"
+    "game_save_manager": "game save manager",
+    "already_running": "SaveSync is already running.\nCheck the system tray."
   },
   "dates": {
     "jan": "Jan",
@@ -168,7 +169,8 @@
     "no_games_match_search_dev": "No developer matches your search.",
     "last_session": "Last session",
     "cover_zoom_in": "Zoom in",
-    "cover_zoom_out": "Zoom out"
+    "cover_zoom_out": "Zoom out",
+    "status_playing": "Playing"
   },
   "unknown_history": {
     "badge_tooltip": "Detected games pending — show the queue",
@@ -326,7 +328,10 @@
     "restore_fallback_warning": "Could not automatically find the save folder on this PC. Files were exported to:\n{path}\n\nOpen Edit Game and set the correct path manually, then restore again.",
     "select_restore_destination": "Select destination folder for restore",
     "restore_orphan_success": "Saves restored to selected folder: {path}",
-    "resumed_frozen_game": "A game left frozen by a previous run has been resumed."
+    "resumed_frozen_game": "A game left frozen by a previous run has been resumed.",
+    "restore_which_path": "Which folder should be restored?",
+    "restore_all_paths": "All folders",
+    "restore_source_missing": "not on this machine"
   },
   "settings": {
     "title": "Settings",
@@ -450,7 +455,8 @@
     "save_edit_copy_days_tooltip": "Copies older than this are removed. The newest is always kept, however old it is, so there is always something to undo with.",
     "diagnostics_running": "Running diagnostic checks...",
     "backup_archives_too": "Include archives in “back up everything” and “sync everything”",
-    "backup_archives_too_tooltip": "Archives are save folders you handed over without adding the game to the library. On, a sweep covers them like any game. Off, sweeps stay to the library and an archive is backed up by its own buttons or its scheduled re-check."
+    "backup_archives_too_tooltip": "Archives are save folders you handed over without adding the game to the library. On, a sweep covers them like any game. Off, sweeps stay to the library and an archive is backed up by its own buttons or its scheduled re-check.",
+    "export_error_io": "the file could not be written"
   },
   "config_transfer": {
     "preview_title": "Import Configuration Preview",
@@ -635,7 +641,9 @@
     "remove_image_tooltip": "Remove image from the list",
     "appid_placeholder": "Steam appid, or paste a launcher URL (battlenet://, epic://, etc.)",
     "remove_url_tooltip": "Remove URL",
-    "open_cache_folder": "Open the image cache folder"
+    "open_cache_folder": "Open the image cache folder",
+    "ignored_section_session": "Removed in this confirmation",
+    "ignored_section_saved": "Your save folders"
   },
   "auto_scan": {
     "window_title": "SaveSync - Auto Save Path Scan",
@@ -659,7 +667,12 @@
     "games_updated": "✅ {games} games updated with {paths} paths found",
     "background_paths_found": "✅ {count} paths found from background scan",
     "extended_scan_btn": "Extended Scan",
-    "registry_key_tooltip": "Registry key: its values are exported into the backup and restored on demand (Unity PlayerPrefs and similar)."
+    "registry_key_tooltip": "Registry key: its values are exported into the backup and restored on demand (Unity PlayerPrefs and similar).",
+    "previously_removed": "Previously removed by you — tick it to put it back",
+    "existing_paths_title": "📁  Your save folders",
+    "existing_path_excluded": "(skipped at backup)",
+    "removed_tag": "(removed)",
+    "removed_paths_count": "Removed paths: {count}"
   },
   "restore": {
     "window_title": "Restore — {game}",
@@ -676,7 +689,10 @@
     "backup_before_download_note": "pre-download backup",
     "online": "● Online",
     "offline": "● Offline",
-    "save_folder_detected": "📂 Save folder detected for {name} — open Library to scan and confirm"
+    "save_folder_detected": "📂 Save folder detected for {name} — open Library to scan and confirm",
+    "no_tray_title": "Close SaveSync",
+    "no_tray_body": "This desktop has no system tray, so there is nowhere for SaveSync to hide.\n\nMinimize it to the taskbar, or quit?",
+    "no_tray_quit": "Quit"
   },
   "file_list": {
     "show_files": "Show files",
@@ -696,8 +712,7 @@
   "notifications": {
     "backup_created": "Backup created for {game}",
     "backup_unchanged": "No changes detected for {game} — backup skipped",
-    "cooldown_active": "This operation has been temporarily disabled, please retry in {seconds}s",
-    "sync_no_changes": "No changes to synchronize"
+    "cooldown_active": "This operation has been temporarily disabled, please retry in {seconds}s"
   },
   "backups": {
     "game_running": "Game running",
@@ -722,7 +737,6 @@
     "verify_unchecked": "Not checked yet",
     "verify_click": "Click to check this backup",
     "verify_checked_at": "checked {when}",
-    "verify_all": "Check backups",
     "verify_all_tooltip": "Check backups: open every backup and confirm it is still readable and complete.",
     "verify_game_tooltip": "Check backups: open every backup of the selected game and confirm it is still readable and complete.",
     "backup_now_tooltip": "Run a backup now for the selected game, or for every game if none is selected.",
@@ -745,8 +759,6 @@
     "archive_paths_empty": "No paths yet — add the folder this archive's saves live in",
     "archive_paths_btn": "Your user paths…",
     "archive_auto_no_source": "This archive has no source folder recorded, so the scheduled re-check is off. Add the archive again to point it at a folder here.",
-    "archive_auto_last": "Last check: {when}",
-    "archive_auto_never": "Not checked yet",
     "archive_auto_minutes": "minutes"
   },
   "errors": {
@@ -832,7 +844,6 @@
     "please_wait": "Please wait…",
     "cancel_search": "Stop searching",
     "cancelling": "Stopping…",
-    "to_sidebar": "Minimize",
     "minimize": "Minimize",
     "open": "Open",
     "progress_label": "{label}  {done}/{total}",
@@ -984,7 +995,6 @@
   },
   "buttons": {
     "restore": "Restore",
-    "delete": "✕",
     "open_folder": "📂  Open Folder",
     "backup_now": "💾  Backup Now",
     "play": "▶  Play",
@@ -1031,18 +1041,14 @@
     "empty": "No folders yet. Use Add one or Add several.",
     "name_placeholder": "Game name",
     "path_placeholder": "Save path",
-    "include_tooltip": "Include this folder when saving",
     "remove_tooltip": "Remove this row",
-    "verdict_actual": "✓  Actual path: {path}",
     "verdict_actual_missing": "⚠  Actual path, but it does not exist yet: {path}",
     "verdict_dest_known": "✓  Destination: {path}",
     "verdict_dest_relative": "↪  Destination relative to the game: {chain}",
     "verdict_dest_here": "✓  The saves are in this folder",
-    "verdict_resolved": "✓  Found among known game locations: {path}",
     "verdict_predicted": "⚠  Destination relative to the game, not located on disk yet. It is registered and anchored on its own once the game turns up.",
     "save": "Save folders",
     "done": "Done",
-    "nothing_selected": "No rows selected.",
     "none_resolved": "No path resolved to an existing folder: fix the paths or use Browse.",
     "result_added": "{count} backups archived (not added to the library).",
     "result_updated": "{count} paths added to existing games.",
@@ -1051,7 +1057,6 @@
     "result_unresolved": "{count} unresolved and ignored: {names}",
     "reading": "Reading folders…",
     "reading_folder": "Reading {current}/{total} — {name}",
-    "inserting_folder": "Adding {current}/{total} — {name}",
     "storing": "Saving {current}/{total} — {name}",
     "cancelled": "Operation cancelled.",
     "cancelling": "Cancelling…",
@@ -1070,7 +1075,9 @@
     "same_name_never": "no source recorded",
     "same_name_update": "Same saves — update it",
     "same_name_separate": "Different game — keep both",
-    "same_name_all": "Answer the same for the rest"
+    "same_name_all": "Answer the same for the rest",
+    "all_known": "Every folder here is already saved ({count}).",
+    "found_with_known": "{count} of {total} folders — {known} already saved"
   },
   "batch": {
     "backup_label": "Backup",
@@ -1103,8 +1110,6 @@
     "all_known": "Found {count} games, but they are all in the library already.",
     "found": "{count} games found — check the name and path of each.",
     "found_with_known": "{total} games found — {known} already in the library, left out. Check the name and path of the remaining {count}.",
-    "skipped_known": "({count} already in the library, left out.)",
-    "include_tooltip": "Include this title",
     "remove_tooltip": "Remove this title",
     "name_placeholder": "Game name",
     "path_placeholder": "Executable path",
@@ -1133,7 +1138,6 @@
   "game_search": {
     "title": "Web search for titles",
     "running_hint": "Looking up each title in turn. SaveSync stays usable; progress is also in the sidebar. Minimise only if you want — the search keeps running and reopens from there.",
-    "nav": "Web search",
     "nav_tooltip_done": "Web search finished — click the sidebar bar to review.",
     "nav_tooltip_failed": "Web search cancelled — click the sidebar bar to review what completed.",
     "sidebar_tooltip_running": "Web search running — click to open details. Minimising does not stop it.",
@@ -1165,7 +1169,6 @@
     "save_filter": "Text files",
     "save_filter_image": "Images",
     "save_title": "Save the note",
-    "title": "Pinned",
     "unreadable": "This file could not be read.",
     "write_failed": "This file could not be written — use 💾 to keep the note somewhere else.",
     "unsaved_hint": "Not saved yet — use 💾 to choose where",
@@ -1257,14 +1260,8 @@
     "file_type": "Files of type:",
     "add_to_sidebar": "Add to sidebar",
     "remove_from_sidebar": "Remove from sidebar",
-    "all_files": "All Files",
-    "executables": "Executables",
-    "folders": "Folders",
-    "save_files": "Save files",
-    "folders_and_files": "Folders and files",
     "select": "Select",
     "save": "Save",
-    "open": "Open",
     "filter_all_files": "All Files (*.*)",
     "filter_folders": "Folders",
     "back": "Back",
@@ -1277,7 +1274,6 @@
     "delete": "Delete",
     "show_hidden": "Show hidden files",
     "cannot_remove_system_pin": "System locations cannot be removed",
-    "remove": "Remove",
     "col_name": "Name",
     "col_size": "Size",
     "col_type": "Type",
@@ -1285,8 +1281,6 @@
     "my_computer": "This PC",
     "user_home": "User folder",
     "desktop": "Desktop",
-    "documents": "Documents",
-    "downloads": "Downloads",
     "type_folder": "File folder",
     "type_app": "Application",
     "type_text": "Text Document",
@@ -1295,6 +1289,8 @@
     "type_image": "Image file",
     "type_audio": "Audio file",
     "type_video": "Video file",
-    "type_shortcut": "Shortcut"
+    "type_shortcut": "Shortcut",
+    "filter_executables": "Executables",
+    "filter_any_file": "All files"
   }
 }

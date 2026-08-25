@@ -59,12 +59,17 @@ class _ScanWorker(QThread):
         self._root = root
         self._max_depth = max_depth
         self._stop = False
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         from core.exe_scan import scan_folder_for_games
         try:
             hits = scan_folder_for_games(
@@ -239,12 +244,17 @@ class _StoreWorker(QThread):
         super().__init__(parent)
         self._pending = pending  # list[(name, exe)]
         self._stop = False
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         from core.library import GameEntry, get_library
         from core.machine import get_machine_id
         from core.constants import get_folder_name_for_save
@@ -595,16 +605,29 @@ class ExeScanDialog(WindowedListMixin, QDialog):
         self._sync_row_to_entry(row)
 
     def _wl_row_height(self) -> int:
+        """The TALLEST shape a row can take, measured once.
+
+        Same rule as the manual-path list, and for the same reason: every
+        row is clamped to this one number, so measuring an EMPTY probe
+        measured the shortest row there is. A candidate carries a name, a
+        path and a verdict line under them, and a row clamped shorter than
+        its own layout needs has its QLineEdits squeezed until they cannot
+        be clicked into — which is exactly the "some rows won't edit"
+        the bulk lists showed after a fast scroll.
+        """
         h = getattr(self, "_row_h", 0)
         if not h:
             from core.exe_scan import ScanHit
-            probe = _CandidateRow(ScanHit(folder="", exe_path="", name=""),
-                                  parent=self)
-            h = max(1, probe.sizeHint().height())
+            probe = _CandidateRow(
+                ScanHit(folder="C:/probe", exe_path="C:/probe/probe.exe",
+                        name="probe"),
+                parent=self)
+            h = max(probe.sizeHint().height(),
+                    probe.minimumSizeHint().height())
             probe.setParent(None)
             probe.deleteLater()
-            self._row_h = h
-        return h
+            self._row_h = max(1, h)
+        return self._row_h
 
     def _wl_make_row(self, key, entry):
         from core.exe_scan import ScanHit

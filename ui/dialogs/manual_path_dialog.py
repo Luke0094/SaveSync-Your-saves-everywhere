@@ -88,12 +88,17 @@ class _CollectionWorker(QThread):
         super().__init__(parent)
         self._root = root
         self._stop = False
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         try:
             found = scan_save_collection(
                 self._root,
@@ -195,10 +200,23 @@ class _ManualPathRow(QFrame):
         self._path_edit.setPlaceholderText(t("manual_path.path_placeholder"))
         self._path_edit.textEdited.connect(self._on_path_edited)
         self._path_edit.textChanged.connect(self._revalidate)
+        # Open the folder, next to the one that picks a different one.
+        # Reading a row is mostly deciding whether THIS is the right folder,
+        # and a path string is a poor way to answer that when the contents
+        # settle it in a glance. The path field carries the stretch, so it
+        # gives up exactly this button's width and nothing else moves.
+        self._open_btn = QPushButton("📂")
+        _ob = scaled(26, self, min_px=22)
+        self._open_btn.setFixedSize(_ob, _ob)
+        self._open_btn.setObjectName("auto_scan_icon_btn")
+        self._open_btn.setToolTip(t("add_game.open_folder"))
+        self._open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open_btn.clicked.connect(self._open_folder)
         browse = QPushButton(t("add_game.browse"))
         browse.setFixedWidth(scaled(80, self))
         browse.clicked.connect(self._browse)
         path_row.addWidget(self._path_edit, 1)
+        path_row.addWidget(self._open_btn)
         path_row.addWidget(browse)
         outer.addLayout(path_row)
 
@@ -278,6 +296,24 @@ class _ManualPathRow(QFrame):
     def chain(self) -> str:
         """The game-relative destination this row was read from, if any."""
         return self._chain
+
+    def _open_folder(self):
+        """Show this row's folder in the file manager.
+
+        Falls back to the nearest parent that exists rather than refusing:
+        a row can hold a path that is still being typed, or one predicted
+        for a game that is not installed here, and landing next to where it
+        WOULD be is more use than an error.
+        """
+        from ui.helpers import open_in_file_manager
+        raw = (self._path_edit.text() or "").strip().strip('"')
+        target = Path(raw) if raw else None
+        while target is not None and not target.exists():
+            parent = target.parent
+            target = None if parent == target else parent
+        if target is None:
+            return
+        open_in_file_manager(target)
 
     def _browse(self):
         from ui.widgets.file_pickers import pick_folder
@@ -414,6 +450,40 @@ def _archive_index(bm):
     return known_paths, orphan_owner, list(by_id.values())
 
 
+def drop_already_archived(found: list) -> tuple:
+    """Split collected folders into ``(new, already_archived)``.
+
+    The counterpart of core.exe_scan.drop_already_in_library, which is what
+    the bulk Add Game list uses so it never shows a game you already have.
+    This list had no equivalent: every folder in the collection was listed,
+    already-saved ones included, and the only thing that noticed was the
+    store — which quietly re-backed them up instead of adding a duplicate.
+    Correct, but invisible, so a long list gave the user no way to tell what
+    was actually new.
+
+    The same key the store deduplicates on (_store_key's destination label),
+    so what is hidden here is exactly what would have been folded in there.
+    """
+    try:
+        from core.backup import get_backup_manager
+        known_paths, _owner, _archives = _archive_index(get_backup_manager())
+    except Exception:
+        logger.debug("could not read the archive index", exc_info=True)
+        return list(found), []
+    if not known_paths:
+        return list(found), []
+    new, present = [], []
+    for c in found:
+        try:
+            _title, _chain, _recorded, path_key, _ident, _origin = _store_key(
+                c.name, c.item, c.chain, c.source, True)
+        except Exception:
+            new.append(c)
+            continue
+        (present if path_key in known_paths else new).append(c)
+    return new, present
+
+
 class _StoreWorker(QThread):
     """Match + mtime checks off the GUI thread for large batches."""
     progress = Signal(int, int, str)
@@ -433,12 +503,17 @@ class _StoreWorker(QThread):
         # two the user cannot undo afterwards, so it is never the default.
         self._decisions = dict(decisions or {})
         self._stop = False
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         from core.backup import get_backup_manager
 
         # Where every archive and every library game already lives. Which
@@ -525,7 +600,18 @@ class _StoreWorker(QThread):
                     # with nothing the user can do about it.
                     wrote_origin = False
                     try:
-                        wrote_origin = bm.add_orphan_sources(owner, [item.path])
+                        # The folder, and — separately — where its files go
+                        # back. The two are only the same when the user
+                        # handed over a live save folder; a copy on a shelf
+                        # rebuilds somewhere else entirely, and neither of
+                        # them is the archive's stripped title.
+                        wrote_origin = bm.add_orphan_sources(
+                            owner, [item.path],
+                            dest_map={item.path: {
+                                "path": recorded or item.path,
+                                "chain": chain or "",
+                                "content": chain or "",
+                            }})
                     except Exception:
                         logger.debug("could not record archive origin", exc_info=True)
                     try:
@@ -796,6 +882,22 @@ class ManualPathDialog(WindowedListMixin, QDialog):
             information_window_modal(self, t("manual_path.title"),
                                      t("manual_path.no_subfolders", path=root_label))
             return
+        # Folders already covered by an archive (or by a library game) are
+        # not news. Hidden rather than listed, exactly as the bulk Add Game
+        # list hides games already in the library — and counted, so "42
+        # folders, 13 already saved" is visible instead of 55 rows the user
+        # has to tell apart by eye.
+        found, already = drop_already_archived(found)
+        self._already_archived = len(already)
+        if already:
+            logger.info("Collection scan: %d folder(s) already archived",
+                        len(already))
+        if not found:
+            self._set_idle("")
+            information_window_modal(
+                self, t("manual_path.title"),
+                t("manual_path.all_known", count=len(already)))
+            return
         self._found_serialized = [self._serialize_collected(c) for c in found]
         # No chunk pump any more: only a page is built, and a page is small
         # enough to appear at once. What used to be inserted here folder by
@@ -808,7 +910,12 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         self._multi_btn.setEnabled(True)
         self._single_btn.setEnabled(True)
         self._save_btn.setEnabled(True)
-        msg = t("manual_path.multiple_added", count=len(found))
+        _known = getattr(self, "_already_archived", 0)
+        if _known:
+            msg = t("manual_path.found_with_known",
+                    total=len(found) + _known, known=_known, count=len(found))
+        else:
+            msg = t("manual_path.multiple_added", count=len(found))
         unresolved = sum(1 for c in found if not c.item.backupable)
         if unresolved:
             msg += "  " + t("manual_path.multiple_unresolved", count=unresolved)
@@ -924,6 +1031,7 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         self._wl_clear()
         self._clear_rows()
         self._found_serialized = []
+        self._already_archived = 0
         self._insert_index = 0
         self._collection_root = ""
         self._pending_for_store = []
@@ -935,21 +1043,20 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         """Empty the list. The holder goes with it — see _wl_render, which
         builds a new one rather than reusing this."""
         self._rows = []
-        old = self._scroll.takeWidget()
-        holder = QWidget()
+        holder = QWidget(self._scroll)
         holder.setObjectName("transparent_bg")
         from PySide6.QtWidgets import QVBoxLayout as _VBox
         layout = _VBox(holder)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        self._empty_lbl.setParent(None)
+        self._empty_lbl.setParent(holder)
         layout.addWidget(self._empty_lbl)
         self._empty_lbl.setVisible(True)
         layout.addStretch()
         self._rows_layout = layout
-        self._scroll.setWidget(holder)
-        if old is not None:
-            old.deleteLater()
+        # Never leaves the previous holder unparented — see swap_scroll_widget.
+        from ui.helpers import swap_scroll_widget
+        swap_scroll_widget(self._scroll, holder)
 
     # ── The windowed list (see ui.widgets.windowed_list) ────────────────────
 
@@ -981,11 +1088,19 @@ class ManualPathDialog(WindowedListMixin, QDialog):
             for kw in ({"name": "", "index": -1},
                        {"name": "x", "index": -1, "source": "x", "chain": "x"}):
                 probe = _ManualPathRow("x", parent=self, **kw)
-                h = max(h, probe.sizeHint().height())
+                # sizeHint alone can come back short for a widget that has
+                # never been laid out; minimumSizeHint is what the layout
+                # will actually refuse to go below, and a row clamped under
+                # THAT is a row whose QLineEdits get squeezed out of reach.
+                h = max(h, probe.sizeHint().height(),
+                        probe.minimumSizeHint().height())
                 probe.setParent(None)
                 probe.deleteLater()
             self._row_h = max(1, h)
-        return h
+        # self._row_h, not the local: they differ whenever the probes
+        # measured nothing (h == 0), and returning the 0 handed every row
+        # setFixedHeight(0) — built, counted, and invisible.
+        return self._row_h
 
     def _wl_make_row(self, key, entry):
         collected = self._deserialize_collected(entry)

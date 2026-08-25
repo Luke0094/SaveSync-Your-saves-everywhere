@@ -401,12 +401,17 @@ class _SaveLoadWorker(QThread):
         self._path = path
         self._game_dir = game_dir
         self._is_cancelled = False
-        self.setPriority(QThread.Priority.IdlePriority)
 
     def cancel(self):
         self._is_cancelled = True
 
     def run(self):
+        # Set from inside run(): setPriority only applies to a RUNNING
+        # thread. From __init__ it did nothing but log "Cannot set
+        # priority, thread is not running", so these scans never
+        # actually ran at idle priority — which is the one thing the
+        # call was there to do while a game has the CPU.
+        self.setPriority(QThread.Priority.IdlePriority)
         from time import monotonic
         start_mono = monotonic()
         last_emit = 0.0

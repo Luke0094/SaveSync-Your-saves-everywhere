@@ -8,6 +8,7 @@ Frameless always-on-top overlay.
 """
 import html
 import logging
+import os
 import platform
 import re
 from pathlib import Path
@@ -25,6 +26,20 @@ if platform.system() == "Windows":
     from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
+
+
+def _xwayland_session() -> bool:
+    """True when X clients here are bridged by a Wayland compositor.
+
+    Not "is Qt on the Wayland plugin" — this is about the X server on the
+    other end of the connection. SaveSync deliberately asks for xcb even in
+    a Wayland session (positioning and the global hotkey need it), so the
+    plugin says nothing about who manages the windows.
+    """
+    if platform.system() == "Windows":
+        return False
+    return bool(os.environ.get("WAYLAND_DISPLAY")
+                or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland")
 
 _AUTO_HIDE_MS  = 5000    # default timeout if user doesn't hover
 _FADE_IN_MS    = 200
@@ -103,11 +118,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._context_exe         = ""
         self._hide_anim_connected = False
         self._hover_active        = False   # True while mouse is inside overlay
-        self._pending_auto_hide   = 0       # ms to resume after mouse leaves
+        self._auto_hide_ms        = 0       # the countdown in force, in full
 
         self._auto_hide_timer = QTimer(self)
         self._auto_hide_timer.setSingleShot(True)
-        self._auto_hide_timer.timeout.connect(self.hide_animated)
+        self._auto_hide_timer.timeout.connect(self._auto_hide_due)
 
         # Timer to periodically re-assert topmost status for fullscreen games
         self._topmost_timer = QTimer(self)
@@ -162,16 +177,58 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # ── Window ────────────────────────────────────────────────────────────────
 
     def _setup_window(self):
-        self.setWindowFlags(
+        flags = (
             Qt.WindowType.FramelessWindowHint  |
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool                 |
-            Qt.WindowType.NoDropShadowWindowHint |
-            Qt.WindowType.WindowDoesNotAcceptFocus
+            Qt.WindowType.NoDropShadowWindowHint
         )
+        if platform.system() == "Windows":
+            # WS_EX_NOACTIVATE: the panel never takes keyboard focus from
+            # the game, and mouse input reaches it perfectly well.
+            #
+            # Not set elsewhere, and that is the point. X11 implements this
+            # by clearing the window's ICCCM input hint, which is a much
+            # stronger statement — a window that tells the manager it takes
+            # no input is one several managers then decline to route clicks
+            # to. The overlay is a dashboard with buttons on it. On X11 the
+            # WA_ShowWithoutActivating below already gives the half that
+            # matters: it appears without stealing focus.
+            flags |= Qt.WindowType.WindowDoesNotAcceptFocus
+        elif _xwayland_session():
+            # Under a Wayland compositor's X window manager, a client does
+            # not get to say where its windows go — placement belongs to
+            # the compositor, and the X bridge honours the protocol by
+            # ignoring the request. Measured on WSLg: the panel is mapped,
+            # viewable, correctly sized, and parked at -32768,-32768. Off
+            # screen, so the pointer never reaches it: no hover, no clicks,
+            # no way to close it, and an auto-hide that cannot see a cursor
+            # it is nowhere near.
+            #
+            # Override-redirect takes the window manager out of the loop
+            # entirely: the panel is placed exactly where it asks to be and
+            # nothing reparents or reframes it. That is what this flag is
+            # for, and the panel gives up nothing by using it — it is
+            # frameless, always on top, driven with the mouse, and asks for
+            # no keyboard focus in the first place.
+            #
+            # Only here. On a plain X11 desktop the window manager places
+            # the panel correctly (verified under Openbox: positioned top
+            # right, enter/move/press/release all delivered), and a managed
+            # window is the better neighbour.
+            flags |= Qt.WindowType.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus)  # Linux support
+        # WA_X11DoNotAcceptFocus is deliberately NOT set, despite the name
+        # reading like Linux support. WindowDoesNotAcceptFocus above already
+        # says "do not take keyboard focus" on every platform, and does it
+        # in the way that keeps the panel CLICKABLE — on Windows it becomes
+        # WS_EX_NOACTIVATE, which passes mouse input through perfectly well.
+        # The X11 attribute is the stronger statement: it clears the ICCCM
+        # input hint, and a window that tells the window manager it accepts
+        # no input at all is one several managers then decline to interact
+        # with. The overlay is a dashboard with buttons, not a toast.
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         # Explicit arrow so immersive games that set a NULL cursor still get
@@ -343,28 +400,109 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     # ── Mouse hover — pauses auto-hide timer ─────────────────────────────────
 
-    def enterEvent(self, event):
-        """Mouse entered overlay — pause auto-hide countdown.
+    def _make_clickable_off_windows(self):
+        """Take focus on X11 when there is no game to take it from.
 
-        Reads remainingTime() only when the timer is active, and clamps
-        the value to 0 in case a TOCTOU race causes the timer to fire
-        between isActive() and remainingTime() (which returns -1).
+        The pointer already reaches this panel — the cursor changes shape
+        over it — so the events arrive; what does not arrive is the CLICK.
+        Under a click-to-focus window manager the first press on a window
+        that is not the active one is swallowed to focus it, and a window
+        that never becomes active swallows every press, for ever. The panel
+        has buttons on it, so that makes it furniture.
+
+        Only where the trade does not cost anything. On Windows the panel
+        deliberately never activates: it is shown over a running game and
+        taking focus would minimise it. With no game running there is
+        nothing to take focus from, and being the active window is the
+        difference between a dashboard and a picture of one.
+        """
+        if platform.system() == "Windows":
+            return
+        if _xwayland_session():
+            # The bypass flag took the window manager out of the loop, so
+            # there is no activation to ask for and nothing that would
+            # grant it. Measured: press and release arrive on their own.
+            return
+        try:
+            if self._game_is_running():
+                return
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            logger.debug("Could not activate the overlay", exc_info=True)
+
+    def _auto_hide_due(self):
+        """The countdown ran out. Hide, unless the pointer is really on it.
+
+        Asked here rather than kept as a paused timer, and that is the
+        whole point. The old shape stopped the timer on enterEvent and
+        restarted it on leaveEvent — so a window that OPENS under the
+        pointer gets the enter, never gets the leave, and stays up for
+        ever. On Windows the overlay is placed in a screen corner away
+        from the cursor and this never showed; on a Wayland compositor,
+        which places the window where it likes, it happens on the first
+        notification and the overlay is then stuck open for the session.
+
+        Checking the cursor when the timer fires cannot wedge, even though
+        a hover now buys the whole countdown back rather than a 1.5 s
+        scrap: the timer always runs, the pointer is re-read every time it
+        fires, and the moment the pointer is elsewhere the next expiry
+        hides the panel. Nothing is ever paused indefinitely — the
+        countdown is restarted, and restarting it is a decision taken with
+        the cursor's real position in hand.
+        """
+        try:
+            from PySide6.QtGui import QCursor
+            # mapFromGlobal, not geometry().contains: geometry() is where
+            # this process ASKED to be, and a compositor that places the
+            # window itself leaves that number stale — the pointer then
+            # never counts as inside and the panel closes under the user's
+            # hand. mapFromGlobal asks the platform where the window really
+            # is. underMouse() is checked too, for the case where Qt has
+            # tracked the enter but the coordinates disagree.
+            inside = self.underMouse()
+            if not inside:
+                inside = self.rect().contains(
+                    self.mapFromGlobal(QCursor.pos()))
+            if self.isVisible() and inside:
+                self._hover_active = True
+                # The FULL countdown, not a 1.5 s stub. Granting a fixed
+                # scrap each time the timer expired meant the panel lived
+                # in 1.5 s instalments for as long as the pointer was on
+                # it — a countdown that never restarted and never quite
+                # ran out. Restarting it whole is what "the timer resets
+                # while you are reading it" means.
+                self._auto_hide_timer.start(self._auto_hide_ms or _AUTO_HIDE_MS)
+                return
+        except Exception:
+            pass
+        self._hover_active = False
+        self.hide_animated()
+
+    def enterEvent(self, event):
+        """Mouse entered the overlay — noted, but the countdown keeps running.
+
+        Stopping it here is what used to leave the overlay open for ever
+        when no matching leaveEvent arrived. _auto_hide_due re-checks the
+        pointer instead, which needs no leave event at all.
         """
         super().enterEvent(event)
-        if self._auto_hide_timer.isActive():
-            remaining = self._auto_hide_timer.remainingTime()
-            self._pending_auto_hide = max(remaining, 0)
-            self._auto_hide_timer.stop()
         self._hover_active = True
+        # The reset itself. Waiting for the countdown to expire before
+        # noticing the pointer leaves the panel closing under a hand that
+        # arrived a moment too late.
+        if self.isVisible() and self._auto_hide_ms > 0:
+            self._auto_hide_timer.start(self._auto_hide_ms)
 
     def leaveEvent(self, event):
-        """Mouse left overlay — resume auto-hide countdown."""
+        """Mouse left the overlay — the countdown, already running, runs out.
+
+        Nothing is restarted here. There is exactly one timer and one rule:
+        it is set when the panel appears, reset whenever the pointer
+        arrives, and otherwise left alone.
+        """
         super().leaveEvent(event)
         self._hover_active = False
-        remaining = self._pending_auto_hide
-        self._pending_auto_hide = 0
-        if remaining > 0:
-            self._auto_hide_timer.start(max(remaining, 1500))  # at least 1.5 s
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1013,8 +1151,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._auto_hide_timer.stop()
         menu = self._build_pin_menu()
         menu.exec(self._pin_btn.mapToGlobal(QPoint(0, self._pin_btn.height())))
-        if self._pending_auto_hide:
-            self._auto_hide_timer.start(self._pending_auto_hide)
+        # Reading a menu is not idling: the countdown starts again whole.
+        if self._auto_hide_ms > 0:
+            self._auto_hide_timer.start(self._auto_hide_ms)
 
     def _pin_capture(self) -> None:
         """Grab a piece of the screen and pin it.
@@ -1749,16 +1888,32 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._notif_index += 1
             self._render_current_notification(in_place=True)
 
-    def _clear_notification_queue(self) -> None:
+    def _clear_notification_queue(self, hide_carousel: bool = True) -> None:
         """Reset the queue. Called when user manually dismisses or a non-queued
-        show method is called (e.g. game detected, save done in-game)."""
+        show method is called (e.g. game detected, save done in-game).
+
+        *hide_carousel* exists for the one caller that is on its way out.
+        Hiding a child widget is instant; fading the window is not. Doing
+        both from hide_animated made the arrows and the counter blink out
+        of a panel that was still fully opaque, and only then did the rest
+        fade — the queue appearing to close before the overlay it lives in.
+        The data is dropped either way; only the widgets wait.
+        """
         self._notif_queue.clear()
         self._notif_meta.clear()
         self._notif_index = 0
         self._unknown_queue = None
-        self._carousel_prev.setVisible(False)
-        self._carousel_next.setVisible(False)
-        self._carousel_counter.setVisible(False)
+        if hide_carousel:
+            self._hide_carousel_controls()
+
+    def _hide_carousel_controls(self) -> None:
+        """Take down the browse arrows and the counter."""
+        for widget in (self._carousel_prev, self._carousel_next,
+                       self._carousel_counter):
+            try:
+                widget.setVisible(False)
+            except RuntimeError:
+                pass
 
     # ── Public notification helpers ───────────────────────────────────────────
 
@@ -1982,7 +2137,6 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 pass
             self._hide_anim_connected = False
         self._hover_active        = False
-        self._pending_auto_hide   = 0
         self.setWindowOpacity(0.0)
 
         # ── Capture current foreground ──────────────────────────────────────
@@ -1999,6 +2153,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self.show()
         self._take_the_front()
         self._ensure_visible_on_screen()
+        self._make_clickable_off_windows()
 
         if pointer and self._game_is_running():
             SystemCursor.reassert()
@@ -2028,6 +2183,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._anim.setEndValue(1.0)
         self._anim.start()
 
+        self._auto_hide_ms = max(0, int(auto_hide))
         if auto_hide > 0:
             self._auto_hide_timer.start(auto_hide)
 
@@ -2035,11 +2191,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._auto_hide_timer.stop()
         self._topmost_timer.stop()
         self._uninstall_foreground_hook()
-        self._pending_auto_hide = 0
+        self._auto_hide_ms = 0
         self._set_mode("")
         # When the user explicitly closes the overlay, reset the notification
         # queue so stale notifications don't reappear on the next show_animated.
-        self._clear_notification_queue()
+        # The arrows and the counter stay on screen until the fade is over —
+        # see _clear_notification_queue.
+        self._clear_notification_queue(hide_carousel=False)
         # Any priority prompt is now resolved/closed: drop the lock and replay
         # deferred notifications AFTER the fade-out (an inline replay would be
         # cancelled by the fade-out started below).
@@ -2293,6 +2451,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         except RuntimeError:
             pass   # already disconnected — harmless
         self.hide()
+        # Now that nothing is on screen, the queue's controls can go.
+        self._hide_carousel_controls()
 
     def _get_active_screen_geometry(self):
         """Get the available geometry of the screen where the active window / cursor is."""

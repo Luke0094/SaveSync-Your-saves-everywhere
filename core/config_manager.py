@@ -230,6 +230,70 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "backup_on_exit": lambda x: isinstance(x, bool),
     "backup_during_game": lambda x: isinstance(x, bool),
     "auto_backup": lambda x: isinstance(x, bool),
+
+    # ── Keys that had a default but no rule ──────────────────────────────
+    # _load() reverts a value to its default only when a rule REJECTS it,
+    # so a key with no rule was loaded exactly as the file spelled it —
+    # including a string where a list belongs, which then reaches the code
+    # that iterates it. Every rule below is a SHAPE check and nothing more:
+    # the point is that a corrupted or hand-edited file cannot get past the
+    # loader, not to second-guess a value the user legitimately holds.
+    "check_for_updates": lambda x: isinstance(x, bool),
+    # ISO datetime strings, kept as "" when never run. Not parsed here: an
+    # unparseable stamp makes its check run again, which is the safe way
+    # round, while rejecting it would reset a stamp that is merely odd.
+    "update_check_last": lambda x: isinstance(x, str),
+    "update_notified_version": lambda x: isinstance(x, str),
+    "backup_verify_last": lambda x: isinstance(x, str),
+    "auto_export_config_last": lambda x: isinstance(x, str),
+    # Seconds, with jitter; 0 means "work one out on the next check".
+    "update_check_interval_sec": lambda x: isinstance(x, (int, float)) and x >= 0,
+    "suppress_cloud_config_prompt": lambda x: isinstance(x, bool),
+    "last_cloud_config_hash": lambda x: x is None or isinstance(x, str),
+    "last_cloud_config_import": lambda x: x is None or isinstance(x, str),
+    # Library page. The sort criterion is open-ended on purpose — a new one
+    # added later must not reset every user's choice on upgrade — but the
+    # direction is a closed set of three.
+    "library_sort": lambda x: isinstance(x, str),
+    "library_sort_direction": lambda x: x in ("", "asc", "desc"),
+    "library_folders": lambda x: isinstance(x, list) and all(
+        isinstance(f, dict) and isinstance(f.get("name", ""), str)
+        for f in x),
+    # Path lists and hint lists: iterated as strings everywhere they are read.
+    "save_folder_hints": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "extra_watch_paths": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "ignored_processes": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "suppressed_overlay_apps": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "suppressed_cloud_no_local": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "auto_scan_confirmed_games": lambda x: isinstance(x, list),
+    # {game_id: [...]} maps. Only the outer shape and the value type are
+    # checked; the ids inside are the library's business.
+    "auto_scan_deselected_paths": lambda x: isinstance(x, dict) and all(
+        isinstance(v, list) for v in x.values()),
+    "auto_scan_deleted_paths": lambda x: isinstance(x, dict) and all(
+        isinstance(v, list) for v in x.values()),
+    "suppressed_ingame_notifs": lambda x: isinstance(x, dict),
+    "scan_auto_accept_games": lambda x: isinstance(x, dict),
+    "confirmed_process_matches": lambda x: isinstance(x, dict) and all(
+        isinstance(v, str) for v in x.values()),
+    "rejected_process_matches": lambda x: isinstance(x, dict) and all(
+        isinstance(v, list) for v in x.values()),
+    # Sync bookkeeping. sync_provider / provider_was_connected /
+    # sync_credentials are the pre-multi-provider shapes and are still
+    # migrated by _load, so they have to survive validation to be migrated.
+    "sync_providers": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "providers_connected": lambda x: isinstance(x, dict),
+    "provider_was_connected": lambda x: isinstance(x, bool),
+    "sync_provider": lambda x: x is None or isinstance(x, str),
+    "sync_credentials": lambda x: isinstance(x, dict),
+    "machine_id": lambda x: x is None or isinstance(x, str),
+    "schema_version": lambda x: isinstance(x, int) and x >= 1,
 }
 
 _MISSING = object()  # sentinel for get() default detection

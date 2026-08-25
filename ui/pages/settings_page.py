@@ -1938,8 +1938,12 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._saved_lbl.setText(t("settings.config_unchanged"))
             self._saved_lbl.setVisible(True)
         else:
-            warning_window_modal(self, t("settings.export_config"),
-                                t("settings.export_failed", error="I/O error"))
+            # The reason goes INTO a translated sentence, so it has to be
+            # translated too — "Esportazione fallita: I/O error" was half
+            # in each language.
+            warning_window_modal(
+                self, t("settings.export_config"),
+                t("settings.export_failed", error=t("settings.export_error_io")))
 
     def _on_import_config(self):
         from ui.widgets.file_pickers import pick_file

@@ -172,7 +172,6 @@ class ShelfCancelButton(QPushButton):
         super().__init__(t("common.cancel"), parent)
         self.setObjectName("shelf_cancel_btn")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(scaled(24, self))
         self.setStyleSheet(
             "QPushButton#shelf_cancel_btn {"
             " background: transparent; border: 1px solid %s;"
@@ -181,6 +180,22 @@ class ShelfCancelButton(QPushButton):
             "QPushButton#shelf_cancel_btn:hover { background: %s22; }"
             % (palette("error"), palette("error"), scaled(11, self),
                palette("error")))
+        # setFixedHeight(scaled(24)) came BEFORE this stylesheet and did not
+        # know about it. In Qt's box model a QSS `margin` is taken out of the
+        # widget's OWN height, so 2px top + 6px bottom + two 1px borders left
+        # `scaled(24) - 10` for the label — and at the scales this app
+        # actually runs at that is less than one line of an 11px font. The
+        # button drew its outline, took its clicks, and had nowhere to put
+        # the word: exactly "il reticolo c'è ma la scritta manca".
+        #
+        # minimumSizeHint() is the answer to "how tall does this have to be",
+        # and for a styled widget Qt computes it from this stylesheet —
+        # margin, border and font included — so it stays right on any screen
+        # and at any ui_scale. A MINIMUM, not a fixed size: the design 24 is
+        # honoured whenever it is big enough, and the text wins when it is not.
+        self.ensurePolished()
+        self.setMinimumHeight(max(int(scaled(24, self)),
+                                  self.minimumSizeHint().height()))
         self.hide()
         self._armed = False
         self._timer = QTimer(self)
@@ -366,6 +381,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         self._setup_ui()
         self._setup_tray()
+        # After the tray, because whether there IS one decides what
+        # closing the window means — and this is the way out when
+        # there is not. Installed on every platform: a standard
+        # shortcut costs nothing where a tray menu already offers it.
+        self._install_quit_shortcut()
         self._setup_blur_modal()
         self._setup_overlay()
         self._setup_monitors()
@@ -1090,6 +1110,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._wire_dpi_screens(app.screens())
         app.screenAdded.connect(self._on_screen_added)
         app.screenRemoved.connect(self._on_screen_removed)
+        # A graphics card deciding which monitor is primary — an AV receiver
+        # waking up and briefly taking the role before it hands back — moves
+        # no window and changes no DPI, so neither screenChanged nor the
+        # dots-per-inch signals fire. But the scale IS read from the primary
+        # screen's work area when there is no widget to ask, so the app was
+        # left sized for whichever monitor happened to answer first.
+        try:
+            app.primaryScreenChanged.connect(self._on_primary_screen_changed)
+        except Exception:
+            logger.debug("primaryScreenChanged unavailable", exc_info=True)
         wh = self.windowHandle()
         if wh is not None:
             wh.screenChanged.connect(self._on_host_screen_changed)
@@ -1107,10 +1137,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if id(s) in self._wired_screen_ids:
                 continue
             try:
+                # geometryChanged / availableGeometryChanged matter as much
+                # as the DPI ones and were missing: the UI scale comes from
+                # the work-area WIDTH (resolution_scale), so a monitor that
+                # changes resolution in place — 1280x720 while a receiver
+                # negotiates, then 4K — changes the scale without touching
+                # DPI, and nothing here noticed. The window kept the size it
+                # was given for the small mode while its contents were
+                # re-laid out for the big one.
                 for sig in ("logicalDotsPerInchChanged",
                             "physicalDotsPerInchChanged",
                             "physicalSizeChanged",
-                            "virtualGeometryChanged"):
+                            "virtualGeometryChanged",
+                            "geometryChanged",
+                            "availableGeometryChanged"):
                     if hasattr(s, sig):
                         getattr(s, sig).connect(self._on_screen_dpi_changed)
             except Exception:
@@ -1127,6 +1167,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_screen_dpi_changed(self, _value=None):
         logger.info("DPI change detected via Qt screen signals")
         self._ui_scale_reapply_timer.start()
+
+    def _on_primary_screen_changed(self, screen=None):
+        """The desktop's primary monitor changed under us.
+
+        Treated exactly like the window moving to another screen: re-apply
+        the scale, then re-fit the window once the monitors have stopped
+        renegotiating. Both are debounced, so a card that flips primary two
+        or three times while a receiver wakes up settles into one pass.
+        """
+        try:
+            name = screen.name() if screen is not None else "?"
+        except Exception:
+            name = "?"
+        logger.info("Primary screen changed to %s — re-applying UI scale", name)
+        self._on_host_screen_changed(screen)
 
     def _on_host_screen_changed(self, _screen=None):
         logger.info(f"Screen changed signal received, triggering DPI reapply")
@@ -1543,6 +1598,24 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     # ── Tray ──────────────────────────────────────────────────────────────────
 
     def _setup_tray(self):
+        """Build the tray icon — when the desktop actually has a tray.
+
+        Never asked before, because Windows always has one. Plenty of Linux
+        desktops do not: GNOME dropped the tray years ago and needs an
+        extension for it, and a bare Wayland compositor has none at all.
+        There, QSystemTrayIcon.show() succeeds and puts nothing anywhere —
+        and since closing the window hides it into that tray, the window
+        could not be brought back and the app could not be quit except by
+        killing the process. See closeEvent, which now asks the same
+        question.
+        """
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            logger.info("No system tray on this desktop — closing the "
+                        "window asks whether to minimise or quit, and Ctrl+Q "
+                        "quits (the tray menu is where Quit normally lives).")
+            return
+
         icon = QApplication.instance().windowIcon()
         if icon.isNull():
             # Fallback: load from assets directly
@@ -1614,7 +1687,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         try:
             self._save_window_state()
-            self.hide()
+            if self._tray is not None:
+                self.hide()
+            else:
+                # No tray to hide into: minimise instead, so the window is
+                # still reachable from the taskbar or dock while the game
+                # runs. Hiding it there would put SaveSync out of reach for
+                # the whole session.
+                self.showMinimized()
             self._hidden_for_game = True
         except RuntimeError:
             pass
@@ -1634,6 +1714,24 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             pass
         self._hidden_for_game = False
         self.show_and_raise()
+
+    def _install_quit_shortcut(self):
+        """Ctrl+Q quits, whether or not there is a tray to quit from.
+
+        The tray menu used to be the ONLY way out. On a desktop without a
+        tray — GNOME by default, a bare compositor, a kiosk — that left no
+        way to end the application at all once closing stopped meaning
+        quit. A standard shortcut costs nothing on the systems that do have
+        a tray and is the whole answer on the ones that do not.
+        """
+        try:
+            from PySide6.QtGui import QKeySequence, QShortcut
+            self._quit_shortcut = QShortcut(QKeySequence.StandardKey.Quit, self)
+            self._quit_shortcut.setContext(
+                Qt.ShortcutContext.ApplicationShortcut)
+            self._quit_shortcut.activated.connect(self._quit_app)
+        except Exception:
+            logger.debug("Could not install the quit shortcut", exc_info=True)
 
     def _quit_app(self):
         """Full application exit (tray 'Quit'). Since Qt 6.3 quit() first
@@ -1675,8 +1773,31 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._save_window_state()
 
         if config.get("minimize_to_tray", True):
-            event.ignore()
-            self.hide()
+            if self._tray is not None:
+                event.ignore()
+                self.hide()
+            else:
+                choice = self._ask_close_or_minimize()
+                if choice == "cancel":
+                    event.ignore()
+                    return
+                if choice == "quit":
+                    event.accept()
+                    self._really_quit = True
+                    QApplication.quit()
+                    return
+                event.ignore()
+                # showNormal FIRST, and that is not redundant. A window
+                # restored by the window manager rather than by us can leave
+                # Qt still believing it is minimised — it never saw the
+                # transition — and showMinimized() on a state Qt already
+                # holds is a no-op. That is why the second press of the
+                # close button did nothing at all: the first minimised,
+                # the manager restored, and Qt's idea of the state never
+                # came back. Clearing it first guarantees a transition.
+                if self.windowState() & Qt.WindowState.WindowMinimized:
+                    self.showNormal()
+                self.showMinimized()
             from ui.helpers import trim_process_memory
             trim_process_memory()
         else:
@@ -1685,6 +1806,90 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # closeEvent, which must keep accepting.
             self._really_quit = True
             QApplication.quit()
+
+    def _ask_close_or_minimize(self) -> str:
+        """Ask what the close button should mean when there is no tray.
+
+        "Closing minimises instead of quitting" is a kindness as long as
+        there is a tray to minimise TO: the icon is right there, one click
+        brings the window back, and Quit is in its menu. Without a tray the
+        same rule becomes a trap — the window goes to the taskbar, comes
+        back, goes again, and no amount of pressing the close button ever
+        ends the application. The only way out is a keyboard shortcut
+        nobody has been told about.
+
+        So where the setting cannot be honoured as written, the choice goes
+        back to the person making it, every time, rather than being decided
+        for them. Turning minimize-to-tray OFF still closes immediately and
+        silently: someone who has said "closing means quitting" is not
+        asked to confirm it twice.
+
+        Returns "minimize", "quit" or "cancel".
+        """
+        if getattr(self, "_close_prompt_open", False):
+            return "cancel"
+        from PySide6.QtWidgets import QMessageBox
+        self._close_prompt_open = True
+        try:
+            box = QMessageBox(self)
+            box.setWindowModality(Qt.WindowModality.WindowModal)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle(t("main.no_tray_title"))
+            box.setText(t("main.no_tray_body"))
+            keep = box.addButton(t("common.minimize"),
+                                 QMessageBox.ButtonRole.AcceptRole)
+            leave = box.addButton(t("main.no_tray_quit"),
+                                  QMessageBox.ButtonRole.DestructiveRole)
+            stay = box.addButton(t("common.cancel"),
+                                 QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(keep)
+            box.setEscapeButton(stay)
+            # Qt puts a message box where the window manager likes, which on
+            # a large desktop is nowhere in particular. Centre it on the
+            # screen the window is on — the same place the window itself
+            # opens, so the question appears where the eye already is.
+            #
+            # show(), hide(), place, exec — and each of those four is load
+            # bearing.
+            #
+            # A QMessageBox will not say how big it is until it is shown:
+            # it recomputes the whole layout in showEvent. Measured here,
+            # sizeHint said 889x167 and the box that appeared was 500x223,
+            # so anything centred on the hint is centred on a fiction.
+            #
+            # And the position has to be the one it is FIRST MAPPED at. A
+            # move afterwards is a request the window manager answers as it
+            # sees fit — a Wayland compositor's X bridge answers it by
+            # sliding the window inside a frame it added, moving the
+            # contents rather than the window.
+            #
+            # show() runs showEvent synchronously, so the size is settled;
+            # hide() before the event loop turns means the window is never
+            # actually mapped, so there is no flash to see; exec() then maps
+            # it once, where it was put.
+            try:
+                box.show()
+                box.hide()
+                screen = self.screen() or QApplication.primaryScreen()
+                if screen is not None:
+                    frame = box.frameGeometry()
+                    frame.moveCenter(screen.availableGeometry().center())
+                    box.move(frame.topLeft())
+            except Exception:
+                logger.debug("Could not centre the close prompt", exc_info=True)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is leave:
+                return "quit"
+            if clicked is stay:
+                return "cancel"
+            return "minimize"
+        except Exception:
+            # Whatever went wrong, do the reversible thing.
+            logger.debug("Could not ask about closing", exc_info=True)
+            return "minimize"
+        finally:
+            self._close_prompt_open = False
 
     def _save_window_state(self):
         """Persist current window geometry and maximised state to config.
@@ -1695,6 +1900,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         config = get_config()
         is_max = bool(self.windowState() & Qt.WindowState.WindowMaximized)
         config.set("window_maximized", is_max)
+        # x and y are still recorded, and nothing reads them any more: the
+        # window opens centred (see _restore_window_state). They are kept
+        # because they cost a line, they say where the window was when the
+        # config was written, and dropping the keys would change the shape
+        # of a validated setting for no gain.
 
         # normalGeometry() returns the pre-maximise size even when maximised,
         # so we can always store it without an oversized window on next launch.
@@ -1703,18 +1913,35 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except Exception:
             geo = self.geometry()
 
+        # The scale the size was written AT. Without it the number is
+        # meaningless on any other screen: every font, padding and control
+        # inside the window is multiplied by ui_scale, so a window saved at
+        # 0.85 and reopened at 1.5 holds contents half again as big as the
+        # frame it was sized for. scale_all_top_level_windows already does
+        # this correction for a scale change while running; restoring from
+        # disk is the same change, spread over a restart.
+        try:
+            from ui.helpers import ui_scale as _ui_scale
+            _scale = round(float(_ui_scale(self)), 4)
+        except Exception:
+            _scale = 0.0
         config.set("window_geometry", {
             "x": geo.x(), "y": geo.y(),
             "w": geo.width(), "h": geo.height(),
+            "scale": _scale,
         })
         # Force immediate disk write — debounced write timer may not fire before exit
         config.save()
 
     def _restore_window_state(self):
-        """Restore window geometry from config, falling back to defaults.
-        
-        Also performs emergency safety check: if saved geometry is unusable
-        (window too large for screen or completely off-screen), resets to safe scale.
+        """Restore the saved window SIZE, centred on the screen.
+
+        Size, maximised state and UI scale come back from config; the
+        position does not — the window is centred every time it opens. See
+        the centring block below for why.
+
+        Also performs emergency safety check: if the saved size is unusable
+        (larger than the work area) it is clamped, per dimension.
         """
         config = get_config()
         geo = config.get("window_geometry", None)
@@ -1731,39 +1958,73 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 w = max(200, int(geo.get("w", 1100)))
                 h = max(200, int(geo.get("h", 720)))
 
-                # Emergency safety check: if window is too large for screen
+                # Bring the saved SIZE to the scale in force now. The
+                # position is not restored at all — the window is centred
+                # below.
+                try:
+                    from ui.helpers import ui_scale as _ui_scale
+                    saved_scale = float(geo.get("scale") or 0.0)
+                    now_scale = float(_ui_scale(self))
+                    if saved_scale > 0 and now_scale > 0 and abs(
+                            now_scale - saved_scale) > 0.02:
+                        factor = now_scale / saved_scale
+                        w = max(200, int(round(w * factor)))
+                        h = max(200, int(round(h * factor)))
+                        logger.info(
+                            "Window size rescaled %.2f->%.2f (x%.3f) -> %dx%d",
+                            saved_scale, now_scale, factor, w, h)
+                except Exception:
+                    logger.debug("Could not rescale the saved window size",
+                                 exc_info=True)
+
+                # Emergency safety check: does the saved window still FIT?
                 if available:
                     screen_w = available.width()
                     screen_h = available.height()
-                    if w > screen_w * 0.9 or h > screen_h * 0.9:
-                        # Emergency reset: window too large, clamp to a safe
-                        # size. This used to ALSO disable auto-scale
-                        # (ui_scale_auto=False + factor 1.0) — but the saved
-                        # geometry can be oversized for a totally benign
-                        # reason (a monitor swap since the last run), and
-                        # silently turning the user's auto-scale off on every
-                        # such boot is what made "auto scale randomly
-                        # disabled" reports: the scale itself is fine, only
-                        # the saved window no longer fits this screen.
+                    # "Beyond the limits" means it does not fit — not that it
+                    # is merely large. The test used to be 90% of the work
+                    # area in either dimension, which fires on windows that
+                    # fit perfectly well: a 768x1026 window on a 1920x1080
+                    # desktop is 95% of the height and entirely usable, and
+                    # it was reset on every launch.
+                    if w > screen_w or h > screen_h:
                         logger.warning(
-                            f"Emergency: Saved window size ({w}x{h}) too large for screen "
-                            f"({screen_w}x{screen_h}). Clamping to safe size."
+                            f"Emergency: saved window size ({w}x{h}) does not fit "
+                            f"the work area ({screen_w}x{screen_h}). Clamping."
                         )
-                        # Use safe default geometry
-                        w = min(1100, int(screen_w * 0.8))
-                        h = min(720, int(screen_h * 0.8))
-                        x = available.x() + (screen_w - w) // 2
-                        y = available.y() + (screen_h - h) // 2
+                        # Clamp each dimension to what the screen allows,
+                        # rather than substituting a default shape. The old
+                        # code replaced the geometry with 1100x720, so a
+                        # deliberately tall narrow window came back wide and
+                        # short with nothing to undo it — the size the user
+                        # had chosen was simply gone. Clamping keeps it
+                        # recognisably theirs, and only in the dimension that
+                        # actually overflowed.
+                        #
+                        # This does NOT touch auto-scale: the saved geometry
+                        # can overflow for a benign reason (a monitor swap
+                        # since the last run), and silently turning the
+                        # user's auto-scale off on such a boot is what
+                        # produced the "auto scale randomly disabled"
+                        # reports.
+                        w = min(w, screen_w)
+                        h = min(h, screen_h)
 
                         # Show emergency toast after window is shown
                         from PySide6.QtCore import QTimer
                         QTimer.singleShot(100, self._show_dpi_emergency_toast)
-                    else:
-                        # Clamp position so window stays on-screen. When the
-                        # saved size fits the screen (≤90%), clamping x/y is
-                        # safe in both dimensions.
-                        x = max(available.x(), min(x, available.right() - w))
-                        y = max(available.y(), min(y, available.bottom() - h))
+
+                    # The window opens in the middle of the screen, at
+                    # whatever size was saved. A remembered POSITION is worth
+                    # less than it looks: the desk it was saved on may have
+                    # had another monitor, the resolution may have changed,
+                    # and a compositor that places windows itself ignores the
+                    # request anyway — so the same config produced a window
+                    # in a different place on every machine. The centre is
+                    # somewhere the window is always fully on screen and
+                    # always where it was last time.
+                    x = available.x() + max(0, (available.width() - w) // 2)
+                    y = available.y() + max(0, (available.height() - h) // 2)
 
                 self.setGeometry(x, y, w, h)
             except Exception:
@@ -2688,6 +2949,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # monitor starts tracking (no window where a sync could fire without it).
         entry.pending_local_wins = force_local_wins
 
+        # The user is playing this game right now — that is the only reason
+        # the overlay is on screen offering to add it. Stamped BEFORE
+        # add_game so the very first write to disk already carries it:
+        # afterwards the answer depended on the monitor late-matching the
+        # running process, and when that did not happen the game sat in the
+        # library reading "never played" while it was on screen.
+        entry.mark_played()
+
         # Add to library
         get_library().add_game(entry)
 
@@ -2838,7 +3107,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # overlay once the hide has started.
                 self._overlay.hide_animated()
                 self._overlay._auto_hide_timer.stop()
-                self._overlay._pending_auto_hide = 0
+                self._overlay._auto_hide_ms = 0
                 QTimer.singleShot(150, lambda: self._show_manual_forced())
                 return
         
@@ -2922,7 +3191,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overlay.setWindowOpacity(0.0)
         # Ensure timer is reset before showing
         self._overlay._auto_hide_timer.stop()
-        self._overlay._pending_auto_hide = 0
+        self._overlay._auto_hide_ms = 0
         self._overlay.show_manual(stats)
 
     def _update_hotkey(self, old: str, new: str):
@@ -3186,9 +3455,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         seconds_per_day = 86400
         min_seconds = frequency_days * seconds_per_day
         
-        if current_time - last_check < min_seconds:
-            days_until_next = (min_seconds - (current_time - last_check)) // seconds_per_day
-            logger.info(f"Self-checks already run recently, next check in {days_until_next} days")
+        elapsed = current_time - last_check
+        if last_check and elapsed < 0:
+            # The clock moved back (a timezone fix, an NTP correction, a
+            # restored image). A stamp in the future would otherwise hold
+            # the checks off until real time caught up with it.
+            logger.info("Last self-check is in the future — running now")
+            elapsed = min_seconds
+        if elapsed < min_seconds:
+            remaining = min_seconds - elapsed
+            # Whole days truncate to "0 days" for anything under 24 hours,
+            # which reads as "due now" on a line that is explaining why
+            # nothing ran. Report the unit that actually has a number in it.
+            if remaining >= seconds_per_day:
+                due_in = f"{remaining // seconds_per_day}d"
+            elif remaining >= 3600:
+                due_in = f"{remaining // 3600}h"
+            else:
+                due_in = f"{max(1, remaining // 60)}m"
+            logger.info("Self-checks not due yet — next run in %s "
+                        "(every %d day(s))", due_in, frequency_days)
             return
             
         # Run the checks and update last check time. Same list the Backups
@@ -3778,27 +4064,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 logger.info(f"Live tracking disabled in settings — stopping for {game_id}")
                 _stop()
                 return
-            # Stop polling once game exits
-            playing_ids = {e.id for e in get_monitor().currently_playing()}
-            if game_id not in playing_ids:
+            # Stop polling once game exits. is_playing compares ids under
+            # the monitor's lock; currently_playing() deep-copied every
+            # tracked GameEntry to build a list this line immediately
+            # reduced back to a set of ids — on the GUI thread, once a
+            # minute, for the whole session.
+            if not get_monitor().is_playing(game_id):
                 _stop()
-                return
-
-            # Find current PID for this game.
-            # Prefer find_game_process (handles launcher→child scenarios)
-            # to reach the real game process that has save files open.
-            _monitor = get_monitor()
-            pid = _monitor.find_game_process(game_id, entry.exe_path or "")
-
-            if not pid:
-                # Fallback: tracked snapshot (bridge exe still running)
-                tracked = _monitor.get_tracked_snapshot()
-                for key, te in tracked.items():
-                    if te and te.id == game_id:
-                        pid = key[0]
-                        break
-
-            if not pid:
                 return
 
             import threading
@@ -3809,6 +4081,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
             def _scan():
                 try:
+                    # Finding the pid belongs HERE, not on the GUI thread.
+                    # find_game_process falls back to walking the process
+                    # table and resolving executables when the game is not
+                    # matched by id — the same work the monitor's own poll is
+                    # deliberately slowed down for during a session, because
+                    # that CPU belongs to the game. Running it on the GUI
+                    # thread is a stall the user feels while typing.
+                    _monitor = get_monitor()
+                    pid = _monitor.find_game_process(game_id, exe_path or "")
+                    if not pid:
+                        # Fallback: a bridge exe still running under this id.
+                        pid = _monitor.tracked_pid_for(game_id)
+                    if not pid:
+                        return
+
                     from core.save_detector import detect_save_paths
                     # Known paths feed the temporal-correlation stage: a
                     # container folder written in the same instant as one of
@@ -5196,7 +5483,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _pump_backup_queue(self):
         from core.concurrency import backup_max_inflight
-        cap = self._backup_max_inflight or backup_max_inflight()
+        # Asked again on every pass, not read from what the batch started
+        # with. A sweep over hundreds of games outlives the conditions it
+        # began in — a game launched halfway through, memory filling up —
+        # and `self._backup_max_inflight or ...` pinned the ceiling to the
+        # machine as it looked at the first job. The helper caches its own
+        # inputs, so this costs a dict lookup most of the time.
+        cap = backup_max_inflight()
+        self._backup_max_inflight = cap
         while True:
             with self._backup_lock:
                 if len(self._backup_inflight) >= cap:
@@ -5277,6 +5571,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         game_id = job["game_id"]
         mgr = get_backup_manager()
         if not mgr.has_local_entries(game_id):
+            # Nothing on this machine to re-read — an archive listed off the
+            # provider is the usual case. The job still has to END the way
+            # every other one does: "back up, then sync" is what the Backups
+            # page asks for under a provider filter, and returning here left
+            # that request stranded in the pending set, to fire unasked after
+            # some later, unrelated backup of the same archive.
+            if not job.get("batch"):
+                self._sync_after_backup_if_asked(game_id)
             self._finish_backup_job(game_id, batch=job.get("batch", False))
             return
         if self._backup_batch and job.get("batch"):
@@ -5697,6 +5999,47 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         )
         dlg.exec()
 
+    def _ask_which_archive_root(self, roots: list):
+        """Which of an archive's folders to restore.
+
+        ``None`` for all of them, ``False`` when the user walked away, and
+        otherwise the chosen record. A popup rather than a dialog because
+        this is the same question the library's save-folder dropdown asks —
+        short label, full path on hover — and it is asked from a button.
+        """
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui import QCursor
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        header = menu.addAction(t("backup.restore_which_path"))
+        header.setEnabled(False)
+        menu.addSeparator()
+        act_all = menu.addAction(t("backup.restore_all_paths"))
+        menu.addSeparator()
+        by_action = {}
+        for rec in roots:
+            src = rec.get("source") or ""
+            if src:
+                parts = Path(src).parts
+                label = str(Path(*parts[-2:])) if len(parts) >= 2 else src
+            else:
+                label = rec.get("root") or "?"
+            action = menu.addAction(f"📂  {label}")
+            # The full source path, and whether it is here — restoring into
+            # a folder that is gone is a different decision from restoring
+            # into one that is not.
+            tip = src or rec.get("root") or ""
+            if src and not rec.get("exists"):
+                tip = f"{tip}  —  {t('backup.restore_source_missing')}"
+            action.setToolTip(tip)
+            by_action[action] = rec
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return False
+        if chosen is act_all:
+            return None
+        return by_action.get(chosen)
+
     def _restore_game_by_id(self, game_id: str, backup_id: str, confirmed: bool = False):
         """Restore backup_id for game_id.  If confirmed=False, ask the user first.
         For orphan backups (no game in library), prompts user with custom file picker."""
@@ -5705,17 +6048,37 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         target_dir = ""
         is_orphan = lib_entry is None or not bk or not bk.save_paths
 
+        only_roots = None
         if is_orphan:
             # Archive with no library game: ask where to put it. Library
             # restores are untouched — they still resolve their own absolute
             # or relative save paths as always.
             from ui.widgets.file_pickers import pick_folder
+            # An archive holds one folder per source, and ONE chosen
+            # destination answers for one of them. With more than one, ask
+            # which — the same question the library's save-folder dropdown
+            # asks, in the same shape.
+            roots = get_backup_manager().archive_roots(bk) if bk else []
+            picked = None
+            if len(roots) > 1:
+                picked = self._ask_which_archive_root(roots)
+                if picked is False:
+                    return
+                if picked is not None:
+                    only_roots = {picked["root"]}
             # Open ON the folder the archive was made from, when that folder
             # is still there. Restoring an archive almost always means putting
             # it back where it came from, and without this the picker started
             # at the drive root and the user re-navigated every single time.
+            # Follow the CHOSEN folder when there was a choice: opening on
+            # some other source would be an invitation to put it in the
+            # wrong place.
             start_dir = ""
-            if bk is not None:
+            for _r in ([picked] if picked else roots):
+                if _r.get("exists"):
+                    start_dir = _r["source"]
+                    break
+            if not start_dir and bk is not None and picked is None:
                 for _src in get_backup_manager().orphan_source_paths(bk):
                     if _src and Path(_src).is_dir():
                         start_dir = _src
@@ -5752,7 +6115,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         import threading
 
         def _do_restore():
-            result = get_backup_manager().restore_backup(backup_id, target_dir=target_dir)
+            result = get_backup_manager().restore_backup(
+                backup_id, target_dir=target_dir, only_roots=only_roots)
             # Remember what WE put there: landing on that exact state is
             # the intended outcome, and must not read as a regression.
             self._last_restored[game_id] = backup_id

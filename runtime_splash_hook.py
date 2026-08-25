@@ -13,12 +13,20 @@ import json
 
 
 def _close_splash():
-    """Close the bootloader splash if still alive."""
+    """Close the bootloader splash if still alive.
+
+    Every exception, not just ImportError. PyInstaller's pyi_splash module
+    IMPORTS fine in a frozen build that has no splash configured and then
+    raises KeyError('_PYI_SPLASH_IPC') at module level — so a build without
+    one printed a traceback to stderr on every single launch. That is the
+    Linux build, where the bootloader splash is not always available, and
+    the message says nothing a user can act on.
+    """
     try:
         import pyi_splash
         if pyi_splash.is_alive():
             pyi_splash.close()
-    except ImportError:
+    except Exception:
         pass
 
 

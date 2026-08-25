@@ -5,6 +5,7 @@ Handles resolution of launcher shortcuts (steam://, epic://, etc.) to executable
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -33,11 +34,17 @@ _IS_LINUX = not _IS_WINDOWS and not _IS_MACOS
 # folder is a game install — that is what is_program_binary is for, and it is
 # host-independent by design.
 _EXEC_SUFFIXES_WINDOWS = ('.exe', '.bat', '.cmd')
-_EXEC_SUFFIXES_LINUX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin')
+# .exe is on the LINUX list, and that is not a leftover: launch_executable
+# runs a Windows game through Proton or Wine here, so one is something this
+# machine can genuinely start — and a picker that filtered it out hid every
+# game in a Wine prefix from the one dialog meant for finding games.
+_EXEC_SUFFIXES_LINUX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin',
+                        '.exe')
 # macOS: .app is the bundle (a directory), .command is Finder's double-
 # clickable shell script. AppImage/.x86_64/.run are Linux packaging formats
 # and never appear here.
-_EXEC_SUFFIXES_MACOS = ('.app', '.command', '.sh')
+# Same reasoning as Linux: CrossOver and Wine run Windows games on macOS.
+_EXEC_SUFFIXES_MACOS = ('.app', '.command', '.sh', '.exe')
 _SHORTCUT_SUFFIXES_WINDOWS = ('.lnk', '.url')
 _SHORTCUT_SUFFIXES_LINUX = ('.desktop',)
 # macOS aliases are extension-less Finder metadata, not a file format this
@@ -81,8 +88,10 @@ def is_executable_file(path) -> bool:
     .bin files are assets/data. Offering any of them produced a library
     entry whose ▶ Play could only ever fail.
 
-    On Linux: extension-less files carrying the exec bit — the usual shape of
-    a game binary — plus .sh/.AppImage/.x86_64/.x86/.run/.bin.
+    On Linux: extension-less files carrying the exec bit — the usual shape
+    of a game binary — plus .sh/.AppImage/.x86_64/.x86/.run/.bin, and .exe.
+    A .exe has no exec bit and never will: it is answered on its extension
+    alone, because what starts it is Wine or Proton and not the kernel.
 
     On macOS: .app bundles (directories), .command/.sh scripts, and
     extension-less exec-bit binaries.
@@ -200,12 +209,36 @@ def is_addable_file(path) -> bool:
     return is_executable_file(path) or is_shortcut_file(path)
 
 
-def executable_name_filter(all_files_label: str = "All Files") -> str:
-    """QFileDialog name filter for picking a game executable."""
+def executable_name_filter(all_files_label: str = "") -> str:
+    """QFileDialog name filter for picking a game executable.
+
+    Both labels are translated, and neither used to be: a picker in Italian
+    still offered "Executables" and "All Files". The default is filled from
+    i18n rather than from an English literal, so a caller that passes
+    nothing gets the user's language instead of the author's.
+
+    The ORDER differs by platform on purpose. On Windows a game is a .exe
+    and the extension filter is the useful default. Everywhere else a
+    native binary usually has no extension at all — filtering by suffix
+    would hide exactly what the user came to pick — so "all files" leads
+    and the suffix list stays available for the Windows games run through
+    Wine or Proton.
+    """
     patterns = " ".join(f"*{s}" for s in executable_suffixes() + shortcut_suffixes())
+    if not all_files_label:
+        try:
+            from i18n import t
+            all_files_label = t("file_picker.filter_any_file")
+        except Exception:
+            all_files_label = "All files"
+    try:
+        from i18n import t
+        exe_label = t("file_picker.filter_executables")
+    except Exception:
+        exe_label = "Executables"
     if _IS_WINDOWS:
-        return f"Executables ({patterns});;{all_files_label} (*)"
-    return f"{all_files_label} (*);;Executables ({patterns})"
+        return f"{exe_label} ({patterns});;{all_files_label} (*)"
+    return f"{all_files_label} (*);;{exe_label} ({patterns})"
 
 
 def fuzzy_slug(s: str) -> str:
@@ -808,7 +841,113 @@ def launch_executable(exe_path: str) -> None:
     if _IS_MACOS and Path(exe_path).suffix.lower() == _MACOS_BUNDLE_SUFFIX:
         subprocess.Popen(["open", exe_path])
         return
+    # A .exe is not something this kernel can run. Off Windows it goes
+    # through Wine or Proton, in the prefix it belongs to.
+    if Path(exe_path).suffix.lower() == ".exe":
+        command, env = windows_runner_command(exe_path)
+        if command:
+            logger.info("Launching %s through %s", Path(exe_path).name,
+                        Path(command[0]).name)
+            subprocess.Popen(command, env=env,
+                             cwd=str(Path(exe_path).parent))
+            return
+        raise RuntimeError(
+            "This is a Windows executable and there is no Wine or Proton "
+            "on this system to run it with. Install wine, or launch the "
+            "game through Steam so its own Proton is used."
+        )
     subprocess.Popen([exe_path])
+
+
+def wine_prefix_for(exe_path) -> str:
+    """The Wine/Proton prefix *exe_path* lives inside, or "".
+
+    A prefix is recognised by its shape — a ``drive_c`` directory with the
+    executable somewhere beneath it — rather than by a list of known
+    layouts, because Steam, Lutris, Bottles and Heroic all arrange theirs
+    differently and a game moved by hand belongs to none of them.
+
+    It matters far more than it looks: run with the wrong prefix, a game
+    finds none of its registry, none of its runtime, and — the part that
+    concerns SaveSync — writes its saves somewhere new.
+    """
+    try:
+        current = Path(exe_path).resolve()
+    except (OSError, ValueError):
+        return ""
+    for parent in current.parents:
+        if parent.name == "drive_c":
+            return str(parent.parent)
+    return ""
+
+
+def _proton_for_prefix(prefix: str) -> str:
+    """The Proton build serving *prefix*, or "".
+
+    A Proton prefix sits at ``<library>/steamapps/compatdata/<appid>/pfx``,
+    and the runtime that made it is a normal Steam app in the same tree.
+    Newest wins: Proton is backwards compatible and a game that ran under
+    an older build runs under a newer one.
+    """
+    p = Path(prefix)
+    if p.name != "pfx" or "compatdata" not in p.parts:
+        return ""
+    try:
+        steamapps = p.parents[list(p.parts).index("compatdata") and 2]
+    except (IndexError, ValueError):
+        return ""
+    common = steamapps / "common"
+    if not common.is_dir():
+        return ""
+    builds = []
+    try:
+        for entry in common.iterdir():
+            if entry.is_dir() and entry.name.lower().startswith("proton"):
+                runner = entry / "proton"
+                if runner.is_file():
+                    builds.append(runner)
+    except OSError:
+        return ""
+    if not builds:
+        return ""
+    builds.sort(key=lambda b: b.parent.name)
+    return str(builds[-1])
+
+
+def windows_runner_command(exe_path) -> tuple:
+    """``(argv, env)`` that runs *exe_path*, or ``(None, None)``.
+
+    Proton first when the executable is inside a Proton prefix — that is
+    the runtime the game was installed with, and the one whose prefix
+    already holds its registry. Wine otherwise, with WINEPREFIX pointed at
+    whatever prefix the executable sits in, so a game keeps writing its
+    saves where it has always written them.
+    """
+    if _IS_WINDOWS:
+        return None, None
+    env = dict(os.environ)
+    prefix = wine_prefix_for(exe_path)
+
+    proton = _proton_for_prefix(prefix) if prefix else ""
+    if proton:
+        compat = str(Path(prefix).parent)          # …/compatdata/<appid>
+        steam_root = ""
+        for candidate in (Path.home() / ".steam" / "steam",
+                          Path.home() / ".local" / "share" / "Steam"):
+            if candidate.is_dir():
+                steam_root = str(candidate)
+                break
+        env.setdefault("STEAM_COMPAT_DATA_PATH", compat)
+        if steam_root:
+            env.setdefault("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root)
+        return [proton, "run", str(exe_path)], env
+
+    runner = env.get("WINE") or shutil.which("wine") or shutil.which("wine64")
+    if not runner:
+        return None, None
+    if prefix:
+        env["WINEPREFIX"] = prefix
+    return [runner, str(exe_path)], env
 
 
 def get_appid_from_url(url: str) -> Optional[str]:

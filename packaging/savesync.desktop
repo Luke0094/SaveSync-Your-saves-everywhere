@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SaveSync
+GenericName=Game Save Manager
+Comment=Back up, sync and restore your game saves
+Exec=savesync %F
+Icon=savesync
+Terminal=false
+Categories=Utility;Game;Archiving;
+Keywords=save;backup;sync;games;
+StartupWMClass=savesync
