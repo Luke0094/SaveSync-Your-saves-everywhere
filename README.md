@@ -160,66 +160,6 @@ Output: `dist/SaveSync-<version>-<arch>.AppImage` — one file, executable,
 no installation. `appimagetool` is fetched into `build/` if it is not on
 PATH; nothing is installed system-wide.
 
-It is a **separate spec** (`packaging/savesync-linux.spec`), not the
-Windows one with flags. That one carries a `.ico` and hidden imports
-naming `pynput.*._win32` and `keyring.backends.Windows` — none of which
-exist here — so bending it into shape would have left the working Windows
-build one edit away from breaking. The Linux spec collects its modules by
-*package* instead of listing them, which reaches the same lazily-imported
-format handlers and cannot fall out of date when one is added.
-
-The splash is the one thing the two builds genuinely share, so they share
-it properly: both import `packaging/splash_frames.py`.
-
-**The splash animates, and it is sized for the display it lands on.**
-PyInstaller's `Splash()` draws one still image, so every frame of
-`assets/splash_animated.gif` is decoded at build time with Pillow —
-`seek()` composes an optimised GIF's deltas, where Tk's own `-index N`
-hands back a misaligned patch — embedded as base64 PNG in the Tcl script
-the bootloader runs, and swapped there on a timer. The frames are prepared
-at three scales (0.75x, 1.0x, 1.5x) and the one that fits is picked at run
-time from `monitor width / 2560`, the same rule the rest of the UI scales
-by. **All of that is Tcl**: it happens before Python exists, which is the
-only reason there is anything on screen while the interpreter loads.
-
-The one thing Tcl cannot work out for itself is *which* monitor. X reports
-a single screen even when it is two side by side, so "the centre" lands on
-the seam — and on a session with a virtual second output, well off to one
-side. The app writes the primary monitor's rectangle to
-`$XDG_DATA_HOME/SaveSync/.screen` each time it starts and the next splash
-reads it; with no file it falls back to the X screen, which is correct on
-a single monitor and wrong for exactly one launch on a desk with two.
-
-Under a Wayland compositor's X bridge the splash is mapped
-override-redirect, set before the window is first mapped. Without it the
-compositor reparents and places the window itself: measured on WSLg, a
-splash asked to sit at `+1040+570` arrived at `+2326+1316`, inside a frame
-it did not ask for.
-
-**A second launch is answered before the splash appears.** The same Tcl
-that draws it first reads `$XDG_DATA_HOME/SaveSync/.savesync.running`,
-which names a pid; `/proc/<pid>` says whether that process is still there
-and `comm` says whether it is still SaveSync rather than a stranger who
-inherited the number. If it is, the same message box Windows shows goes up
-and the launch ends. The Windows test — "can this file be deleted" — is
-not portable: POSIX unlinks a file that is open, so it would both always
-answer "not running" and delete the live instance's sentinel on the way
-past.
-
-Two details that decide whether a bundled Qt application starts on someone
-else's desktop, both handled in `packaging/AppRun`:
-
-- **the bundled Qt must win.** A machine with its own PySide6 exports
-  `QT_PLUGIN_PATH`, and Qt then loads the host's platform plugin against
-  our `libQt6Core` — which fails with *"could not load the Qt platform
-  plugin"*, the most common way this goes wrong. AppRun points it at the
-  bundled plugins and unsets the host's.
-- **onedir, not onefile.** A onefile build unpacks itself into `/tmp` on
-  every launch, which the AppImage then does a second time: two
-  extractions for one start. The AppImage *is* the single file.
-
-Qt picks Wayland or X11 by itself; `SAVESYNC_QT_PLATFORM=xcb` forces one.
-
 ### Linux and macOS
 
 The application itself is portable: nothing imports a Windows module at
@@ -255,21 +195,6 @@ minimize-to-tray off it still quits without asking), **Ctrl+Q** quits
 the window rather than hiding it into a tray that is not there — the same
 setting, the same restore when the game exits.
 
-**Cursor size.** A session that configures no cursor size — a bare
-compositor, a login without a desktop environment — leaves libXcursor to
-guess one from the display and Qt to fall back to a bitmap of its own:
-measured, 64 px inside the application against the desktop's own 24 px
-pointer. SaveSync sets `XCURSOR_SIZE` from the primary monitor and its own
-UI scale, and **only** when nothing else has — a settings daemon, an
-`Xcursor.size` X resource or `XCURSOR_SIZE` in the environment each win
-outright.
-
-**The window opens centred**, at the size that was saved. The position is
-not restored: a remembered place is worth less than it looks once the
-monitor arrangement has changed, and a compositor that positions windows
-itself ignores the request anyway, so the same config meant a different
-place on every machine.
-
 **Save locations searched on Linux:** `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`,
 `~/.renpy` (Ren'Py writes there, outside XDG entirely), `~/Documents`,
 `~/snap`, `~/.var/app` (Flatpak), Steam's `userdata` under both `~/.steam`
@@ -290,33 +215,6 @@ have to be there.
 | `fonts-noto-color-emoji` | every emoji in the interface — folder, disk, bin, refresh — is an empty box |
 | `fonts-noto-cjk` | Japanese, Chinese and Korean titles and paths are empty boxes |
 | `xdg-utils` | every "open folder" button does nothing (SaveSync falls back to `gio`, `kde-open` or `exo-open` when one of those is present) |
-
-**Wayland.** SaveSync asks for `xcb` when a Wayland session also offers an
-X display, because Wayland allows neither of the two things the overlay is
-built on: a client cannot position its own window, and it cannot grab a
-global shortcut.
-
-XWayland gives both of them back, and the overlay needs help with only
-one. A compositor's X window manager does not honour a client's placement
-either — measured on WSLg, the overlay was mapped, viewable, correctly
-sized and parked at `-32768,-32768`, which is why nothing on it could be
-hovered, clicked or closed — so on a Wayland session the overlay is
-created override-redirect, taking that window manager out of the loop. It
-gives up nothing by it: the panel is frameless, always on top, driven with
-the mouse and asks for no keyboard focus. On a plain X11 desktop the
-window manager places it correctly and it stays managed, which is the
-better neighbour.
-
-The hotkey needs nothing: the grab is taken on the X server, and every
-key that reaches an X client passes through it. What it cannot see is a
-key addressed to a **Wayland** client — so on a desktop where SaveSync is
-the X application among Wayland ones, the shortcut works while an X window
-has the keyboard and not otherwise.
-
-`QT_QPA_PLATFORM=wayland` overrides the platform choice and gives up both:
-the overlay is then placed by the compositor and the hotkey never fires.
-Same on a Wayland session with no XWayland at all. The log says which of
-the two SaveSync ended up with, at startup.
 
 ### Dependencies
 
