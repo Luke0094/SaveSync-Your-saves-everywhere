@@ -1014,13 +1014,11 @@ def light_memory_sweep() -> int:
     return reclaimed
 
 
-def trim_process_memory() -> None:
-    """Full sweep: purge every image/cover cache, run GC and hand the working
-    set back to the OS.
+def trim_process_memory(force_working_set: bool = False) -> None:
+    """Full sweep: purge view/cover caches and run GC.
 
     The expensive one — see light_memory_sweep for what a routine tick does
-    instead. Run on explicit user action (Panoramica refresh), after a game
-    session, and on the deep tick of the idle trimmer.
+    instead. Run on explicit user action (Panoramica refresh) and on deep idle ticks.
     """
     try:
         clear_view_cache()
@@ -1033,16 +1031,6 @@ def trim_process_memory() -> None:
     try:
         from ui.widgets.game_items import trim_cover_cache
         trim_cover_cache()
-    except Exception:
-        pass
-    # NOT prune_all(): that deletes save-editor copies from DISK, on the
-    # rotation the user sets (save_edit_copies / save_edit_copy_days). It
-    # frees no memory at all, and sitting here it walked the copies folder on
-    # every trim — every 60s while idle. It still runs where it belongs: once
-    # at startup, and after a write makes a new copy.
-    try:
-        from core.monitor import get_monitor
-        get_monitor().prune_caches()
     except Exception:
         pass
     try:
@@ -1060,39 +1048,28 @@ def trim_process_memory() -> None:
         if app:
             from PySide6.QtCore import QEvent
             app.sendPostedEvents(None, QEvent.Type.DeferredDelete.value if hasattr(QEvent.Type, "DeferredDelete") else 52)
-            app.processEvents()
     except Exception:
         pass
     try:
         import gc
-        gc.collect(2)
-        gc.collect(1)
-        gc.collect(0)
+        gc.collect()
     except Exception:
         pass
-    try:
-        app = QApplication.instance()
-        if app:
-            app.processEvents()
-    except Exception:
-        pass
-    try:
-        import gc
-        gc.collect(2)
-    except Exception:
-        pass
-    if platform.system() == "Windows":
-        _release_working_set_windows()
-    elif platform.system() == "Linux":
-        try:
-            import ctypes
-            # glibc malloc_trim(0) returns unused heap memory back to the OS on Linux
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+
+    if force_working_set:
+        if platform.system() == "Windows":
+            _release_working_set_windows()
+        elif platform.system() == "Linux":
+            try:
+                import ctypes
+                # glibc malloc_trim(0) returns unused heap memory back to the OS on Linux
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
 
 def _pixmap_bytes(px: QPixmap) -> int:
+
     return max(1, px.width() * px.height() * (px.depth() // 8 or 4))
 
 

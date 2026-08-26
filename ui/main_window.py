@@ -968,40 +968,32 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         pressure = memory_pressure()
 
-        # 1. Pressure — before the busy check and before any backoff.
-        if pressure == "ok" and self._heavy_work_in_flight():
-            # 2. Busy: skip, and be ready to run soon once it finishes.
+        # 1. While heavy work or an active game is running, do not sweep heavily
+        if pressure == "ok" and (self._heavy_work_in_flight() or bool(getattr(self, "_live_tracking_timers", None))):
             _set_interval(floor_ms)
             return
 
         self._sweeps_since_deep = getattr(self, "_sweeps_since_deep", 0) + 1
-        # Nobody is using the app: the expensive sweep costs the user nothing
-        # right now, so take it instead of waiting out the counter. Being ON
-        # SCREEN is not a reason to hold back — see _is_unattended, which asks
-        # about the person rather than about the window.
-        unattended = self._is_unattended()
+        # Deep sweep only when machine is truly idle for _UNATTENDED_AFTER_S,
+        # real RAM pressure is detected, or after deep_sweep_after_sweeps light ticks.
+        machine_idle = self._is_unattended()
         deep = (pressure != "ok"
-                or unattended
+                or machine_idle
                 or self._sweeps_since_deep >= deep_sweep_after_sweeps())
         try:
             if deep:
                 self._sweeps_since_deep = 0
-                trim_process_memory()
-                # A loaded save is the single largest thing the app holds on
-                # to by choice; under real pressure it goes now rather than
-                # waiting out its own idle timer — and likewise when there is
-                # nobody in front of the app to notice it being reloaded.
-                if pressure == "critical" or unattended:
+                trim_process_memory(force_working_set=(pressure == "critical"))
+                if pressure == "critical" or machine_idle:
                     self._release_idle_documents()
-                # Deep sweeps always earn the floor: their return value says
-                # nothing about the working set they just released.
                 _set_interval(floor_ms)
             else:
-                # 3. Adapt to what the light sweep actually found.
+                # Routine background ticks run the light sweep and back off exponentially
                 reclaimed = light_memory_sweep()
                 _set_interval(floor_ms if reclaimed else timer.interval() * 2)
         except Exception:
             logger.debug("Background memory sweep failed", exc_info=True)
+
 
     # Fallback for "how long counts as not working with SaveSync". The real
     # value is the user's own idle_after_minutes — this is only what answers
@@ -1056,25 +1048,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if not getattr(self, "_ever_shown", False):
                 # Still starting up: the window has never been on screen yet,
                 # so "not visible" here does not mean put away, it means not
-                # arrived. Reading it as idle would aim the expensive sweep at
-                # precisely the moment the covers and caches are being FILLED,
-                # and throw them out from under the pages building them.
+                # arrived.
                 return False
-            if not self.isVisible() or self.isMinimized():
-                return True
             if QApplication.activeWindow() is not None:
                 return False        # a window of ours is in use right now
         except RuntimeError:
             return False
-        # Seeded in __init__, so "we have only just started" counts as
-        # attended for the first _UNATTENDED_AFTER_S rather than as idle.
-        # Treating it as idle was worse than wrong: startup is exactly when
-        # the covers and caches are being filled, and an upkeep tick landing
-        # in that window would have thrown them straight back out again.
+        # Inactive / minimized only counts as unattended once _UNATTENDED_AFTER_S
+        # has elapsed since the window was last actively used.
         last = getattr(self, "_last_active_mono", None)
         if last is None:
             return False
         return (_time.monotonic() - last) >= self._UNATTENDED_AFTER_S
+
 
     def _release_idle_documents(self):
         """Ask any page holding a big document to let it go."""
@@ -1696,8 +1682,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # the whole session.
                 self.showMinimized()
             self._hidden_for_game = True
+            from ui.helpers import trim_process_memory
+            QTimer.singleShot(250, trim_process_memory)
         except RuntimeError:
             pass
+
 
     def _restore_from_tray_after_game(self, exiting_id: str = ""):
         """Bring SaveSync back from the tray once NO game is still playing — the
@@ -2632,6 +2621,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
             # Just hide — don't show()+hide() which causes flash
             self.hide()
+            from ui.helpers import trim_process_memory
+            QTimer.singleShot(200, trim_process_memory)
 
             logger.info("SaveSync modal mode ended - minimized to tray")
 
