@@ -787,8 +787,9 @@ class ProcessMonitor(QObject):
                                 exe = (proc.exe() or "").strip()
                             except (psutil.AccessDenied, psutil.ZombieProcess):
                                 exe = ""
-                            if exe and not self._is_system_process(name, exe):
+                            if not self._is_system_process(name, exe):
                                 verdict = {"name": name, "exe": exe}
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     pass
                 except Exception:

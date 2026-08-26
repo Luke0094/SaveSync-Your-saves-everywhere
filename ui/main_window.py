@@ -933,8 +933,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """True if any game is currently being played."""
         try:
             from core.monitor import get_monitor
-            if get_monitor().currently_playing():
+            m = get_monitor()
+            if m.currently_playing():
                 return True
+            with m._data_lock:
+                if any(v is not None for v in m._tracked.values()):
+                    return True
+                if bool(m._game_sessions):
+                    return True
         except Exception:
             pass
         if bool(getattr(self, "_live_tracking_timers", None)):
@@ -944,6 +950,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if bool(getattr(self, "_pending_unknown", None)):
             return True
         return bool(getattr(self, "_hidden_for_game", False))
+
 
 
     def _on_auto_memory_trim_tick(self):
@@ -1003,13 +1010,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 trim_process_memory(full=is_full)
                 if pressure == "critical" or unattended:
                     self._release_idle_documents()
-                _set_interval(floor_ms)
-
+                # Once wiped in idle or tray, back off to ceiling_ms (15m) instead of repeating every 60s
+                if unattended or not self.isVisible():
+                    _set_interval(ceiling_ms)
+                else:
+                    _set_interval(floor_ms)
 
             else:
                 # Routine background ticks run the light sweep and back off exponentially
                 reclaimed = light_memory_sweep()
                 _set_interval(floor_ms if reclaimed else timer.interval() * 2)
+
         except Exception:
             logger.debug("Background memory sweep failed", exc_info=True)
 
@@ -4089,6 +4100,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if existing:
             existing.stop()
             existing.deleteLater()
+
+
 
         def _stop():
             timer = self._live_tracking_timers.pop(game_id, None)
