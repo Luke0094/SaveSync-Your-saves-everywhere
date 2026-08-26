@@ -900,9 +900,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                 self.show_step(self.STEP_PICK)
             try:
                 from ui.helpers import trim_process_memory
-                trim_process_memory(full=True)
+                trim_process_memory()
             except Exception:
                 pass
+
 
 
     def on_page_leave(self):
