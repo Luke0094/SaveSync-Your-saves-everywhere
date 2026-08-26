@@ -929,8 +929,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 continue      # dialog already destroyed — nothing running
         return False
 
+    def _is_game_running(self) -> bool:
+        """True if any game is currently being played."""
+        try:
+            from core.monitor import get_monitor
+            if get_monitor().currently_playing():
+                return True
+        except Exception:
+            pass
+        if bool(getattr(self, "_live_tracking_timers", None)):
+            return True
+        if bool(getattr(self, "_ingame_backup_timers", None)):
+            return True
+        if bool(getattr(self, "_pending_unknown", None)):
+            return True
+        return bool(getattr(self, "_hidden_for_game", False))
+
+
     def _on_auto_memory_trim_tick(self):
         """Periodic background memory upkeep, paced by what the app is doing.
+
 
         Three rules, in this order — the order is the design:
 
@@ -969,7 +987,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         pressure = memory_pressure()
 
         # 1. While heavy work or an active game is running, do not sweep heavily
-        if pressure == "ok" and (self._heavy_work_in_flight() or bool(getattr(self, "_live_tracking_timers", None))):
+        if pressure == "ok" and (self._heavy_work_in_flight() or self._is_game_running()):
             _set_interval(floor_ms)
             return
 
@@ -1057,14 +1075,28 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         return (_time.monotonic() - last) >= self._UNATTENDED_AFTER_S
 
     def _release_idle_documents(self):
-        """Ask any page holding a big document to let it go."""
-        page = getattr(self, "_cheats_page", None)
-        release = getattr(page, "release_idle_document", None)
-        if callable(release):
+        """Wipe all built pages and loaded documents so memory drops to minimum."""
+        for page in (getattr(self, "_library_page", None),
+                     getattr(self, "_sync_page", None),
+                     getattr(self, "_backups_page", None),
+                     getattr(self, "_settings_page", None)):
+            if page is None:
+                continue
+            wipe = getattr(page, "wipe_and_reload", None)
+            if callable(wipe):
+                try:
+                    wipe()
+                except Exception:
+                    logger.debug(
+                        f"wipe_and_reload failed for {type(page).__name__}",
+                        exc_info=True)
+        if getattr(self, "_cheats_page", None) is not None:
             try:
-                release()
+                self._cheats_page.wipe_and_reload()
             except Exception:
-                logger.debug("Could not release the loaded save", exc_info=True)
+                logger.debug("wipe_and_reload failed for CheatsPage",
+                             exc_info=True)
+
 
     def _install_dpi_change_watch(self):
         """Event-driven DPI/scale change detection (Qt screen signals).
@@ -1780,8 +1812,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 if self.windowState() & Qt.WindowState.WindowMinimized:
                     self.showNormal()
                 self.showMinimized()
+            if self._is_game_running():
+                self._hidden_for_game = True
+                self._release_idle_documents()
             from ui.helpers import trim_process_memory
             trim_process_memory()
+
+
         else:
             event.accept()
             # Mark before quit(): its own close-all-windows pass re-enters
@@ -2614,8 +2651,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
             # Just hide — don't show()+hide() which causes flash
             self.hide()
+            self._release_idle_documents()
             from ui.helpers import trim_process_memory
             QTimer.singleShot(200, trim_process_memory)
+
 
             logger.info("SaveSync modal mode ended - minimized to tray")
 
@@ -3952,10 +3991,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Minimise SaveSync to the tray for the duration of play (restored on
         # exit by _restore_from_tray_after_game).
         self._hide_to_tray_for_game()
+        self._release_idle_documents()
 
         # Unconditional memory trim at game start to minimise RAM footprint during play
         from ui.helpers import trim_process_memory
         QTimer.singleShot(400, trim_process_memory)
+
 
         # Reset per-session dialog guard when game starts (allows dialog on next exit)
 
@@ -4432,8 +4473,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._backup_game(entry.id, force_full=False)
         # Trigger auto scan confirmation for this specific game if needed
         self._check_auto_scan_for_game(entry)
+        self._release_idle_documents()
         from ui.helpers import trim_process_memory
         QTimer.singleShot(1000, lambda: trim_process_memory(full=True))
+
 
 
     def _on_unknown_game_exited(self, exe_path: str):
