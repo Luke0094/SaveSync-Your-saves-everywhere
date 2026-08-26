@@ -974,19 +974,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
 
         self._sweeps_since_deep = getattr(self, "_sweeps_since_deep", 0) + 1
-        # Deep sweep only when machine is truly idle for _UNATTENDED_AFTER_S,
-        # real RAM pressure is detected, or after deep_sweep_after_sweeps light ticks.
-        machine_idle = self._is_unattended()
+        unattended = self._is_unattended()
         deep = (pressure != "ok"
-                or machine_idle
+                or unattended
                 or self._sweeps_since_deep >= deep_sweep_after_sweeps())
         try:
             if deep:
                 self._sweeps_since_deep = 0
-                trim_process_memory(force_working_set=(pressure == "critical"))
-                if pressure == "critical" or machine_idle:
+                trim_process_memory()
+                if pressure == "critical" or unattended:
                     self._release_idle_documents()
-                _set_interval(floor_ms)
+                _set_interval(timer.interval() * 2)
             else:
                 # Routine background ticks run the light sweep and back off exponentially
                 reclaimed = light_memory_sweep()
@@ -1040,27 +1038,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
            is what keeps a glance at the browser and back from counting.
         """
         import time as _time
-        from ui.helpers import system_idle_seconds
-        idle = system_idle_seconds()
-        if idle >= 0.0 and idle >= self._UNATTENDED_AFTER_S:
-            return True
         try:
             if not getattr(self, "_ever_shown", False):
-                # Still starting up: the window has never been on screen yet,
-                # so "not visible" here does not mean put away, it means not
-                # arrived.
                 return False
-            if QApplication.activeWindow() is not None:
-                return False        # a window of ours is in use right now
+            if QApplication.activeWindow() is not None and self.isActiveWindow():
+                # Actively focused/used right now
+                self._last_active_mono = _time.monotonic()
+                return False
         except RuntimeError:
             return False
-        # Inactive / minimized only counts as unattended once _UNATTENDED_AFTER_S
-        # has elapsed since the window was last actively used.
         last = getattr(self, "_last_active_mono", None)
         if last is None:
             return False
         return (_time.monotonic() - last) >= self._UNATTENDED_AFTER_S
-
 
     def _release_idle_documents(self):
         """Ask any page holding a big document to let it go."""
@@ -3960,7 +3950,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # exit by _restore_from_tray_after_game).
         self._hide_to_tray_for_game()
 
+        # Unconditional memory trim at game start to minimise RAM footprint during play
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(400, trim_process_memory)
+
         # Reset per-session dialog guard when game starts (allows dialog on next exit)
+
         if hasattr(self, '_scan_dialog_shown_this_session'):
             self._scan_dialog_shown_this_session.discard(entry.id)
 

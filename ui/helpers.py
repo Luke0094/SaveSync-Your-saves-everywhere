@@ -1014,11 +1014,12 @@ def light_memory_sweep() -> int:
     return reclaimed
 
 
-def trim_process_memory(force_working_set: bool = False) -> None:
-    """Full sweep: purge view/cover caches and run GC.
+def trim_process_memory() -> None:
+    """Full sweep: purge view/cover caches, run GC and release working set to the OS.
 
     The expensive one — see light_memory_sweep for what a routine tick does
-    instead. Run on explicit user action (Panoramica refresh) and on deep idle ticks.
+    instead. Run on explicit user action (Panoramica refresh), after game exit,
+    and on deep idle ticks.
     """
     try:
         clear_view_cache()
@@ -1056,16 +1057,16 @@ def trim_process_memory(force_working_set: bool = False) -> None:
     except Exception:
         pass
 
-    if force_working_set:
-        if platform.system() == "Windows":
-            _release_working_set_windows()
-        elif platform.system() == "Linux":
-            try:
-                import ctypes
-                # glibc malloc_trim(0) returns unused heap memory back to the OS on Linux
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+    if platform.system() == "Windows":
+        _release_working_set_windows()
+    elif platform.system() == "Linux":
+        try:
+            import ctypes
+            # glibc malloc_trim(0) returns unused heap memory back to the OS on Linux
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
 
 
 def _pixmap_bytes(px: QPixmap) -> int:
