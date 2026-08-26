@@ -1068,9 +1068,10 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             # working set; doing it up front was the worst of the three.
             try:
                 from ui.helpers import trim_process_memory
-                trim_process_memory()
+                trim_process_memory(full=True)
             except Exception:
                 pass
+
 
     def _stop_refresh_busy(self):
         if getattr(self, "_refresh_busy", None) is not None:

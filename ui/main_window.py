@@ -1676,10 +1676,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # the whole session.
                 self.showMinimized()
             self._hidden_for_game = True
-            from ui.helpers import trim_process_memory
-            QTimer.singleShot(250, trim_process_memory)
         except RuntimeError:
             pass
+
 
 
     def _restore_from_tray_after_game(self, exiting_id: str = ""):
@@ -4434,7 +4433,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Trigger auto scan confirmation for this specific game if needed
         self._check_auto_scan_for_game(entry)
         from ui.helpers import trim_process_memory
-        QTimer.singleShot(1000, trim_process_memory)
+        QTimer.singleShot(1000, lambda: trim_process_memory(full=True))
+
 
     def _on_unknown_game_exited(self, exe_path: str):
         """An unregistered process exited. We track and scan ONLY games the user

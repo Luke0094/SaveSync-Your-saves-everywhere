@@ -1014,12 +1014,17 @@ def light_memory_sweep() -> int:
     return reclaimed
 
 
-def trim_process_memory() -> None:
+def trim_process_memory(full: bool = False) -> None:
     """Full sweep: purge view/cover caches, run GC and release working set to the OS.
 
     The expensive one — see light_memory_sweep for what a routine tick does
     instead. Run on explicit user action (Panoramica refresh), after game exit,
     and on deep idle ticks.
+
+    When *full* is True (after game exit, manual library refresh, etc.),
+    the process monitor snapshot cache is also fully reset to re-evaluate from clean baseline.
+    When *full* is False (routine idle ticks), process monitor snapshot verdicts are preserved
+    so background processes follow the near-zero cost cached path.
     """
     try:
         clear_view_cache()
@@ -1036,9 +1041,10 @@ def trim_process_memory() -> None:
         pass
     try:
         from core.monitor import get_monitor
-        get_monitor().prune_caches()
+        get_monitor().prune_caches(full=full)
     except Exception:
         pass
+
     try:
         from core.watcher import prune_watcher_caches
         prune_watcher_caches()

@@ -900,9 +900,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                 self.show_step(self.STEP_PICK)
             try:
                 from ui.helpers import trim_process_memory
-                trim_process_memory()
+                trim_process_memory(full=True)
             except Exception:
                 pass
+
 
     def on_page_leave(self):
         """Clean up in-flight pumps and active holds when user switches to another tab.
