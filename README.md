@@ -169,12 +169,10 @@ module level, the data directory follows XDG (`$XDG_DATA_HOME/SaveSync`,
 `.desktop` or a LaunchAgent, folders open through `xdg-open` / `open`, and
 the global hotkey goes through pynput rather than a Windows hook.
 
-Four things are Windows-only **by nature**, and degrade rather than fail:
+Two things are Windows-only **by nature**, and degrade rather than fail:
 
 | | On Windows | Elsewhere |
 |---|---|---|
-| Saves kept in the registry | read and restored (`registry:` save paths) | not offered; a game that stores saves there has none to find |
-| `.lnk` shortcut targets | resolved | the shortcut is treated as an ordinary file |
 | Credential protection | DPAPI, tied to the account | the OS keyring when one answers, otherwise a key derived from a salt file — with the salt, the credential blob and its copy all written **0600** |
 | Token file hardening | `icacls`, ACL narrowed to the user | `chmod 0600` |
 
@@ -314,7 +312,7 @@ savesync/
 │   │       ├── game_keys.py       # Remembered decrypt keys, per game
 │   │       └── unityfs.py         # Unity asset bundles, unpacked to find keys
 │   ├── manual_paths.py            # Hand-registered save folders, single or in bulk
-│   ├── registry_saves.py          # Windows-registry save locations
+│   ├── registry_saves.py          # Registry save locations (Windows & Wine/Proton on Linux)
 │   ├── skip_dirs.py               # Shared skip-list of noise directories
 │   ├── backup.py                  # Versioned zip backups, retention, dedup
 │   ├── pending_batch_jobs.py      # Persisted multi-operation batch queues
@@ -828,8 +826,9 @@ parallel lists of keys and values. Read literally that gives rows called
 ##### Unity PlayerPrefs
 
 Unity PlayerPrefs are a save with no file behind them. On Windows they
-live in the registry under the company and product the game was built with,
-and SaveSync has always backed them up, exporting the key as JSON. That same
+live in the Windows registry (and on Linux under Proton/Wine inside the
+prefix's `user.reg`), under the company and product the game was built with,
+and SaveSync backs them up by exporting the key tree as JSON. That same
 export is what the editor opens, so the two cannot disagree about what a key
 contains. Unity hides each preference's name behind a checksum of it, and the
 checksum cannot be turned back into anything — but it does not need to be,

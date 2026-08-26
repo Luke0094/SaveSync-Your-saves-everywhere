@@ -46,11 +46,10 @@ _EXEC_SUFFIXES_LINUX = ('.sh', '.appimage', '.x86_64', '.x86', '.run', '.bin',
 # Same reasoning as Linux: CrossOver and Wine run Windows games on macOS.
 _EXEC_SUFFIXES_MACOS = ('.app', '.command', '.sh', '.exe')
 _SHORTCUT_SUFFIXES_WINDOWS = ('.lnk', '.url')
-_SHORTCUT_SUFFIXES_LINUX = ('.desktop',)
-# macOS aliases are extension-less Finder metadata, not a file format this
-# can resolve — there is no macOS counterpart to .lnk/.desktop to offer.
-_SHORTCUT_SUFFIXES_MACOS: tuple[str, ...] = ()
+_SHORTCUT_SUFFIXES_LINUX = ('.desktop', '.lnk', '.url')
+_SHORTCUT_SUFFIXES_MACOS: tuple[str, ...] = ('.lnk', '.url')
 _MACOS_BUNDLE_SUFFIX = '.app'
+
 
 
 def executable_suffixes() -> tuple[str, ...]:
@@ -996,24 +995,174 @@ def resolve_desktop_entry(path: str) -> str:
     return path
 
 
-def resolve_lnk_target(path: str) -> str:
-    """Resolve a .lnk shortcut to its target path (Windows only).
-
-    Uses ``win32com.client.Dispatch("WScript.Shell")`` under the hood.
-    Returns the original *path* if resolution fails (e.g. pywin32 not
-    installed, or the file is not a valid .lnk).
+def _parse_lnk_binary(raw_bytes: bytes) -> tuple[Optional[str], Optional[str]]:
+    """Parse Windows Shell Link (.lnk) binary payload.
+    Returns (target_path, arguments).
     """
-    import os
-    if os.name != 'nt' or not path.lower().endswith('.lnk'):
+    if len(raw_bytes) < 76:
+        return None, None
+
+    header_size = int.from_bytes(raw_bytes[0:4], "little")
+    if header_size != 0x4C:
+        return None, None
+
+    clsid = raw_bytes[4:20]
+    expected_clsid = b"\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00\x46"
+    if clsid != expected_clsid:
+        return None, None
+
+    flags = int.from_bytes(raw_bytes[20:24], "little")
+    has_target_id_list = bool(flags & 0x01)
+    has_link_info = bool(flags & 0x02)
+    has_name = bool(flags & 0x04)
+    has_relative_path = bool(flags & 0x08)
+    has_working_dir = bool(flags & 0x10)
+    has_arguments = bool(flags & 0x20)
+    is_unicode = bool(flags & 0x80)
+
+    offset = 76
+
+    if has_target_id_list:
+        if len(raw_bytes) < offset + 2:
+            return None, None
+        id_list_size = int.from_bytes(raw_bytes[offset:offset + 2], "little")
+        offset += 2 + id_list_size
+
+    target_path = None
+
+    if has_link_info:
+        if len(raw_bytes) >= offset + 4:
+            link_info_size = int.from_bytes(raw_bytes[offset:offset + 4], "little")
+            link_info_bytes = raw_bytes[offset:offset + link_info_size]
+            if len(link_info_bytes) >= 28:
+                header_len = int.from_bytes(link_info_bytes[4:8], "little")
+                local_base_offset = int.from_bytes(link_info_bytes[16:20], "little")
+                unicode_local_base_offset = 0
+                if header_len >= 0x24 and len(link_info_bytes) >= 32:
+                    unicode_local_base_offset = int.from_bytes(link_info_bytes[28:32], "little")
+
+                if unicode_local_base_offset > 0 and unicode_local_base_offset < len(link_info_bytes):
+                    raw_str = link_info_bytes[unicode_local_base_offset:]
+                    null_idx = 0
+                    while null_idx + 1 < len(raw_str):
+                        if raw_str[null_idx] == 0 and raw_str[null_idx + 1] == 0:
+                            break
+                        null_idx += 2
+                    try:
+                        target_path = raw_str[:null_idx].decode("utf-16-le", errors="ignore")
+                    except Exception:
+                        pass
+
+                if not target_path and local_base_offset > 0 and local_base_offset < len(link_info_bytes):
+                    raw_str = link_info_bytes[local_base_offset:]
+                    null_idx = raw_str.find(b"\x00")
+                    if null_idx >= 0:
+                        raw_str = raw_str[:null_idx]
+                    try:
+                        target_path = raw_str.decode("mbcs", errors="ignore") or raw_str.decode("utf-8", errors="ignore")
+                    except Exception:
+                        target_path = raw_str.decode("latin1", errors="ignore")
+            offset += link_info_size
+
+    def _read_string_data(curr_offset: int) -> tuple[Optional[str], int]:
+        if len(raw_bytes) < curr_offset + 2:
+            return None, curr_offset
+        char_count = int.from_bytes(raw_bytes[curr_offset:curr_offset + 2], "little")
+        curr_offset += 2
+        byte_len = char_count * 2 if is_unicode else char_count
+        if len(raw_bytes) < curr_offset + byte_len:
+            return None, curr_offset
+        raw_str = raw_bytes[curr_offset:curr_offset + byte_len]
+        curr_offset += byte_len
+        try:
+            val = raw_str.decode("utf-16-le" if is_unicode else "utf-8", errors="ignore")
+            return val, curr_offset
+        except Exception:
+            return None, curr_offset
+
+    relative_path = None
+    arguments = None
+
+    if has_name:
+        _name, offset = _read_string_data(offset)
+    if has_relative_path:
+        relative_path, offset = _read_string_data(offset)
+    if has_working_dir:
+        _wdir, offset = _read_string_data(offset)
+    if has_arguments:
+        arguments, offset = _read_string_data(offset)
+
+    return target_path or relative_path, arguments
+
+
+def _resolve_wine_lnk_target(lnk_path: Path, target_path: str) -> str:
+    """Resolve a Windows target path from a .lnk file to an on-disk POSIX path on Linux."""
+    from core.save_detector import resolve_case_insensitive
+
+    norm_target = target_path.replace("\\", "/")
+    candidate_rel = resolve_case_insensitive(lnk_path.parent / norm_target)
+    if candidate_rel.exists():
+        return str(candidate_rel)
+
+    cur = lnk_path.parent
+    drive_c = None
+    while cur != cur.parent:
+        if cur.name.lower() == "drive_c":
+            drive_c = cur
+            break
+        cur = cur.parent
+
+    if drive_c is not None:
+        rel_to_c = re.sub(r'^[A-Za-z]:[/\\]+', '', target_path).replace("\\", "/")
+        candidate_pfx = resolve_case_insensitive(drive_c / rel_to_c)
+        if candidate_pfx.exists():
+            return str(candidate_pfx)
+
+    home = Path.home()
+    wine_c = home / ".wine" / "drive_c"
+    if wine_c.is_dir():
+        rel_to_c = re.sub(r'^[A-Za-z]:[/\\]+', '', target_path).replace("\\", "/")
+        candidate_wine = resolve_case_insensitive(wine_c / rel_to_c)
+        if candidate_wine.exists():
+            return str(candidate_wine)
+
+    return target_path
+
+
+def resolve_lnk_target(path: str) -> str:
+    """Resolve a .lnk shortcut to its target path across platforms (Windows, Linux, macOS).
+
+    Parses the MS-SHLLINK binary structure directly and resolves relative or
+    Wine/Proton drive_c paths when running on non-Windows hosts.
+    """
+    if not isinstance(path, str) or not path.lower().endswith('.lnk'):
         return path
+
+    p = Path(path)
+    if not p.is_file():
+        return path
+
     try:
-        from win32com.client import Dispatch
-        shell = Dispatch("WScript.Shell")
-        shortcut = shell.CreateShortCut(path)
-        target = shortcut.TargetPath
+        raw_bytes = p.read_bytes()
+        target, args = _parse_lnk_binary(raw_bytes)
         if target:
-            args = shortcut.Arguments
+            if os.name != 'nt':
+                target = _resolve_wine_lnk_target(p, target)
             return (target + " " + args).strip() if args else target
-        return path
-    except Exception:
-        return path
+    except Exception as e:
+        logger.debug(f"Binary .lnk parse failed for {path}: {e}")
+
+    if os.name == 'nt':
+        try:
+            from win32com.client import Dispatch
+            shell = Dispatch("WScript.Shell")
+            shortcut = shell.CreateShortCut(path)
+            target = shortcut.TargetPath
+            if target:
+                args = shortcut.Arguments
+                return (target + " " + args).strip() if args else target
+        except Exception:
+            pass
+
+    return path
+

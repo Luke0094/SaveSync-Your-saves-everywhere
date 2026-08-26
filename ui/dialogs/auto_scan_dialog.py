@@ -170,17 +170,22 @@ def filter_uncovered_paths(paths: List[str], confirmed_paths: List[str]) -> List
     the manual panel could propose paths that were already configured.
     """
     from core.registry_saves import is_registry_path
+    from core.save_detector import path_identity
     resolved_confirmed: List[Path] = []
+    norm_confirmed: set[str] = set()
     for cp in confirmed_paths or []:
         if is_registry_path(cp):
             continue
+        ident = path_identity(cp)
+        if ident:
+            norm_confirmed.add(ident)
         try:
             resolved_confirmed.append(Path(cp).resolve())
         except Exception:
             resolved_confirmed.append(Path(cp))
-    confirmed_reg = [c.lower() for c in (confirmed_paths or [])
+    confirmed_reg = [c.lower().strip() for c in (confirmed_paths or [])
                      if is_registry_path(c)]
-    if not resolved_confirmed and not confirmed_reg:
+    if not resolved_confirmed and not confirmed_reg and not norm_confirmed:
         return list(paths)
 
     def _covered(p: str) -> bool:
@@ -188,9 +193,15 @@ def filter_uncovered_paths(paths: List[str], confirmed_paths: List[str]) -> List
         # confirmed ancestor/descendant key (string prefix on \\-separated
         # keys) — never by filesystem paths.
         if is_registry_path(p):
-            pl = p.lower()
+            pl = p.lower().strip()
             return any(pl == cl or pl.startswith(cl + "\\")
                        or cl.startswith(pl + "\\") for cl in confirmed_reg)
+
+        # Fast identity match (case-insensitive & separator-normalized)
+        p_ident = path_identity(p)
+        if p_ident and p_ident in norm_confirmed:
+            return True
+
         try:
             pp = Path(p).resolve()
         except Exception:
@@ -211,7 +222,6 @@ def filter_uncovered_paths(paths: List[str], confirmed_paths: List[str]) -> List
         return False
 
     return [p for p in paths if not _covered(p)]
-
 
 class ScanWorkerThread(QThread):
     """Background thread for scanning save paths"""
@@ -532,6 +542,7 @@ class SavePathItem(QWidget):
         from core.save_detector import path_identity as _pid
         _shown = {_pid(p) for p in self.paths}
         _dropped = {_pid(p) for p in self._locally_deleted_paths}
+        _all_known = {_pid(p) for p in self._all_detected_paths}
         added = []
         for path in new_paths:
             _key = _pid(path)
@@ -543,8 +554,9 @@ class SavePathItem(QWidget):
             # (delete_path() drops it from self.paths only). apply_changes()
             # rebuilds save_paths from _all_detected_paths, so appending
             # blindly would write the path into the game twice.
-            if path not in self._all_detected_paths:
+            if _key not in _all_known:
                 self._all_detected_paths.append(path)
+                _all_known.add(_key)
             self._build_path_row(path)
             added.append(path)
         return added
@@ -818,6 +830,10 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             # actually searches for.
             game = get_library().get_by_id(self._single_game_mode_id)
             self.games_without_saves = [game] if game else []
+            if game:
+                self.show_existing_paths(game)
+                self.show_manage_row(game)
+                self.refit_to_content()
         else:
             # Get games without save paths
             library = get_library()
@@ -902,8 +918,8 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         filtered_paths = filter_selectable_paths(
             game_id, paths, include_rejected=_mine)
 
-        # For games with already-confirmed paths, also drop re-detections
-        # covered by the confirmed list (same rule as the automatic at-exit
+        # For games with already-saved paths, drop re-detections
+        # covered by existing paths (same rule as the automatic at-exit
         # flow) — this is the single choke point for everything the dialog
         # shows, including live detections pushed while the panel is open.
         #
@@ -912,7 +928,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         # or deletion here; it is shown, read-only, in its own section — see
         # _show_existing_paths.
         _game = get_library().get_by_id(game_id)
-        if _game is not None and _game.save_paths_confirmed and not _game.requires_confirmation:
+        if _game is not None and _game.save_paths:
             filtered_paths = filter_uncovered_paths(filtered_paths, _game.save_paths or [])
 
         if not filtered_paths:
@@ -1405,11 +1421,13 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
                                    if p in previously_rejected
                                    and p in selected_paths]
 
-                    preserved_untouched = [p for p in old_paths if p not in all_detected_paths]
+                    from core.save_detector import path_identity as _pid, dedupe_paths
+                    _all_det_keys = {_pid(x) for x in all_detected_paths}
+                    preserved_untouched = [p for p in old_paths if _pid(p) not in _all_det_keys]
                     kept_from_this_round = [p for p in all_detected_paths
                                             if p not in locally_deleted
                                             and p not in still_rejected]
-                    game.save_paths = preserved_untouched + kept_from_this_round
+                    game.save_paths = dedupe_paths(preserved_untouched + kept_from_this_round)
 
                     # excluded_save_paths tracks deselected-but-kept paths —
                     # skipped at backup time, but still ordinary, visible,
@@ -1865,10 +1883,8 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             game.id, pre_scanned_paths, include_rejected=_mine)
 
         # Paths already covered by confirmed save paths are not news — same
-        # rule the automatic at-exit flow applies. Skipped while the game
-        # still awaits its FIRST confirmation: there the user must see every
-        # detected path, including ones provisionally sitting in save_paths.
-        if game.save_paths_confirmed and not game.requires_confirmation:
+        # rule the automatic at-exit flow applies.
+        if game.save_paths:
             selectable = filter_uncovered_paths(selectable, game.save_paths or [])
 
         if not selectable:
@@ -2025,25 +2041,35 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
     flags = (Qt.WindowType.Dialog
              | Qt.WindowType.CustomizeWindowHint
              | Qt.WindowType.WindowTitleHint
-             | Qt.WindowType.WindowCloseButtonHint)
-    if platform.system() == "Windows":
-        flags |= Qt.WindowType.WindowStaysOnTopHint
+             | Qt.WindowType.WindowCloseButtonHint
+             | Qt.WindowType.WindowStaysOnTopHint)
     dialog.setWindowFlags(flags)
     dialog.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
+
+    # If game_id is provided, remember it and immediately load existing paths
+    if game_id:
+        dialog._single_game_mode_id = game_id
+        try:
+            _g = get_library().get_by_id(game_id)
+            if _g:
+                dialog.show_existing_paths(_g)
+                dialog.show_manage_row(_g)
+                dialog.refit_to_content()
+        except Exception:
+            logger.debug("could not list the game's existing save folders",
+                         exc_info=True)
+
     if pre_scanned_paths:
         if not dialog._use_pre_scanned_paths(pre_scanned_paths, game_id=game_id):
-            # Nothing selectable (excluded / already saved / empty) — the
-            # dialog must not open, and no "paths found" signal reaches
-            # the user at all.
-            dialog.deleteLater()
-            return None
+            # If there's nothing new to propose, but the panel was user-initiated or
+            # has existing save paths to show, keep it open in idle state rather than closing.
+            if user_initiated or (dialog._existing_box and dialog._existing_box.isVisible()):
+                dialog.show_idle_empty_state()
+            else:
+                dialog.deleteLater()
+                return None
     else:
-        # No pre-scanned paths: with a game_id the scan stays scoped to
-        # that game (force-rescanned even if it already has confirmed
-        # paths — used by the in-game [i] overlay shortcut).
-        if game_id:
-            dialog._single_game_mode_id = game_id
         if auto_scan:
             QTimer.singleShot(0, dialog.start_scan)
         else:
@@ -2052,20 +2078,6 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
             # had nothing usable to hand over) — open empty instead;
             # Extended Scan stays a conscious, opt-in action for the user.
             dialog.show_idle_empty_state()
-
-    # Only on a panel the user opened: at game exit the question is about
-    # the folder that just changed, and a list of settled ones is noise.
-    if user_initiated and game_id:
-        try:
-            _g = get_library().get_by_id(game_id)
-            dialog.show_existing_paths(_g)
-            dialog.show_manage_row(_g)
-            # Both were empty when _build measured the panel; it has to be
-            # measured again now that they hold something.
-            dialog.refit_to_content()
-        except Exception:
-            logger.debug("could not list the game's existing save folders",
-                         exc_info=True)
 
     # Centred before it is shown. finalize_adaptive_dialog_size restores a
     # remembered SIZE, but position is left to the window manager, which for
@@ -2077,3 +2089,4 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
     dialog.show()
     dialog.raise_()
     return dialog
+

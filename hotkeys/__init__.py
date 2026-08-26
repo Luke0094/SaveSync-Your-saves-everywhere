@@ -147,6 +147,12 @@ class HotkeyManager(QObject):
 
     def _try_init(self):
         try:
+            import os
+            import platform
+            # On Linux, ensure the unprivileged X11/xorg backend is used when available
+            # so no special root or /dev/uinput group permissions are required across distros.
+            if platform.system() == "Linux" and os.environ.get("DISPLAY") and not os.environ.get("PYNPUT_BACKEND_KEYBOARD"):
+                os.environ["PYNPUT_BACKEND_KEYBOARD"] = "xorg"
             from pynput import keyboard as pynput_keyboard
             self._pynput_keyboard = pynput_keyboard
             self._available = True
@@ -156,7 +162,7 @@ class HotkeyManager(QObject):
         except Exception as e:
             import platform
             if platform.system() == "Linux":
-                logger.warning(f"Hotkey init failed (needs an X11/uinput-capable session): {e}")
+                logger.warning(f"Hotkey init failed (needs an active desktop session): {e}")
             elif platform.system() == "Darwin":
                 logger.warning(f"Hotkey init failed (requires accessibility permissions on macOS): {e}")
             else:
@@ -174,7 +180,7 @@ class HotkeyManager(QObject):
             except Exception:
                 pass
             self._listener = None
-        if not self._combos:
+        if not self._combos or not self._pynput_keyboard:
             return
 
         def _fire_for(hk: str):
@@ -193,10 +199,15 @@ class HotkeyManager(QObject):
             return _fire
 
         mapping = {combo: _fire_for(hk) for hk, combo in self._combos.items()}
-        listener = self._pynput_keyboard.GlobalHotKeys(mapping)
-        listener.daemon = True
-        listener.start()
-        self._listener = listener
+        try:
+            listener = self._pynput_keyboard.GlobalHotKeys(mapping)
+            listener.daemon = True
+            listener.start()
+            self._listener = listener
+        except Exception as e:
+            logger.warning(f"Could not start hotkey listener: {e}")
+            self._listener = None
+
 
     def _clear_listener_state(self):
         """Drop pynput's idea of which keys are down.

@@ -633,10 +633,14 @@ def force_topmost(widget) -> None:
             logger.debug(f"force_topmost failed: {e}")
     else:
         try:
+            from PySide6.QtCore import Qt
+            if not (widget.windowFlags() & Qt.WindowType.WindowStaysOnTopHint):
+                widget.setWindowFlags(widget.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+                if widget.isVisible():
+                    widget.show()
             widget.raise_()
         except Exception:
             pass
-
 
 def system_idle_seconds() -> float:
     """Seconds since the last keyboard or mouse input ANYWHERE on this machine.

@@ -16,7 +16,7 @@ import re
 import time
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union, List, Set, Dict
 
 from core.constants import (
     SAVE_FOLDER_HINTS, WATCH_PATHS_TEMPLATES, SKIP_EXTENSIONS,
@@ -131,24 +131,86 @@ _CONTAINER_DIR_NAMES = frozenset({
 })
 
 
+def resolve_case_insensitive(path_input: Union[str, Path]) -> Path:
+    """Resolve a filesystem path case-insensitively on case-sensitive filesystems (ext4/btrfs).
+
+    If the path exists as given, returns Path(path_input).resolve().
+    Otherwise, traverses path components from the root, matching each
+    component case-insensitively against actual directory entries on disk.
+    """
+    p = Path(path_input)
+    try:
+        if p.exists():
+            return p.resolve()
+    except (OSError, ValueError):
+        pass
+
+    parts = p.parts
+    if not parts:
+        return p
+
+    current = Path(parts[0])
+    try:
+        if not current.exists():
+            return p
+    except (OSError, ValueError):
+        return p
+
+    for segment in parts[1:]:
+        exact = current / segment
+        try:
+            if exact.exists():
+                current = exact
+                continue
+        except (OSError, ValueError):
+            pass
+
+        found = None
+        try:
+            if current.is_dir():
+                target_lower = segment.lower()
+                for entry in current.iterdir():
+                    if entry.name.lower() == target_lower:
+                        found = entry
+                        break
+        except (OSError, PermissionError):
+            pass
+
+        if found is not None:
+            current = found
+        else:
+            current = exact
+
+    try:
+        if current.exists():
+            return current.resolve()
+    except (OSError, ValueError):
+        pass
+    return current
+
+
 def path_identity(path_str: str) -> str:
     """Identity key for a detected save path, for de-duplication.
 
-    Case and separator differences do NOT make two paths different on
-    Windows: the watcher reports a folder with its on-disk casing
-    ("…\\Save") while the open-file scan can report the same folder as the
-    game opened it ("…\\save"), and both used to survive as two entries —
-    listed twice in the confirmation panel, zipped twice into a backup.
-    normcase+normpath collapses exactly those spellings and nothing else
-    (a registry key normalises the same way: those are case-insensitive
-    too). Empty input maps to "" so it can never collide with a real path.
+    Collapses case, separator, and symlink variations across platforms:
+    - Virtual registry keys ('registry:HKCU\\...') are normalized with standard slashes & lowercase.
+    - Filesystem paths on POSIX/Linux are resolved against actual on-disk casing if present.
+    - On Windows, normcase normalizes case and separators.
     """
     if not path_str:
         return ""
+    s = str(path_str).strip()
+    if s.lower().startswith("registry:"):
+        return s.replace("/", "\\").lower()
     try:
-        return os.path.normcase(os.path.normpath(path_str.strip()))
+        norm = os.path.normpath(s)
+        if platform.system() == "Windows":
+            return os.path.normcase(norm)
+        else:
+            resolved = resolve_case_insensitive(norm)
+            return str(resolved)
     except (OSError, ValueError, AttributeError):
-        return path_str.strip().lower()
+        return s.lower()
 
 
 def dedupe_paths(paths) -> list[str]:
@@ -163,6 +225,7 @@ def dedupe_paths(paths) -> list[str]:
         seen.add(key)
         result.append(p)
     return result
+
 
 
 def derive_display_name(exe_path: str, fallback: str = "") -> str:
@@ -1088,7 +1151,9 @@ def _prefix_user_dirs(prefix: Path) -> list[Path]:
     """Save-bearing directories inside a Wine/Proton prefix."""
     users = prefix / "drive_c" / "users"
     if not users.is_dir():
-        return []
+        users = resolve_case_insensitive(users)
+        if not users.is_dir():
+            return []
     out = []
     try:
         for d in users.iterdir():
@@ -1096,12 +1161,13 @@ def _prefix_user_dirs(prefix: Path) -> list[Path]:
             if not d.is_dir() or d.name.lower() == "public":
                 continue
             for rel in _PREFIX_SAVE_SUBDIRS:
-                p = d.joinpath(*rel.split("/"))
-                if p.is_dir():
+                p = resolve_case_insensitive(d.joinpath(*rel.split("/")))
+                if p.is_dir() and p not in out:
                     out.append(p)
     except OSError:
         pass
     return out
+
 
 
 # Without an appid every prefix on the machine is a candidate, and a library
