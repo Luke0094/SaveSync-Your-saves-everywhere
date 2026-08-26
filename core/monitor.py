@@ -829,13 +829,25 @@ class ProcessMonitor(QObject):
         self._stem_lookup = None
         self._proc_match_cache.clear()
 
-    def prune_caches(self):
-        """Trim memory held by cached lookup maps and snapshot verdicts."""
+    def prune_caches(self, full: bool = False):
+        """Trim memory held by cached lookup maps without discarding process verdicts.
+
+        Snapshot verdicts for running processes are preserved across routine sweeps so that
+        subsequent polls take the instant zero-I/O cached path for known system processes.
+        Dead processes are naturally evicted on each snapshot pass.
+        """
         with self._data_lock:
-            self._invalidate_entry_lookup()
-            self._proc_resolved_cache.clear()
-            self._snap_verdicts.clear()
-            self._snap_gen = getattr(self, "_snap_gen", 0) + 1
+            if full:
+                self._invalidate_entry_lookup()
+                self._proc_resolved_cache.clear()
+                self._snap_verdicts.clear()
+                self._snap_gen = getattr(self, "_snap_gen", 0) + 1
+            else:
+                if len(self._proc_resolved_cache) > 256:
+                    self._proc_resolved_cache.clear()
+                if len(self._proc_match_cache) > 512:
+                    self._proc_match_cache.clear()
+
 
     def _build_entry_lookup(self):
         from core.resolvers import fuzzy_slug as _slug

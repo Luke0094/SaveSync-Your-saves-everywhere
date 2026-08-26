@@ -1035,6 +1035,11 @@ def trim_process_memory() -> None:
     except Exception:
         pass
     try:
+        from core.monitor import get_monitor
+        get_monitor().prune_caches()
+    except Exception:
+        pass
+    try:
         from core.watcher import prune_watcher_caches
         prune_watcher_caches()
     except Exception:
@@ -1049,11 +1054,25 @@ def trim_process_memory() -> None:
         if app:
             from PySide6.QtCore import QEvent
             app.sendPostedEvents(None, QEvent.Type.DeferredDelete.value if hasattr(QEvent.Type, "DeferredDelete") else 52)
+            app.processEvents()
     except Exception:
         pass
     try:
         import gc
-        gc.collect()
+        gc.collect(2)
+        gc.collect(1)
+        gc.collect(0)
+    except Exception:
+        pass
+    try:
+        app = QApplication.instance()
+        if app:
+            app.processEvents()
+    except Exception:
+        pass
+    try:
+        import gc
+        gc.collect(2)
     except Exception:
         pass
 
@@ -1066,7 +1085,6 @@ def trim_process_memory() -> None:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
-
 
 
 def _pixmap_bytes(px: QPixmap) -> int:

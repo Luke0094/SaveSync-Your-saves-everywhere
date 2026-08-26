@@ -984,7 +984,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 trim_process_memory()
                 if pressure == "critical" or unattended:
                     self._release_idle_documents()
-                _set_interval(timer.interval() * 2)
+                _set_interval(floor_ms)
             else:
                 # Routine background ticks run the light sweep and back off exponentially
                 reclaimed = light_memory_sweep()
@@ -1038,13 +1038,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
            is what keeps a glance at the browser and back from counting.
         """
         import time as _time
+        from ui.helpers import system_idle_seconds
+        idle = system_idle_seconds()
+        if idle >= 0.0 and idle >= self._UNATTENDED_AFTER_S:
+            return True
         try:
             if not getattr(self, "_ever_shown", False):
                 return False
-            if QApplication.activeWindow() is not None and self.isActiveWindow():
-                # Actively focused/used right now
-                self._last_active_mono = _time.monotonic()
-                return False
+            if not self.isVisible() or self.isMinimized():
+                return True
+            if QApplication.activeWindow() is not None:
+                return False        # a window of ours is in use right now
         except RuntimeError:
             return False
         last = getattr(self, "_last_active_mono", None)
