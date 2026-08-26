@@ -986,8 +986,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         pressure = memory_pressure()
 
-        # 1. While heavy work or an active game is running, do not sweep heavily
-        if pressure == "ok" and (self._heavy_work_in_flight() or self._is_game_running()):
+        # 1. While heavy work or an active game is running, NEVER sweep, trim, or flush
+        if self._heavy_work_in_flight() or self._is_game_running():
             _set_interval(floor_ms)
             return
 
@@ -999,10 +999,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         try:
             if deep:
                 self._sweeps_since_deep = 0
-                trim_process_memory()
+                is_full = (pressure != "ok") and not (self._heavy_work_in_flight() or self._is_game_running())
+                trim_process_memory(full=is_full)
                 if pressure == "critical" or unattended:
                     self._release_idle_documents()
                 _set_interval(floor_ms)
+
+
             else:
                 # Routine background ticks run the light sweep and back off exponentially
                 reclaimed = light_memory_sweep()
@@ -1096,6 +1099,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             except Exception:
                 logger.debug("wipe_and_reload failed for CheatsPage",
                              exc_info=True)
+        # Flush Qt deferred deletions immediately so C++ widget memory is freed
+        try:
+            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        except Exception:
+            pass
+
 
 
     def _install_dpi_change_watch(self):
@@ -1812,11 +1821,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 if self.windowState() & Qt.WindowState.WindowMinimized:
                     self.showNormal()
                 self.showMinimized()
+            self._release_idle_documents()
             if self._is_game_running():
                 self._hidden_for_game = True
-                self._release_idle_documents()
             from ui.helpers import trim_process_memory
             trim_process_memory()
+
+
 
 
         else:

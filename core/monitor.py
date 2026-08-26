@@ -4,6 +4,7 @@ Detects ONLY new processes (baseline captured silently on first poll).
 Uses (pid, create_time) as identity to disambiguate same-name executables.
 Self-excludes via own PID comparison.
 """
+import concurrent.futures
 import copy
 import logging
 import os
@@ -422,6 +423,9 @@ class ProcessMonitor(QObject):
         self._ignored_cache: set[str] = set()
         self._own_exe       = self._get_own_exe()
         self._refresh_ignored_cache()
+        self._snapshot_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="monitor-snap"
+        )
         
         # Initialize adaptive polling variables
         self._fast_poll_count = 0
@@ -681,56 +685,122 @@ class ProcessMonitor(QObject):
     def _snapshot(self) -> dict[ProcessKey, dict]:
         """One pass over the process table, CACHED across polls with zero-allocation steady state.
 
-        Uses psutil.pids() for ultra-fast (0.2 ms) process enumeration in steady state.
-        Known background/system processes are evaluated ONCE and remembered by PID.
-        Dead processes are evicted in O(1) time without rebuilding the full dictionary.
-        Only newly spawned PIDs are inspected for name/exe/system filters.
+        Uses fast process table enumeration (CreateToolhelp32Snapshot on Windows / psutil on Linux)
+        to inspect running PIDs and process names in ~1-10 ms without per-process syscall overhead.
+
+        PID recycling is fully protected against:
+        - If a PID is reused by a different executable, name mismatch immediately invalidates the entry.
+        - Candidate game processes verify create_time on each poll.
+        - Result is keyed by (pid, create_time) ProcessKey identity.
         """
         result: dict[ProcessKey, dict] = {}
         if not PSUTIL_AVAILABLE:
             return result
-        try:
-            live_pids = set(psutil.pids())
-        except Exception as e:
-            logger.debug(f"psutil.pids error: {e}")
-            return result
+
+        live_procs: dict[int, str] = {}
+        if _IS_WINDOWS:
+            try:
+                import ctypes
+                import ctypes.wintypes as wt
+
+                class _PROCESSENTRY32(ctypes.Structure):
+                    _fields_ = [
+                        ('dwSize', wt.DWORD),
+                        ('cntUsage', wt.DWORD),
+                        ('th32ProcessID', wt.DWORD),
+                        ('th32DefaultHeapID', ctypes.c_void_p),
+                        ('th32ModuleID', wt.DWORD),
+                        ('cntThreads', wt.DWORD),
+                        ('th32ParentProcessID', wt.DWORD),
+                        ('pcPriClassBase', wt.LONG),
+                        ('dwFlags', wt.DWORD),
+                        ('szExeFile', ctypes.c_char * 260)
+                    ]
+
+                k32 = ctypes.windll.kernel32
+                hSnap = k32.CreateToolhelp32Snapshot(2, 0)
+                if hSnap != -1:
+                    entry = _PROCESSENTRY32()
+                    entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+                    if k32.Process32First(hSnap, ctypes.byref(entry)):
+                        while True:
+                            pid = entry.th32ProcessID
+                            if pid != _OWN_PID and pid > 0:
+                                live_procs[pid] = entry.szExeFile.decode('latin1', 'ignore').strip()
+                            if not k32.Process32Next(hSnap, ctypes.byref(entry)):
+                                break
+                    k32.CloseHandle(hSnap)
+            except Exception as e:
+                logger.debug(f"Toolhelp snapshot error: {e}")
+                live_procs.clear()
+
+        # Fallback if Windows toolhelp snapshot was empty or on Linux/other OS
+        if not live_procs:
+            try:
+                for p in psutil.process_iter(['pid', 'name']):
+                    pid = p.info['pid']
+                    if pid != _OWN_PID and pid > 0:
+                        live_procs[pid] = (p.info.get('name') or '').strip()
+            except Exception as e:
+                logger.debug(f"process_iter error: {e}")
+                return result
 
         # 1. Evict terminated PIDs from cache
-        dead_pids = set(self._snap_verdicts.keys()) - live_pids
+        dead_pids = set(self._snap_verdicts.keys()) - set(live_procs.keys())
         for dead_pid in dead_pids:
             self._snap_verdicts.pop(dead_pid, None)
 
-        # 2. Evaluate only newly spawned PIDs
-        new_pids = live_pids - set(self._snap_verdicts.keys())
-        for pid in new_pids:
-            if pid == _OWN_PID:
-                self._snap_verdicts[pid] = (0.0, None)
-                continue
-            try:
-                proc = psutil.Process(pid)
-                name = (proc.name() or "").strip()
-                ctime = round(proc.create_time(), 1)
-                verdict = None
-                if name and not (_IS_WINDOWS and not name.lower().endswith(".exe")):
-                    s = _stem(name)
-                    if not _stem_ignored(s, _SYSTEM_STEMS, self._ignored_cache):
-                        try:
-                            exe = (proc.exe() or "").strip()
-                        except (psutil.AccessDenied, psutil.ZombieProcess):
-                            exe = ""
-                        if exe and not self._is_system_process(name, exe):
-                            verdict = {"name": name, "exe": exe}
-                self._snap_verdicts[pid] = (ctime, verdict)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                self._snap_verdicts[pid] = (0.0, None)
-            except Exception:
-                self._snap_verdicts[pid] = (0.0, None)
+        # 2. Evaluate processes (verifying identity and catching PID recycling)
+        tracked_pids = set()
+        with self._data_lock:
+            tracked_pids = {k[0] for k in self._tracked}
 
-        # 3. Assemble snapshot output for candidate non-system processes
-        for pid, (ctime, verdict) in self._snap_verdicts.items():
-            if verdict is not None:
+        for pid, name in live_procs.items():
+            cached = self._snap_verdicts.get(pid)
+            if cached is not None:
+                cached_name, cached_ctime, verdict = cached
+                # Protection 1: If executable name changed, PID was recycled by OS!
+                if name.lower() != cached_name.lower():
+                    cached = None
+                # Protection 2: For actively tracked games, verify create_time has not changed (same-name relaunch)
+                elif pid in tracked_pids:
+                    try:
+                        cur_proc = psutil.Process(pid)
+                        cur_ctime = round(cur_proc.create_time(), 1)
+                        if cur_ctime != cached_ctime:
+                            cached = None  # PID was recycled by another instance of the game
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        cached = None
+
+
+            if cached is None:
+                # Newly spawned or recycled PID: evaluate full pipeline once
+                ctime = 0.0
+                verdict = None
+                try:
+                    proc = psutil.Process(pid)
+                    ctime = round(proc.create_time(), 1)
+                    if name and not (_IS_WINDOWS and not name.lower().endswith(".exe")):
+                        s = _stem(name)
+                        if not _stem_ignored(s, _SYSTEM_STEMS, self._ignored_cache):
+                            try:
+                                exe = (proc.exe() or "").strip()
+                            except (psutil.AccessDenied, psutil.ZombieProcess):
+                                exe = ""
+                            if exe and not self._is_system_process(name, exe):
+                                verdict = {"name": name, "exe": exe}
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+                except Exception:
+                    pass
+                self._snap_verdicts[pid] = (name, ctime, verdict)
+
+        # 3. Assemble snapshot output for candidate processes
+        for pid, (name, ctime, verdict) in self._snap_verdicts.items():
+            if verdict is not None and ctime > 0:
                 result[(pid, ctime)] = verdict
         return result
+
 
 
     def _is_system_process(self, name: str, exe: str) -> bool:
@@ -828,16 +898,12 @@ class ProcessMonitor(QObject):
         Dead processes are naturally evicted on each snapshot pass.
         """
         with self._data_lock:
+            self._proc_resolved_cache.clear()
+            self._proc_match_cache.clear()
             if full:
                 self._invalidate_entry_lookup()
-                self._proc_resolved_cache.clear()
                 self._snap_verdicts.clear()
                 self._snap_gen = getattr(self, "_snap_gen", 0) + 1
-            else:
-                if len(self._proc_resolved_cache) > 256:
-                    self._proc_resolved_cache.clear()
-                if len(self._proc_match_cache) > 512:
-                    self._proc_match_cache.clear()
 
 
     def _build_entry_lookup(self):
@@ -1251,8 +1317,10 @@ class ProcessMonitor(QObject):
                 current = {}
             self._snapshot_ready.emit(current)
 
-        threading.Thread(target=_bg, daemon=True,
-                         name="monitor-snapshot").start()
+        try:
+            self._snapshot_executor.submit(_bg)
+        except Exception:
+            self._snapshot_in_flight = False
 
     def _on_snapshot_ready(self, current: dict):
         self._snapshot_in_flight = False

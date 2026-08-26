@@ -1019,13 +1019,14 @@ def trim_process_memory(full: bool = False) -> None:
 
     The expensive one — see light_memory_sweep for what a routine tick does
     instead. Run on explicit user action (Panoramica refresh), after game exit,
-    and on deep idle ticks.
+    when the system is under memory pressure, and on deep idle ticks.
 
-    When *full* is True (after game exit, manual library refresh, etc.),
+    When *full* is True (after game exit, manual library refresh, or system memory pressure),
     the process monitor snapshot cache is also fully reset to re-evaluate from clean baseline.
     When *full* is False (routine idle ticks), process monitor snapshot verdicts are preserved
     so background processes follow the near-zero cost cached path.
     """
+
     try:
         clear_view_cache()
     except Exception:
