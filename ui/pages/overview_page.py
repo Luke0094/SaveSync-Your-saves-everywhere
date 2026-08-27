@@ -589,8 +589,6 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.timeout.connect(self.refresh)
         # Separate timer for relative-time labels (e.g. "2 min fa") — runs every 60s
         # so timestamps update without triggering a full data reload.
         self._ts_timer = QTimer(self)
@@ -1068,10 +1066,9 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             # working set; doing it up front was the worst of the three.
             try:
                 from ui.helpers import trim_process_memory
-                trim_process_memory(full=True)
+                trim_process_memory()
             except Exception:
                 pass
-
 
     def _stop_refresh_busy(self):
         if getattr(self, "_refresh_busy", None) is not None:
@@ -1100,11 +1097,6 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
     def refresh(self):
         """Refresh all live data — safe to call from GUI thread only."""
         if not _safe(self._header):
-            return
-        # If the page or its parent window is hidden or minimized, DO NOT run UI rebuild in background!
-        win = self.window()
-        if not self.isVisible() or (win and (win.isMinimized() or not win.isVisible())):
-            self._dirty_while_hidden = True
             return
         self._dirty_while_hidden = False
         # Cancel a pending debounce so we don't double-refresh right after.
@@ -1249,9 +1241,6 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         Called every 60 s by _ts_timer.  Avoids a full data reload when all
         that changed is "2 min fa" → "3 min fa".
         """
-        win = self.window()
-        if not self.isVisible() or (win and (win.isMinimized() or not win.isVisible())):
-            return
         if not _safe(self._activity_layout):
             return
         from core import to_local_dt
@@ -1533,19 +1522,13 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Poll less often than before — signals + debounce cover live changes;
-        # this is a safety net for playtime / active-game banner.
-        if not self._refresh_timer.isActive():
-            self._refresh_timer.start(10_000)
         if not self._ts_timer.isActive():
             self._ts_timer.start()
-        # Cover the enter refresh after the page paints. Periodic timer
-        # refreshes stay silent.
+        # Cover the enter refresh after the page paints.
         self.refresh_on_enter()
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        self._refresh_timer.stop()
         self._ts_timer.stop()
         self._debounce.stop()
         # RAM cleanup on leaving the dashboard: the full-screen decoded
@@ -1556,37 +1539,9 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         from ui.helpers import clear_view_cache as _clear_view_cache
         _clear_view_cache()
 
-    def wipe_and_reload(self):
-        """Release activity rows, stat values, and donut data when entering deep idle."""
-        self._dirty_while_hidden = True
-        self._activity_cache_key = None
-        self._refresh_timer.stop()
-        self._ts_timer.stop()
-        self._debounce.stop()
-        if _safe(self._activity_layout):
-            items_to_remove = []
-            for i in range(self._activity_layout.count()):
-                item = self._activity_layout.itemAt(i)
-                w = item.widget() if item else None
-                if w is not None and w is not getattr(self, "_activity_empty", None):
-                    items_to_remove.append(w)
-            for w in items_to_remove:
-                self._activity_layout.removeWidget(w)
-                w.deleteLater()
-        if _safe(self._donut_chart):
-            self._donut_chart._data = []
-            self._donut_chart._total = 0
-            self._donut_chart._ring_hit = None
-            self._donut_chart.update()
-
     def disconnect_signals(self):
-        self._refresh_timer.stop()
         self._ts_timer.stop()
         self._debounce.stop()
-        try:
-            self._refresh_timer.timeout.disconnect(self.refresh)
-        except (RuntimeError, TypeError):
-            pass
         try:
             get_library().game_updated.disconnect(self.schedule_refresh)
         except (RuntimeError, TypeError):

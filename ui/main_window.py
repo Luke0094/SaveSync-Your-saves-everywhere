@@ -743,8 +743,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._stage2_idle_threads_timer.stop()
         if getattr(self, "_overview_page", None) is not None and getattr(self, "_current_page_index", 0) == 0:
             try:
-                if not self._overview_page._refresh_timer.isActive():
-                    self._overview_page._refresh_timer.start(10_000)
                 if not self._overview_page._ts_timer.isActive():
                     self._overview_page._ts_timer.start()
                 if getattr(self._overview_page, "_dirty_while_hidden", False):
@@ -940,24 +938,29 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Stop overview recurring background timers while window is minimized/in tray
         if getattr(self, "_overview_page", None) is not None:
             try:
-                self._overview_page._refresh_timer.stop()
                 self._overview_page._ts_timer.stop()
                 self._overview_page._debounce.stop()
             except Exception:
                 pass
-        if not self._heavy_work_in_flight() and not self._is_game_running():
+        if not self._heavy_work_in_flight():
             try:
                 from ui.helpers import clear_view_cache, trim_process_memory
                 clear_view_cache()
-                trim_process_memory(full=False)
+                is_gaming = self._is_game_running()
+                if is_gaming:
+                    self._release_idle_documents(force_all=True)
+                trim_process_memory(full=is_gaming)
+                # Deferred trim: once Qt completes hide transitions and event loop drains,
+                # sweep transient paint buffers and release working set
+                QTimer.singleShot(250, lambda: trim_process_memory(full=is_gaming))
             except Exception:
                 pass
 
     def _on_stage2_threads_cleanup(self):
         """Stage 2 cleanup (after 2 minutes in background/tray):
         Drains non-essential background threads, purges cover pixmap caches, and releases working set.
-        Protected: active operations, open/shelved search dialogs, loaded cheat save."""
-        if self._heavy_work_in_flight() or self._is_game_running():
+        Protected: active operations, open/shelved search dialogs."""
+        if self._heavy_work_in_flight() or self._has_active_or_pending_dialogs():
             return
         logger.debug("Stage 2 cleanup (2 minutes in background): trimming cover caches and inactive workers.")
         try:
@@ -965,7 +968,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             from ui.helpers import clear_view_cache, trim_process_memory
             clear_view_cache()
             trim_cover_cache()
-            trim_process_memory(full=False)
+            is_gaming = self._is_game_running()
+            if is_gaming:
+                self._release_idle_documents(force_all=True)
+            trim_process_memory(full=True)
         except Exception:
             logger.debug("Stage 2 cleanup failed", exc_info=True)
 
@@ -1025,11 +1031,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return True
         return bool(getattr(self, "_hidden_for_game", False))
 
-
-
     def _on_auto_memory_trim_tick(self):
         """Periodic background memory upkeep, paced by what the app is doing.
-
 
         Three rules, in this order — the order is the design:
 
@@ -1080,7 +1083,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         try:
             if deep:
                 self._sweeps_since_deep = 0
-                is_full = (pressure != "ok") and not (self._heavy_work_in_flight() or self._is_game_running())
+                is_full = not (self._heavy_work_in_flight() or self._is_game_running())
                 if pressure == "critical" or unattended:
                     self._release_idle_documents(force_all=True)
                 trim_process_memory(full=is_full)
@@ -1094,10 +1097,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # Routine background ticks run the light sweep and back off exponentially
                 reclaimed = light_memory_sweep()
                 _set_interval(floor_ms if reclaimed else timer.interval() * 2)
-
         except Exception:
             logger.debug("Background memory sweep failed", exc_info=True)
-
 
     # Fallback for "how long counts as not working with SaveSync". The real
     # value is the user's own idle_after_minutes — this is only what answers
@@ -1137,7 +1138,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         1. Nobody has touched the machine at all for _UNATTENDED_AFTER_S.
            They are not at the PC. This is the case the old rule missed
            entirely, and the one the window state can never detect.
-        2. The window is hidden or minimised for at least _UNATTENDED_AFTER_S (or system idle).
+        2. The window is hidden or minimised — kept, because it is still a
+           perfectly good signal, just no longer a required one.
         3. On screen, but no window of ours has been the active one for
            _UNATTENDED_AFTER_S: they are working in something else. The delay
            is what keeps a glance at the browser and back from counting.
@@ -1149,18 +1151,23 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return True
         try:
             if not getattr(self, "_ever_shown", False):
+                # Still starting up: the window has never been on screen yet,
+                # so "not visible" here does not mean put away, it means not
+                # arrived. Reading it as idle would aim the expensive sweep at
+                # precisely the moment the covers and caches are being FILLED,
+                # and throw them out from under the pages building them.
                 return False
             if not self.isVisible() or self.isMinimized():
-                last_active = getattr(self, "_last_active_mono", None)
-                if last_active is not None and (_time.monotonic() - last_active) >= self._UNATTENDED_AFTER_S:
-                    return True
-                if idle >= 0.0 and idle >= self._UNATTENDED_AFTER_S:
-                    return True
-                return False
+                return True
             if QApplication.activeWindow() is not None:
                 return False        # a window of ours is in use right now
         except RuntimeError:
             return False
+        # Seeded in __init__, so "we have only just started" counts as
+        # attended for the first _UNATTENDED_AFTER_S rather than as idle.
+        # Treating it as idle was worse than wrong: startup is exactly when
+        # the covers and caches are being filled, and an upkeep tick landing
+        # in that window would have thrown them straight back out again.
         last = getattr(self, "_last_active_mono", None)
         if last is None:
             return False
@@ -1200,8 +1207,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         except Exception:
             pass
-
-
 
     def _install_dpi_change_watch(self):
         """Event-driven DPI/scale change detection (Qt screen signals).
@@ -1818,8 +1823,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except RuntimeError:
             pass
 
-
-
     def _restore_from_tray_after_game(self, exiting_id: str = ""):
         """Bring SaveSync back from the tray once NO game is still playing — the
         counterpart to _hide_to_tray_for_game. Only restores what WE hid
@@ -1899,6 +1902,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if self._tray is not None:
                 event.ignore()
                 self.hide()
+                self._on_window_minimized_or_hidden()
             else:
                 choice = self._ask_close_or_minimize()
                 if choice == "cancel":
@@ -1921,10 +1925,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 if self.windowState() & Qt.WindowState.WindowMinimized:
                     self.showNormal()
                 self.showMinimized()
-            if self._is_game_running():
-                self._hidden_for_game = True
-            self._on_window_minimized_or_hidden()
-
+                self._on_window_minimized_or_hidden()
         else:
             event.accept()
             # Mark before quit(): its own close-all-windows pass re-enters
@@ -2760,7 +2761,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._release_idle_documents(force_all=True)
             from ui.helpers import trim_process_memory
             QTimer.singleShot(200, lambda: trim_process_memory(full=True))
-
 
             logger.info("SaveSync modal mode ended - minimized to tray")
 
@@ -4096,6 +4096,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Ensure all background and page timers are fully stopped for gameplay
         self._on_window_minimized_or_hidden()
+        # Minimise SaveSync to the tray for the duration of play (restored on
+        # exit by _restore_from_tray_after_game).
         self._hide_to_tray_for_game()
         self._release_idle_documents(force_all=True)
 
@@ -4103,9 +4105,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.helpers import trim_process_memory
         QTimer.singleShot(400, lambda: trim_process_memory(full=True))
 
-
         # Reset per-session dialog guard when game starts (allows dialog on next exit)
-
         if hasattr(self, '_scan_dialog_shown_this_session'):
             self._scan_dialog_shown_this_session.discard(entry.id)
 
@@ -4189,8 +4189,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if existing:
             existing.stop()
             existing.deleteLater()
-
-
 
         def _stop():
             timer = self._live_tracking_timers.pop(game_id, None)
@@ -4345,8 +4343,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._ingame_backup_tick(gid)
                 t.setSingleShot(False)
                 t.setInterval(iv)
+                try:
+                    t.timeout.disconnect()
+                except Exception:
+                    pass
+                t.timeout.connect(lambda: self._ingame_backup_tick(gid))
                 t.start()
-            timer.timeout.disconnect()
+            try:
+                timer.timeout.disconnect()
+            except Exception:
+                pass
             timer.timeout.connect(_first_tick)
         timer.start(first_delay_ms if first_delay_ms != interval_ms else interval_ms)
         self._ingame_backup_timers[entry.id] = timer
@@ -4590,8 +4596,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             QTimer.singleShot(400, lambda: trim_process_memory(full=True))
         # Trigger auto scan confirmation for this specific game if needed
         self._check_auto_scan_for_game(entry)
-
-
 
     def _on_unknown_game_exited(self, exe_path: str):
         """An unregistered process exited. We track and scan ONLY games the user

@@ -1014,19 +1014,15 @@ def light_memory_sweep() -> int:
     return reclaimed
 
 
-def trim_process_memory(full: bool = False) -> None:
-    """Full sweep: purge view/cover caches, run GC and release working set to the OS.
+def trim_process_memory(full: bool = True) -> None:
+    """Sweep memory: purge image/cover cache, run GC and hand the working
+    set back to the OS.
 
-    The expensive one — see light_memory_sweep for what a routine tick does
-    instead. Run on explicit user action (Panoramica refresh), after game exit,
-    when the system is under memory pressure, and on deep idle ticks.
-
-    When *full* is True (after game exit, manual library refresh, or system memory pressure),
-    the process monitor snapshot cache is also fully reset to re-evaluate from clean baseline.
-    When *full* is False (routine idle ticks), process monitor snapshot verdicts are preserved
-    so background processes follow the near-zero cost cached path.
+    If full is False (Stage 1 minimization), clears light view cache and dead registry
+    while preserving cover pixmaps for 0 ms resume.
+    If full is True (game launch/exit, Stage 3 deep idle, manual trim), purges covers,
+    runs full GC generations 2, 1, 0 and releases working set pages to the OS.
     """
-
     try:
         clear_view_cache()
     except Exception:
@@ -1035,27 +1031,27 @@ def trim_process_memory(full: bool = False) -> None:
         prune_scaled_registry()
     except Exception:
         pass
-    try:
-        from ui.widgets.game_items import trim_cover_cache
-        trim_cover_cache()
-    except Exception:
-        pass
-    try:
-        from core.monitor import get_monitor
-        get_monitor().prune_caches(full=full)
-    except Exception:
-        pass
-
-    try:
-        from core.watcher import prune_watcher_caches
-        prune_watcher_caches()
-    except Exception:
-        pass
-    try:
-        from PySide6.QtGui import QPixmapCache
-        QPixmapCache.clear()
-    except Exception:
-        pass
+    if full:
+        try:
+            from ui.widgets.game_items import trim_cover_cache
+            trim_cover_cache()
+        except Exception:
+            pass
+        try:
+            from core.monitor import get_monitor
+            get_monitor().prune_caches()
+        except Exception:
+            pass
+        try:
+            from core.watcher import prune_watcher_caches
+            prune_watcher_caches()
+        except Exception:
+            pass
+        try:
+            from PySide6.QtGui import QPixmapCache
+            QPixmapCache.clear()
+        except Exception:
+            pass
     try:
         app = QApplication.instance()
         if app:
@@ -1071,18 +1067,6 @@ def trim_process_memory(full: bool = False) -> None:
         gc.collect(0)
     except Exception:
         pass
-    try:
-        app = QApplication.instance()
-        if app:
-            app.processEvents()
-    except Exception:
-        pass
-    try:
-        import gc
-        gc.collect(2)
-    except Exception:
-        pass
-
     if platform.system() == "Windows":
         _release_working_set_windows()
     elif platform.system() == "Linux":
@@ -1095,7 +1079,6 @@ def trim_process_memory(full: bool = False) -> None:
 
 
 def _pixmap_bytes(px: QPixmap) -> int:
-
     return max(1, px.width() * px.height() * (px.depth() // 8 or 4))
 
 
