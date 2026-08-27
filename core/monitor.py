@@ -894,8 +894,8 @@ class ProcessMonitor(QObject):
     def prune_caches(self, full: bool = False):
         """Trim memory held by cached lookup maps without discarding process verdicts.
 
-        Snapshot verdicts for running processes are preserved across routine sweeps so that
-        subsequent polls take the instant zero-I/O cached path for known system processes.
+        Snapshot verdicts for running processes are preserved so that subsequent polls take the
+        instant zero-I/O cached path for known system processes without re-opening psutil handles.
         Dead processes are naturally evicted on each snapshot pass.
         """
         with self._data_lock:
@@ -903,8 +903,6 @@ class ProcessMonitor(QObject):
             self._proc_match_cache.clear()
             if full:
                 self._invalidate_entry_lookup()
-                self._snap_verdicts.clear()
-                self._snap_gen = getattr(self, "_snap_gen", 0) + 1
 
 
     def _build_entry_lookup(self):
@@ -1331,6 +1329,9 @@ class ProcessMonitor(QObject):
 
     def _process_snapshot(self, current: dict):
         self._fast_poll_count += 1
+
+        if self._baseline_done and current == self._running:
+            return
 
         if not self._baseline_done:
             with self._data_lock:

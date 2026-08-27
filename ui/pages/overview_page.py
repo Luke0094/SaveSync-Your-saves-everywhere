@@ -1101,6 +1101,11 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         """Refresh all live data — safe to call from GUI thread only."""
         if not _safe(self._header):
             return
+        # If the page or its parent window is hidden or minimized, DO NOT run UI rebuild in background!
+        win = self.window()
+        if not self.isVisible() or (win and (win.isMinimized() or not win.isVisible())):
+            self._dirty_while_hidden = True
+            return
         self._dirty_while_hidden = False
         # Cancel a pending debounce so we don't double-refresh right after.
         if self._debounce.isActive():
@@ -1244,6 +1249,9 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         Called every 60 s by _ts_timer.  Avoids a full data reload when all
         that changed is "2 min fa" → "3 min fa".
         """
+        win = self.window()
+        if not self.isVisible() or (win and (win.isMinimized() or not win.isVisible())):
+            return
         if not _safe(self._activity_layout):
             return
         from core import to_local_dt

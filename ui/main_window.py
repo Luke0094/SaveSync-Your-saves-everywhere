@@ -741,6 +741,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         super().showEvent(event)
         if hasattr(self, "_stage2_idle_threads_timer"):
             self._stage2_idle_threads_timer.stop()
+        if getattr(self, "_overview_page", None) is not None and getattr(self, "_current_page_index", 0) == 0:
+            try:
+                if not self._overview_page._refresh_timer.isActive():
+                    self._overview_page._refresh_timer.start(10_000)
+                if not self._overview_page._ts_timer.isActive():
+                    self._overview_page._ts_timer.start()
+                if getattr(self._overview_page, "_dirty_while_hidden", False):
+                    self._overview_page.refresh_on_enter()
+            except Exception:
+                pass
         try:
             from ui.helpers import set_dark_title_bar
             from ui.styles.theme import get_theme_manager
@@ -927,6 +937,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if hasattr(self, "_stage2_idle_threads_timer"):
             self._stage2_idle_threads_timer.stop()
             self._stage2_idle_threads_timer.start()
+        # Stop overview recurring background timers while window is minimized/in tray
+        if getattr(self, "_overview_page", None) is not None:
+            try:
+                self._overview_page._refresh_timer.stop()
+                self._overview_page._ts_timer.stop()
+                self._overview_page._debounce.stop()
+            except Exception:
+                pass
         if not self._heavy_work_in_flight() and not self._is_game_running():
             try:
                 from ui.helpers import clear_view_cache, trim_process_memory
