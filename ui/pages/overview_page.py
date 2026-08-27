@@ -1548,6 +1548,29 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         from ui.helpers import clear_view_cache as _clear_view_cache
         _clear_view_cache()
 
+    def wipe_and_reload(self):
+        """Release activity rows, stat values, and donut data when entering deep idle."""
+        self._dirty_while_hidden = True
+        self._activity_cache_key = None
+        self._refresh_timer.stop()
+        self._ts_timer.stop()
+        self._debounce.stop()
+        if _safe(self._activity_layout):
+            items_to_remove = []
+            for i in range(self._activity_layout.count()):
+                item = self._activity_layout.itemAt(i)
+                w = item.widget() if item else None
+                if w is not None and w is not getattr(self, "_activity_empty", None):
+                    items_to_remove.append(w)
+            for w in items_to_remove:
+                self._activity_layout.removeWidget(w)
+                w.deleteLater()
+        if _safe(self._donut_chart):
+            self._donut_chart._data = []
+            self._donut_chart._total = 0
+            self._donut_chart._ring_hit = None
+            self._donut_chart.update()
+
     def disconnect_signals(self):
         self._refresh_timer.stop()
         self._ts_timer.stop()

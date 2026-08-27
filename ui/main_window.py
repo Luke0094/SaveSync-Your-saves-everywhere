@@ -725,6 +725,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._ui_scale_reapply_timer.timeout.connect(self._reapply_ui_scale)
         self._last_ui_scale = None
 
+        # Stage 2 background cleanup timer (2 minutes after minimizing or traying)
+        self._stage2_idle_threads_timer = QTimer(self)
+        self._stage2_idle_threads_timer.setSingleShot(True)
+        self._stage2_idle_threads_timer.setInterval(120_000)
+        self._stage2_idle_threads_timer.timeout.connect(self._on_stage2_threads_cleanup)
+
     # How long after the window first appears the one-shot startup trim
     # waits. Long enough for the first paint, the theme build and the initial
     # page to settle; short enough that the startup garbage is handed back
@@ -733,6 +739,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self, "_stage2_idle_threads_timer"):
+            self._stage2_idle_threads_timer.stop()
         try:
             from ui.helpers import set_dark_title_bar
             from ui.styles.theme import get_theme_manager
@@ -893,7 +901,55 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 return True
         except Exception:
             pass
+        for thread_attr in ("_auto_export_thread", "_update_check_thread", "_verify_thread"):
+            t = getattr(self, thread_attr, None)
+            if t is not None and getattr(t, "is_alive", lambda: False)():
+                return True
         return self._shelved_work_running()
+
+    def _has_active_or_pending_dialogs(self) -> bool:
+        """True if there are shelved dialogs or visible child dialogs with pending search/scan results."""
+        if bool(getattr(self, "_shelved_add_entries", None)):
+            return True
+        try:
+            for widget in QApplication.topLevelWidgets():
+                if widget is not self and widget.isVisible():
+                    from PySide6.QtWidgets import QDialog
+                    if isinstance(widget, QDialog):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _on_window_minimized_or_hidden(self):
+        """Stage 1 cleanup: Immediate light trim on minimize (Linux/Windows) or close to tray.
+        Keeps UI widgets, documents, and dialogs intact for 0 ms resume. Starts 2-minute Stage 2 timer."""
+        if hasattr(self, "_stage2_idle_threads_timer"):
+            self._stage2_idle_threads_timer.stop()
+            self._stage2_idle_threads_timer.start()
+        if not self._heavy_work_in_flight() and not self._is_game_running():
+            try:
+                from ui.helpers import clear_view_cache, trim_process_memory
+                clear_view_cache()
+                trim_process_memory(full=False)
+            except Exception:
+                pass
+
+    def _on_stage2_threads_cleanup(self):
+        """Stage 2 cleanup (after 2 minutes in background/tray):
+        Drains non-essential background threads, purges cover pixmap caches, and releases working set.
+        Protected: active operations, open/shelved search dialogs, loaded cheat save."""
+        if self._heavy_work_in_flight() or self._is_game_running():
+            return
+        logger.debug("Stage 2 cleanup (2 minutes in background): trimming cover caches and inactive workers.")
+        try:
+            from ui.widgets.game_items import trim_cover_cache
+            from ui.helpers import clear_view_cache, trim_process_memory
+            clear_view_cache()
+            trim_cover_cache()
+            trim_process_memory(full=False)
+        except Exception:
+            logger.debug("Stage 2 cleanup failed", exc_info=True)
 
     def _shelved_work_running(self) -> bool:
         """True while a dialog shelved into the sidebar is still working.
@@ -1007,11 +1063,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if deep:
                 self._sweeps_since_deep = 0
                 is_full = (pressure != "ok") and not (self._heavy_work_in_flight() or self._is_game_running())
-                trim_process_memory(full=is_full)
                 if pressure == "critical" or unattended:
-                    self._release_idle_documents()
+                    self._release_idle_documents(force_all=True)
+                trim_process_memory(full=is_full)
                 # Once wiped in idle or tray, back off to ceiling_ms (15m) instead of repeating every 60s
-                if unattended or not self.isVisible():
+                if unattended or not self.isVisible() or self.isMinimized():
                     _set_interval(ceiling_ms)
                 else:
                     _set_interval(floor_ms)
@@ -1063,8 +1119,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         1. Nobody has touched the machine at all for _UNATTENDED_AFTER_S.
            They are not at the PC. This is the case the old rule missed
            entirely, and the one the window state can never detect.
-        2. The window is hidden or minimised — kept, because it is still a
-           perfectly good signal, just no longer a required one.
+        2. The window is hidden or minimised for at least _UNATTENDED_AFTER_S (or system idle).
         3. On screen, but no window of ours has been the active one for
            _UNATTENDED_AFTER_S: they are working in something else. The delay
            is what keeps a glance at the browser and back from counting.
@@ -1078,7 +1133,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if not getattr(self, "_ever_shown", False):
                 return False
             if not self.isVisible() or self.isMinimized():
-                return True
+                last_active = getattr(self, "_last_active_mono", None)
+                if last_active is not None and (_time.monotonic() - last_active) >= self._UNATTENDED_AFTER_S:
+                    return True
+                if idle >= 0.0 and idle >= self._UNATTENDED_AFTER_S:
+                    return True
+                return False
             if QApplication.activeWindow() is not None:
                 return False        # a window of ours is in use right now
         except RuntimeError:
@@ -1088,9 +1148,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return False
         return (_time.monotonic() - last) >= self._UNATTENDED_AFTER_S
 
-    def _release_idle_documents(self):
-        """Wipe all built pages and loaded documents so memory drops to minimum."""
-        for page in (getattr(self, "_library_page", None),
+    def _release_idle_documents(self, force_all: bool = False):
+        """Wipe all built pages and loaded documents so memory drops to minimum.
+        Protected: does not wipe CheatsPage if a save is loaded unless force_all is True (deep idle / game start/exit)."""
+        if not force_all and self._has_active_or_pending_dialogs():
+            return
+
+        for page in (getattr(self, "_overview_page", None),
+                     getattr(self, "_library_page", None),
                      getattr(self, "_sync_page", None),
                      getattr(self, "_backups_page", None),
                      getattr(self, "_settings_page", None)):
@@ -1106,7 +1171,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         exc_info=True)
         if getattr(self, "_cheats_page", None) is not None:
             try:
-                self._cheats_page.wipe_and_reload()
+                has_doc = getattr(self._cheats_page, "has_loaded_document", lambda: False)()
+                if not has_doc or force_all:
+                    self._cheats_page.wipe_and_reload()
             except Exception:
                 logger.debug("wipe_and_reload failed for CheatsPage",
                              exc_info=True)
@@ -1701,6 +1768,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         reappears UNDER whatever the user had open. force_foreground does the
         rest — transiently, without pinning the window above everything.
         """
+        if hasattr(self, "_stage2_idle_threads_timer"):
+            self._stage2_idle_threads_timer.stop()
         if self.isMinimized():
             self.showNormal()
         elif not self.isVisible():
@@ -1785,8 +1854,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._last_active_mono = _time.monotonic()
         if etype == QEvent.Type.WindowStateChange:
             if self.isMinimized():
-                from ui.helpers import trim_process_memory
-                QTimer.singleShot(150, trim_process_memory)
+                self._on_window_minimized_or_hidden()
+            else:
+                if hasattr(self, "_stage2_idle_threads_timer"):
+                    self._stage2_idle_threads_timer.stop()
 
     def closeEvent(self, event):
         config = get_config()
@@ -1832,14 +1903,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 if self.windowState() & Qt.WindowState.WindowMinimized:
                     self.showNormal()
                 self.showMinimized()
-            self._release_idle_documents()
             if self._is_game_running():
                 self._hidden_for_game = True
-            from ui.helpers import trim_process_memory
-            trim_process_memory()
-
-
-
+            self._on_window_minimized_or_hidden()
 
         else:
             event.accept()
@@ -2673,9 +2739,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
             # Just hide — don't show()+hide() which causes flash
             self.hide()
-            self._release_idle_documents()
+            self._release_idle_documents(force_all=True)
             from ui.helpers import trim_process_memory
-            QTimer.singleShot(200, trim_process_memory)
+            QTimer.singleShot(200, lambda: trim_process_memory(full=True))
 
 
             logger.info("SaveSync modal mode ended - minimized to tray")
@@ -4013,11 +4079,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Minimise SaveSync to the tray for the duration of play (restored on
         # exit by _restore_from_tray_after_game).
         self._hide_to_tray_for_game()
-        self._release_idle_documents()
+        self._release_idle_documents(force_all=True)
 
-        # Unconditional memory trim at game start to minimise RAM footprint during play
+        # Unconditional heavy memory trim at game start to maximise RAM available for play
         from ui.helpers import trim_process_memory
-        QTimer.singleShot(400, trim_process_memory)
+        QTimer.singleShot(400, lambda: trim_process_memory(full=True))
 
 
         # Reset per-session dialog guard when game starts (allows dialog on next exit)
@@ -4497,7 +4563,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._backup_game(entry.id, force_full=False)
         # Trigger auto scan confirmation for this specific game if needed
         self._check_auto_scan_for_game(entry)
-        self._release_idle_documents()
+        self._release_idle_documents(force_all=True)
         from ui.helpers import trim_process_memory
         QTimer.singleShot(1000, lambda: trim_process_memory(full=True))
 

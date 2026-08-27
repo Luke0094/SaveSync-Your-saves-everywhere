@@ -925,6 +925,15 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                 self._save_load_worker = None
             self._stop_deferred_busy()
 
+    def has_loaded_document(self) -> bool:
+        """True if a savefile is currently loaded in memory or actively being parsed by a worker."""
+        if getattr(self, "_doc", None) is not None:
+            return True
+        worker = getattr(self, "_save_load_worker", None)
+        if worker is not None and getattr(worker, "isRunning", lambda: False)():
+            return True
+        return False
+
     def wipe_and_reload(self):
         """Wipe save editor state and prune old save structures from memory."""
         self._cancel_row_insert()
