@@ -1594,6 +1594,11 @@ class ProcessMonitor(QObject):
     def is_active(self) -> bool:
         return self._active
 
+    def has_running_game(self) -> bool:
+        """Fast boolean check if any tracked game is running (zero-copy)."""
+        with self._data_lock:
+            return any(e is not None for e in self._tracked.values())
+
     def currently_playing(self) -> list[GameEntry]:
         """Return all known games currently being tracked (one entry per
         game, even when the game runs as multiple processes)."""

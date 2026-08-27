@@ -1008,7 +1008,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         try:
             from core.monitor import get_monitor
             m = get_monitor()
-            if m.currently_playing():
+            if m.has_running_game():
                 return True
             with m._data_lock:
                 if any(v is not None for v in m._tracked.values()):
@@ -4094,8 +4094,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # through _check_cloud_on_launch — same notification, no silent adopt.
         self._update_sidebar_status()
 
-        # Minimise SaveSync to the tray for the duration of play (restored on
-        # exit by _restore_from_tray_after_game).
+        # Ensure all background and page timers are fully stopped for gameplay
+        self._on_window_minimized_or_hidden()
         self._hide_to_tray_for_game()
         self._release_idle_documents(force_all=True)
 
@@ -4169,6 +4169,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._overlay.show_game_launched(
                 entry.name, exe_path,
                 engine=engine_display(engine_for_game(entry)))
+
+        # Hook heavy trim to tracking activation/notification: release memory for gameplay
+        self._release_idle_documents(force_all=True)
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(600, lambda: trim_process_memory(full=True))
 
     def _start_live_tracking_loop(self, entry: GameEntry):
         """Poll open files every 60 s while game is running.
@@ -4579,11 +4584,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if config.get("backup_on_exit", True) and entry.auto_backup_enabled and entry.save_paths:
             logger.info(f"Game exited — checking for exit backup for {entry.name}")
             self._backup_game(entry.id, force_full=False)
+        else:
+            self._release_idle_documents(force_all=True)
+            from ui.helpers import trim_process_memory
+            QTimer.singleShot(400, lambda: trim_process_memory(full=True))
         # Trigger auto scan confirmation for this specific game if needed
         self._check_auto_scan_for_game(entry)
-        self._release_idle_documents(force_all=True)
-        from ui.helpers import trim_process_memory
-        QTimer.singleShot(1000, lambda: trim_process_memory(full=True))
 
 
 
@@ -5836,6 +5842,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # half is on screen before the sync half takes it over.
                 if then_sync or get_config().get("auto_sync_after_backup", False):
                     QTimer.singleShot(0, self._sync_all_after_backup)
+        if not batch:
+            with self._backup_lock:
+                no_more_backups = not self._backup_inflight and not self._backup_job_queue
+            if no_more_backups and not self._is_game_running():
+                self._release_idle_documents(force_all=True)
+                from ui.helpers import trim_process_memory
+                QTimer.singleShot(400, lambda: trim_process_memory(full=True))
         self._pump_backup_queue()
 
     def _sync_all_after_backup(self):
