@@ -1547,6 +1547,7 @@ class ProcessMonitor(QObject):
         # 2. Direct exe match in running dict
         pid = self.find_pid_by_exe(exe_path)
         if pid:
+            self._remember_resolved_pid(game_id, pid)
             return pid
 
         # 3. Launcher→child pattern: find the largest non-system process whose
@@ -1593,7 +1594,44 @@ class ProcessMonitor(QObject):
         if best_pid:
             logger.info(f"Found game process via directory match: PID {best_pid} "
                        f"(game_id={game_id}, install_dir={exe_dir})")
+            self._remember_resolved_pid(game_id, best_pid)
         return best_pid
+
+    def _remember_resolved_pid(self, game_id: str, pid: int) -> None:
+        """Backfill a PID found the expensive way (Steps 2-3 above) into
+        _tracked, keyed the same way the normal poll's match+track flow
+        keys it — (pid, create_time) -> entry.
+
+        Without this, a game whose live process never exactly equals
+        entry.exe_path in _tracked (a launcher→child game where only the
+        launcher's pid got tracked, or a freshly overlay-added game whose
+        exe_path is a fuzzy-resolved guess) fails Step 1 forever: every
+        caller pays the full Step 2/3 walk again, every time. The
+        live-tracking loop calls find_game_process once per tick, 60s
+        apart, for the whole session — that walk is a Path.resolve() over
+        every non-ignored process on the machine (Step 2), and for Step 3
+        a second resolve pass plus a memory_info() per candidate in the
+        install directory, repeating on a background thread every single
+        tick instead of once. Registering the resolved pid here means the
+        NEXT tick's Step 1 finds it via a plain dict scan and a single
+        is_running() check — no path resolution at all — the same cheap
+        path a game tracked through the normal launch flow already takes.
+        """
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running():
+                return
+            key = (pid, round(proc.create_time(), 1))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        entry = get_library().get_by_id(game_id)
+        if entry is None:
+            return
+        with self._data_lock:
+            if key not in self._tracked:
+                self._register_tracked_locked(key, entry)
+                logger.debug(f"Backfilled tracked pid {pid} for game_id={game_id} "
+                            "so future find_game_process calls take the cheap path")
 
     def get_tracked_snapshot(self) -> dict:
         """Return a thread-safe snapshot of tracked processes."""
