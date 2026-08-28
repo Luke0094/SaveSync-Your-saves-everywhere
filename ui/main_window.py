@@ -942,25 +942,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._overview_page._debounce.stop()
             except Exception:
                 pass
-        if not self._heavy_work_in_flight():
+        if not self._heavy_work_in_flight() and not self._is_game_running():
             try:
                 from ui.helpers import clear_view_cache, trim_process_memory
                 clear_view_cache()
-                is_gaming = self._is_game_running()
-                if is_gaming:
-                    self._release_idle_documents(force_all=True)
-                trim_process_memory(full=is_gaming)
-                # Deferred trim: once Qt completes hide transitions and event loop drains,
-                # sweep transient paint buffers and release working set
-                QTimer.singleShot(250, lambda: trim_process_memory(full=is_gaming))
+                trim_process_memory(full=False)
             except Exception:
                 pass
 
     def _on_stage2_threads_cleanup(self):
         """Stage 2 cleanup (after 2 minutes in background/tray):
         Drains non-essential background threads, purges cover pixmap caches, and releases working set.
-        Protected: active operations, open/shelved search dialogs."""
-        if self._heavy_work_in_flight() or self._has_active_or_pending_dialogs():
+        Protected: active operations, open/shelved search dialogs, loaded cheat save."""
+        if self._heavy_work_in_flight() or self._is_game_running() or self._has_active_or_pending_dialogs():
             return
         logger.debug("Stage 2 cleanup (2 minutes in background): trimming cover caches and inactive workers.")
         try:
@@ -968,10 +962,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             from ui.helpers import clear_view_cache, trim_process_memory
             clear_view_cache()
             trim_cover_cache()
-            is_gaming = self._is_game_running()
-            if is_gaming:
-                self._release_idle_documents(force_all=True)
-            trim_process_memory(full=True)
+            trim_process_memory(full=False)
         except Exception:
             logger.debug("Stage 2 cleanup failed", exc_info=True)
 
@@ -1077,13 +1068,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         self._sweeps_since_deep = getattr(self, "_sweeps_since_deep", 0) + 1
         unattended = self._is_unattended()
+        # Stage 3 (Deep Idle / Pressure): corresponds to the Stage 3 schema documented in ui.helpers.trim_process_memory
         deep = (pressure != "ok"
                 or unattended
                 or self._sweeps_since_deep >= deep_sweep_after_sweeps())
         try:
             if deep:
+                # Stage 3 deep sweep: purges cover caches, runs full GC, and releases working set pages to the OS
                 self._sweeps_since_deep = 0
-                is_full = not (self._heavy_work_in_flight() or self._is_game_running())
+                is_full = (pressure != "ok") and not (self._heavy_work_in_flight() or self._is_game_running())
                 if pressure == "critical" or unattended:
                     self._release_idle_documents(force_all=True)
                 trim_process_memory(full=is_full)
@@ -1501,8 +1494,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         if done == 0 and not self._sync_batch_notice.isVisible():
             self._sync_batch_notice.begin(t("batch.sync_label"), total, name or "")
+            self._sync_batch_notice.set_cancel(
+                t("common.cancel"), self._cancel_sync_batch, min_seconds=30)
         else:
             self._sync_batch_notice.update_progress(done, total, name or "")
+
+    def _cancel_sync_batch(self):
+        """Cancel the running sync batch: drain the queue and finish inflight."""
+        from sync import get_orchestrator
+        orch = get_orchestrator()
+        if orch is not None:
+            with orch._sync_lock:
+                orch._sync_job_queue.clear()
+            logger.info("Sync batch cancelled by user")
+            if getattr(orch, "_sync_batch", None):
+                orch._sync_batch["pending_ids"] = []
 
     def _on_sync_batch_finished(self, done: int, name: str = ""):
         if done == 1 and name:
@@ -5612,10 +5618,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         })
         self._backup_batch_notice.begin(
             t("batch.backup_label"), len(ids), self._batch_item_name(ids[0]))
+        self._backup_batch_notice.set_cancel(
+            t("common.cancel"), self._cancel_backup_batch, min_seconds=30)
         for gid in ids:
             self._enqueue_backup(gid, force_full=force_full, silent=True,
                                 part_of_batch=True)
         self._pump_backup_queue()
+
+    def _cancel_backup_batch(self):
+        """Cancel the running backup batch: drain the queue and finish inflight."""
+        with self._backup_lock:
+            self._backup_job_queue.clear()
+            self._backup_queued.clear()
+        logger.info("Backup batch cancelled by user")
+        if self._backup_batch:
+            # Let _finish_backup_job see an empty pending list so it wraps up.
+            self._backup_batch["pending_ids"] = []
 
     def _enqueue_backup(self, game_id: str, force_full: bool = False,
                         silent: bool = False, part_of_batch: bool = False):
@@ -6500,16 +6518,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._status_bar.showMessage(f"{t('core.launch_failed')}: {e}", 5000)
                 logger.warning(f"Launch failed for {entry.exe_path}: {e}")
                 return
-
-        # We know a game is starting — the monitor should not have to
-        # rediscover that on an idle-rate timer. After a quiet spell its
-        # interval has backed off to four times the base, so the process was
-        # not even looked for until seconds after the user pressed Play, and
-        # only then did the runtime threshold start counting.
-        try:
-            get_monitor().nudge()
-        except Exception:
-            logger.debug("could not nudge the process monitor", exc_info=True)
 
     def _on_folder_appeared(self, game_id: str):
         """Save folder just appeared for the first time.

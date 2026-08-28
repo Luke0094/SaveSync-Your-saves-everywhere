@@ -593,8 +593,9 @@ def _record_unattributed(src_path: str, game_id: str, inner_handler=None):
             return
         _UNATTRIBUTED_EVENTS.append((now, file_key, strength == 2))
         anchor = _LAST_ANCHOR_TS.get(game_id, 0.0)
-    window = strong_s if strength == 2 else weak_s
-    if anchor and (now - anchor) <= window:
+        window = strong_s if strength == 2 else weak_s
+        should_claim = bool(anchor and (now - anchor) <= window)
+    if should_claim:
         _claim_event_for_game(game_id, file_key,
                               f"Δ={(now - anchor) * 1000:.0f}ms from anchor")
         if inner_handler is not None:

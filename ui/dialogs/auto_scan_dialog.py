@@ -1007,13 +1007,16 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         excluded = set(getattr(game, "excluded_save_paths", None) or [])
         game_id = getattr(game, "id", "") or ""
 
+        # Compact spacing: header, paths, and manage button sit close together.
+        self._existing_layout.setSpacing(0)
+
         header = QLabel(t("auto_scan.existing_paths_title"))
         header.setObjectName("auto_scan_game_header")
         self._existing_layout.addWidget(header)
 
         for path in paths:
             row = QHBoxLayout()
-            row.setContentsMargins(20, 2, 2, 2)
+            row.setContentsMargins(20, 1, 2, 1)
 
             cb = ElidedCheckBox()
             cb.setObjectName("list_cb_sm")
@@ -1043,6 +1046,24 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             file_list = FileListWidget(path, game_id)
             file_list.set_selectable(False)
             self._existing_layout.addWidget(file_list)
+
+        # Manage button — always available so the user can review excluded
+        # paths even when no new proposals were found.
+        manage_row = QHBoxLayout()
+        manage_row.setContentsMargins(20, 2, 2, 0)
+        manage_lbl = QLabel()
+        manage_lbl.setObjectName("auto_scan_muted")
+        manage_row.addWidget(manage_lbl, 1)
+        manage_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
+        lock_min_size(
+            manage_btn, scaled(88, self, min_px=72), scaled(24, self, min_px=22),
+            policy_h=QSizePolicy.Policy.Minimum,
+            policy_v=QSizePolicy.Policy.Fixed)
+        manage_btn.setObjectName("auto_scan_sm_btn")
+        manage_btn.clicked.connect(
+            lambda: self._open_ignored_dialog_for(game))
+        manage_row.addWidget(manage_btn)
+        self._existing_layout.addLayout(manage_row)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)

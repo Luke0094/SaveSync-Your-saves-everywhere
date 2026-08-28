@@ -201,7 +201,13 @@ def _parse_wine_value(raw_val: str) -> Tuple[Any, int]:
         try:
             b = bytes(int(x, 16) for x in hex_bytes if x)
             decoded = b.decode("utf-16-le", errors="ignore")
-            parts = [p for p in decoded.split('\x00') if p]
+            if decoded.endswith("\x00\x00"):
+                decoded = decoded[:-2]
+            elif decoded.endswith("\x00"):
+                decoded = decoded[:-1]
+            if not decoded:
+                return [], REG_MULTI_SZ
+            parts = decoded.split('\x00')
             return parts, REG_MULTI_SZ
         except Exception:
             return [], REG_MULTI_SZ

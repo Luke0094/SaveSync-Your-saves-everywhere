@@ -726,7 +726,8 @@ class SyncOrchestrator(QObject):
         # AND a network transfer, so it is the one most worth backing off.
         cap = sync_max_inflight()
         self._sync_max_inflight = cap
-        while True:
+        max_iterations = max(cap * 4, 64)
+        for _ in range(max_iterations):
             with self._sync_lock:
                 inflight = len(self._syncing_games)
                 if inflight >= cap or not self._sync_job_queue:

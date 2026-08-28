@@ -977,11 +977,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._refresh_badge_interactivity()
 
     def _refresh_badge_interactivity(self):
-        """Badge affordance follows the overlay mode: an active button only
-        over the tracking toast (clicking swaps in the unknown queue); a
-        flat counter everywhere else — on the unknown view the arrows
-        already browse the queue, so a click would be a no-op there."""
-        clickable = self._overlay_mode == "tracking"
+        """Badge affordance follows the overlay mode: clickable everywhere
+        except the unknown view itself — where the arrows already browse
+        the queue — so the user can always reach the queue from any
+        notification."""
+        clickable = self._overlay_mode != "unknown"
         base = (
             f"QPushButton{{color:{palette('accent_text')};background:{palette('accent')};"
             f"border:none;border-radius:10px;font-size:{scaled(11, self)}px;font-weight:700;"
@@ -998,7 +998,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._unknown_badge.setToolTip(t("unknown_history.badge_pending"))
 
     def _on_badge_clicked(self):
-        if self._overlay_mode != "tracking":
+        if self._overlay_mode == "unknown":
             return
         self.show_unknown_queue()
 

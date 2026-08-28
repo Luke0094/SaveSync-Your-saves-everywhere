@@ -406,8 +406,8 @@ class ConfigManager(QObject):
                     with open(tmp_path, "w", encoding="utf-8") as f:
                         json.dump(fallback_snapshot, f, indent=2, default=str)
                     _atomic_replace(tmp_path, CONFIG_FILE)
-                except Exception:
-                    pass
+                except Exception as fallback_err:
+                    logger.error(f"Fallback config write also failed: {fallback_err}")
         except BaseException:
             # Ensure _writing is cleared even on KeyboardInterrupt / SystemExit
             with self._io_lock:

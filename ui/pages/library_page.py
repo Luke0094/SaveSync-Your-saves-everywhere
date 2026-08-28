@@ -801,6 +801,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         self._update_empty_state()
 
     def _make_widget(self, entry: GameEntry) -> QWidget:
+        entry = get_library().get_by_id(entry.id) or entry
         if self._view_mode == "card":
             w = GameCard(entry)
         else:
@@ -810,6 +811,12 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
                     "review_provisional_requested", "cheats_requested"):
             getattr(w, sig).connect(getattr(self, sig))
         w.detail_requested.connect(self._on_detail_requested)
+        try:
+            from core.monitor import get_monitor
+            if get_monitor().is_playing(entry.id):
+                w.set_playing(True)
+        except Exception:
+            pass
         return w
 
     def _on_detail_requested(self, game_id: str):
@@ -898,6 +905,12 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
             if tags_changed:
                 self._refresh_tag_sidebar()
         else:
+            queue = getattr(self, "_insert_queue", None)
+            if queue:
+                for i, q_entry in enumerate(queue):
+                    if getattr(q_entry, "id", None) == entry.id:
+                        queue[i] = entry
+                        break
             self._refresh_tag_sidebar()
 
     def _on_game_removed(self, gid: str):

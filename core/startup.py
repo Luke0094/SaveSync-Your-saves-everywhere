@@ -279,7 +279,7 @@ def validate_directories() -> bool:
 
 def cleanup_temp_files() -> None:
     """Clean up temporary files and old logs."""
-    from core.constants import _user_data_dir
+    from core.constants import _user_data_dir, BACKUP_DIR
     
     try:
         data_dir = _user_data_dir()
@@ -290,6 +290,15 @@ def cleanup_temp_files() -> None:
             shutil.rmtree(temp_dir, ignore_errors=True)
             temp_dir.mkdir(exist_ok=True)
         
+        # Remove orphaned .tmp files left behind after a crash during backup
+        # creation (the .tmp → .replace() was not reached).
+        if BACKUP_DIR.exists():
+            for tmp in BACKUP_DIR.rglob("*.tmp"):
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
         # Clean old log files (keep last 5)
         log_dir = data_dir / "logs"
         if log_dir.exists():

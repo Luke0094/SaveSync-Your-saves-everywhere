@@ -3,12 +3,15 @@ SaveSync - Core Constants
 Centralized configuration to avoid hardcoding.
 """
 from pathlib import Path
+import logging
 import os
 import platform
 
+logger = logging.getLogger(__name__)
+
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
@@ -311,6 +314,9 @@ def disambiguate_name(base: str, taken, hint: str = "") -> str:
     while True:
         candidate = f"{base}{_DISAMBIGUATION_MARK}{uuid.uuid4().hex[:6]}"
         if candidate.casefold() not in used:
+            return candidate
+        if len(used) > 1000:
+            logger.warning("disambiguate_name: exhausted %d candidates for %r", len(used), base)
             return candidate
 
 

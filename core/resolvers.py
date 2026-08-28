@@ -838,7 +838,10 @@ def launch_executable(exe_path: str) -> None:
         os.startfile(exe_path)          # type: ignore[attr-defined]
         return
     if _IS_MACOS and Path(exe_path).suffix.lower() == _MACOS_BUNDLE_SUFFIX:
-        subprocess.Popen(["open", exe_path])
+        try:
+            subprocess.Popen(["open", exe_path])
+        except OSError as e:
+            logger.warning("Failed to open macOS bundle %s: %s", exe_path, e)
         return
     # A .exe is not something this kernel can run. Off Windows it goes
     # through Wine or Proton, in the prefix it belongs to.
@@ -847,15 +850,21 @@ def launch_executable(exe_path: str) -> None:
         if command:
             logger.info("Launching %s through %s", Path(exe_path).name,
                         Path(command[0]).name)
-            subprocess.Popen(command, env=env,
-                             cwd=str(Path(exe_path).parent))
+            try:
+                subprocess.Popen(command, env=env,
+                                 cwd=str(Path(exe_path).parent))
+            except OSError as e:
+                logger.warning("Failed to launch %s: %s", exe_path, e)
             return
         raise RuntimeError(
             "This is a Windows executable and there is no Wine or Proton "
             "on this system to run it with. Install wine, or launch the "
             "game through Steam so its own Proton is used."
         )
-    subprocess.Popen([exe_path])
+    try:
+        subprocess.Popen([exe_path])
+    except OSError as e:
+        logger.warning("Failed to launch %s: %s", exe_path, e)
 
 
 def wine_prefix_for(exe_path) -> str:

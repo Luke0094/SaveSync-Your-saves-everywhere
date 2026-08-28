@@ -25,12 +25,15 @@ from core.machine import get_machine_id
 import i18n
 
 # Extensions that should NEVER be in a save backup (game assets, binaries)
+# Built on top of SKIP_EXTENSIONS (constants.py) with additional game-specific
+# formats that the scanner intentionally keeps (they could be saves in some
+# engines) but backup must never include.
 _BACKUP_SKIP_EXTENSIONS = frozenset(SKIP_EXTENSIONS) | frozenset({
     ".dylib", ".bundle",        # macOS libraries
-    ".pak", ".pck", ".asset",   # game asset packages
+    ".pck", ".asset",           # game asset packages (not in SKIP_EXTENSIONS)
     ".bank", ".fsb",            # audio banks (FMOD, Wwise)
-    ".dds", ".ktx", ".pvr",    # compressed textures
-    ".webm", ".bik", ".usm",   # game video formats
+    ".dds", ".ktx", ".pvr",    # compressed textures (.dds not in SKIP)
+    ".webm", ".bik", ".usm",   # game video formats (.webm not in SKIP)
     ".zip", ".rar", ".7z", ".tar", ".gz",  # archives
     ".tmp", ".temp", ".cache",  # temporary files
 })
@@ -74,7 +77,8 @@ def scan_relevant_save_mtimes(
         try:
             mtime = float(registry_last_write(rp) or 0.0)
         except Exception:
-            return False, count, max_mtime
+            logger.debug("Registry mtime read failed for %s, skipping", rp)
+            continue
         if threshold is not None and mtime > threshold + eps:
             return False, count, max(max_mtime, mtime)
         max_mtime = max(max_mtime, mtime)
@@ -813,12 +817,13 @@ class BackupManager(QObject):
     def _load_deleted_ids(self) -> dict[str, list[str]]:
         try:
             p = self._deleted_ids_path()
-            if p.exists():
-                with open(p, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return {str(k): [str(b) for b in v] for k, v in data.items()
-                            if isinstance(v, list)}
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): [str(b) for b in v] for k, v in data.items()
+                        if isinstance(v, list)}
+        except FileNotFoundError:
+            pass
         except Exception as e:
             logger.warning(f"Could not load deleted-backups tombstones: {e}")
         return {}
@@ -1727,16 +1732,14 @@ class BackupManager(QObject):
             )
             return _ret(None, False)
 
-        zip_path_tmp = None
+            zip_path_tmp = None
         try:
             # Write ALL files to .tmp first, then atomic rename.
             # Every backup is a complete snapshot so any single backup can
             # be restored without depending on previous ones.
             game_backup_dir.mkdir(parents=True, exist_ok=True)
             zip_path_tmp = zip_path.with_suffix(".tmp")
-            zf = None
-            try:
-                zf = zipfile.ZipFile(zip_path_tmp, "w", zipfile.ZIP_DEFLATED)
+            with zipfile.ZipFile(zip_path_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f, rel_root, arc_name in resolved_files:
                     try:
                         zf.write(f, arc_name)
@@ -1744,9 +1747,6 @@ class BackupManager(QObject):
                         logger.warning(f"Skipping file {f}: {e}")
                 for arc_name, data in reg_exports:
                     zf.writestr(arc_name, data)
-            finally:
-                if zf:
-                    zf.close()
 
             zip_path_tmp.replace(zip_path)
 
