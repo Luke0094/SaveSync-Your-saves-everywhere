@@ -119,6 +119,21 @@ CRASH_HANDLER_STEMS = expand_stems({
     "bugsplat", "sentry",
 })
 
+# Anti-cheat services. Installed BESIDE the game, often in the game's own
+# install directory or a subfolder of it, and running for the whole
+# session — unlike the crash handlers above, not necessarily small: a
+# heavy anti-cheat service can transiently out-weigh the actual game in
+# memory. core.monitor's directory-match fallback picks whichever process
+# in the install folder is currently using the most memory as "the game";
+# without excluding these by name first, that comparison has no way to
+# tell a well-known anti-cheat service apart from the thing it's guarding.
+ANTICHEAT_STEMS = expand_stems({
+    "easyanticheat", "easyanticheat launcher", "easyanticheat eos setup",
+    "battleye", "beservice",
+    "pnkbstra", "pnkbstrb",
+    "vgc", "vgtray",
+})
+
 # Redistributables and prerequisites a game installer drops in its folder.
 REDIST_STEMS = expand_stems({
     "vcredist", "vcredist x86", "vcredist x64", "dxsetup", "dxwebsetup",
@@ -156,7 +171,7 @@ AMBIGUOUS_TOOL_STEMS = expand_stems({
 
 # Everything that is never the game, whatever it scores otherwise.
 NEVER_A_GAME_STEMS = (
-    INSTALLER_STEMS | UPDATER_STEMS | CRASH_HANDLER_STEMS
+    INSTALLER_STEMS | UPDATER_STEMS | CRASH_HANDLER_STEMS | ANTICHEAT_STEMS
     | REDIST_STEMS | RUNTIME_STEMS | HELPER_TOOL_STEMS | AMBIGUOUS_TOOL_STEMS
 )
 
@@ -174,7 +189,7 @@ NEVER_A_GAME_STEMS = (
 # - AMBIGUOUS_TOOL_STEMS. core.watcher reuses this set to veto save-path
 #   components, where "tools"/"patch" are ordinary folder names.
 NEVER_A_GAME_PROCESS_STEMS = (
-    INSTALLER_STEMS | UPDATER_STEMS | CRASH_HANDLER_STEMS
+    INSTALLER_STEMS | UPDATER_STEMS | CRASH_HANDLER_STEMS | ANTICHEAT_STEMS
     | REDIST_STEMS | HELPER_TOOL_STEMS
 )
 

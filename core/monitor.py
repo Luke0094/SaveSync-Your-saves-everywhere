@@ -1532,21 +1532,50 @@ class ProcessMonitor(QObject):
         if not PSUTIL_AVAILABLE:
             return 0
 
-        # 1. Check tracked games
+        # 1. Check tracked games — and prune any dead entries for this
+        # game_id found along the way, rather than leaving them to sit in
+        # _tracked/_game_sessions forever. A stale entry doesn't change
+        # whether this search has to fall through to Steps 2/3 (a dead pid
+        # is still checked, still confirmed dead, every single call) — it
+        # only means the dict never stops growing.
+        found_pid = 0
+        dead_keys = []
         with self._data_lock:
             for key, entry in self._tracked.items():
                 if entry is not None and entry.id == game_id:
-                    # Verify the process is still running
                     try:
                         proc = psutil.Process(key[0])
                         if proc.is_running():
-                            return key[0]
+                            if not found_pid:
+                                found_pid = key[0]
+                        else:
+                            dead_keys.append(key)
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
+                        dead_keys.append(key)
+            for key in dead_keys:
+                self._tracked.pop(key, None)
+                self._first_seen.pop(key, None)
+                sess = self._game_sessions.get(game_id)
+                if sess is not None:
+                    sess["procs"].discard(key)
+        if dead_keys:   # [DIAG]
+            logger.info(f"[DIAG] find_game_process game_id={game_id}: "
+                        f"pruned {len(dead_keys)} dead tracked pid(s) {[k[0] for k in dead_keys]} "
+                        f"for this game — they were tracked, now confirmed gone")
+        if found_pid:
+            logger.info(f"[DIAG] find_game_process game_id={game_id}: "
+                        f"step 1 HIT pid={found_pid}")
+            return found_pid
+
+        # [DIAG] temporary — remove once we know what's actually happening.
+        sess = self._game_sessions.get(game_id)
+        session_age = round(time.time() - sess["start"], 1) if sess else None
 
         # 2. Direct exe match in running dict
         pid = self.find_pid_by_exe(exe_path)
         if pid:
+            logger.info(f"[DIAG] find_game_process game_id={game_id}: "
+                        f"step 1 miss, step 2 HIT pid={pid}, session_age={session_age}s")
             self._remember_resolved_pid(game_id, pid)
             return pid
 
@@ -1557,6 +1586,9 @@ class ProcessMonitor(QObject):
         try:
             exe_dir = Path(exe_path).resolve().parent
         except (OSError, ValueError):
+            logger.info(f"[DIAG] find_game_process game_id={game_id}: "
+                        f"step 1+2 miss, can't resolve exe_dir from {exe_path!r}, "
+                        f"session_age={session_age}s")
             return 0
 
         # Import outside the lock to avoid potential deadlock with the
@@ -1570,6 +1602,7 @@ class ProcessMonitor(QObject):
 
         best_pid = 0
         best_mem = 0
+        candidates = []   # [DIAG]
         for key, info in running_snapshot:
             exe = info.get("exe", "")
             if not exe:
@@ -1582,14 +1615,36 @@ class ProcessMonitor(QObject):
                     try:
                         proc = psutil.Process(key[0])
                         mem = proc.memory_info().rss
+                        age = round(time.time() - proc.create_time(), 1)
+                        candidates.append((info.get("name", "?"), key[0], mem, age))
                         if mem > best_mem:
                             best_mem = mem
                             best_pid = key[0]
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        candidates.append((info.get("name", "?"), key[0], -1, -1))
                         if not best_pid:
                             best_pid = key[0]
             except (OSError, ValueError, RuntimeError, RecursionError):
                 continue
+
+        # [DIAG] full candidate dump — every process step 3 considered inside
+        # exe_dir, its memory in MB and how long it had been running, and
+        # which one won. This is the one log line that will actually show us
+        # whether something is out-competing the game, whether the pick
+        # changes call to call, and how far into the session this is
+        # happening — rather than guessing further.
+        if candidates:
+            cand_str = "; ".join(
+                f"{n!r} pid={p} mem={(m // (1024*1024)) if m >= 0 else '?'}MB age={a}s"
+                for n, p, m, a in candidates
+            )
+            logger.info(f"[DIAG] find_game_process game_id={game_id} step 3 "
+                        f"session_age={session_age}s exe_dir={exe_dir} "
+                        f"candidates: {cand_str} -> picked pid={best_pid}")
+        else:
+            logger.info(f"[DIAG] find_game_process game_id={game_id} step 3 "
+                        f"session_age={session_age}s exe_dir={exe_dir}: "
+                        f"NO candidates found at all")
 
         if best_pid:
             logger.info(f"Found game process via directory match: PID {best_pid} "
