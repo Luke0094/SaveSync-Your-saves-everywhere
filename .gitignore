@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Vendored dependency wheels (hundreds of MB, platform-specific —
+# regenerate locally with download_offline_deps.bat)
+offline_deps/
+
+# Dev-only test harness (not part of the published project)
+tests/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Runtime artifacts
+*.log

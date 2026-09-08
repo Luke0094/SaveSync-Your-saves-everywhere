@@ -952,6 +952,34 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
         if event.is_directory:
             return
 
+        # Reject anything under a path the user has explicitly excluded,
+        # before any other processing. This is the one place every watch
+        # for this game funnels through — the per-path watch on confirmed
+        # save_paths AND the broad-discovery watches on common roots / the
+        # install tree — so checking here covers all of them, regardless
+        # of which watch actually triggered the event. Excluded paths were
+        # previously only filtered at backup-creation time (create_backup's
+        # excluded_paths arg), which is too late: the excluded folder's own
+        # write activity was still triggering detection, debounce, and a
+        # backup attempt every time, even though its files never ended up
+        # in the resulting archive. Checked fresh from the library each
+        # time (not cached at handler creation) so a change to the
+        # exclusion list takes effect immediately, mid-session.
+        try:
+            from core.library import get_library
+            _entry = get_library().get_by_id(self._game_id)
+            if _entry is not None and _entry.excluded_save_paths:
+                _changed = Path(event.src_path).resolve()
+                for _excl in _entry.excluded_save_paths:
+                    try:
+                        _excl_p = Path(_excl).resolve()
+                    except (OSError, ValueError):
+                        continue
+                    if _changed == _excl_p or _is_relative_to_compat(_changed, _excl_p):
+                        return
+        except Exception:
+            pass   # exclusion check is best-effort — never block a real event on it
+
         # Correlation ANCHOR — set BEFORE any rejection below. This handler
         # only receives game-linked events (game-scoped watches, or common
         # -root events that passed the name filter), so even a file we then
@@ -1691,11 +1719,16 @@ class SaveWatcher(QObject):
             # The game's OWN install tree — recursive, no name-filter needed
             # (everything under it is already scoped to this one game).
             # Skipped if a confirmed save_path already covers it (exactly,
-            # or as an ancestor) to avoid watching the same tree twice.
+            # as an ancestor, OR as a descendant — a confirmed path nested
+            # inside the install dir, e.g. <install>/game/saves, is the
+            # common case, and without this direction the per-path watch
+            # on it and this recursive install-tree watch both cover the
+            # same subtree independently: every change inside fires twice).
             if _install_dir is not None:
                 _install_str = str(_install_dir)
                 already_covered = any(
                     _install_str == ps or _install_str.startswith(ps + os.sep)
+                    or ps.startswith(_install_str + os.sep)
                     for ps in save_paths
                 )
                 key = f"{game_id}:__install__:{_install_str}"

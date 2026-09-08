@@ -25,6 +25,7 @@ from core.constants import (
 )
 from core.config_manager import get_config
 from core import is_relative_to as _is_relative_to
+from core import win_open_files
 import i18n
 
 # Resolve SaveSync's own data dir once — never detect it as a game save path
@@ -819,6 +820,83 @@ _NON_SAVE_EXTENSIONS = frozenset({
 # slot_03.sav / slot_07.sav, where only the digits differ.
 _SAVE_SLOT_RE = re.compile(r'^(.*?)(\d+)(\D*)$')
 
+# Chromium / NW.js / CEF keep a browser profile under a "User Data" folder
+# (RPG Maker MV/MZ, Tyrano and other web-UI engines default to
+# %LOCALAPPDATA%\<product>\User Data, or a bare %LOCALAPPDATA%\User Data
+# when the app sets no product name).
+#
+# A game that persists saves in here writes them into a folder it names
+# itself — e.g. ``User Data\Default\<game-title>\file1.rpgsave`` — which
+# is kept by exclusion: nothing here matches any game title, the rule
+# only knows the browser's own names. Everything the browser manages is
+# dropped: its loose state files (Cookies, History, Local State,
+# Preferences, …) which sit directly in the profile, its caches, and
+# every LevelDB / web-platform store (Local Storage, Session Storage,
+# IndexedDB, VideoDecodeStats, Service Worker, …) — none of which is ever
+# a game's own save file, even for a game that uses the localStorage API.
+_CHROMIUM_PROFILE_DIR = "user data"
+# Profile subdirectories directly under "User Data": Default, Profile 1…,
+# Guest Profile, System Profile. A loose file in one of these is browser
+# state; a game makes its own subfolder below it.
+_CHROMIUM_PROFILE_SUBDIRS = frozenset({
+    "default", "guest profile", "system profile",
+})
+_CHROMIUM_PROFILE_RE = re.compile(r"^profile \d+$")
+# Directory names the browser creates and owns, anywhere under the profile.
+_CHROMIUM_MANAGED_DIRS = frozenset({
+    # web-platform / per-origin storage
+    "local storage", "session storage", "indexeddb", "databases",
+    "file system", "shared dictionary", "cache storage", "service worker",
+    "videodecodestats", "shared_proto_db", "quota",
+    # caches
+    "cache", "code cache", "gpucache", "shadercache", "grshadercache",
+    "dawncache", "dawngraphitecache", "graphitedawncache", "dawnwebgpucache",
+    "component_crx_cache", "extensions_crx_cache",
+    # browser bookkeeping / telemetry / ML
+    "crashpad", "crash reports", "blob_storage", "sessions", "thumbnails",
+    "search logos", "web applications", "history provider cache",
+    "network", "download service", "webrtc logs", "browsermetrics",
+    "module info cache", "widevinecdm", "safe browsing", "sync data",
+    "extension rules", "extension state", "extension scripts",
+    "local extension settings", "sync extension settings",
+    "managed extension settings", "platform notifications",
+    "feature engagement tracker", "site characteristics database",
+    "autofillstrikedatabase", "budgetdatabase", "segmentation_platform",
+    "optimization_guide_hint_cache_store", "affiliation database",
+    "optimization_guide_model_and_features_store",
+    "data_reduction_proxy_leveldb", "persistentorigintrials",
+    "attributionreporting", "commerce_subscription_db",
+})
+
+
+def _looks_like_leveldb(d: Path) -> bool:
+    """A directory that is a LevelDB store (Chromium storage backend) — its
+    contents are opaque key/value pages, never a game's own save file."""
+    try:
+        return (d / "CURRENT").is_file() and any(d.glob("MANIFEST-*"))
+    except OSError:
+        return False
+
+
+def _is_chromium_managed(fp: Path) -> bool:
+    """True when *fp* is a file the browser owns inside a "User Data"
+    profile — as opposed to something a game wrote into its own subfolder
+    there. Assumes the caller already knows "user data" is in the path."""
+    parts = [p.lower() for p in fp.parts]
+    try:
+        i = len(parts) - 1 - parts[::-1].index(_CHROMIUM_PROFILE_DIR)
+    except ValueError:
+        return False
+    dirs = parts[i + 1:-1]          # directory components below "User Data"
+    if dirs and (dirs[0] in _CHROMIUM_PROFILE_SUBDIRS
+                 or _CHROMIUM_PROFILE_RE.match(dirs[0])):
+        dirs = dirs[1:]             # step past the profile dir
+    if not dirs:
+        return True                # loose file at "User Data" / profile root
+    if set(dirs) & _CHROMIUM_MANAGED_DIRS:
+        return True
+    return _looks_like_leveldb(fp.parent)
+
 
 def _looks_like_save_sibling(name_a: str, name_b: str) -> bool:
     """True if *name_b* is the same save-slot family as *name_a* -- identical
@@ -897,6 +975,86 @@ def _dir_has_recent_activity(path_str: str, since_ts: float, slack: float = 2.0,
         return False
 
 
+# ── Fast open-files path (Windows) ───────────────────────────────────────
+# psutil's Process.open_files() on Windows enumerates the whole-system
+# handle table (100k+ entries) to find one process's handles, and holds
+# the GIL for the entire call — 85-370ms measured, worse on some handle
+# types. The live-tracking loop pays that once a minute for a whole play
+# session; on the measured repro a single-process game with 33 open files
+# cost 450-550ms per poll and hitched the game.
+#
+# core.win_open_files does the same job from the target process's handle
+# table alone (NtQueryInformationProcess) and never holds the GIL — 2-10ms
+# typical. It's Windows-only and best-effort, so psutil stays the fallback
+# and, for the first few polls of each new pid, runs alongside it as a
+# cross-check: a missed save directory is silent until a save is lost, so
+# the swap logs its parity before anything relies on it.
+#
+# The cross-check runs on a DETACHED thread, never on the poll's critical
+# path: psutil's open_files() can take 1s+ on a game holding ~1000 handles
+# (measured), which is exactly the cost this change removes — feeding it
+# back into the poll, even briefly at launch, would defeat the point. The
+# poll returns the fast result immediately; the comparison just logs
+# whenever it finishes. One check per pid: the handle set is largest and
+# most active right after launch, so a first-poll match is the signal that
+# matters, and each check still costs one ~1s psutil call (off-thread).
+_OPEN_FILES_VERIFY_POLLS = 1
+_open_files_verify_lock = _threading.Lock()
+_open_files_verify_counts: dict = {}
+
+
+def _spawn_open_files_verify(pid: int, poll: int, fast_paths: set) -> None:
+    """Compare psutil's open_files() against the fast path's result off the
+    critical path and log the difference. Best-effort; a slow or failing
+    psutil call only delays/skips a log line."""
+    def _run():
+        # let the poll that spawned us finish first — psutil.open_files()
+        # holds the GIL for ~1s and we don't want that landing on top of
+        # the poll's own tail work.
+        time.sleep(2.0)
+        try:
+            import psutil
+            ref = {f.path for f in psutil.Process(pid).open_files()}
+        except Exception as e:
+            logger.info("[DIAG] fast open_files pid=%s poll=%d: psutil "
+                        "cross-check unavailable (%s) — trusting fast path",
+                        pid, poll, type(e).__name__)
+            return
+        missing, extra = ref - fast_paths, fast_paths - ref
+        if missing or extra:
+            logger.warning(
+                "[DIAG] fast open_files pid=%s poll=%d: MISMATCH vs psutil "
+                "— missing=%s extra=%s", pid, poll,
+                sorted(missing), sorted(extra))
+        else:
+            logger.info("[DIAG] fast open_files pid=%s poll=%d: parity %d/%d",
+                        pid, poll, len(fast_paths), len(ref))
+
+    _threading.Thread(target=_run, daemon=True,
+                      name="open-files-verify").start()
+
+
+def _open_files_for_pid(proc_obj):
+    """``(pid, [win_open_files.popenfile, ...])`` — fast path, psutil
+    fallback handled by the caller. Fires a detached psutil cross-check for
+    the first ``_OPEN_FILES_VERIFY_POLLS`` observations of each pid."""
+    pid = proc_obj.pid
+    if not win_open_files.AVAILABLE:
+        return pid, proc_obj.open_files()
+
+    fast = win_open_files.open_files(pid)   # may raise -> caller falls back
+
+    with _open_files_verify_lock:
+        n = _open_files_verify_counts.get(pid, 0)
+        if n < _OPEN_FILES_VERIFY_POLLS:
+            _open_files_verify_counts[pid] = n + 1
+            _spawn_open_files_verify(pid, n + 1, {f.path for f in fast})
+        if len(_open_files_verify_counts) > 256:
+            _open_files_verify_counts.clear()
+
+    return pid, fast
+
+
 def _live_save_paths(pid: int) -> list[str]:
     """Track save-file directories by following the game's process tree,
     narrowed to files with actual *write* evidence since launch.
@@ -927,11 +1085,45 @@ def _live_save_paths(pid: int) -> list[str]:
         logger.debug(f"Live tracking: cannot attach to PID {pid}: {e}")
         return []
 
+    _t_start = time.time()   # [DIAG]
+
     # Collect the full process tree: game process + all descendants
     try:
         all_procs = [proc] + proc.children(recursive=True)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         all_procs = [proc]
+
+    _t_tree = time.time()   # [DIAG]
+
+    # Filter out known Chromium/Electron/NW.js sandboxed child process
+    # types before they're ever considered for open_files(). Chromium's
+    # own multi-process architecture tags every child with an explicit
+    # --type= flag on its command line (gpu-process, renderer, utility,
+    # zygote, crashpad-handler, ...) — the main/browser process has none.
+    # In Chromium's security model, sandboxed children don't do direct
+    # file I/O; it's proxied through the main process via IPC. So these
+    # are essentially never going to hold a save-file handle, and walking
+    # them just to find that out is exactly the cost this is meant to
+    # avoid. The root process (all_procs[0], the pid we were actually
+    # asked about) is always kept regardless of its own cmdline.
+    if len(all_procs) > 1:
+        _root = all_procs[0]
+        _pre_filter_count = len(all_procs)   # [DIAG]
+        _kept = [_root]
+        for _p in all_procs[1:]:
+            try:
+                _cmdline = " ".join(_p.cmdline())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+                _kept.append(_p)   # can't tell — keep it, safer to over-include than miss a real save writer
+                continue
+            if "--type=" in _cmdline:
+                continue   # sandboxed Chromium/Electron/NW.js child — skip
+            _kept.append(_p)
+        all_procs = _kept
+    else:
+        _pre_filter_count = len(all_procs)   # [DIAG]
+
+    _t_procfilter = time.time()   # [DIAG]
 
     exe_lower = ""
     exe_dir: Optional[Path] = None
@@ -952,11 +1144,76 @@ def _live_save_paths(pid: int) -> list[str]:
 
     written_files: set[Path] = set()
 
-    for p in all_procs:
+    # Enumerating a process's open files is the heavy part of this scan.
+    # On Windows core.win_open_files does it from the target process's own
+    # handle table without holding the GIL (2-10ms typical); psutil's
+    # open_files() walks the whole-system handle table and holds the GIL
+    # for the entire call (85-370ms measured, worse on some handle types)
+    # and is kept only as the fallback. Either way a
+    # Chromium/NW.js/Electron game's GPU and renderer children hold dozens
+    # of handles each, so every process in the tree is enumerated
+    # concurrently below: wall time is close to the SLOWEST single
+    # process, not the sum, and nothing is skipped or discarded.
+    import concurrent.futures
+
+    def _open_files_safe(proc_obj):
         try:
-            open_fds = p.open_files()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+            return _open_files_for_pid(proc_obj)
+        except Exception as e:
+            # Fast path unavailable or it raised (elevated game, race on
+            # exit, unexpected ctypes failure). Fall back to psutil, which
+            # sometimes has access the fast path doesn't — and if that
+            # also fails, this process just contributes no fds this poll.
+            try:
+                return proc_obj.pid, proc_obj.open_files()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return proc_obj.pid, []
+            except Exception:
+                logger.debug("open_files failed for pid=%s: %r",
+                             proc_obj.pid, e)
+                return proc_obj.pid, []
+
+    open_fds_by_pid: dict[int, list] = {}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(all_procs)))
+    futures = {ex.submit(_open_files_safe, p): p for p in all_procs}
+    # Generous last-resort safety net — NOT a normal-path bound.
+    # Parallelizing already solves "many processes = long wait"; this
+    # only guards the documented worst case of a single handle the
+    # kernel is genuinely stuck on, which running concurrently doesn't
+    # fix by itself. Sized well beyond anything a legitimately busy
+    # process should need, so it should essentially never trigger —
+    # and if it does, only THAT process's data is missing, not the
+    # whole tree's.
+    _SAFETY_NET_S = 8.0
+    done, not_done = concurrent.futures.wait(futures, timeout=_SAFETY_NET_S)
+    for fut in done:
+        proc_pid, open_fds = fut.result()
+        open_fds_by_pid[proc_pid] = open_fds
+    if not_done:
+        stuck_pids = [futures[f].pid for f in not_done]
+        logger.warning(f"Live tracking: {len(not_done)} process(es) "
+                      f"{stuck_pids} did not finish open_files() within "
+                      f"{_SAFETY_NET_S}s — proceeding without just "
+                      f"those, not the whole tree; this should be rare")
+    # No 'with' block: that would call shutdown(wait=True) on exit and
+    # block for however long the straggler actually takes — the exact
+    # thing the timeout above was supposed to prevent. Detach instead:
+    # let it finish in the background, its result simply goes unused.
+    ex.shutdown(wait=False)
+
+    _t_enum = time.time()   # [DIAG]
+    _total_fds = sum(len(v) for v in open_fds_by_pid.values())   # [DIAG]
+    try:                                                          # [DIAG]
+        # num_handles() is Windows-only; num_fds() is its Unix counterpart
+        _total_handles = sum(
+            (getattr(pp, "num_handles", None) or pp.num_fds)()
+            for pp in all_procs
+        )
+    except Exception:
+        _total_handles = -1
+
+    for p in all_procs:
+        open_fds = open_fds_by_pid.get(p.pid, [])
 
         for f in open_fds:
             fpath = f.path
@@ -982,6 +1239,13 @@ def _live_save_paths(pid: int) -> list[str]:
             # Skip known system / engine directories
             f_parts = {part.lower() for part in fp.parts}
             if f_parts & _SKIP_DIRS:
+                continue
+
+            # Chromium/NW.js/CEF player-profile tree: keep a game's own
+            # subfolder (Default\<GameName>\*.rpgsave), drop everything the
+            # browser manages — its loose state files, caches, and every
+            # LevelDB store (Local Storage, VideoDecodeStats, …).
+            if _CHROMIUM_PROFILE_DIR in f_parts and _is_chromium_managed(fp):
                 continue
 
             # Ren'Py ships its own interpreter/common-code in a "renpy"
@@ -1022,6 +1286,20 @@ def _live_save_paths(pid: int) -> list[str]:
             logger.debug(
                 f"Live tracking [pid={p.pid} {p.name()!r}]: write evidence -> {fp}"
             )
+
+    _t_filter = time.time()   # [DIAG]
+    try:
+        _pid_set = ",".join(f"{p.pid}:{p.name()}" for p in all_procs)   # [DIAG]
+    except Exception:
+        _pid_set = ",".join(str(p.pid) for p in all_procs)   # [DIAG]
+    logger.info(f"[DIAG] _live_save_paths pid={pid}: "
+                f"tree={( _t_tree-_t_start)*1000:.0f}ms ({_pre_filter_count} procs found) | "
+                f"cmdline_filter={(_t_procfilter-_t_tree)*1000:.0f}ms "
+                f"({len(all_procs)} procs kept: {_pid_set}) | "
+                f"enum={(_t_enum-_t_procfilter)*1000:.0f}ms ({_total_fds} total fds, "
+                f"{_total_handles} handles) | "
+                f"filter+stat={(_t_filter-_t_enum)*1000:.0f}ms | "
+                f"total={(_t_filter-_t_start)*1000:.0f}ms")
 
     if not written_files:
         return []
@@ -1884,10 +2162,13 @@ def detect_save_paths(
 
     # Strategy 1: Live open-file tracking (highest confidence, only when running)
     if pid:
+        _t_live0 = time.time()   # [DIAG]
         live_paths = _live_save_paths(pid)
+        _live_ms = (time.time() - _t_live0) * 1000   # [DIAG]
         for p in live_paths:
             _add(p, is_live_result=True)
-        logger.info(f"Live tracking strategy found {len(live_paths)} paths")
+        logger.info(f"Live tracking strategy found {len(live_paths)} paths "
+                    f"[DIAG live_ms={_live_ms:.0f}]")
 
     # When live_only is set, skip the registry/generic-fs strategies (3-4 —
     # the broad, low-precision sources), but still check known engine-
@@ -1956,12 +2237,18 @@ def detect_save_paths(
             # already-associated path's write time — the simultaneous
             # double-write IS the association.
             if correlate_paths:
+                _t_corr0 = time.time()   # [DIAG]
                 try:
                     _own_id = game_entry.id if game_entry is not None else ""
-                    for p in correlated_engine_paths(exe_path, correlate_paths,
-                                                     since_ts,
-                                                     own_game_id=_own_id):
+                    _corr_results = list(correlated_engine_paths(
+                        exe_path, correlate_paths, since_ts, own_game_id=_own_id))
+                    for p in _corr_results:
                         _add(p, is_live_result=True)
+                    _corr_ms = (time.time() - _t_corr0) * 1000   # [DIAG]
+                    logger.info(f"[DIAG] correlated_engine_paths: "
+                                f"known_paths={len(correlate_paths)} "
+                                f"found={len(_corr_results)} "
+                                f"total={_corr_ms:.0f}ms")   # [DIAG]
                 except Exception as e:
                     logger.debug(f"Live-only correlation check failed: {e}")
 

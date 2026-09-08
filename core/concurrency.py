@@ -346,13 +346,20 @@ def memory_sweep_max_interval_s() -> int:
 
 
 def deep_sweep_after_sweeps() -> int:
-    """Cheap sweeps between two DEEP ones (cache purge + gc + working-set).
+    """Idle ticks between two DEEP sweeps while the user stays away.
 
-    Deliberately NOT shortened for weak machines, which is the one place the
-    "weak → do it sooner" rule inverts. A deep sweep throws away decoded
-    covers and hands the working set back, so the next interaction re-decodes
-    and re-faults — precisely the stutter a weak machine can least afford.
-    Real memory pressure triggers one early instead (see memory_pressure).
+    The first tick after someone leaves does a deep sweep; this is how
+    often to do ANOTHER one if they are still gone, because a machine left
+    for hours keeps creeping (Qt internals, allocator fragmentation, the
+    watcher, timers still firing) and one sweep at minute one does not
+    hold. Only ever consulted while unattended — a deep sweep drops
+    decoded covers and hands the working set back, so it is never run
+    speculatively while someone is looking at the window; real memory
+    pressure is the separate, any-time trigger.
+
+    Not shortened for weak machines: paced by the sweep backoff, N ticks
+    works out near an hour regardless of tier, and a weak machine profits
+    least from re-faulting everything it just gave back.
     """
     tier = _tier()
     if tier == "high":
@@ -405,7 +412,7 @@ def log_limits() -> None:
         _cpu_count(), avail_gb, total_gb, _TIER_CACHE_S,
     )
     logger.info(
-        "Adaptive upkeep: poll=x%.1f sweep=%s..%ss deep=every %s sweeps "
+        "Adaptive upkeep: poll=x%.1f sweep=%s..%ss re-deep=every %s idle ticks "
         "idle_release=%smin pressure=%s",
         process_poll_multiplier(), memory_sweep_interval_s(),
         memory_sweep_max_interval_s(), deep_sweep_after_sweeps(),

@@ -1018,11 +1018,24 @@ def trim_process_memory(full: bool = True) -> None:
     """Sweep memory: purge image/cover cache, run GC and hand the working
     set back to the OS.
 
-    If full is False (Stage 1 minimization), clears light view cache and dead registry
-    while preserving cover pixmaps for 0 ms resume.
-    If full is True (game launch/exit, Stage 3 deep idle, manual trim), purges covers,
-    runs full GC generations 2, 1, 0 and releases working set pages to the OS.
+    If full is False (Stage 1/2), clears light view cache and dead registry
+    while preserving cover pixmaps for 0 ms resume — but STILL hands the
+    working set back to the OS: that call (EmptyWorkingSet on Windows,
+    malloc_trim(0) on Linux) is a near-free syscall on its own, confirmed
+    by direct timing (0.01ms), and it's what actually produces the visible
+    RAM drop on minimize. It's deliberately NOT bundled with gc.collect()
+    or the other cache purges below, which stay full=True only — those are
+    the genuinely expensive part (gc.collect() walking the whole object
+    graph), not this.
+    If full is True (game launch/exit, Stage 3 deep idle, manual trim), ALSO
+    purges covers, watcher/monitor caches, and runs full GC generations 2, 1, 0.
     """
+    _rss_before = None   # [DIAG]
+    try:
+        import psutil
+        _rss_before = psutil.Process().memory_info().rss   # [DIAG]
+    except Exception:
+        pass
     try:
         clear_view_cache()
     except Exception:
@@ -1052,6 +1065,34 @@ def trim_process_memory(full: bool = True) -> None:
             QPixmapCache.clear()
         except Exception:
             pass
+        try:
+            # Every logged traceback (this codebase uses exc_info=True
+            # freely) makes linecache hold the full source of each frame's
+            # file for the life of the process. Cheap to drop, rebuilt on
+            # demand next time something raises.
+            import linecache
+            linecache.clearcache()
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect(2)
+            gc.collect(1)
+            gc.collect(0)
+        except Exception:
+            pass
+    # Working-set release runs regardless of full — confirmed cheap on its
+    # own (see docstring), and it's specifically what makes a light trim
+    # visible in Task Manager rather than just clearing a couple of caches.
+    if platform.system() == "Windows":
+        _release_working_set_windows()
+    elif platform.system() == "Linux":
+        try:
+            import ctypes
+            # glibc malloc_trim(0) returns unused heap memory back to the OS on Linux
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
     try:
         app = QApplication.instance()
         if app:
@@ -1060,20 +1101,16 @@ def trim_process_memory(full: bool = True) -> None:
             app.processEvents()
     except Exception:
         pass
-    try:
-        import gc
-        gc.collect(2)
-        gc.collect(1)
-        gc.collect(0)
-    except Exception:
-        pass
-    if platform.system() == "Windows":
-        _release_working_set_windows()
-    elif platform.system() == "Linux":
+    if _rss_before is not None:   # [DIAG]
         try:
-            import ctypes
-            # glibc malloc_trim(0) returns unused heap memory back to the OS on Linux
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            import psutil
+            _rss_after = psutil.Process().memory_info().rss
+            _before_mb = _rss_before / (1024 * 1024)
+            _after_mb = _rss_after / (1024 * 1024)
+            _delta_mb = _after_mb - _before_mb
+            logger.info(f"[DIAG] trim_process_memory(full={full}): "
+                        f"rss {_before_mb:.1f}MB -> {_after_mb:.1f}MB "
+                        f"({'+' if _delta_mb >= 0 else ''}{_delta_mb:.1f}MB)")
         except Exception:
             pass
 

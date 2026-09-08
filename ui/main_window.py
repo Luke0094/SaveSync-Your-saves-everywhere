@@ -286,6 +286,23 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._blur_modal: Optional[BlurModalWidget] = None
         self._is_modal_mode = False  # Track if window is in modal mode
         self._hidden_for_game = False  # True while minimised to tray for a running game
+        # True once the user has manually brought the window back (tray,
+        # hotkey, overlay) while _hidden_for_game was still set — i.e. mid
+        # session, not the automatic restore-on-exit. Consumed by the next
+        # hide/minimize to run one targeted full trim, since Stage 1/2 both
+        # skip entirely while a game is running and this episode's own
+        # allocations (rebuilt pages, decoded covers) would otherwise sit
+        # until the game eventually exits.
+        self._reopened_mid_game = False
+        # Idle ticks since the last deep sweep, for the recurring upkeep
+        # tick (_on_auto_memory_trim_tick). It re-deeps every
+        # deep_sweep_after_sweeps() idle ticks while the person stays away
+        # — a machine left for hours keeps creeping past the first sweep —
+        # and every attended tick re-arms it to that threshold so the
+        # first tick after they leave sweeps at once. Seeded armed for the
+        # case of walking away before any attended tick has run.
+        from core.concurrency import deep_sweep_after_sweeps as _dsas
+        self._sweeps_since_deep = _dsas()
         # Store original window flags to restore properly
         self._original_window_flags = None
         # exe_path → display_name for unknown games seen this session
@@ -707,7 +724,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._auto_memory_trim_timer.setInterval(memory_sweep_interval_s() * 1000)
         self._auto_memory_trim_timer.timeout.connect(self._on_auto_memory_trim_tick)
         self._auto_memory_trim_timer.start()
-        self._sweeps_since_deep = 0
 
         # Archives (folders handed over without adding the game to the
         # library) re-check on a minute cadence the user sets per archive.
@@ -784,8 +800,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if self._heavy_work_in_flight():
                 logger.debug("Startup trim skipped: work in flight")
                 return
+            import time as _t   # [DIAG]
+            _t0 = _t.perf_counter()   # [DIAG]
             from ui.helpers import trim_process_memory
             trim_process_memory()
+            _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+            logger.info(f"[DIAG] startup_trim: FULL sweep total={_ms:.2f}ms")   # [DIAG]
         except Exception:
             logger.debug("Startup trim failed", exc_info=True)
 
@@ -913,6 +933,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             t = getattr(self, thread_attr, None)
             if t is not None and getattr(t, "is_alive", lambda: False)():
                 return True
+        # Batch online game search (covers + metadata over the library).
+        # It runs whether its panel is open, minimised, or closed to just a
+        # sidebar notice, and it writes into the library and the cover
+        # cache — exactly what a sweep would pull out from under it.
+        runner = getattr(self, "_search_runner", None)
+        if runner is not None and getattr(runner, "running", False):
+            return True
         return self._shelved_work_running()
 
     def _has_active_or_pending_dialogs(self) -> bool:
@@ -942,27 +969,58 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._overview_page._debounce.stop()
             except Exception:
                 pass
-        if not self._heavy_work_in_flight() and not self._is_game_running():
+        if self._heavy_work_in_flight():
+            logger.info("[DIAG] stage1_minimize: SKIPPED (heavy work in flight)")   # [DIAG]
+        elif getattr(self, "_reopened_mid_game", False) and self._is_game_running():
+            # The one deliberate exception to "never while a game is
+            # running": this window was manually brought up mid-session and
+            # is going away again, so whatever IT allocated (rebuilt pages,
+            # freshly decoded covers) is safe and worth freeing now rather
+            # than waiting for the game to exit. full=True — the same call
+            # already made at game launch itself, alongside the game
+            # process, so it's known-safe to run while one is active.
+            self._reopened_mid_game = False
             try:
+                import time as _t   # [DIAG]
+                _t0 = _t.perf_counter()   # [DIAG]
+                from ui.helpers import clear_view_cache, trim_process_memory
+                clear_view_cache()
+                trim_process_memory(full=True)
+                _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+                logger.info(f"[DIAG] stage1_minimize: FULL sweep (mid-game reopen close) total={_ms:.2f}ms")   # [DIAG]
+            except Exception:
+                pass
+        elif not self._is_game_running():
+            try:
+                import time as _t   # [DIAG]
+                _t0 = _t.perf_counter()   # [DIAG]
                 from ui.helpers import clear_view_cache, trim_process_memory
                 clear_view_cache()
                 trim_process_memory(full=False)
+                _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+                logger.info(f"[DIAG] stage1_minimize: LIGHT sweep total={_ms:.2f}ms")   # [DIAG]
             except Exception:
                 pass
 
     def _on_stage2_threads_cleanup(self):
-        """Stage 2 cleanup (after 2 minutes in background/tray):
+        """Stage 2 cleanup (after 2 minutes not focused — hidden/minimized,
+        or just visible but unfocused, same "not on focus" signal Stage 3's
+        _is_unattended treats as valid, at this shorter threshold):
         Drains non-essential background threads, purges cover pixmap caches, and releases working set.
         Protected: active operations, open/shelved search dialogs, loaded cheat save."""
         if self._heavy_work_in_flight() or self._is_game_running() or self._has_active_or_pending_dialogs():
+            logger.info("[DIAG] stage2_idle: SKIPPED (heavy work, game running, or active dialogs)")   # [DIAG]
             return
-        logger.debug("Stage 2 cleanup (2 minutes in background): trimming cover caches and inactive workers.")
         try:
+            import time as _t   # [DIAG]
+            _t0 = _t.perf_counter()   # [DIAG]
             from ui.widgets.game_items import trim_cover_cache
             from ui.helpers import clear_view_cache, trim_process_memory
             clear_view_cache()
             trim_cover_cache()
             trim_process_memory(full=False)
+            _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+            logger.info(f"[DIAG] stage2_idle: MEDIUM sweep total={_ms:.2f}ms")   # [DIAG]
         except Exception:
             logger.debug("Stage 2 cleanup failed", exc_info=True)
 
@@ -1023,75 +1081,143 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         return bool(getattr(self, "_hidden_for_game", False))
 
     def _on_auto_memory_trim_tick(self):
-        """Periodic background memory upkeep, paced by what the app is doing.
+        """Periodic background memory upkeep — Stage 3 only.
 
-        Three rules, in this order — the order is the design:
+        Stage 1 (light, on minimize — _on_window_minimized_or_hidden) and
+        Stage 2 (medium, full=False, 2 min after losing focus —
+        _on_stage2_threads_cleanup) are both separate, event-driven
+        mechanisms, untouched by this. This recurring tick's only job is
+        Stage 3 (full=True): game start and exit already trigger it
+        directly (see _on_game_launched / _on_game_exited), and the mid-
+        session UI reopen-then-close case is handled in
+        _on_window_minimized_or_hidden (_reopened_mid_game). What's left
+        for THIS tick to catch, on a fixed cadence, is the other two
+        Stage 3 triggers:
+          - the user has been unattended for the idle threshold they set
+            in Settings (idle_after_minutes), or
+          - memory pressure is not ok — checked regardless of idle time.
+            No separate "is SaveSync focused" gate needed here:
+            _heavy_work_in_flight() (checked below, with an early return)
+            already covers "a queue is going on" via _backup_job_queue /
+            _sync_job_queue, with no regard for window focus — SaveSync
+            can be unfocused in the background while a queue is still
+            actively running, and that's already caught before this point.
+        A running game stops the timer outright — nothing here needs to
+        catch that case, game exit already restarts it right after.
 
-        1. REAL PRESSURE WINS. If free RAM is actually short, sweep deeply
-           now, whatever else is going on. Checked first so a long quiet
-           spell that backed the interval off to its ceiling cannot leave the
-           machine draining while this waits its turn.
-        2. HEAVY WORK IS LEFT ALONE. A backup scan, an archive verify or a
-           sync wants the memory and the CPU it is using; taking either away
-           mid-operation is the opposite of help. The interval snaps back to
-           the floor on the way out, so the first tick AFTER the work lands
-           quickly — that is when there is most to reclaim.
-        3. OTHERWISE, SWEEP AND ADAPT. A sweep that reclaimed something earns
-           the floor cadence. One that found nothing doubles the wait, up to
-           the tier's ceiling: repeating a cleanup that frees nothing costs
-           the process a wake-up and buys it nothing.
+        Adaptive in exactly two ways, both driven by what the last tick
+        found, nothing else:
 
-        The deep sweep (cache purge + full gc + working-set release) stays on
-        its own counter and always resets it — unlike the light sweep, its
-        main job is handing pages back, which no return value can measure.
+        - a CHEAP pass every tick (light_memory_sweep: dead scaled-widget
+          rows, idle watcher indices — nothing decoded is discarded);
+        - the interval drifts from memory_sweep_interval_s() up towards
+          memory_sweep_max_interval_s() while ticks keep finding nothing,
+          and snaps back to the floor the moment one does real work, so a
+          quiet app stops waking every minute.
+
+        The DEEP pass (full trim: covers, gc, working set) fires when RAM
+        is tight (any time) or the person is away. While they STAY away it
+        repeats every deep_sweep_after_sweeps() idle ticks — one sweep at
+        minute one does not hold on a machine left for hours — but never
+        on a fixed schedule while someone is at the window, since dropping
+        decoded covers under them is the one cost this must not pay
+        speculatively.
         """
         from core.concurrency import (memory_sweep_interval_s,
                                       memory_sweep_max_interval_s,
-                                      deep_sweep_after_sweeps, memory_pressure)
-        from ui.helpers import light_memory_sweep, trim_process_memory
+                                      memory_pressure, deep_sweep_after_sweeps)
+        from ui.helpers import trim_process_memory, light_memory_sweep
+        import time as _t   # [DIAG]
+        _t0 = _t.perf_counter()   # [DIAG]
 
         floor_ms = memory_sweep_interval_s() * 1000
-        ceiling_ms = memory_sweep_max_interval_s() * 1000
+        ceil_ms = memory_sweep_max_interval_s() * 1000
         timer = self._auto_memory_trim_timer
 
-        def _set_interval(ms: int):
-            ms = max(floor_ms, min(ceiling_ms, int(ms)))
-            if timer.interval() != ms:
-                timer.setInterval(ms)      # restarts the countdown
-
-        pressure = memory_pressure()
-
-        # 1. While heavy work or an active game is running, NEVER sweep, trim, or flush
-        if self._heavy_work_in_flight() or self._is_game_running():
-            _set_interval(floor_ms)
+        if self._is_game_running():
+            timer.stop()
+            _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+            logger.info(f"[DIAG] memory_trim_tick: STOPPED (game running) total={_ms:.2f}ms")   # [DIAG]
             return
 
-        self._sweeps_since_deep = getattr(self, "_sweeps_since_deep", 0) + 1
-        unattended = self._is_unattended()
-        # Stage 3 (Deep Idle / Pressure): corresponds to the Stage 3 schema documented in ui.helpers.trim_process_memory
-        deep = (pressure != "ok"
-                or unattended
-                or self._sweeps_since_deep >= deep_sweep_after_sweeps())
-        try:
-            if deep:
-                # Stage 3 deep sweep: purges cover caches, runs full GC, and releases working set pages to the OS
-                self._sweeps_since_deep = 0
-                is_full = (pressure != "ok") and not (self._heavy_work_in_flight() or self._is_game_running())
-                if pressure == "critical" or unattended:
-                    self._release_idle_documents(force_all=True)
-                trim_process_memory(full=is_full)
-                # Once wiped in idle or tray, back off to ceiling_ms (15m) instead of repeating every 60s
-                if unattended or not self.isVisible() or self.isMinimized():
-                    _set_interval(ceiling_ms)
-                else:
-                    _set_interval(floor_ms)
+        # Heavy work (backup scan, archive verify, sync) — leave it alone,
+        # retry next tick without disturbing the interval.
+        if self._heavy_work_in_flight():
+            if not timer.isActive():
+                timer.start(floor_ms)
+            _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+            logger.debug(f"[DIAG] memory_trim_tick: BAIL (heavy-work) total={_ms:.2f}ms")   # [DIAG]
+            return
 
-            else:
-                # Routine background ticks run the light sweep and back off exponentially
-                reclaimed = light_memory_sweep()
-                _set_interval(floor_ms if reclaimed else timer.interval() * 2)
+        unattended = self._is_unattended()
+        pressure = memory_pressure()
+        redeep_every = deep_sweep_after_sweeps()
+        if unattended:
+            self._sweeps_since_deep += 1
+        else:
+            # Attended: arm the counter so the first tick after they leave
+            # deep-sweeps straight away.
+            self._sweeps_since_deep = redeep_every
+
+        # Cheap pass, every tick. Safe at the short cadence (see its
+        # docstring); its return count drives the backoff below.
+        try:
+            reclaimed = light_memory_sweep()
         except Exception:
-            logger.debug("Background memory sweep failed", exc_info=True)
+            reclaimed = 0
+            logger.debug("light_memory_sweep failed", exc_info=True)
+
+        # Deep pass: RAM tight (any time, retried every tick while it
+        # persists), or the person is away — first tick, then again every
+        # redeep_every idle ticks for as long as they stay away.
+        #
+        # Held off while an Add/Edit/scan dialog is open (or shelved and
+        # still working): a full trim wipes the built pages and pages out
+        # the search/scan results the user walked away from mid-task and
+        # expects to find intact. _heavy_work_in_flight() above already
+        # covers the batch search, backups and sync; this covers the rest.
+        # The counter keeps climbing while held off, so the moment they
+        # finish the deferred sweep runs.
+        pressure_bad = (pressure != "ok")
+        want_deep = pressure_bad or (unattended
+                                     and self._sweeps_since_deep >= redeep_every)
+        deferred = want_deep and self._has_active_or_pending_dialogs()
+        do_deep = want_deep and not deferred
+        if do_deep:
+            self._sweeps_since_deep = 0
+            try:
+                self._release_idle_documents(force_all=True)
+                trim_process_memory(full=True)
+            except Exception:
+                logger.debug("Background deep sweep failed", exc_info=True)
+
+        # A tick that did real work resets to the floor; a barren one
+        # drifts towards the ceiling. setInterval() restarts the running
+        # timer from zero in Qt6 — which is what we want — so nothing
+        # calls start() after it on the normal path.
+        did_work = do_deep or reclaimed > 0
+        cur = timer.interval() or floor_ms
+        new = floor_ms if did_work else min(ceil_ms, int(cur * 1.5))
+        if new != timer.interval():
+            timer.setInterval(new)
+        if not timer.isActive():
+            timer.start(new)
+
+        _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
+        if do_deep:
+            _why = "pressure" if pressure_bad else "away"   # [DIAG]
+            logger.info(f"[DIAG] memory_trim_tick: DEEP ({_why} "
+                        f"pressure={pressure}) reclaimed={reclaimed} "
+                        f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
+        elif deferred:
+            logger.info(f"[DIAG] memory_trim_tick: DEEP deferred (dialog/task open) "
+                        f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
+        elif reclaimed:
+            logger.info(f"[DIAG] memory_trim_tick: light reclaimed={reclaimed} "
+                        f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
+        else:
+            logger.debug(f"[DIAG] memory_trim_tick: idle next={new // 1000}s "
+                         f"total={_ms:.2f}ms")   # [DIAG]
 
     # Fallback for "how long counts as not working with SaveSync". The real
     # value is the user's own idle_after_minutes — this is only what answers
@@ -1150,12 +1276,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # precisely the moment the covers and caches are being FILLED,
                 # and throw them out from under the pages building them.
                 return False
-            if not self.isVisible() or self.isMinimized():
-                return True
-            if QApplication.activeWindow() is not None:
+            if self.isVisible() and not self.isMinimized() and QApplication.activeWindow() is not None:
                 return False        # a window of ours is in use right now
         except RuntimeError:
             return False
+        # Not currently in use — whether hidden, minimized, or just visible
+        # but unfocused, the same delay applies either way: unattended once
+        # it's been _UNATTENDED_AFTER_S since a window of ours was last the
+        # active one. Hidden/minimized used to short-circuit straight to
+        # True here with no wait at all — a real bug against "full after
+        # the idle time set by the user": it fired the very next tick after
+        # minimizing, before that idle time had actually elapsed. Being
+        # hidden is still kept as a real signal, per the reasoning above —
+        # it's just no longer an instant one.
         # Seeded in __init__, so "we have only just started" counts as
         # attended for the first _UNATTENDED_AFTER_S rather than as idle.
         # Treating it as idle was worse than wrong: startup is exactly when
@@ -1799,6 +1932,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """
         if hasattr(self, "_stage2_idle_threads_timer"):
             self._stage2_idle_threads_timer.stop()
+        # _hidden_for_game is still True here for a manual reopen mid-session
+        # (tray, hotkey, overlay) — the automatic restore-on-exit path clears
+        # it BEFORE calling show_and_raise, so this only fires for the case
+        # Stage 1/2 can't otherwise reach: brought up while a game is still
+        # running.
+        if getattr(self, "_hidden_for_game", False):
+            self._reopened_mid_game = True
         if self.isMinimized():
             self.showNormal()
         elif not self.isVisible():
@@ -1826,6 +1966,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # the whole session.
                 self.showMinimized()
             self._hidden_for_game = True
+            self._reopened_mid_game = False   # fresh episode — nothing reopened yet
         except RuntimeError:
             pass
 
@@ -1843,6 +1984,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except Exception:
             pass
         self._hidden_for_game = False
+        self._reopened_mid_game = False
         self.show_and_raise()
 
     def _install_quit_shortcut(self):
@@ -1875,10 +2017,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def changeEvent(self, event):
         super().changeEvent(event)
         etype = event.type()
-        if etype == QEvent.Type.ActivationChange and self.isActiveWindow():
-            # The clock _is_unattended reads for its third test.
-            import time as _time
-            self._last_active_mono = _time.monotonic()
+        if etype == QEvent.Type.ActivationChange:
+            if self.isActiveWindow():
+                # The clock _is_unattended reads for its third test.
+                import time as _time
+                self._last_active_mono = _time.monotonic()
+                # Actively in use again — Stage 2 shouldn't be counting
+                # down while we're the active window.
+                if hasattr(self, "_stage2_idle_threads_timer"):
+                    self._stage2_idle_threads_timer.stop()
+            else:
+                # Lost focus — not necessarily minimized, could just be
+                # visible but unfocused (alt-tabbed to something else).
+                # Same "not on focus" signal Stage 3's _is_unattended
+                # already treats as valid on its own, at Stage 2's own,
+                # shorter 2-minute threshold — matching it exactly,
+                # instead of requiring the stricter "minimized" event
+                # _on_window_minimized_or_hidden alone used to require.
+                if hasattr(self, "_stage2_idle_threads_timer"):
+                    self._stage2_idle_threads_timer.start()
         if etype == QEvent.Type.WindowStateChange:
             if self.isMinimized():
                 self._on_window_minimized_or_hidden()
@@ -3996,17 +4153,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         lib.game_removed.connect(_on_game_removed)
 
     def _on_save_changed(self, game_id: str):
-        """Save file changed (watchdog). Two independent jobs:
+        """Save file changed (watchdog). One job now: DISCOVERY.
 
-        1) DISCOVERY (always, regardless of the during-game backup toggle):
-           the watchdog is the only thing that reliably sees atomic save
-           writes — the 60 s open-file poll misses them. Bridge the folders it
-           just found into _pending_auto_scans so they get PROPOSED at the
-           confirmation panel, and push them live into an already-open panel.
-           This is what makes "I saved but nothing was proposed" work, and it
-           surfaces the real save dir (e.g. game/saves) with nothing hardcoded.
-        2) BACKUP (only when during-game backup is enabled): provisional
-           backup when there is no confirmed path, else the confirmed-path one.
+        The watchdog is the only thing that reliably sees atomic save
+        writes — the 60s open-file poll misses them. Bridge the folders it
+        just found into _pending_auto_scans so they get PROPOSED at the
+        confirmation panel, and push them live into an already-open panel.
+        This is what makes "I saved but nothing was proposed" work, and it
+        surfaces the real save dir (e.g. game/saves) with nothing hardcoded.
+
+        Deliberately does NOT trigger a backup — that used to happen here,
+        reactively, on every debounced change, independent of
+        backup_interval_sec. Actual backup creation is exclusively
+        _ingame_backup_tick's job now: it runs on the configured interval,
+        already skips via create_backup(force=False) when nothing changed,
+        and (see below) gets started even pre-confirmation the first time
+        discovery surfaces something.
         """
         entry = get_library().get_by_id(game_id)
         if not entry:
@@ -4062,17 +4224,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except Exception as e:
             logger.debug(f"Watchdog discovery bridge failed for {game_id}: {e}")
 
-        # 2) Backup — unchanged gating (during-game backup toggle).
-        if not get_config().get("backup_during_game", False):
-            return
-        if not entry.save_paths:
-            # No confirmed path yet — exclusively the standalone provisional
-            # mechanism's job (see _backup_provisional_paths), which has its
-            # own auto_backup_enabled check internally.
-            self._backup_provisional_paths(game_id, silent=True)
-            return
-        if entry.auto_backup_enabled:
-            self._backup_game(game_id, silent=True)  # automatic — no toast spam
+        # Backup is deliberately NOT triggered from here anymore. It used to
+        # fire reactively on every debounced file-change detection —
+        # immediate backup whenever something changed, none when nothing
+        # did — independent of backup_interval_sec entirely. The scheduled
+        # _ingame_backup_tick (started above, even pre-confirmation, the
+        # moment discovery surfaces something) already does this correctly:
+        # it runs on the configured interval AND already skips via
+        # create_backup(force=False) when nothing's actually changed. This
+        # function's only remaining job is discovery.
 
     def _on_game_launched(self, entry: GameEntry, exe_path: str):
         """Known game started.
@@ -4107,7 +4267,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._hide_to_tray_for_game()
         self._release_idle_documents(force_all=True)
 
-        # Unconditional heavy memory trim at game start to maximise RAM available for play
+        # Unconditional heavy memory trim at game start to maximise RAM
+        # available for play. A second, identical call also fires ~600ms
+        # from here via _start_tracking_after_cloud_check, once tracking
+        # actually activates — kept deliberately: that path depends on the
+        # cloud-check flow resolving, and this one doesn't, so losing this
+        # one would mean no launch-time trim at all if that flow is ever
+        # slow or doesn't fire the way it's expected to.
         from ui.helpers import trim_process_memory
         QTimer.singleShot(400, lambda: trim_process_memory(full=True))
 
@@ -4187,6 +4353,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         Detected paths are immediately fed into:
         - _pending_auto_scans  (shown at game exit for confirmation)
         - backup timer          (temporary backups while playing)
+
+        Games that already have a confirmed save path at session start
+        get a backoff after the first few polls: the watcher is already
+        covering that known path via filesystem events for the rest of
+        the session, so the open-files poll's only remaining job is
+        catching an *additional* location this session might create.
+        That's still checked periodically, just far less often than
+        every 60s for the entire session — every poll here pays a real
+        cost (500ms-1200ms+ measured, even for a single process with no
+        children, per NtQueryObject being slow to answer on Windows for
+        certain handles) and paying it every minute for a multi-hour
+        session for a path that's already known and already watched
+        isn't buying much. A game with no confirmed path yet keeps
+        polling at the normal rate indefinitely, since live-tracking is
+        the only way that path is ever going to be found.
         """
         game_id = entry.id
 
@@ -4195,6 +4376,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if existing:
             existing.stop()
             existing.deleteLater()
+
+        _had_confirmed_path = bool(entry.save_paths)
+        _EARLY_POLLS = 3                  # ~3 min at the normal rate
+        _BACKOFF_INTERVAL_MS = 300_000    # then every 5 min instead of every 60s
+        _poll_count = {"n": 0}
 
         def _stop():
             timer = self._live_tracking_timers.pop(game_id, None)
@@ -4219,6 +4405,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if not get_monitor().is_playing(game_id):
                 _stop()
                 return
+
+            _poll_count["n"] += 1
+            if _had_confirmed_path and _poll_count["n"] == _EARLY_POLLS:
+                timer.setInterval(_BACKOFF_INTERVAL_MS)
+                logger.info(f"[DIAG] live_tracking: backing off to "
+                            f"{_BACKOFF_INTERVAL_MS // 1000}s for {game_id} — "
+                            f"path already confirmed, {_EARLY_POLLS} polls "
+                            f"in and nothing new so far")
 
             import threading
             game_name = entry.name
@@ -4291,7 +4485,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             threading.Thread(target=_scan, daemon=True).start()
 
         timer = QTimer(self)
-        timer.setInterval(60_000)   # poll every 60 s
+        timer.setInterval(60_000)   # poll every 60 s (until/unless backed off above)
         timer.timeout.connect(_poll)
         timer.start()
         self._live_tracking_timers[game_id] = timer
@@ -4382,6 +4576,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         entry = get_library().get_by_id(game_id)
         if not entry or not entry.auto_backup_enabled:
+            self._stop_ingame_backup_timer(game_id)
+            return
+        if not get_config().get("backup_during_game", False):
             self._stop_ingame_backup_timer(game_id)
             return
 
@@ -4551,6 +4748,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 return
 
         self._update_sidebar_status()
+        # The memory-trim timer was stopped outright while this game was
+        # running (see _on_auto_memory_trim_tick) — revive it. start() with
+        # no argument resumes at whatever interval was in force when the
+        # game launched, NOT the floor: the exit-time deep trim below
+        # (_release_idle_documents + trim_process_memory(full=True)) has
+        # already reclaimed everything the game's departure freed, so the
+        # next routine tick has nothing to find and snapping back to the
+        # 60 s floor would just spend a barren tick and re-climb the
+        # backoff it had already earned before the session started.
+        if hasattr(self, "_auto_memory_trim_timer"):
+            self._auto_memory_trim_timer.start()
         self._stop_ingame_backup_timer(entry.id)
         # Stop watching save paths for this game — no need to watch when not running
         self._watcher.unwatch_game(entry.id)

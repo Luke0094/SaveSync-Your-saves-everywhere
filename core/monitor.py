@@ -822,11 +822,24 @@ class ProcessMonitor(QObject):
         self._proc_match_cache.clear()
 
     def prune_caches(self):
-        """Trim memory held by cached lookup maps and snapshot verdicts."""
+        """Invalidate the library-derived lookup tables.
+
+        Deliberately does NOT touch _snap_verdicts or _proc_resolved_cache.
+        Both are already self-bounding: _snap_verdicts is rebuilt from
+        live process keys on every single poll — a still-running process's
+        verdict is never stale and needs no re-deriving, and a dead one's
+        entry is dropped for free, automatically, the moment it stops
+        appearing in psutil.process_iter() (see _snapshot()'s docstring).
+        _proc_resolved_cache caps itself at 512 entries on its own.
+        Wiping either here reclaimed no memory a single poll cycle
+        wouldn't already reclaim by itself, but DID force every
+        still-running process on the machine through the full expensive
+        exe-resolution pipeline again on the very next poll — paid right
+        as a game launches, since this runs from trim_process_memory
+        (full=True), which fires unconditionally at game launch.
+        """
         with self._data_lock:
             self._invalidate_entry_lookup()
-            self._proc_resolved_cache.clear()
-            self._snap_verdicts.clear()
             self._snap_gen = getattr(self, "_snap_gen", 0) + 1
 
     def _build_entry_lookup(self):
@@ -1509,14 +1522,51 @@ class ProcessMonitor(QObject):
         except (OSError, ValueError):
             return 0
         with self._data_lock:
-            for key, info in self._running.items():
-                exe = info.get("exe", "")
-                if exe:
-                    try:
-                        if Path(exe).resolve() == target:
-                            return key[0]
-                    except (OSError, ValueError):
-                        continue
+            running_snapshot = list(self._running.items())
+        for key, info in running_snapshot:
+            exe = info.get("exe", "")
+            if not exe:
+                continue
+            try:
+                if Path(exe).resolve() != target:
+                    continue
+            except (OSError, ValueError):
+                continue
+            # self._running is a cache from the general poll's last
+            # snapshot cycle, not a live view — a process that exited
+            # since then can sit here, stale, until that poll's own
+            # cadence catches up. While a game is being tracked, that
+            # poll deliberately backs off (this loop belongs to the
+            # game, not to us), so the window a dead pid can linger in
+            # here isn't just a race, it can be real seconds. Trusting
+            # it blindly means this "succeeds" against a process that
+            # no longer exists, and the live-tracking loop — which has
+            # no other way to learn the game exited — keeps believing
+            # it's still playing. Verify before trusting the cache, and
+            # keep looking: another entry may still be a genuine hit.
+            try:
+                proc = psutil.Process(key[0])
+                if not proc.is_running():
+                    continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            # A Chromium/Electron/NW.js-based game runs its GPU, renderer,
+            # utility, and crashpad-handler processes from this SAME exe
+            # binary — only distinguished by a --type= command-line flag,
+            # invisible to an exe-path match. These can and do outlive the
+            # main process by a few seconds during shutdown (crashpad-
+            # handler especially, since its whole job is finishing up
+            # after the main process is already gone), so matching on exe
+            # path alone means a lingering child gets mistaken for the
+            # game itself still running — exactly the "never detected as
+            # closed" case. The main/browser process carries no --type=
+            # flag; only its sandboxed children do.
+            try:
+                if "--type=" in " ".join(proc.cmdline()):
+                    continue
+            except Exception:
+                pass   # can't read cmdline — accept it rather than lose a genuine match
+            return key[0]
         return 0
 
     def find_game_process(self, game_id: str, exe_path: str) -> int:
@@ -1545,7 +1595,16 @@ class ProcessMonitor(QObject):
                 if entry is not None and entry.id == game_id:
                     try:
                         proc = psutil.Process(key[0])
-                        if proc.is_running():
+                        # is_running() alone isn't enough: it only confirms
+                        # *some* process currently holds this pid number, not
+                        # that it's the SAME process instance we tracked. The
+                        # OS can and does recycle a pid once the original
+                        # exits — key[1] is the create_time we cached
+                        # specifically to tell those apart (same identity
+                        # scheme _snapshot() already uses), so confirm the
+                        # live process at this pid is still the one we
+                        # started with before trusting it.
+                        if proc.is_running() and round(proc.create_time(), 1) == key[1]:
                             if not found_pid:
                                 found_pid = key[0]
                         else:

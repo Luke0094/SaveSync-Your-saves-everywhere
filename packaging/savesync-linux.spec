@@ -18,7 +18,26 @@ imported lazily inside format handlers and analysis never sees them;
 collecting the packages whole reaches the same modules and cannot drift
 out of date when one is added.
 
-Build (on Linux):
+Build
+-----
+Full AppImage (freeze -> AppDir -> appimagetool), from the repo root:
+
+    bash packaging/build_appimage.sh
+    # -> dist/SaveSync-<APP_VERSION>-<arch>.AppImage
+
+From Windows with WSL — run from the repo directory (wsl inherits the
+current dir, mapping the drive path to its /mnt/<letter>/ equivalent):
+
+    wsl -d Ubuntu-24.04 bash -lc "bash packaging/build_appimage.sh"
+	# or just:  wsl bash packaging/build_appimage.sh (run from the repo dir)
+
+The script auto-fetches appimagetool into build/ if it is not on PATH and
+sets APPIMAGE_EXTRACT_AND_RUN=1 so it works without FUSE (WSL, containers).
+Override the interpreter with SAVESYNC_PYTHON=/path/to/python if the build
+host has several. Pass --keep-appdir to leave build/appimage/ in place.
+
+Just the freeze step (no AppImage), for iterating on the spec itself:
+
     pyinstaller --clean --noconfirm packaging/savesync-linux.spec
 
 Always pass --clean when the splash has been touched: the Tcl script is

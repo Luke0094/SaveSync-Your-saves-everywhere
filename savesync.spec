@@ -126,7 +126,7 @@ a = Analysis(
         'core', 'core.config_transfer', 'core.config_manager', 'core.library',
         'core.backup', 'core.monitor', 'core.watcher', 'core.credentials',
         'core.machine', 'core.save_detector', 'core.startup', 'core.constants',
-        'core.resolvers', 'core.game_api',
+        'core.resolvers', 'core.game_api', 'core.win_open_files',
         # Save editor + engine codecs (lazy-imported inside format handlers —
         # listed so a frozen build cannot drop one that analysis skipped).
         'core.save_editor', 'core.save_editor.save_editor',
