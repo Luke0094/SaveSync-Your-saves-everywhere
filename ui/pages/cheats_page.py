@@ -664,9 +664,17 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         bar.addWidget(self._group_combo)
         self._field_filter = ClearableLineEdit()
         self._field_filter.setObjectName("list_search")
-        self._field_filter.setPlaceholderText(t("cheats.filter_values"))
         self._field_filter.setFixedHeight(scaled(30, self))
         self._field_filter.textChanged.connect(self._apply_field_filter)
+        # Search by field NAME or by current VALUE. With thousands of values
+        # the name is often unknown ("which flag is party gold?"), but the
+        # number showing in-game is not — so a small toggle on the left of
+        # the field switches what the text matches against.
+        self._filter_by_value = False
+        self._filter_mode_btn = self._field_filter.add_leading_button(
+            "Aa", t("cheats.filter_mode_name"))
+        self._filter_mode_btn.clicked.connect(self._toggle_filter_mode)
+        self._sync_filter_mode()
         bar.addWidget(self._field_filter, 1)
         self._save_btn = QPushButton(t("cheats.apply"))
         self._save_btn.setObjectName("form_primary_btn")
@@ -1151,6 +1159,18 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         except SaveEditorError as e:
             warning_window_modal(self, t("cheats.title"), explain(e))
             return
+        except OSError as e:
+            logger.error(f"Restore failed for {target.name}: {e}")
+            warning_window_modal(self, t("cheats.title"),
+                                 t("cheats.write_failed", error=str(e)))
+            return
+        # Drop any document held for this file: the bytes on disk just changed
+        # under it, and the editor must reopen from the restored file rather
+        # than redisplay what was in memory before the restore.
+        if getattr(self, "_loaded_path", None) == Path(target).resolve():
+            self._doc = None
+            self._loaded_path = None
+            self._loaded_mtime = 0
         self._subtitle.setText(t("cheats.restored", name=target.name))
         if self._entry is not None:
             self._open_game(self._entry)
@@ -1217,6 +1237,8 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         except OSError:
             mtime = 0
         if (self._doc is not None
+                and mtime  # a failed stat (locked mid-write) reads as 0 —
+                           # never serve the cache off that, always reload
                 and getattr(self, "_loaded_path", None) == resolved_path
                 and getattr(self, "_loaded_mtime", 0) == mtime):
             self._close_load_notice()
@@ -1455,7 +1477,15 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             fields = [f for f in fields if f.group == group]
         q = self._field_filter.text().strip().casefold()
         if q:
-            fields = [f for f in fields if q in f.label.casefold()]
+            if getattr(self, "_filter_by_value", False):
+                # Match the value AS IT IS IN THE SAVE, not the unsaved edit:
+                # a filter has to keep its set stable while you change values
+                # inside it, or the row you just edited drops out from under
+                # you on the next repaint.
+                fields = [f for f in fields
+                          if q in str(f.value).casefold()]
+            else:
+                fields = [f for f in fields if q in f.label.casefold()]
         return fields
 
     def _fill_groups(self):
@@ -1628,6 +1658,24 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._page = 0
         self._render_page()
         self._reset_idle_save_timer()
+
+    def _sync_filter_mode(self):
+        """Reflect the current name/value mode on the toggle and placeholder."""
+        by_value = getattr(self, "_filter_by_value", False)
+        self._filter_mode_btn.setText("#" if by_value else "Aa")
+        self._filter_mode_btn.setToolTip(
+            t("cheats.filter_mode_value") if by_value
+            else t("cheats.filter_mode_name"))
+        self._field_filter.setPlaceholderText(
+            t("cheats.filter_by_value") if by_value
+            else t("cheats.filter_by_name"))
+
+    def _toggle_filter_mode(self):
+        self._filter_by_value = not getattr(self, "_filter_by_value", False)
+        self._sync_filter_mode()
+        if self._field_filter.text().strip():
+            self._page = 0
+            self._render_page()
 
     def _apply_edits(self):
         if self._doc is None or getattr(self._doc, "read_only", False):
@@ -1889,7 +1937,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._title.setText(t("cheats.title"))
         self._subtitle.setText(t("cheats.subtitle"))
         self._search.setPlaceholderText(t("cheats.search_placeholder"))
-        self._field_filter.setPlaceholderText(t("cheats.filter_values"))
+        self._sync_filter_mode()
         self._save_btn.setText(t("cheats.apply"))
         self._kept_lbl.setText(t("cheats.kept_copies"))
         self._files_lbl.setText(t("cheats.pick_save"))

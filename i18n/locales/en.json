@@ -1195,6 +1195,10 @@
     "err_unreadable": "{name} is not a save format SaveSync can read.",
     "err_unreal_new": "{name} is an Unreal Engine save, but SaveSync could not read all the way through it, so it will not write to it either.",
     "filter_values": "Filter values…",
+    "filter_by_name": "Filter by name…",
+    "filter_by_value": "Filter by value…",
+    "filter_mode_name": "Matching field names — click to match values instead",
+    "filter_mode_value": "Matching current values — click to match names instead",
     "groups": {
       "switches": "Switches",
       "variables": "Variables",

@@ -303,6 +303,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # case of walking away before any attended tick has run.
         from core.concurrency import deep_sweep_after_sweeps as _dsas
         self._sweeps_since_deep = _dsas()
+        # When the working set was last handed back to the OS. While the app
+        # is simply in use (no pressure, nobody away) a light sweep alone
+        # never calls EmptyWorkingSet / malloc_trim, so RSS just climbs.
+        # WALL CLOCK, not a tick count: the sweep interval backs off while
+        # ticks find nothing to prune, and "nothing to prune" says nothing
+        # about RSS drift — a tick counter would stretch this to over an
+        # hour. Any deep pass also refreshes it (it hands the set back too).
+        import time as _time_mod
+        self._last_working_set_mono = _time_mod.monotonic()
         # Store original window flags to restore properly
         self._original_window_flags = None
         # exe_path → display_name for unknown games seen this session
@@ -1105,23 +1114,31 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         A running game stops the timer outright — nothing here needs to
         catch that case, game exit already restarts it right after.
 
-        Adaptive in exactly two ways, both driven by what the last tick
-        found, nothing else:
+        Three passes, in increasing cost:
 
         - a CHEAP pass every tick (light_memory_sweep: dead scaled-widget
-          rows, idle watcher indices — nothing decoded is discarded);
-        - the interval drifts from memory_sweep_interval_s() up towards
-          memory_sweep_max_interval_s() while ticks keep finding nothing,
-          and snaps back to the floor the moment one does real work, so a
-          quiet app stops waking every minute.
+          rows, idle watcher indices — nothing decoded is discarded, and
+          nothing is handed back to the OS);
+        - a MEDIUM pass (trim_process_memory(full=False): clears the light
+          view cache and hands the working set back — EmptyWorkingSet /
+          malloc_trim — but KEEPS decoded covers and the loaded save)
+          while the app is simply in use, every deep_sweep_after_sweeps()
+          attended ticks. Without this a session that never goes idle just
+          keeps climbing; the working-set call itself is a near-free
+          syscall and re-decodes nothing, so it is safe to run attended;
+        - the DEEP pass (full trim: covers, gc, working set) when RAM is
+          tight (any time) or the person is away. While they STAY away it
+          repeats every deep_sweep_after_sweeps() idle ticks — one sweep at
+          minute one does not hold on a machine left for hours — but never
+          on a fixed schedule while someone is at the window, since
+          dropping decoded covers under them is the one cost this must not
+          pay speculatively.
 
-        The DEEP pass (full trim: covers, gc, working set) fires when RAM
-        is tight (any time) or the person is away. While they STAY away it
-        repeats every deep_sweep_after_sweeps() idle ticks — one sweep at
-        minute one does not hold on a machine left for hours — but never
-        on a fixed schedule while someone is at the window, since dropping
-        decoded covers under them is the one cost this must not pay
-        speculatively.
+        The interval drifts from memory_sweep_interval_s() up towards
+        memory_sweep_max_interval_s() while ticks keep finding nothing, and
+        snaps back to the floor the moment one does real work, so a quiet
+        app stops waking every minute. Any dialog or shelved task open
+        holds the medium and deep passes off until it closes.
         """
         from core.concurrency import (memory_sweep_interval_s,
                                       memory_sweep_max_interval_s,
@@ -1155,8 +1172,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if unattended:
             self._sweeps_since_deep += 1
         else:
-            # Attended: arm the counter so the first tick after they leave
-            # deep-sweeps straight away.
+            # Attended: arm the deep counter so the first tick after they
+            # leave deep-sweeps straight away.
             self._sweeps_since_deep = redeep_every
 
         # Cheap pass, every tick. Safe at the short cadence (see its
@@ -1181,21 +1198,41 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         pressure_bad = (pressure != "ok")
         want_deep = pressure_bad or (unattended
                                      and self._sweeps_since_deep >= redeep_every)
-        deferred = want_deep and self._has_active_or_pending_dialogs()
-        do_deep = want_deep and not deferred
+        # MEDIUM (full=False): attended, pressure ok. Hands the working set
+        # back to the OS but keeps decoded covers and the loaded save — so
+        # RSS stops climbing during ordinary use, with none of the re-decode
+        # cost that makes the deep pass attended-unsafe. Wall clock:
+        # redeep_every sweep-floor-lengths since the last hand-back
+        # (~8-10 min), regardless of how far the tick interval has drifted.
+        import time as _tmod
+        _now_mono = _tmod.monotonic()
+        medium_due_s = redeep_every * memory_sweep_interval_s()
+        want_medium = (not want_deep and not unattended
+                       and _now_mono - self._last_working_set_mono >= medium_due_s)
+        dialogs = self._has_active_or_pending_dialogs()
+        deferred = (want_deep or want_medium) and dialogs
+        do_deep = want_deep and not dialogs
+        do_medium = want_medium and not dialogs
         if do_deep:
             self._sweeps_since_deep = 0
+            self._last_working_set_mono = _now_mono
             try:
                 self._release_idle_documents(force_all=True)
                 trim_process_memory(full=True)
             except Exception:
                 logger.debug("Background deep sweep failed", exc_info=True)
+        elif do_medium:
+            self._last_working_set_mono = _now_mono
+            try:
+                trim_process_memory(full=False)
+            except Exception:
+                logger.debug("Background medium sweep failed", exc_info=True)
 
         # A tick that did real work resets to the floor; a barren one
         # drifts towards the ceiling. setInterval() restarts the running
         # timer from zero in Qt6 — which is what we want — so nothing
         # calls start() after it on the normal path.
-        did_work = do_deep or reclaimed > 0
+        did_work = do_deep or do_medium or reclaimed > 0
         cur = timer.interval() or floor_ms
         new = floor_ms if did_work else min(ceil_ms, int(cur * 1.5))
         if new != timer.interval():
@@ -1209,8 +1246,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.info(f"[DIAG] memory_trim_tick: DEEP ({_why} "
                         f"pressure={pressure}) reclaimed={reclaimed} "
                         f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
+        elif do_medium:
+            logger.info(f"[DIAG] memory_trim_tick: MEDIUM (working set, "
+                        f"covers kept) reclaimed={reclaimed} "
+                        f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
         elif deferred:
-            logger.info(f"[DIAG] memory_trim_tick: DEEP deferred (dialog/task open) "
+            logger.info(f"[DIAG] memory_trim_tick: sweep deferred (dialog/task open) "
                         f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
         elif reclaimed:
             logger.info(f"[DIAG] memory_trim_tick: light reclaimed={reclaimed} "
@@ -4224,15 +4265,24 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except Exception as e:
             logger.debug(f"Watchdog discovery bridge failed for {game_id}: {e}")
 
-        # Backup is deliberately NOT triggered from here anymore. It used to
-        # fire reactively on every debounced file-change detection —
-        # immediate backup whenever something changed, none when nothing
-        # did — independent of backup_interval_sec entirely. The scheduled
-        # _ingame_backup_tick (started above, even pre-confirmation, the
-        # moment discovery surfaces something) already does this correctly:
-        # it runs on the configured interval AND already skips via
-        # create_backup(force=False) when nothing's actually changed. This
-        # function's only remaining job is discovery.
+        # Backup from here is OFF by default and stays that way for polling-only
+        # setups. The scheduled _ingame_backup_tick runs on the configured
+        # per-game interval and already skips via create_backup(force=False)
+        # when nothing changed — that is the normal path.
+        #
+        # Only when "backup_during_game" is explicitly enabled does this also
+        # back up *reactively*, the instant a watched save write is detected,
+        # on top of the interval. Left as an opt-in because an autosave-heavy
+        # engine (Ren'Py) writes every few seconds and would otherwise churn.
+        if not get_config().get("backup_during_game", False):
+            return
+        if not entry.save_paths:
+            # No confirmed path yet — exclusively the standalone provisional
+            # mechanism's job (its own auto_backup_enabled check is internal).
+            self._backup_provisional_paths(game_id, silent=True)
+            return
+        if entry.auto_backup_enabled:
+            self._backup_game(game_id, silent=True)  # automatic — no toast spam
 
     def _on_game_launched(self, entry: GameEntry, exe_path: str):
         """Known game started.
@@ -4576,9 +4626,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         entry = get_library().get_by_id(game_id)
         if not entry or not entry.auto_backup_enabled:
-            self._stop_ingame_backup_timer(game_id)
-            return
-        if not get_config().get("backup_during_game", False):
             self._stop_ingame_backup_timer(game_id)
             return
 

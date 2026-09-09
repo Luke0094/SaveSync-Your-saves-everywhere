@@ -118,6 +118,24 @@ def _is_subpath(file_key: str, parent: Path) -> bool:
     except (ValueError, OSError):
         return False
 
+
+def _norm_key(p) -> str:
+    """Canonical string key for the path caches.
+
+    Two watch handlers can see the same file under different spellings — the
+    per-path watch on a confirmed save_path vs the broad common-root walk,
+    or simply Windows' case-insensitive filenames. Keyed raw, the same save
+    then lands in the pending / discovered / backed-up sets twice: a doubled
+    "detected" log, an inflated file count, and a missed _BACKED_UP_FILES
+    hit that lets an already-handled file churn again.
+
+    normcase + normpath is a pure string fold — no filesystem access, so it
+    is cheap enough to run on every event — and collapses case (on Windows),
+    separator direction, and redundant "." / ".." / "//" segments. On
+    case-sensitive Linux only the separator/segment cleanup applies.
+    """
+    return os.path.normcase(os.path.normpath(str(p)))
+
 # File extensions to ignore (not save files)
 _IGNORE_EXTENSIONS = frozenset({
     ".tmp", ".temp", ".log", ".cache", ".bak", ".old",
@@ -587,7 +605,7 @@ def _record_unattributed(src_path: str, game_id: str, inner_handler=None):
     # an attribute change is delivered as the very same event.
     if not _has_fresh_write(src_path, now):
         return
-    file_key = str(fp)
+    file_key = _norm_key(fp)
     with _CACHE_LOCK:
         if file_key in _BACKED_UP_FILES or file_key in _CLAIMED_EVENTS:
             return
@@ -617,6 +635,11 @@ def _claim_event_for_game(game_id: str, file_key: str, reason: str) -> bool:
         if file_key in _CLAIMED_EVENTS:
             return False
         _CLAIMED_EVENTS.add(file_key)
+        # This is the correlation path (save_correlation_enabled, off by
+        # default). It only has the case-folded key here, so the pending
+        # entry is case-folded too — get_pending_save_paths will show that
+        # one correlated folder lower-cased. Acceptable for an opt-in path;
+        # path_identity dedup downstream is case-insensitive regardless.
         _PENDING_FILES.setdefault(game_id, set()).add(file_key)
         _DISCOVERED_SAVE_FILES.add(file_key)
     try:
@@ -770,6 +793,7 @@ def _matches_common_save_patterns(file_path: Path) -> bool:
 
 def _add_seed_pattern(directory_path: str, file_path: Path):
     """Add a discovered save file pattern to the seed patterns for its directory."""
+    directory_path = _norm_key(directory_path)
     pattern = _extract_save_pattern(file_path)
 
     with _CACHE_LOCK:
@@ -793,8 +817,8 @@ def _find_similar_files_in_directory(file_path: Path, seed_patterns: Set[str]) -
                 continue
 
             # Skip if it's the same file or already processed
-            sibling_key = str(sibling_file)
-            if sibling_key == str(file_path) or sibling_key in discovered_snapshot:
+            sibling_key = _norm_key(sibling_file)
+            if sibling_key == _norm_key(file_path) or sibling_key in discovered_snapshot:
                 continue
             
             # Check file extension/name and size
@@ -821,17 +845,18 @@ def _find_similar_files_in_directory(file_path: Path, seed_patterns: Set[str]) -
 
 def _scan_directory_for_seeded_saves(directory_path: str, new_save_file: Path):
     """Scan directory for additional save files based on newly discovered save file."""
+    directory_path = _norm_key(directory_path)
     with _CACHE_LOCK:
         if directory_path not in _SEED_PATTERNS:
             return []
         seed_patterns = set(_SEED_PATTERNS[directory_path])  # snapshot
     similar_files = _find_similar_files_in_directory(new_save_file, seed_patterns)
-    
+
     # Mark discovered files
     discovered_files = []
     with _CACHE_LOCK:
         for similar_file in similar_files:
-            file_key = str(similar_file)
+            file_key = _norm_key(similar_file)
             if file_key not in _DISCOVERED_SAVE_FILES and file_key not in _BACKED_UP_FILES:
                 _DISCOVERED_SAVE_FILES.add(file_key)
                 discovered_files.append(similar_file)
@@ -1030,7 +1055,7 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 pass
             
             # Check if file was already backed up
-            file_key = str(file_path)
+            file_key = _norm_key(file_path)
             with _CACHE_LOCK:
                 if file_key in _BACKED_UP_FILES:
                     logger.debug(f"File {file_path.name} already backed up, skipping")
@@ -1060,7 +1085,7 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 # to avoid O(n) Path construction for every known file)
                 known_patterns = set()
                 try:
-                    parent_str = str(file_path.parent)
+                    parent_str = _norm_key(file_path.parent)
                     # Use the per-directory index for O(1) lookup instead of
                     # iterating the entire _KNOWN_FILES set on every event.
                     with _CACHE_LOCK:
@@ -1077,7 +1102,7 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
             
             # 4. NEW: Check against seed patterns from discovered save files
             if not is_save_file:
-                directory_path = str(file_path.parent)
+                directory_path = _norm_key(file_path.parent)
                 with _CACHE_LOCK:
                     seed_snapshot = set(_SEED_PATTERNS.get(directory_path, set()))
                 if seed_snapshot and _is_similar_save_file(file_path, seed_snapshot):
@@ -1112,7 +1137,7 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 return
             
             # NEW: Add to seed patterns and scan for similar files
-            directory_path = str(file_path.parent)
+            directory_path = _norm_key(file_path.parent)
             _add_seed_pattern(directory_path, file_path)
             
             # Scan for additional similar files in the same directory
@@ -1123,17 +1148,34 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
             # (in _fire_all_pending), not here, to avoid marking files as backed up
             # if the backup later fails.
             with _CACHE_LOCK:
-                if self._game_id not in _PENDING_FILES:
-                    _PENDING_FILES[self._game_id] = set()
-                _PENDING_FILES[self._game_id].add(file_key)
+                pend = _PENDING_FILES.setdefault(self._game_id, set())
+                # _PENDING_FILES keeps the path as the OS spelled it — it feeds
+                # the confirmation panel via get_pending_save_paths, which
+                # should show real folder names. The dedup/known sets key off
+                # the case-folded form (file_key). Keep one spelling per file:
+                # the two watches (confirmed path + common-root scan) can each
+                # report it, and first-seen wins so the result is stable.
+                if not any(_norm_key(e) == file_key for e in pend):
+                    pend.add(str(file_path))
+                # Autosave-heavy games (Ren'Py, RPG Maker) rewrite the same
+                # file every few seconds. Announce a save the first time it is
+                # seen; after that it is just noise — the discovery already
+                # happened and the periodic backup timer owns the rest.
+                first_sight = file_key not in _DISCOVERED_SAVE_FILES
                 _DISCOVERED_SAVE_FILES.add(file_key)
-                logger.info(f"Save file detected: {file_path.name}")
+                if first_sight:
+                    logger.info(f"Save file detected: {file_path.name}")
+                else:
+                    logger.debug(f"Save file touched again: {file_path.name}")
 
-                # Add any additional discovered files
+                # Queue any siblings the seed scan turned up. They were already
+                # added to _DISCOVERED_SAVE_FILES and logged inside
+                # _scan_directory_for_seeded_saves — here they just join the
+                # pending set (real spelling, one per file, as above).
                 for additional_file in additional_saves:
-                    additional_key = str(additional_file)
-                    _PENDING_FILES[self._game_id].add(additional_key)
-                    logger.info(f"Additional save file discovered: {additional_file.name}")
+                    ak = _norm_key(additional_file)
+                    if not any(_norm_key(e) == ak for e in pend):
+                        pend.add(str(additional_file))
             
         except (ValueError, OSError):
             return
@@ -1191,15 +1233,24 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                     pass
 
             if pending_files:
-                logger.info(f"Backing up {len(pending_files)} save files: {[Path(f).name for f in pending_files]}")
+                # The callback's normal job is discovery — surface changed
+                # folders for the confirmation panel and start the in-game
+                # backup timer. Routine backups run on the configured
+                # interval in _ingame_backup_tick, NOT per filesystem event
+                # (only the opt-in "backup_during_game" adds a reactive one).
+                # Kept at debug so an autosave-heavy game does not fill the log.
+                uniq = {os.path.normcase(f) for f in pending_files}
+                logger.debug(
+                    f"Save activity settled for {self._game_id}: "
+                    f"{len(uniq)} file(s) changed — notifying")
                 try:
                     self._on_change(self._game_id)
                     # The callback is asynchronous (queued to the Qt event loop).
-                    # Files remain in _PENDING_FILES until the backup completes
+                    # Files remain in _PENDING_FILES until a backup completes
                     # and mark_game_files_backed_up() moves them to _BACKED_UP_FILES.
                     # On failure, they stay pending and will be retried on next event.
                 except Exception as e:
-                    logger.warning(f"Backup callback failed for {self._game_id}, "
+                    logger.warning(f"Discovery callback failed for {self._game_id}, "
                                    f"files will be retried: {e}")
         finally:
             with self._lock:
@@ -1768,7 +1819,11 @@ class SaveWatcher(QObject):
                         try:
                             file_size = file_path.stat().st_size
                             if file_size <= _MAX_SAVE_FILE_SIZE:
-                                found_files.append(str(file_path))
+                                # Same canonical key the event handlers use, so
+                                # a file that existed at startup is recognised
+                                # as already-baselined however the watch that
+                                # later sees it spells the path.
+                                found_files.append(_norm_key(file_path))
                         except OSError:
                             pass
         except (OSError, PermissionError):
@@ -1780,7 +1835,7 @@ class SaveWatcher(QObject):
                 # Mark as already backed-up so the watcher treats these files
                 # as baseline — only NEW modifications will trigger save_changed.
                 _BACKED_UP_FILES.add(fp)
-                parent_dir = str(Path(fp).parent)
+                parent_dir = _norm_key(Path(fp).parent)
                 _KNOWN_FILES_BY_DIR.setdefault(parent_dir, set()).add(fp)
         logger.info(
             f"Initialized watcher baseline: {len(found_files)} files in {path} "
@@ -1874,8 +1929,8 @@ class SaveWatcher(QObject):
                     except (ValueError, OSError):
                         pass
 
-            remove_seed_keys.append(str(resolved_path))
-            remove_seed_keys.append(str(path))
+            remove_seed_keys.append(_norm_key(resolved_path))
+            remove_seed_keys.append(_norm_key(path))
 
             for file_key in discovered_snapshot:
                 try:
@@ -1890,7 +1945,7 @@ class SaveWatcher(QObject):
             _KNOWN_FILES.difference_update(remove_known)
             # Keep per-directory index in sync
             for fp in remove_known:
-                parent_dir = str(Path(fp).parent)
+                parent_dir = _norm_key(Path(fp).parent)
                 dir_set = _KNOWN_FILES_BY_DIR.get(parent_dir)
                 if dir_set is not None:
                     dir_set.discard(fp)
@@ -2024,7 +2079,9 @@ def mark_game_files_backed_up(game_id: str) -> None:
     with _CACHE_LOCK:
         pending = _PENDING_FILES.pop(game_id, set())
         for fp in pending:
-            _BACKED_UP_FILES.add(fp)
+            # _PENDING_FILES holds real spellings; _BACKED_UP_FILES is keyed
+            # by the case-folded form the change handler checks against.
+            _BACKED_UP_FILES.add(_norm_key(fp))
 
 
 def get_pending_save_paths(game_id: str, exe_dir: str = "") -> list[str]:

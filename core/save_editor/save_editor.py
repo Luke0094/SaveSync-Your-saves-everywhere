@@ -23,6 +23,7 @@ Two rules the whole module is built around:
   every parsing gap without having to enumerate them.
 """
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field as _field
 from datetime import datetime
@@ -881,7 +882,28 @@ def restore_backup(backup, target) -> None:
     if not b.is_file():
         raise SaveEditorError("that copy is no longer there",
                               "cheats.err_copy_gone")
+    # Read the copy's contents NOW, before backup_original() below. That call
+    # keeps the file we're about to overwrite as a new copy, which runs
+    # prune_backups() — and if THIS copy is the oldest one and the slot is
+    # already full, pruning deletes it out from under us. Restoring the
+    # oldest kept copy used to fail with FileNotFoundError for exactly that
+    # reason.
+    try:
+        payload = b.read_bytes()
+    except OSError as e:
+        raise SaveEditorError("that copy could not be read",
+                              "cheats.err_copy_gone") from e
     if t.exists():
         backup_original(t)
-    shutil.copy2(b, t)
+    # write_bytes rather than copy2: the restored file must read as a fresh
+    # write. copy2 would carry the copy's old mtime across, making the restore
+    # look like nothing changed to everything that keys off mtime — the
+    # editor's (path, mtime) reload cache, the watcher, the backup manager's
+    # mtime preflight. os.utime as a belt-and-braces stamp (no O_CREAT open
+    # that could fail on a save the game still holds).
+    t.write_bytes(payload)
+    try:
+        os.utime(t, None)
+    except OSError:
+        pass
     logger.info(f"Restored {t.name} from {b.name}")

@@ -1195,6 +1195,10 @@
     "err_unreadable": "{name} non è un formato di salvataggio che SaveSync sa leggere.",
     "err_unreal_new": "{name} è un salvataggio Unreal Engine, ma SaveSync non è riuscito a leggerlo fino in fondo, quindi non ci scrive nemmeno.",
     "filter_values": "Filtra valori…",
+    "filter_by_name": "Filtra per nome…",
+    "filter_by_value": "Filtra per valore…",
+    "filter_mode_name": "Cerca nei nomi dei campi — clicca per cercare nei valori",
+    "filter_mode_value": "Cerca nei valori attuali — clicca per cercare nei nomi",
     "groups": {
       "switches": "Interruttori",
       "variables": "Variabili",

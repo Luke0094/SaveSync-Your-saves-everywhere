@@ -35,6 +35,7 @@ class ClearableLineEdit(QLineEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._leading_btn = None
         self._clear_btn = QToolButton(self)
         self._clear_btn.setText("×")
         self._clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -53,11 +54,41 @@ class ClearableLineEdit(QLineEdit):
         self.setTextMargins(0, 0, 20, 0)
         self._position_clear_btn()
 
+    def add_leading_button(self, text: str, tooltip: str = "") -> QToolButton:
+        """Embed a small button flush with the LEFT edge — a search-mode
+        toggle, say. Opt-in: fields that never call this are unchanged.
+        Returns the button so the caller wires ``clicked`` and swaps its
+        ``setText`` between states. A fixed width keeps the text margin
+        stable when the label changes."""
+        btn = QToolButton(self)
+        btn.setText(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tooltip:
+            btn.setToolTip(tooltip)
+        btn.setFixedSize(scaled(22, self), scaled(18, self))
+        btn.setStyleSheet(
+            f"QToolButton{{background:{palette('bg_elevated')};"
+            f"color:{palette('text_secondary')};"
+            f"border:1px solid {palette('border')};border-radius:4px;"
+            f"font-size:{scaled(9, self)}px;font-weight:bold;padding:0px;}}"
+            f"QToolButton:hover{{border-color:{palette('accent')};"
+            f"color:{palette('accent')};}}"
+        )
+        self._leading_btn = btn
+        m = self.textMargins()
+        self.setTextMargins(btn.width() + 8, m.top(), m.right(), m.bottom())
+        btn.show()
+        self._position_clear_btn()
+        return btn
+
     def _position_clear_btn(self):
         r = self.rect()
         x = r.right() - self._clear_btn.width() - 4
         y = (r.height() - self._clear_btn.height()) // 2
         self._clear_btn.move(x, y)
+        if self._leading_btn is not None:
+            lb = self._leading_btn
+            lb.move(4, (r.height() - lb.height()) // 2)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

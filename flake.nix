@@ -86,7 +86,7 @@
 
         savesyncPkg = pkgs.python312Packages.buildPythonApplication {
           pname = "savesync";
-          version = "1.3.6";
+          version = "1.3.8";
           format = "other";
 
           # `./.` on its own drags offline_deps/, dist/ and build/ — about
