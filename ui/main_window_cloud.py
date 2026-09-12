@@ -457,9 +457,21 @@ class CloudFlowsMixin:
         content hash instead of the dates stops asking when the bytes are
         already what the cloud holds. Falls back to False (keep asking) when
         the comparison cannot be made.
+
+        A file the CURRENT session itself just wrote — an engine rewriting
+        its own settings on open is the confirmed case, RPG Maker's is a
+        real example — does not count as a mismatch either; see
+        current_state_hash's changes_explained_since for why that is not
+        "the mtime changed" in the sense the docstring above means to exclude,
+        it is a genuine content difference that still isn't what this prompt
+        exists to catch (an external, unattended change). This is always
+        called with the game already launched (see _on_cloud_check_result),
+        so the tracked process's own create_time is the exact cutoff; the
+        grace-window fallback is only for the rare case it isn't tracked.
         """
         try:
             from core.backup import get_backup_manager
+            from core.monitor import get_monitor
             bm = get_backup_manager()
             backups = bm.get_backups_for_game(entry.id)
             if not backups:
@@ -469,7 +481,13 @@ class CloudFlowsMixin:
             recorded_hash = meta.get("save_hash") or ""
             if not recorded_hash:
                 return False
-            current = bm.current_state_hash(entry.id, entry.save_paths or [])
+            since = get_monitor().tracked_process_start_time(entry.id)
+            if not since:
+                import time as _time
+                since = _time.time() - bm._RECENT_LOCAL_WRITE_GRACE_S
+            current = bm.current_state_hash(
+                entry.id, entry.save_paths or [],
+                changes_explained_since=since)
             return bool(current) and current == recorded_hash
         except Exception:
             logger.debug("Local content check failed", exc_info=True)

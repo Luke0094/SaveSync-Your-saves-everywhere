@@ -39,6 +39,18 @@ _COMMON_SKIP_DIRS = frozenset({
     # SAVE_FOLDER_HINTS), which is why these roots have to be named here or
     # the profile gets offered as a save path.
     "mmz-game", "mv-game", "rmmv-game",
+    # Ren'Py's own internal mirror of the save directory it sits in
+    # (AppData/Roaming/RenPy/<GameFolder>/sync) — every file in it is a
+    # duplicate of one already directly under <GameFolder>, kept there for
+    # Ren'Py's own cloud-sync bookkeeping. The recursive scanner used to be
+    # able to score and propose it as an independent save path: confirmed,
+    # it doubled that game's backups (every real save zipped in twice,
+    # under two different member names) and, once its own copy of a file
+    # drifted a beat behind the original, the mismatch could make a later
+    # session's state look like it had reverted to an old backup. Never a
+    # legitimate save location on its own, whatever engine it turns up
+    # under, so excluded from both the scan and the backup content-walk.
+    "sync",
 })
 
 # ── Backup content-walk exclusions ──────────────────────────────────────────

@@ -1013,7 +1013,64 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     def showEvent(self, event):
         self.refresh_unknown_badge()
+        self._install_dpi_change_watch()
         super().showEvent(event)
+
+    def _install_dpi_change_watch(self):
+        """Wire this window's OWN screen/DPI signals.
+
+        MainWindow has the equivalent (_install_dpi_change_watch there) but
+        it only reacts to ITS OWN screenChanged/DPI signals — and the
+        overlay is a separate top-level window that follows the ACTIVE
+        screen (see _position_top_right / _get_active_screen_geometry),
+        which is very often the game's monitor, not wherever the main
+        window happens to sit. Moving between two screens of different DPI
+        (or scale) with the main window untouched fires nothing there,
+        leaving this window's fixed-size chrome — built with scaled() calls
+        for whatever screen it was FIRST shown on — stuck at the wrong size
+        even though _position_top_right correctly follows it to the new
+        screen. That is the "shrunk overlay after a monitor switch" report.
+
+        windowHandle() only exists once the native window is created, so
+        this runs from showEvent (idempotent — connects once) rather than
+        __init__.
+        """
+        if getattr(self, "_dpi_watch_installed", False):
+            return
+        wh = self.windowHandle()
+        if wh is None:
+            return
+        self._dpi_watch_installed = True
+        try:
+            wh.screenChanged.connect(self._on_overlay_screen_changed)
+        except Exception:
+            pass
+        try:
+            if hasattr(wh, "devicePixelRatioChanged"):
+                wh.devicePixelRatioChanged.connect(self._on_overlay_screen_changed)
+        except Exception:
+            pass
+
+    def _on_overlay_screen_changed(self, *_args):
+        """Re-scale this window's own chrome for the screen it is now on.
+
+        _recalculate_all_scaled_dimensions is the same app-wide registry
+        MainWindow's DPI reapply uses; it is safe to call from here alone
+        because each entry recomputes from ITS OWN widget's current
+        screen (ui_scale(widget) -> widget.screen()), so widgets elsewhere
+        in the app that have not moved come back with the same values they
+        already had — only this window's registered dimensions actually
+        change.
+        """
+        logger.info("Overlay: own screen/DPI change detected — re-scaling")
+        try:
+            from ui.helpers import _recalculate_all_scaled_dimensions
+            _recalculate_all_scaled_dimensions()
+            self.refresh_styles()
+        except Exception:
+            logger.debug("Overlay DPI reapply failed", exc_info=True)
+        # Existing screen-signal reaction: reposition for the new geometry.
+        self._on_screen_changed()
 
     def _on_action(self, action: str):
         self.action_requested.emit(action, self._context_exe)

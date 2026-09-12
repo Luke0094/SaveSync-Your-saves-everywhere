@@ -2073,6 +2073,13 @@ QCheckBox::indicator:disabled {
     background: #f4f4f8;
 }
 
+/* Mirror of the DARK_THEME block — see the note there: without this a
+   checked+disabled box rendered identically to an unticked one. */
+QCheckBox::indicator:checked:disabled {
+    background-color: #d4e0c0;
+    border-color: #b8c8a0;
+}
+
 QSpinBox:disabled, QDoubleSpinBox:disabled {
     color: #a8a8b4;
     background-color: #f4f4f8;

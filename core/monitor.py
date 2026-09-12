@@ -91,6 +91,41 @@ _SYSTEM_STEMS: frozenset[str] = _NEVER_A_GAME_PROCESS_STEMS | frozenset({
 _MIN_EXE_BYTES = 64 * 1024    # < 64 KB → almost certainly not a game
 _MIN_RUNTIME_SECONDS = 6    # Process must run at least 6 seconds to be considered a game (avoid borderline 10s cases)
 
+# How long a candidate exe that didn't pan out (see _candidate_last_seen)
+# stays exempt from getting ANOTHER confirmation timer scheduled for it.
+# A few minutes: comfortably longer than the handful of seconds a rapidly
+# respawning helper process lives and dies on, short enough that a real
+# game which merely crashed on its first attempt is evaluated fully again
+# well within the same play session.
+_CANDIDATE_COOLDOWN_S = 180.0
+# Bound on _candidate_last_seen itself, so a machine that genuinely runs
+# hundreds of distinct short-lived non-game processes over a long session
+# doesn't grow this dict forever — same idea as _proc_resolved_cache's cap.
+_CANDIDATE_CACHE_MAX = 512
+
+# Bounds for the tracked-process watchdog (see _tracked_watchdog). The
+# interval itself is DERIVED from the user's own "Process scan interval"
+# rather than fixed, for the reason process_poll_multiplier documents about
+# that setting: it is applied on top of their choice, never instead of it.
+# Somebody who sets 60 seconds is asking SaveSync to be quiet, and a fixed
+# 700 ms timer would be waking the process eighty times more often than they
+# asked, however little each wake does.
+#
+# The floor keeps it useful (there is no point being slower than the poll it
+# exists to pre-empt) and the ceiling keeps a very slow setting from turning
+# exit detection back into minutes.
+_WATCHDOG_MIN_MS = 500
+_WATCHDOG_MAX_MS = 5000
+
+
+def _watchdog_interval_ms() -> int:
+    """How often to ask whether the tracked pids are still alive."""
+    try:
+        base = float(get_config().get("process_poll_interval", 1)) * 1000.0
+    except Exception:
+        base = 1000.0
+    return int(max(_WATCHDOG_MIN_MS, min(_WATCHDOG_MAX_MS, base / 2.0)))
+
 
 # Identity of a process = (pid, create_time_rounded)
 ProcessKey = tuple[int, float]
@@ -330,6 +365,12 @@ class ProcessMonitor(QObject):
         super().__init__(parent)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
+        # Cheap liveness probe over the tracked pids only — see
+        # _tracked_watchdog. Separate from _timer because the whole point is
+        # that it runs at its own fast rate while _timer is throttled down.
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(_watchdog_interval_ms())
+        self._watchdog.timeout.connect(self._tracked_watchdog)
         self._snapshot_in_flight = False
         self._snapshot_ready.connect(self._on_snapshot_ready)
         # Process→entry matching caches (see _find_entry): library lookups
@@ -385,6 +426,18 @@ class ProcessMonitor(QObject):
         self._first_seen: dict[ProcessKey, float] = {}
         # Exes already shown overlay for (per session)
         self._seen_unknown_exes: set[str] = set()
+        # Candidate exe (lowercased, resolved) → time.time() it last got a
+        # confirmation timer scheduled (see _candidate_on_cooldown). A
+        # process that never lives long enough to confirm as a game — the
+        # common case for a name-only library match or the broad
+        # _is_plausible_game heuristic — gets a fresh QTimer/closure every
+        # single time it (re)spawns, with nothing remembered between one
+        # short life and the next. A background app that respawns its own
+        # helper process every few seconds paid that cost every time, for
+        # no different an answer. This is deliberately a COOLDOWN, not a
+        # permanent blacklist: a real game that happened to crash on its
+        # first try still gets evaluated again once the window passes.
+        self._candidate_last_seen: dict[str, float] = {}
 
         # Flag set by signal handler, checked in next poll cycle
         self._emergency_flag = False
@@ -669,6 +722,32 @@ class ProcessMonitor(QObject):
 
         except (OSError, ValueError):
             return False
+
+    def _candidate_on_cooldown(self, exe: str) -> bool:
+        """True if *exe* already got a confirmation timer scheduled within
+        _CANDIDATE_COOLDOWN_S — the caller should skip scheduling another
+        one. Records this call's exe + timestamp either way, so the next
+        (re)spawn of the same exe sees an up to date cooldown regardless of
+        which branch (unverified match / plausible unknown) asked.
+
+        Deliberately keyed on the exe path, not the pid: the whole point is
+        that a NEW pid every time (the normal case for a process that keeps
+        getting relaunched) must not look like a genuinely new question.
+        """
+        try:
+            key = str(Path(exe).resolve()).lower()
+        except (OSError, ValueError):
+            key = exe.lower()
+        now = time.time()
+        last = self._candidate_last_seen.get(key)
+        on_cooldown = last is not None and (now - last) < _CANDIDATE_COOLDOWN_S
+        if len(self._candidate_last_seen) >= _CANDIDATE_CACHE_MAX and key not in self._candidate_last_seen:
+            # Evict the stalest entry rather than let this grow without
+            # bound — same tradeoff _proc_resolved_cache makes.
+            oldest = min(self._candidate_last_seen, key=self._candidate_last_seen.get)
+            self._candidate_last_seen.pop(oldest, None)
+        self._candidate_last_seen[key] = now
+        return on_cooldown
 
     def _snapshot(self) -> dict[ProcessKey, dict]:
         """One pass over the process table, CACHED across polls.
@@ -1084,6 +1163,8 @@ class ProcessMonitor(QObject):
         self._last_activity_time = time.time()
         interval = 500  # Start with 500ms for fast detection
         self._timer.start(interval)
+        self._watchdog.setInterval(_watchdog_interval_ms())
+        self._watchdog.start()
         self._active = True
         logger.info(f"Process monitor started ({interval}ms interval with adaptive polling)")
 
@@ -1138,10 +1219,15 @@ class ProcessMonitor(QObject):
 
     def stop(self):
         self._timer.stop()
+        self._watchdog.stop()
         self._active = False
 
     def restart_with_new_interval(self):
         if self._active:
+            # The watchdog is derived from the same setting, so it moves with
+            # it — otherwise changing "Process scan interval" would leave the
+            # cheaper timer still running at the old rate.
+            self._watchdog.setInterval(_watchdog_interval_ms())
             self._timer.stop()
             self._refresh_ignored_cache()
             # Reset adaptive polling so it recalculates from current activity
@@ -1149,6 +1235,71 @@ class ProcessMonitor(QObject):
             self._last_activity_time = time.time()
             interval = self._get_adaptive_interval()
             self._timer.start(interval)
+
+    def _tracked_watchdog(self):
+        """Notice a tracked game exiting NOW, not at the next throttled poll.
+
+        The main poll is deliberately slowed to base*4 during a session:
+        it walks the entire process table and resolves executables, and that
+        CPU belongs to the game. The consequence was that the one event that
+        matters most during a session — the game closing — waited out that
+        whole interval before anything downstream (final backup, save scan,
+        restoring the window from the tray) even started.
+
+        This costs nothing to do properly, because the tracked processes are
+        already known by pid: asking the OS whether a pid still exists is a
+        single syscall per tracked process, a couple of them per tick, versus
+        hundreds of process inspections. When one is gone the real poll is
+        armed for the next event-loop turn and does the authoritative work —
+        session accounting, signals, cleanup — exactly as it always did.
+
+        A recycled pid can only make this MISS an early trigger (the normal
+        poll still catches it a moment later), never fabricate an exit: this
+        method decides nothing on its own, it only asks the poll to run.
+        """
+        if not (self._active and PSUTIL_AVAILABLE):
+            return
+        with self._data_lock:
+            pids = {key[0] for key in self._tracked}
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                alive = psutil.pid_exists(pid)
+            except Exception:
+                continue        # unreadable — leave it to the real poll
+            if not alive:
+                logger.debug(
+                    f"Watchdog: tracked pid {pid} is gone — polling immediately")
+                self.nudge()
+                return
+
+    def nudge(self):
+        """Poll on the next event-loop turn, and treat now as fresh activity.
+
+        For the moments the app already KNOWS something happened and should
+        not have to rediscover it on a timer: the user pressing Play, a
+        tracked process vanishing. Without this, launching a game from
+        SaveSync after a quiet spell waited out the idle interval (base*4)
+        before the process was even looked for, and only then started the
+        runtime threshold — the delay was self-inflicted, not inherent.
+        """
+        if not self._active:
+            return
+        self._last_activity_time = time.time()
+        # A ONE-OFF poll, deliberately not self._timer.start(0).
+        #
+        # _timer repeats, and _poll returns early whenever a snapshot is
+        # already in flight — without ever reaching _update_polling_interval,
+        # which is what would put a sane interval back. Re-arming it at zero
+        # would therefore spin: fire, see the in-flight guard, return, fire
+        # again, for as long as the background process walk takes (tens to
+        # hundreds of milliseconds), while the watchdog kept re-nudging
+        # because _tracked is not cleared until that walk lands. A singleShot
+        # gets the immediate poll with no interval to restore, and the
+        # scheduled timer keeps its own cadence untouched — the freshly reset
+        # activity time above is what makes the NEXT interval the fast one.
+        QTimer.singleShot(0, self._poll)
 
     # ── Poll ──────────────────────────────────────────────────────────────────
 
@@ -1261,8 +1412,22 @@ class ProcessMonitor(QObject):
             if entry is not None and not verified:
                 # Matched on the name alone (unreadable process path). Do NOT
                 # start tracking a game we can't confirm this is — ask.
-                new_processes_found = True
-                self._prompt_unverified_after_runtime(entry, name, key)
+                # Does NOT reset the adaptive-polling activity clock: the
+                # confirmation below runs on its own timer regardless of the
+                # main poll's rate, and a name-only match is exactly the
+                # case least worth trusting as "the player is doing
+                # something" — see _is_plausible_game's note on the same
+                # question for the unknown-process branch below.
+                #
+                # Also skipped entirely on cooldown (see
+                # _candidate_on_cooldown): a new pid every relaunch is the
+                # NORMAL case for this branch (the path couldn't even be
+                # verified), so without this a process that keeps
+                # respawning under the same name scheduled a brand new
+                # confirmation timer every single time, for an answer that
+                # had not changed since the last one.
+                if not self._candidate_on_cooldown(exe):
+                    self._prompt_unverified_after_runtime(entry, name, key)
                 continue
 
             if entry:
@@ -1299,7 +1464,16 @@ class ProcessMonitor(QObject):
             else:
                 # Unknown process - check if it could be a game
                 if self._is_plausible_game(exe):
-                    new_processes_found = True
+                    # Deliberately does NOT reset the adaptive-polling
+                    # activity clock. _is_plausible_game excludes only
+                    # system directories — "everything else is fair game" —
+                    # which any ordinary program launching from outside
+                    # Program Files satisfies just as well as an actual
+                    # game does. Resetting on every one of those kept the
+                    # poll pinned to its fastest tier for whole sessions
+                    # where nothing the user was tracking ever ran; the
+                    # confirmation below has its own timer and needs none
+                    # of that.
 
                     # Wait a bit longer to ensure process stays active before showing popup
                     def check_runtime(_runtime_check_exe=exe, _key=key):
@@ -1331,11 +1505,17 @@ class ProcessMonitor(QObject):
                         except Exception:
                             pass
                     
-                    # Track as None so exit handler can clean up
+                    # Track as None so exit handler can clean up — regardless
+                    # of cooldown, THIS pid still needs its exit noticed.
                     with self._data_lock:
                         self._tracked[key] = None
-                    # Schedule runtime check with a buffer to account for timing issues
-                    QTimer.singleShot((_MIN_RUNTIME_SECONDS + 2) * 1000, check_runtime)
+                    # Schedule runtime check with a buffer to account for
+                    # timing issues — skipped when this exe already got one
+                    # recently (see _candidate_on_cooldown): the answer for
+                    # "is this a game" hasn't changed since the last spawn,
+                    # so there is nothing new for another timer to learn.
+                    if not self._candidate_on_cooldown(exe):
+                        QTimer.singleShot((_MIN_RUNTIME_SECONDS + 2) * 1000, check_runtime)
                 else:
                     # Not a plausible game, track as None but don't show popup
                     with self._data_lock:
@@ -1622,7 +1802,11 @@ class ProcessMonitor(QObject):
                         f"pruned {len(dead_keys)} dead tracked pid(s) {[k[0] for k in dead_keys]} "
                         f"for this game — they were tracked, now confirmed gone")
         if found_pid:
-            logger.info(f"[DIAG] find_game_process game_id={game_id}: "
+            # The common case — the live-tracking loop calls this once per
+            # tick (every 60s, backing off to 5 min) for as long as a game
+            # runs, and this is a HIT almost every time. Debug: it narrated
+            # nothing but "still running" for the length of every session.
+            logger.debug(f"[DIAG] find_game_process game_id={game_id}: "
                         f"step 1 HIT pid={found_pid}")
             return found_pid
 
@@ -1633,7 +1817,7 @@ class ProcessMonitor(QObject):
         # 2. Direct exe match in running dict
         pid = self.find_pid_by_exe(exe_path)
         if pid:
-            logger.info(f"[DIAG] find_game_process game_id={game_id}: "
+            logger.debug(f"[DIAG] find_game_process game_id={game_id}: "
                         f"step 1 miss, step 2 HIT pid={pid}, session_age={session_age}s")
             self._remember_resolved_pid(game_id, pid)
             return pid
@@ -1781,6 +1965,26 @@ class ProcessMonitor(QObject):
                 if entry is not None and entry.id == game_id:
                     return key[0]
         return 0
+
+    def tracked_process_start_time(self, game_id: str) -> float:
+        """When the tracked process for *game_id* was created (epoch
+        seconds), or 0 if it isn't tracked.
+
+        Same no-process-table-walk cost as tracked_pid_for — the create_time
+        is already cached as the second half of the tracking key (see
+        _snapshot's identity scheme), so this is a dict scan, not a fresh
+        psutil call. Lets a caller distinguish a file this exact session
+        wrote from one that was already different before it started,
+        without picking an arbitrary "how recent counts" window: anything
+        written at or after this timestamp was this process, full stop.
+        """
+        if not game_id:
+            return 0.0
+        with self._data_lock:
+            for key, entry in self._tracked.items():
+                if entry is not None and entry.id == game_id:
+                    return key[1]
+        return 0.0
 
     def start_tracking(self, entry, exe_path: str):
         """Add a game to tracked processes (thread-safe public API).

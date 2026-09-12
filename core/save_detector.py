@@ -1292,7 +1292,12 @@ def _live_save_paths(pid: int) -> list[str]:
         _pid_set = ",".join(f"{p.pid}:{p.name()}" for p in all_procs)   # [DIAG]
     except Exception:
         _pid_set = ",".join(str(p.pid) for p in all_procs)   # [DIAG]
-    logger.info(f"[DIAG] _live_save_paths pid={pid}: "
+    # Per-call timing breakdown — this runs every live-tracking poll (every
+    # 60s, backing off to 5 min once a path is confirmed), so at INFO it
+    # narrated the same "still here, still fine" numbers for the length of
+    # every session. Debug: still there for the one time this timing
+    # actually needs to be read.
+    logger.debug(f"[DIAG] _live_save_paths pid={pid}: "
                 f"tree={( _t_tree-_t_start)*1000:.0f}ms ({_pre_filter_count} procs found) | "
                 f"cmdline_filter={(_t_procfilter-_t_tree)*1000:.0f}ms "
                 f"({len(all_procs)} procs kept: {_pid_set}) | "
@@ -2039,7 +2044,12 @@ def detect_save_paths(
         game_name = ""
     config = get_config()
     hints  = config.get("save_folder_hints", SAVE_FOLDER_HINTS)
-    logger.info("detect_save_paths: cancel=%s hints=%d terms_start=%s",
+    # Entry trace. Called every live-tracking poll for a running game (as
+    # often as every 60s) as well as the rarer full/manual scans — routine
+    # either way, and the caller already logs at INFO when a poll actually
+    # turns up something new (see ui.main_window's "Live tracking found new
+    # path" line).
+    logger.debug("detect_save_paths: cancel=%s hints=%d terms_start=%s",
                 _is_cancelled(), len(hints), game_name[:50])
     seen: set[str] = set()
     results: list[str] = []
@@ -2167,7 +2177,7 @@ def detect_save_paths(
         _live_ms = (time.time() - _t_live0) * 1000   # [DIAG]
         for p in live_paths:
             _add(p, is_live_result=True)
-        logger.info(f"Live tracking strategy found {len(live_paths)} paths "
+        logger.debug(f"Live tracking strategy found {len(live_paths)} paths "
                     f"[DIAG live_ms={_live_ms:.0f}]")
 
     # When live_only is set, skip the registry/generic-fs strategies (3-4 —
@@ -2245,7 +2255,10 @@ def detect_save_paths(
                     for p in _corr_results:
                         _add(p, is_live_result=True)
                     _corr_ms = (time.time() - _t_corr0) * 1000   # [DIAG]
-                    logger.info(f"[DIAG] correlated_engine_paths: "
+                    # Every poll, and a same-instant no-op whenever
+                    # save_correlation_enabled is off (its own default) —
+                    # not worth an INFO line each time.
+                    logger.debug(f"[DIAG] correlated_engine_paths: "
                                 f"known_paths={len(correlate_paths)} "
                                 f"found={len(_corr_results)} "
                                 f"total={_corr_ms:.0f}ms")   # [DIAG]
@@ -2271,7 +2284,7 @@ def detect_save_paths(
         # precision of Strategy 1 is preserved; what this adds is exact-dup
         # removal and never returning both "game" and "game/save".
         results = expand_selectable_paths(results, engine=game_engine)
-        logger.info(
+        logger.debug(
             f"Live-only tracking found {len(results)} save paths for '{game_name}'"
         )
         return results

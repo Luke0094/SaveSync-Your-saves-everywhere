@@ -22,7 +22,19 @@ choice — with an always-on-top overlay so you never have to leave the game.
 - **Auto-detection of running games** via process monitoring, with a cached
   process snapshot (per-process verdicts memoized across polls) and gentler
   polling while a game session is active — near-zero background cost during
-  CPU-bound gameplay
+  CPU-bound gameplay. A confirmed game in your library is the only thing
+  that speeds polling back up; a merely plausible-looking process (anything
+  outside a system directory) no longer does, and a candidate that didn't
+  pan out — a name-only match, or an unknown process that exited before
+  being confirmed — gets a 3-minute cooldown per executable before it's
+  evaluated again, so a program that keeps respawning its own short-lived
+  helper process isn't re-asked about on every single spawn
+- **Cheap process-exit watchdog** — while a game is tracked, a lightweight
+  timer (derived from `process_poll_interval`, 0.5–5 s) checks only that
+  game's own pid instead of waiting for the next full scan, so closing it
+  (final backup, save scan, window restore) starts immediately rather than
+  after the poll's session-long backoff. Pressing Play does the same in the
+  other direction — it doesn't wait for the next scheduled poll either
 - **Heuristic save-folder detection** — scored candidates from folder keywords,
   game-name similarity (`match_slug` keeps letters and digits in any script —
   Japanese, Chinese, Korean, Cyrillic, Greek — not only ASCII), file analysis,
@@ -54,7 +66,10 @@ choice — with an always-on-top overlay so you never have to leave the game.
   recently, and flush index files once per game
 - **Interference alerts** — when something outside SaveSync puts an older save
   state back (a launcher's automatic sync, say), it says so, and can force the
-  restore with the game frozen
+  restore with the game frozen. A save written by the game's own process since
+  it started — some engines rewrite their own settings file just from opening —
+  is never mistaken for that; only a difference that already existed before
+  this session counts
 - **Periodic in-game backups** — configurable per-game interval while playing
 - **Provisional backups** — pre-confirmation saves are protected from the very
   first session, before you've even confirmed the paths
@@ -993,12 +1008,19 @@ art and hands the working set back, and re-decoding is precisely what a slow
 machine can least afford. One shared multiplier would have got at least one
 of those backwards.
 
-**Two kinds of sweep.** The routine tick only drops what is already dead —
+**Three kinds of sweep.** The routine tick only drops what is already dead —
 registry rows whose widget is gone, watcher file indices once nothing is being
-watched. It costs about 12 ms including the next process poll. The full trim
-(purge cover/image caches, full GC, hand the working set back to the OS) costs
-roughly 100 ms and runs on a long counter instead, or immediately when free RAM
-is genuinely short.
+watched. It costs about 12 ms including the next process poll. A medium pass
+hands the working set back to the OS but keeps decoded covers and the loaded
+save, so it's safe to run while you're actively using the app — it's what
+keeps RSS from just climbing during a long session, roughly every
+`memory sweep` interval below. The full trim (also purge cover/image caches,
+full GC) costs roughly 100 ms and runs on a long counter, or immediately when
+free RAM is genuinely short — but never at the cost of a visible repaint: if
+the window is on screen and you're merely not focused on it (not genuinely
+away from the PC, and memory isn't actually tight), the full trim holds back
+to the medium pass for whichever page you're looking at specifically, while
+still fully cleaning every other, off-screen page.
 
 **It paces itself by what the app is doing**, not by the clock:
 
@@ -1020,7 +1042,12 @@ shows `N/M — name` while they run.
 Other automatic I/O habits worth knowing:
 
 - **Filesystem watcher** coalesces save bursts (~5 s, ~8 s when many files are
-  pending) before triggering a backup
+  pending) before acting — discovery only (surfacing the folder for
+  confirmation, and starting the in-game backup timer the first time it
+  finds something) unless `backup_during_game` is explicitly turned on, in
+  which case it also backs up reactively on every settled burst. The actual
+  periodic backup while playing always runs on the per-game interval set in
+  Add/Edit Game, independent of this
 - **Backup / sync “already current”** uses an mtime + entry-count preflight so
   unchanged games are skipped without rebuilding zip content hashes
 - **Config export history** (snapshots created on export, cloud upload,

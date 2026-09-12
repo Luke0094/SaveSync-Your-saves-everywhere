@@ -4356,7 +4356,26 @@ class BackupManager(QObject):
 
     # ── Save-state regression ────────────────────────────────────────────────
 
-    def current_state_hash(self, game_id: str, save_paths: list) -> str:
+    # Fallback for changes_explained_since when no tracked process start time
+    # is available. Both callers of this fallback are already close to "now"
+    # by construction, not open-ended sessions: the post-restore regression
+    # check runs synchronously right after the restore's own write, and the
+    # cloud-check race (game exits between its background network call
+    # finishing and the GUI-thread continuation running) is a dispatch delay,
+    # not a multi-second gap. Kept short on purpose — wide enough to absorb
+    # that dispatch delay or a slow disk flushing a large restore, not so
+    # wide that an unrelated external write landing in the same window would
+    # get waved through with nothing to actually tie it to what just happened.
+    _RECENT_LOCAL_WRITE_GRACE_S = 15.0
+    # Safety margin subtracted from an exact process create_time before
+    # comparing: it's cached rounded to 0.1s (see ProcessKey), and mtimes
+    # and process clocks are two different OS readings that are not
+    # guaranteed to agree to the millisecond — a write genuinely made by
+    # the process moments after it started must never lose to rounding.
+    _PROCESS_START_FUDGE_S = 2.0
+
+    def current_state_hash(self, game_id: str, save_paths: list,
+                           changes_explained_since: float = 0) -> str:
         """The state hash of a game's saves AS THEY ARE NOW.
 
         Comparable with the hash recorded on its backups because it goes
@@ -4364,6 +4383,27 @@ class BackupManager(QObject):
         as the previous one so unchanged files are never re-read — that is
         what keeps this in the milliseconds and lets it run at game launch
         instead of needing a watcher.
+
+        *changes_explained_since*: a changed file written at or after this
+        timestamp does not count against the returned hash — it still counts
+        as changed everywhere else (create_backup's own manifest pass is
+        untouched by this; a real backup must reflect real bytes). This
+        exists for the two callers that use this hash to decide whether to
+        warn the player that something looks wrong (detect_regression, and
+        the cloud "download instead?" prompt): a save folder is not only
+        touched by the player. RPG Maker rewrites its own settings file
+        (volume, window size) the moment it opens, before any of THIS
+        session's saving has happened — a write byte-for-byte as real as any
+        other, but one the game itself just made, not something that
+        happened while nothing was running to see it. Pass the tracked
+        process's own create_time here when there is one (see
+        ProcessMonitor.tracked_process_start_time) rather than an arbitrary
+        "how recent counts" window: a write is explained by THIS session the
+        moment it lands at or after that process actually started, whether
+        that's one second later or five minutes into a slow-loading game,
+        and never explained by a coincidence of timing otherwise. Zero (the
+        default) keeps this exactly the strict, literal comparison it always
+        was — nothing calls it leniently by accident.
         """
         from core.registry_saves import is_registry_path, registry_key_exists
         try:
@@ -4377,8 +4417,48 @@ class BackupManager(QObject):
             prev = ((backups[0].cloud_metadata or {}).get("file_manifest", {})
                     if backups else {})
             files = self._collect_save_files(fs_paths, _declared_chain_dirs(game_id))
-            manifest, _rf, _re, _ch, state = self._build_manifest(
+            manifest, _rf, _re, changed, state = self._build_manifest(
                 files, valid_reg, prev)
+            # Diagnostic only, and cheap: changed is already computed by
+            # _build_manifest for its own "did anything change" answer, this
+            # just surfaces WHICH files it was — the one thing missing when
+            # a state-hash mismatch (regression check, cloud-download prompt)
+            # needs explaining after the fact ("saves were the exact same").
+            if changed and prev:
+                logger.debug(
+                    f"current_state_hash({game_id}): {len(changed)} file(s) "
+                    f"differ from the last backup's manifest: {changed[:10]}"
+                    f"{'…' if len(changed) > 10 else ''}"
+                )
+            if changed and prev and changes_explained_since > 0:
+                cutoff = changes_explained_since - self._PROCESS_START_FUDGE_S
+                lenient = None
+                explained = []
+                for arc in changed:
+                    fp = manifest.get(arc, "")
+                    parts = fp.split("|")
+                    # 3 parts: a real file, not a "[deleted] ..." marker (a
+                    # deletion has no fresh write to explain it — still counts).
+                    if len(parts) != 3 or arc not in prev:
+                        continue
+                    try:
+                        mtime = float(parts[1])
+                    except ValueError:
+                        continue
+                    if mtime >= cutoff:
+                        if lenient is None:
+                            lenient = dict(manifest)
+                        lenient[arc] = prev[arc]   # counts as unchanged here
+                        explained.append(arc)
+                if lenient is not None:
+                    lenient_state = self.state_hash_of(lenient)
+                    logger.debug(
+                        f"current_state_hash({game_id}): {len(explained)} of "
+                        f"{len(changed)} changed file(s) written at/after "
+                        f"{cutoff:.1f} (this session's own) — not counted: "
+                        f"{explained[:10]}{'…' if len(explained) > 10 else ''}"
+                    )
+                    state = lenient_state
             return state if manifest else ""
         except Exception as e:
             logger.debug(f"Could not hash current save state for {game_id}: {e}")
@@ -4400,7 +4480,8 @@ class BackupManager(QObject):
                    for fp in manifest.values())
 
     def detect_regression(self, game_id: str, save_paths: list,
-                          expected_backup_id: str = "") -> Optional[BackupEntry]:
+                          expected_backup_id: str = "",
+                          changes_explained_since: float = 0) -> Optional[BackupEntry]:
         """Have the saves gone BACK to a state recorded in an older backup?
 
         Returns that older backup, or None.
@@ -4414,6 +4495,11 @@ class BackupManager(QObject):
         this game: landing on that state is the intended outcome, not a
         regression.
 
+        *changes_explained_since*: forwarded to current_state_hash — pass the
+        current session's process start time (the caller has that; this
+        method doesn't reach into core.monitor to get it itself) so a write
+        the game made on its own, opening, doesn't read as a regression.
+
         Only backups whose manifest is comparable take part; see
         _manifest_is_comparable for why.
         """
@@ -4424,7 +4510,12 @@ class BackupManager(QObject):
         if len(usable) < 2:
             return None      # nothing to regress FROM
 
-        current = self.current_state_hash(game_id, save_paths)
+        if not changes_explained_since:
+            import time as _time
+            changes_explained_since = _time.time() - self._RECENT_LOCAL_WRITE_GRACE_S
+        current = self.current_state_hash(
+            game_id, save_paths,
+            changes_explained_since=changes_explained_since)
         if not current:
             return None
 

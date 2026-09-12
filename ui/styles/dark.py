@@ -2150,6 +2150,17 @@ QCheckBox::indicator:disabled {
     background: #16161c;
 }
 
+/* Without this, a checked+disabled box (e.g. a read-only "this path is
+   included" indicator) matched :disabled alone — the last rule in
+   document order wins when both apply — so a genuinely ticked value
+   rendered identically to an unticked one. Dimmed rather than the full
+   accent green: still visibly "on", but consistent with everything else
+   disabled being muted. */
+QCheckBox::indicator:checked:disabled {
+    background-color: #3f4d28;
+    border-color: #4a5c30;
+}
+
 QSpinBox:disabled, QDoubleSpinBox:disabled {
     color: #55555f;
     background-color: #16161c;

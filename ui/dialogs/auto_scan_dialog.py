@@ -349,17 +349,6 @@ class ScanWorkerThread(QThread):
             self.error.emit(str(e))
 
 
-class _GameRef:
-    """Stand-in for a game with no library row (an archive, or one still
-    being added). Carries only what the ignored-paths flow reads."""
-
-    def __init__(self, game_id: str, name: str):
-        self.id = game_id
-        self.name = name
-        self.save_paths: List[str] = []
-        self.excluded_save_paths: List[str] = []
-
-
 class SavePathItem(QWidget):
     """Widget for displaying a single save path option"""
     
@@ -398,24 +387,18 @@ class SavePathItem(QWidget):
         self._rows_end_anchor.setFixedHeight(0)
         layout.addWidget(self._rows_end_anchor)
 
-        # Recovery of paths trashed in THIS confirmation: a counter plus the
-        # Manage dialog, which is where restoring now lives. Deliberately
-        # scoped to the session — a confirmation panel is about the paths just
-        # proposed, and the paths ignored in earlier runs only added noise
-        # here. They remain reviewable in Settings → excluded paths.
+        # Counter of paths trashed in THIS confirmation. No button of its
+        # own any more — _open_ignored_dialog turned out to be a pure
+        # delegate to the panel-level _open_ignored_dialog_for (see that
+        # method's docstring), which already reviews both this session's
+        # removals AND earlier ones and sits once, after every path — proposed
+        # and already-confirmed alike — in show_existing_paths below. Two
+        # "Manage" buttons doing the identical thing was the actual bug.
         ignored_row = QHBoxLayout()
         ignored_row.setContentsMargins(20, 0, 2, 0)
         self._ignored_count_lbl = QLabel()
         self._ignored_count_lbl.setObjectName("auto_scan_muted")
-        manage_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
-        lock_min_size(
-            manage_btn, scaled(88, self, min_px=72), scaled(24, self, min_px=22),
-            policy_h=QSizePolicy.Policy.Minimum,
-            policy_v=QSizePolicy.Policy.Fixed)
-        manage_btn.setObjectName("auto_scan_sm_btn")
-        manage_btn.clicked.connect(self._open_ignored_dialog)
         ignored_row.addWidget(self._ignored_count_lbl, 1)
-        ignored_row.addWidget(manage_btn)
         layout.addLayout(ignored_row)
         self._refresh_ignored_count()
 
@@ -435,31 +418,6 @@ class SavePathItem(QWidget):
             self._ignored_count_lbl.setText(t("add_game.session_ignored_count", count=n))
         else:
             self._ignored_count_lbl.setText(t("add_game.session_ignored_none"))
-
-    def _open_ignored_dialog(self):
-        """Review and restore removed paths. Delegates to the panel.
-
-        Both entry points opened their own dialog before, with different
-        contents and different restore destinations — two controls named
-        Manage that did two different things. The panel owns the one
-        behaviour now; this stays because the row is where the user is
-        looking when they want it.
-        """
-        panel = self.window()
-        handler = getattr(panel, "_open_ignored_dialog_for", None)
-        if not callable(handler):
-            return
-        game = None
-        try:
-            game = get_library().get_by_id(self.game_id)
-        except Exception:
-            game = None
-        if game is None:
-            # No library row: the dialog still needs an id and a name to
-            # read the store and to title itself.
-            game = _GameRef(self.game_id, self.game_name)
-        handler(game)
-        self._refresh_ignored_count()
 
     def _build_path_row(self, path: str):
         """Build and append the checkbox+open+delete+file-browser row for one
@@ -960,6 +918,14 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.path_items.append(item)
         self.results_layout.addWidget(item)
 
+        # A path can be pushed in live, after the panel already built its
+        # manage row (see _on_save_changed's live push into an open panel)
+        # — re-append it so it stays last, after this newly-added card too.
+        box = getattr(self, "_manage_box", None)
+        if box is not None and box.isVisible():
+            self.results_layout.removeWidget(box)
+            self.results_layout.addWidget(box)
+
     def show_existing_paths(self, game) -> int:
         """List the game's already-saved folders, read-only. Returns how many.
 
@@ -1047,24 +1013,11 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             file_list.set_selectable(False)
             self._existing_layout.addWidget(file_list)
 
-        # Manage button — always available so the user can review excluded
-        # paths even when no new proposals were found.
-        manage_row = QHBoxLayout()
-        manage_row.setContentsMargins(20, 2, 2, 0)
-        manage_lbl = QLabel()
-        manage_lbl.setObjectName("auto_scan_muted")
-        manage_row.addWidget(manage_lbl, 1)
-        manage_btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
-        lock_min_size(
-            manage_btn, scaled(88, self, min_px=72), scaled(24, self, min_px=22),
-            policy_h=QSizePolicy.Policy.Minimum,
-            policy_v=QSizePolicy.Policy.Fixed)
-        manage_btn.setObjectName("auto_scan_sm_btn")
-        manage_btn.clicked.connect(
-            lambda: self._open_ignored_dialog_for(game))
-        manage_row.addWidget(manage_btn)
-        self._existing_layout.addLayout(manage_row)
-
+        # No Manage button here any more — show_manage_row (always called
+        # right after this, at every call site) is now the single one,
+        # kept last in results_layout by add_found_paths. Two identical
+        # "Manage" buttons on screen at once, one here and one there, was
+        # the actual bug; see show_manage_row's docstring.
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         self._existing_layout.addWidget(sep)
@@ -1076,11 +1029,21 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         return len(paths)
 
     def show_manage_row(self, game) -> int:
-        """The panel-level "paths you removed" row. Returns how many there are.
+        """The one panel-level "manage removed paths" row. Returns the
+        removed-path count (0 when there's nothing removed to report, even
+        if the row is still showing for the reason below).
 
         Read from the PERSISTED store, so a path removed in an earlier
         session is reachable straight away rather than after a scan that, by
         definition, will never propose it again.
+
+        Shown whenever there is EITHER something removed to review OR the
+        game already has confirmed save paths — that second half used to be
+        a separate button inside show_existing_paths (always called right
+        before this), so the panel could offer "review excluded paths" even
+        with nothing removed yet. Same handler either way, so one row now
+        covers both cases instead of two identical buttons appearing side
+        by side whenever both were true at once.
         """
         box = getattr(self, "_manage_box", None)
         if box is None:
@@ -1093,13 +1056,18 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
 
         game_id = getattr(game, "id", "") or ""
         removed = rejected_paths_for(game_id) if game_id else set()
-        if not removed:
+        has_existing = bool(getattr(game, "save_paths", None))
+        if not removed and not has_existing:
             box.setVisible(False)
             return 0
 
         # Its own string: the per-group counter says "deleted in this
-        # confirmation", and this one is about every session.
-        lbl = QLabel(t("auto_scan.removed_paths_count", count=len(removed)))
+        # confirmation", and this one is about every session. Blank when
+        # there is nothing removed yet — the button alone still says what
+        # it's for, and a "Removed paths: 0" line would only be noise on
+        # every confirmation for a game nothing has ever been trimmed from.
+        lbl = QLabel(t("auto_scan.removed_paths_count", count=len(removed))
+                     if removed else "")
         lbl.setObjectName("auto_scan_muted")
         btn = QPushButton(t("add_game.manage_ignored_paths_btn"))
         lock_min_size(
@@ -1113,6 +1081,12 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self._manage_layout.addWidget(btn)
         box.setVisible(True)
         self.results_area.setVisible(True)
+        # Kept last: proposal cards for this game are appended to
+        # results_layout AFTER this row was first placed there (at
+        # construction, right after _existing_box) — re-adding moves it to
+        # the end, past everything found so far, every time this refreshes.
+        self.results_layout.removeWidget(box)
+        self.results_layout.addWidget(box)
         return len(removed)
 
     def refit_to_content(self) -> None:
@@ -1928,12 +1902,21 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         self.games_without_saves = [game]
         self.extended_scan_btn.setEnabled(True)
 
+        # Same pair start_scan() calls for the manual panel — this is the
+        # at-exit shortcut, and skipping these meant "review/restore removed
+        # paths" was only ever reachable from the per-proposal-card button
+        # that used to sit next to it (now gone, see add_found_paths/
+        # show_manage_row: one row, not two, covers both).
+        self.show_existing_paths(game)
+        self.show_manage_row(game)
+
         self.add_found_paths(game.id, game.name, selectable)
         if not self.path_items:
             # Defensive: add_found_paths applied a stricter filter and
             # nothing survived — same rule, don't show an empty panel.
             return False
         self.results_area.setVisible(True)
+        self.refit_to_content()
 
         self.progress_label.setText(t('auto_scan.background_paths_found', count=len(selectable)))
         self.progress_bar.setVisible(False)

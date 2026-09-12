@@ -1213,12 +1213,35 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         deferred = (want_deep or want_medium) and dialogs
         do_deep = want_deep and not dialogs
         do_medium = want_medium and not dialogs
+        deep_ran_full = False
         if do_deep:
-            self._sweeps_since_deep = 0
+            # "Unattended" (see _is_unattended) also fires the moment this
+            # window merely isn't the focused one, even sitting fully on
+            # screen with the person right there, actively doing something
+            # else. Dropping decoded covers / wiping pages on THAT premise
+            # forces an immediate, visible repaint of content nobody asked
+            # to change — wasted work, and a flicker they can catch out of
+            # the corner of their eye. Only worth that cost when the window
+            # genuinely shows nothing right now (hidden/minimized), the
+            # person is actually away from the PC (not just this window),
+            # or memory pressure makes it worth paying regardless.
+            deep_ran_full = pressure_bad or self._deep_clear_is_visually_free()
             self._last_working_set_mono = _now_mono
             try:
-                self._release_idle_documents(force_all=True)
-                trim_process_memory(full=True)
+                if deep_ran_full:
+                    self._sweeps_since_deep = 0
+                    self._release_idle_documents(force_all=True)
+                    trim_process_memory(full=True)
+                else:
+                    # Due, but not yet safe to touch what's on screen. Every
+                    # OTHER page is off screen regardless of whether this one
+                    # is — wiping those is free, only the visible one has to
+                    # wait. Leave _sweeps_since_deep where it is, so the full
+                    # pass (and the visible page with it) is re-tried, and
+                    # the interval kept at the floor below, every tick until
+                    # it actually can run.
+                    self._release_idle_documents(force_all=True, skip_current=True)
+                    trim_process_memory(full=False)
             except Exception:
                 logger.debug("Background deep sweep failed", exc_info=True)
         elif do_medium:
@@ -1241,10 +1264,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             timer.start(new)
 
         _ms = (_t.perf_counter() - _t0) * 1000   # [DIAG]
-        if do_deep:
+        if do_deep and deep_ran_full:
             _why = "pressure" if pressure_bad else "away"   # [DIAG]
             logger.info(f"[DIAG] memory_trim_tick: DEEP ({_why} "
                         f"pressure={pressure}) reclaimed={reclaimed} "
+                        f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
+        elif do_deep:
+            logger.info(f"[DIAG] memory_trim_tick: DEEP held back (on screen, "
+                        f"not genuinely away) — working set only "
                         f"next={new // 1000}s total={_ms:.2f}ms")   # [DIAG]
         elif do_medium:
             logger.info(f"[DIAG] memory_trim_tick: MEDIUM (working set, "
@@ -1340,18 +1367,59 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return False
         return (_time.monotonic() - last) >= self._UNATTENDED_AFTER_S
 
-    def _release_idle_documents(self, force_all: bool = False):
+    def _deep_clear_is_visually_free(self) -> bool:
+        """True when dropping decoded covers / wiping pages costs nothing
+        VISIBLE right now — nobody could actually see the rebuild that
+        follows.
+
+        A narrower question than _is_unattended(): that one also returns
+        True the moment this window merely isn't the FOCUSED one, even
+        while it sits fully on screen and the person is right there, doing
+        something else — SaveSync visible on a second monitor, or just not
+        the window they clicked into for the last ten minutes. Wiping pages
+        on that premise forces an immediate, visible repaint of content
+        that hasn't actually changed. Free only when either nothing is on
+        screen to repaint (hidden/minimized) or the person is genuinely away
+        from the PC altogether, not merely away from this one window.
+        """
+        from ui.helpers import system_idle_seconds
+        idle = system_idle_seconds()
+        if idle >= 0.0 and idle >= self._UNATTENDED_AFTER_S:
+            return True             # away from the PC, not just this window
+        try:
+            return not self.isVisible() or self.isMinimized()
+        except RuntimeError:
+            return True             # window torn down — nothing to repaint
+
+    def _release_idle_documents(self, force_all: bool = False,
+                                skip_current: bool = False):
         """Wipe all built pages and loaded documents so memory drops to minimum.
-        Protected: does not wipe CheatsPage if a save is loaded unless force_all is True (deep idle / game start/exit)."""
+        Protected: does not wipe CheatsPage if a save is loaded unless force_all is True (deep idle / game start/exit).
+
+        *skip_current*: leave whichever page self._stack is actually showing
+        alone. Every OTHER page is off screen regardless — wiping those
+        costs nothing visible, it's only the one currently painted that a
+        wipe-and-rebuild would flash. Used by the periodic memory tick when
+        it isn't safe to disturb what's on screen (see
+        _deep_clear_is_visually_free) but the other, unseen pages are still
+        worth freeing.
+        """
         if not force_all and self._has_active_or_pending_dialogs():
             return
+
+        current = None
+        if skip_current:
+            try:
+                current = self._stack.currentWidget()
+            except (RuntimeError, AttributeError):
+                current = None
 
         for page in (getattr(self, "_overview_page", None),
                      getattr(self, "_library_page", None),
                      getattr(self, "_sync_page", None),
                      getattr(self, "_backups_page", None),
                      getattr(self, "_settings_page", None)):
-            if page is None:
+            if page is None or page is current:
                 continue
             wipe = getattr(page, "wipe_and_reload", None)
             if callable(wipe):
@@ -1361,7 +1429,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     logger.debug(
                         f"wipe_and_reload failed for {type(page).__name__}",
                         exc_info=True)
-        if getattr(self, "_cheats_page", None) is not None:
+        if getattr(self, "_cheats_page", None) is not None and self._cheats_page is not current:
             try:
                 has_doc = getattr(self._cheats_page, "has_loaded_document", lambda: False)()
                 if not has_doc or force_all:
@@ -3661,13 +3729,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._regression_checking.add(game_id)
 
         from core.backup import get_backup_manager
+        # The tracked process's own start time, when there is one (launch,
+        # or a restore that ran while the game happened to be up) — lets
+        # detect_regression tell a write the game itself just made (opening
+        # rewrites RPG Maker's settings file, say) apart from one that was
+        # already sitting there before this session existed. 0 when nothing
+        # is tracked (a restore with the game closed) — detect_regression
+        # falls back to its own short grace window in that case.
+        _since = get_monitor().tracked_process_start_time(game_id)
 
         def _run():
             try:
                 mgr = get_backup_manager()
                 expected = self._last_restored.get(game_id, "")
                 older = mgr.detect_regression(game_id, list(entry.save_paths),
-                                              expected_backup_id=expected)
+                                              expected_backup_id=expected,
+                                              changes_explained_since=_since)
                 if older is not None:
                     backups = mgr.get_backups_for_game(game_id)
                     newest = backups[0].backup_id if backups else ""
@@ -6773,6 +6850,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._status_bar.showMessage(f"{t('core.launch_failed')}: {e}", 5000)
                 logger.warning(f"Launch failed for {entry.exe_path}: {e}")
                 return
+
+        # We know a game is starting — the monitor should not have to
+        # rediscover that on an idle-rate timer. After a quiet spell its
+        # interval has backed off to four times the base, so the process was
+        # not even looked for until seconds after the user pressed Play, and
+        # only then did the runtime threshold start counting.
+        try:
+            get_monitor().nudge()
+        except Exception:
+            logger.debug("could not nudge the process monitor", exc_info=True)
 
     def _on_folder_appeared(self, game_id: str):
         """Save folder just appeared for the first time.
