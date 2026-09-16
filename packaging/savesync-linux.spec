@@ -101,6 +101,16 @@ hiddenimports += [
     'PIL', 'pillow_avif',
     'jaraco.functools', 'jaraco.context', 'jaraco.text',
     'dateutil', 'dateutil.parser',
+    # core.engines.wolf_lz4: all three lazy-imported inside the module
+    # (same reason as the crypto entries above) — lz4.block decompresses/
+    # recompresses the payload, numpy vectorises its seed search, numba
+    # JIT-compiles that same search roughly 3-4x faster when present
+    # (its own import is try/except, but is a real requirements.txt
+    # dependency now, so analysis needs to see it too).
+    # core.save_editor.crypt.recipes additionally lazy-imports lz4.frame
+    # (never lz4.block — a generic recipe has no out-of-band size to give
+    # a block decoder).
+    'lz4', 'lz4.block', 'lz4.frame', 'numpy', 'numba',
 ]
 
 a = Analysis(                                    # noqa: F821

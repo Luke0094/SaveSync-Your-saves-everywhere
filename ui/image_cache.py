@@ -7,7 +7,6 @@ downloaded artwork small (compress on write, one-off compaction of legacy
 uncompressed caches). Pure move — no behavior change.
 """
 import logging
-import os
 from pathlib import Path
 
 from core.constants import USER_DATA_DIR
@@ -15,6 +14,15 @@ from core.constants import USER_DATA_DIR
 logger = logging.getLogger(__name__)
 
 _ICON_CACHE_DIR = USER_DATA_DIR / "icons"
+
+
+def _file_md5(path: "Path") -> "str | None":
+    """MD5 of a file's bytes, or None if it can't be read."""
+    import hashlib
+    try:
+        return hashlib.md5(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def migrate_icon_cache(old_folder: str, new_folder: str,
@@ -59,7 +67,18 @@ def migrate_icon_cache(old_folder: str, new_folder: str,
             logger.info(f"Renamed icon cache: {old_folder!r} → {new_folder!r}")
             return _remap(result_path)
 
-        # Merge: move what doesn't collide; collisions keep the destination
+        # Merge every file into new_cache — a same-NAME collision is never
+        # assumed to be the same IMAGE (two unrelated downloads can easily
+        # land on the same safe-name/stem). Hash-compare like
+        # _compress_existing_file does: identical bytes → the destination
+        # already has it, drop the source; different bytes → keep BOTH,
+        # renaming the incoming one. This guarantees old_cache is fully
+        # drained before it's ever removed below — the previous version
+        # moved only non-colliding files and then rmtree'd whatever
+        # collisions were left behind "because the current icon survived",
+        # silently destroying any OTHER image (not the one tracked path)
+        # that happened to share a filename. That is exactly how a rename
+        # could quietly drop every cover except the current one.
         for f in list(old_cache.iterdir()):
             if not f.is_file():
                 continue
@@ -69,28 +88,31 @@ def migrate_icon_cache(old_folder: str, new_folder: str,
                     _shutil.move(str(f), str(dest))
                 except OSError as e:
                     logger.warning(f"Icon merge failed for {f.name}: {e}")
-        # Is the current icon STILL physically inside the old folder (a merge
-        # collision left it there), or did it move out (into new) / was it
-        # external all along? Only remove the old folder wholesale in the
-        # latter case — otherwise we'd delete the user's selected icon (exactly
-        # the bug this function's comment warns about).
-        _icon_still_in_old = False
-        if current_image_path and Path(current_image_path).exists():
+                continue
             try:
-                _oc = os.path.normcase(str(old_cache))
-                _ip = os.path.normcase(str(Path(current_image_path)))
-                _icon_still_in_old = _ip == _oc or _ip.startswith(_oc + os.sep)
-            except Exception:
-                _icon_still_in_old = False
+                same = (dest.stat().st_size == f.stat().st_size
+                        and _file_md5(dest) == _file_md5(f))
+            except OSError:
+                same = False
+            if same:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            else:
+                import uuid
+                alt = new_cache / f"{f.stem}_{uuid.uuid4().hex[:8]}{f.suffix}"
+                try:
+                    _shutil.move(str(f), str(alt))
+                except OSError as e:
+                    logger.warning(f"Icon merge collision move failed for {f.name}: {e}")
         result_path = _remap(result_path)
         try:
-            if _icon_still_in_old:
-                if not any(old_cache.iterdir()):
-                    old_cache.rmdir()
-            else:
-                # Icon moved to new (or external / none) — the old folder is now
-                # orphaned even if collision leftovers remain; remove it.
-                _shutil.rmtree(old_cache, ignore_errors=True)
+            if not any(old_cache.iterdir()):
+                old_cache.rmdir()
+            # Anything still left is a file that failed to move/unlink above
+            # (permissions, in use, …) — leave the folder rather than risk
+            # deleting content that was never accounted for.
         except OSError:
             pass
         logger.info(f"Merged icon cache {old_folder!r} into {new_folder!r}")

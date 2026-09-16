@@ -21,7 +21,8 @@ from typing import Optional, Union, List, Set, Dict
 from core.constants import (
     SAVE_FOLDER_HINTS, WATCH_PATHS_TEMPLATES, SKIP_EXTENSIONS,
     DETECTION_SKIP_EXTENSIONS, SKIP_FILENAME_STEMS, USER_DATA_DIR,
-    strip_version_tokens, CAMEL_SPLIT_RE, match_slug, slug_weight,
+    is_chromium_internal_dir, strip_version_tokens, extract_version_token,
+    CAMEL_SPLIT_RE, match_slug, slug_weight,
 )
 from core.config_manager import get_config
 from core import is_relative_to as _is_relative_to
@@ -229,6 +230,33 @@ def dedupe_paths(paths) -> list[str]:
 
 
 
+def _clean_ancestor_folder_name(n: str) -> str:
+    """A folder name reduced to a title: version/build markers and
+    surrounding brackets stripped ("[RJ123456] Super Game v1.2" → "Super
+    Game"), then a TRAILING run of release decorations ("… - Win", "… PC
+    ENG") peeled token-by-token from the end only, so interior punctuation
+    of real titles survives (a hyphenated title keeps its hyphen; "Game
+    v1.2 - Win" reduces to just "Game"). Shared by derive_display_name's
+    main match and its one-level-up "fuller name" check.
+    """
+    cleaned = strip_version_tokens(n)
+    cleaned = re.sub(r'[\[\]\(\)\{\}]', ' ', cleaned)
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(' ._-')
+    try:
+        from core.game_sources.common import _RELEASE_NOISE, _TRAILING_MARKERS
+        while True:
+            m = re.search(r'[\s._\-–—]+([A-Za-z0-9]+)\s*$', cleaned)
+            if not m:
+                break
+            token = m.group(1).lower()
+            if token not in _RELEASE_NOISE and token not in _TRAILING_MARKERS:
+                break
+            cleaned = cleaned[:m.start()].rstrip(' ._-–—')
+    except Exception:
+        pass
+    return cleaned or n
+
+
 def derive_display_name(exe_path: str, fallback: str = "") -> str:
     """Best human display name for a game executable.
 
@@ -237,6 +265,14 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
     the save-search hints — and returns the nearest non-generic folder name
     (version tokens stripped), so a game is never labeled "Game" or
     "Launcher". Falls back to *fallback*, then to the raw stem.
+
+    A release is often unpacked one folder deeper than its own full name —
+    "Some Game Title v2.70b/Some/Game.exe" — and stopping at the very first
+    match alone would return just "Some", quietly dropping the rest of a
+    real title that happens to live one level further up. So the immediate
+    parent of the matched folder is checked too: if ITS cleaned name
+    genuinely EXTENDS the match (same word, more after it — never a merely
+    longer, unrelated ancestor), that fuller name is preferred.
     """
     try:
         p = Path(exe_path)
@@ -249,36 +285,63 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
             n = cur.name.strip()
             nl = n.lower()
             if n and nl not in _GENERIC_EXE_STEMS and nl not in _CONTAINER_DIR_NAMES:
-                # Strip version/build markers and surrounding brackets so
-                # "[RJ123456] Super Game v1.2" → "Super Game"
-                cleaned = strip_version_tokens(n)
-                cleaned = re.sub(r'[\[\]\(\)\{\}]', ' ', cleaned)
-                cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(' ._-')
-                # Peel a TRAILING run of release decorations ("… - Win",
-                # "… PC ENG"): the same noise vocabulary the search layer
-                # uses, but applied token-by-token from the END only, so
-                # interior punctuation of real titles survives untouched
-                # (a hyphenated title keeps its hyphen; a folder like
-                # "Game v1.2 - Win" derives as just "Game").
-                try:
-                    from core.game_sources.common import (
-                        _RELEASE_NOISE, _TRAILING_MARKERS,
-                    )
-                    while True:
-                        m = re.search(r'[\s._\-–—]+([A-Za-z0-9]+)\s*$', cleaned)
-                        if not m:
-                            break
-                        token = m.group(1).lower()
-                        if token not in _RELEASE_NOISE and token not in _TRAILING_MARKERS:
-                            break
-                        cleaned = cleaned[:m.start()].rstrip(' ._-–—')
-                except Exception:
-                    pass
-                return cleaned or n
+                best = _clean_ancestor_folder_name(n)
+                grandparent = cur.parent
+                if grandparent != grandparent.parent:
+                    pn = grandparent.name.strip()
+                    pnl = pn.lower()
+                    if pn and pnl not in _GENERIC_EXE_STEMS and pnl not in _CONTAINER_DIR_NAMES:
+                        fuller = _clean_ancestor_folder_name(pn)
+                        if (fuller.lower() != best.lower()
+                                and fuller.lower().startswith(best.lower())
+                                and not fuller[len(best):len(best) + 1].isalnum()):
+                            best = fuller
+                return best
             cur = cur.parent
         return fallback or stem
     except (OSError, ValueError):
         return fallback or Path(exe_path).stem
+
+
+def find_version_near(exe_path: str) -> str:
+    """The version token nearest an exe's own install folder.
+
+    Walks the same ground derive_display_name does — checking each
+    ancestor while skipping generic/container names, then ALSO one level
+    past the matched title folder — so the version shown always
+    corresponds to whichever folder actually produced the display name,
+    not a separately-drifting guess. A release nested one folder deeper
+    than its own full name ("Some Game Title v2.70b/Some/Game.exe")
+    carries its version on the OUTER folder; checking only the immediate
+    parent (the old behavior) missed it entirely — confirmed on exactly
+    that shape of real folder.
+    """
+    try:
+        cur = Path(exe_path).parent
+        while cur != cur.parent:
+            n = cur.name.strip()
+            if n:
+                token = extract_version_token(n)
+                if token:
+                    return token
+            nl = n.lower()
+            if n and nl not in _GENERIC_EXE_STEMS and nl not in _CONTAINER_DIR_NAMES:
+                # The matched title folder itself carried no version —
+                # check exactly one level further up too (the nested-
+                # release case above), then stop: anything past that
+                # belongs to some other, unrelated ancestor.
+                parent_dir = cur.parent
+                if parent_dir != parent_dir.parent:
+                    pn = parent_dir.name.strip()
+                    if pn:
+                        token = extract_version_token(pn)
+                        if token:
+                            return token
+                break
+            cur = cur.parent
+    except (OSError, ValueError):
+        pass
+    return ""
 
 
 def display_name_for_added_file(path: str) -> str:
@@ -866,6 +929,11 @@ _CHROMIUM_MANAGED_DIRS = frozenset({
     "optimization_guide_model_and_features_store",
     "data_reduction_proxy_leveldb", "persistentorigintrials",
     "attributionreporting", "commerce_subscription_db",
+    # Crash/stability metrics — real, confirmed live: a game's own
+    # "User Data/Stability" folder passed straight through this check and
+    # still showed up as a save candidate for exactly that reason.
+    "stability", "subresource filter", "ssl error assistant",
+    "variations seed", "pnacl",
 })
 
 
@@ -2707,6 +2775,15 @@ def _scan_dir(
                 continue
             if entry.name.lower() in _SKIP_DIRS:
                 continue
+            # Chromium/CEF/Electron's OWN internal bookkeeping ("Stability",
+            # "Crashpad", …) inside a "User Data" browser-profile tree many
+            # games embed for an overlay, launcher or in-game UI — never a
+            # game's own data, unlike a PROFILE folder ("Default" and the
+            # rest), which routinely holds a game's real save data as its
+            # own subfolder and must stay recursable. See
+            # is_chromium_internal_dir's own docstring.
+            if is_chromium_internal_dir(entry):
+                continue
             # Skip Unity engine asset directories: "<GameName>_Data/" contains
             # engine resources (shaders, assets, managed dlls) — never saves.
             if entry.name.endswith("_Data") or entry.name.endswith("_data"):
@@ -2742,8 +2819,20 @@ def _scan_dir(
             # folders score high (exact slug match) but must still be
             # recursed into to reach nested save dirs.
             hint_match = any(h in entry.name.lower() for h in hints)
+            # A Chromium profile subdirectory (Default, Profile 1, Guest
+            # Profile) directly under "User Data" never matches a save
+            # hint by name, yet a game embedding Chromium/CEF/NW.js
+            # routinely writes its own real save data one level inside
+            # exactly this folder — confirmed on a real Electron game:
+            # "User Data/Default/<GameName>/*.rpgsave" sat right there,
+            # and without this the scan hint-gated it out before ever
+            # looking, never reaching a real save folder at all.
+            is_chromium_profile_subdir = (
+                entry.parent.name.lower() == _CHROMIUM_PROFILE_DIR
+                and (entry.name.lower() in _CHROMIUM_PROFILE_SUBDIRS
+                     or _CHROMIUM_PROFILE_RE.match(entry.name.lower())))
             if depth < max_depth:
-                if depth >= 1 and not hint_match:
+                if depth >= 1 and not hint_match and not is_chromium_profile_subdir:
                     pass  # non-save directory, skip recursion
                 else:
                     _scan_dir(entry, game_name, hints, results, depth + 1, max_depth, max_results, exe_path=exe_path)

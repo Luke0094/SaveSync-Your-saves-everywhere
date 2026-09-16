@@ -628,7 +628,14 @@ class SavePathItem(QWidget):
 
 class AutoScanDialog(TopmostPinMixin, QDialog):
     """Dialog for confirming auto-discovered save paths"""
-    
+
+    # Answer to the identity-confirm banner (see show_identity_confirm):
+    # game_id, new_exe_path, choice — "confirm" (it's the auto-picked
+    # entry), "different" (split into a new one), or an alternate's own
+    # game_id (reassign to that one instead). Never emitted unless the
+    # banner was actually shown.
+    identity_choice = Signal(str, str, str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t('auto_scan.window_title'))
@@ -712,6 +719,17 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         # opened themselves — at game exit the question is "is this new
         # folder yours?", and answering it with a list of folders that are
         # already settled is noise.
+        # "Is this actually X?" banner — shown only in single-game mode,
+        # only when show_path_changed left the match ambiguous (see
+        # show_identity_confirm). First in the layout: the identity
+        # question comes before any save-path detail, not after it.
+        self._identity_box = QWidget()
+        self._identity_box.setObjectName("transparent_bg")
+        self._identity_layout = QVBoxLayout(self._identity_box)
+        self._identity_layout.setContentsMargins(0, 0, 0, 10)
+        self._identity_box.setVisible(False)
+        self.results_layout.addWidget(self._identity_box)
+
         self._existing_box = QWidget()
         self._existing_box.setObjectName("transparent_bg")
         self._existing_layout = QVBoxLayout(self._existing_box)
@@ -925,6 +943,55 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         if box is not None and box.isVisible():
             self.results_layout.removeWidget(box)
             self.results_layout.addWidget(box)
+
+    def show_identity_confirm(self, game_name: str, game_id: str,
+                              new_exe_path: str, alternates: list) -> None:
+        """"Is this actually X?" banner — shown only in single-game mode,
+        only when show_path_changed's own match was left ambiguous by
+        alternates (see show_auto_scan_dialog's docstring). The whole
+        session has been observed by the time this panel opens, a better
+        moment to settle it than the live in-game prompt was; answering
+        here reuses the exact same resolution outcomes that prompt
+        offers, via identity_choice."""
+        box = getattr(self, "_identity_box", None)
+        if box is None:
+            return
+        while self._identity_layout.count():
+            w = self._identity_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        msg = QLabel(t("auto_scan.identity_confirm_msg", game=game_name))
+        msg.setWordWrap(True)
+        msg.setObjectName("auto_scan_muted")
+        self._identity_layout.addWidget(msg)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 4, 0, 0)
+
+        def _choice_btn(label: str, choice: str):
+            btn = QPushButton(label)
+            lock_min_size(
+                btn, scaled(88, self, min_px=72), scaled(24, self, min_px=22),
+                policy_h=QSizePolicy.Policy.Minimum,
+                policy_v=QSizePolicy.Policy.Fixed)
+            btn.setObjectName("auto_scan_sm_btn")
+            btn.clicked.connect(
+                lambda: self.identity_choice.emit(game_id, new_exe_path, choice))
+            row.addWidget(btn)
+
+        # First = the auto-picked default, same convention show_path_changed's
+        # own primary button uses — not a distinct style, just first in line.
+        _choice_btn(t("auto_scan.identity_confirm_yes", game=game_name), "confirm")
+        for alt_id, alt_name in alternates:
+            _choice_btn(t("overlay.path_reassign", game=alt_name), alt_id)
+        _choice_btn(t("auto_scan.identity_confirm_different"), "different")
+        row.addStretch()
+        self._identity_layout.addLayout(row)
+
+        box.setVisible(True)
+        self.results_area.setVisible(True)
 
     def show_existing_paths(self, game) -> int:
         """List the game's already-saved folders, read-only. Returns how many.
@@ -2010,7 +2077,9 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
 def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = None,
                           game_id: str = None,
                           user_initiated: bool = False,
-                          auto_scan: bool = True) -> Optional["AutoScanDialog"]:
+                          auto_scan: bool = True,
+                          identity_new_exe_path: str = "",
+                          identity_alternates: Optional[list] = None) -> Optional["AutoScanDialog"]:
     """Show the auto scan dialog (non-modal so overlay notifications stay interactive).
 
     Returns the dialog when shown, None otherwise (truthy/falsy for callers
@@ -2031,6 +2100,13 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
             general one) must stay a conscious, opt-in action for the
             user, never something that starts on its own just because the
             panel was opened with nothing pre-scanned to show.
+        identity_new_exe_path / identity_alternates: set together, only in
+            single-game mode, when this game's library match was still
+            ambiguous (see show_path_changed's own alternates) by the time
+            it exited — shows a compact "is this actually X?" banner at
+            the top of the panel, the natural point to finally settle it
+            once the whole session has been observed. Connect the
+            returned dialog's identity_choice signal to act on the answer.
     """
     dialog = AutoScanDialog(parent)
     dialog._user_initiated = user_initiated
@@ -2057,6 +2133,9 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
         try:
             _g = get_library().get_by_id(game_id)
             if _g:
+                if identity_alternates and identity_new_exe_path:
+                    dialog.show_identity_confirm(
+                        _g.name, game_id, identity_new_exe_path, identity_alternates)
                 dialog.show_existing_paths(_g)
                 dialog.show_manage_row(_g)
                 dialog.refit_to_content()

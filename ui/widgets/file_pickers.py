@@ -16,7 +16,7 @@ import os
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEvent, QTimer, QStandardPaths, QUrl
+from PySide6.QtCore import Qt, QDir, QEvent, QTimer, QStandardPaths, QUrl
 
 from PySide6.QtWidgets import QFileDialog
 
@@ -261,13 +261,39 @@ class _LnkAwareDialog(QFileDialog):
     # navigated anywhere — which is how "Seleziona" and "Salva" both ended
     # up reading "Apri".
     _ACCEPT_LABEL_KEY = "common.open"
+    # "File name:" reads oddly on a dialog that only ever returns a FOLDER —
+    # subclasses that are folder-only override this to "file_picker.folder_path"
+    # ("Path:"), which also doubles as the hint that pasting a full path here
+    # (see _sync_path_field) is a real way to get somewhere, not just a
+    # leftover text box. Same per-subclass class-attribute pattern as
+    # _ACCEPT_LABEL_KEY, for the same reason: _localize_labels re-applies it
+    # on every directory change, so anything set later would be overwritten.
+    _FILENAME_LABEL_KEY = "file_picker.file_name"
 
+    # Shared across every subclass on purpose, not per-class: two of these
+    # open at once — even two of the exact same subclass — hit a real Qt
+    # cross-instance quirk in the non-native dialog's own internals that
+    # corrupts the path field (confirmed directly: clearing one dialog's
+    # field to type a fresh path left the OLD path with the new text
+    # appended after it, instead of actually being empty first). Only one
+    # of these is ever a real use case anyway — closing whichever one was
+    # already open, right before a new one shows, sidesteps the Qt quirk
+    # entirely instead of chasing it inside Qt's own internals.
+    _current_open_picker = None
 
     def __init__(self, parent, caption: str):
         super().__init__(parent, caption)
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
         self.setOption(QFileDialog.Option.DontResolveSymlinks, True)
+        # Windows marks AppData (and plenty of real save locations under
+        # it) Hidden — Qt's non-native dialog respects that by default and
+        # simply leaves it out of both the folder view and the type-ahead,
+        # with no way to reach it at all. The native dialog this
+        # deliberately doesn't use (see module docstring) shows hidden
+        # entries by default, so this restores that rather than adding a
+        # new restriction nothing here asked for.
+        self.setFilter(self.filter() | QDir.Filter.Hidden)
 
         self._apply_window_chrome()
 
@@ -276,6 +302,7 @@ class _LnkAwareDialog(QFileDialog):
         self._load_pinned_places()
         self._hook_folder_context_menu()
         self._localize_labels()
+        self._make_lookin_editable()
 
         self._size_to_screen()
         self._stretch_columns()
@@ -285,6 +312,147 @@ class _LnkAwareDialog(QFileDialog):
         if model is not None:
             model.rootPathChanged.connect(self._redirect_lnk_directory)
             model.directoryLoaded.connect(lambda *_: self._localize_labels())
+            # Windows-address-bar style: the path box always mirrors
+            # wherever navigation (clicking through folders, a sidebar
+            # place, a lnk redirect, a plain setDirectory() call) has
+            # landed, as plain EDITABLE text — never a row of unclickable/
+            # un-pasteable breadcrumb segments. Typing or pasting a
+            # different path over it and pressing Enter/Select is already
+            # Qt's own native behavior for this field (confirmed directly:
+            # it both navigates and can accept in one step) — the only
+            # thing missing was that it started out blank instead of
+            # showing where the dialog actually is, which is what made it
+            # easy to miss as "the place to paste a path" at all.
+            # rootPathChanged, not directoryEntered: confirmed directly
+            # that the latter never fires for setDirectory() (only for
+            # clicking through the view itself), which would have left the
+            # field blank on every caller-supplied starting directory —
+            # rootPathChanged fires for both.
+            model.rootPathChanged.connect(self._sync_path_field)
+
+        from PySide6.QtWidgets import QLineEdit
+        edit = self.findChild(QLineEdit, "fileNameEdit")
+        if edit is not None:
+            # Qt's own Directory-mode internals reset this box to just the
+            # entered folder's BARE NAME on their own, from the view's
+            # internal selection sync — confirmed directly by tracing every
+            # setText() call: only this class's own ever fires, yet the box
+            # still ends up holding "Local" instead of the full path
+            # "C:/Users/monel/AppData/Local" moments later. Not something
+            # any documented signal here can simply run after — the two
+            # writes interleave with no reliable ordering to win by being
+            # "last". So this reacts instead of racing: the ONE narrow
+            # shape that reset takes (text became exactly the current
+            # directory's own bare name, nothing a real pasted/typed path
+            # would coincidentally match) gets corrected right back,
+            # anything else a person actually typed is left alone.
+            edit.textChanged.connect(self._resist_bare_name_reset)
+            # Expanding to the full row width (Qt's own default here) left
+            # almost nothing for Select/Cancel on a wide dialog — capped so
+            # the buttons keep a proper amount of room instead of being
+            # crowded into a sliver on the right. Still wide enough for a
+            # real path to be visible while editing it.
+            edit.setMaximumWidth(scaled(520, self))
+
+    def _make_lookin_editable(self):
+        """Turn "Look in:" from a click-only dropdown into a real Windows-
+        address-bar-style field: still the same history chain (This PC,
+        Desktop, every folder up to the current one), but now also a plain
+        editable box you can paste a path into directly.
+
+        QComboBox.setEditable(True) alone only makes it LOOK editable —
+        confirmed directly that typing a path and pressing Enter left the
+        dialog on its original folder, doing nothing. Qt's own lookInCombo
+        has no built-in "navigate to what was typed" behavior; wiring
+        returnPressed to setDirectory() here is what actually makes
+        pasting a path do something rather than just accepting text Qt
+        then quietly discards.
+        """
+        from PySide6.QtWidgets import QComboBox, QLineEdit
+        combo = self.findChild(QComboBox, "lookInCombo")
+        if combo is None:
+            return
+        combo.setEditable(True)
+
+        # setEditable(True) changes WHICH click opens the chain, not
+        # whether it still exists — confirmed directly: the item list
+        # (current folder, then every parent up to "My Computer") is
+        # identical either way, still built lazily inside Qt's own
+        # showPopup(). Before, the whole control was a single button, so
+        # any click opened it; now the text area is a real text field, so
+        # a plain click there only places a cursor — the popup only
+        # answers to the small drop-down arrow, an easy-to-miss target a
+        # click on the field text itself no longer reaches.
+        #
+        # Restored via a real focusInEvent override, not an event filter —
+        # confirmed directly that Qt never delivers FocusIn for this
+        # line edit through installEventFilter at all (traced every event
+        # type reaching the filter on a real click: press, release, paint,
+        # two others, never FocusIn), while hasFocus() has ALREADY flipped
+        # true by the time the press event itself reaches a filter — so
+        # neither "watch for FocusIn" nor "watch press + check hasFocus"
+        # can work from outside. A tiny QLineEdit subclass swapped in via
+        # setLineEdit() gets the real, un-filtered virtual call instead.
+        class _ChainLineEdit(QLineEdit):
+            def focusInEvent(self_edit, event):
+                super(_ChainLineEdit, self_edit).focusInEvent(event)
+                # MouseFocusReason only — a genuine, direct click on the
+                # field itself. Confirmed the exact other case that must
+                # NOT reopen it: picking an item from the chain closes the
+                # popup and Qt hands focus straight back here with reason
+                # PopupFocusReason, which — before this check — reopened
+                # the very popup the click had just answered. Every other
+                # reason (Tab, a programmatic refocus elsewhere in the
+                # dialog) is excluded the same way: exclusively a click on
+                # the field opens it, nothing else does.
+                if event.reason() == Qt.FocusReason.MouseFocusReason:
+                    QTimer.singleShot(0, combo.showPopup)
+
+        old_line = combo.lineEdit()
+        line = _ChainLineEdit(combo)
+        if old_line is not None:
+            line.setText(old_line.text())
+        combo.setLineEdit(line)
+
+        def _go():
+            text = line.text().strip()
+            try:
+                if text and Path(text).is_dir():
+                    self.setDirectory(text)
+            except OSError:
+                pass
+        line.returnPressed.connect(_go)
+
+    def _sync_path_field(self, path: str):
+        try:
+            from PySide6.QtWidgets import QLineEdit
+            edit = self.findChild(QLineEdit, "fileNameEdit")
+            if edit is None:
+                return
+            self._path_field_synced_to = path
+            edit.setText(path)
+        except RuntimeError:
+            pass
+
+    def _resist_bare_name_reset(self, text: str):
+        try:
+            if text == "":
+                # An explicit clear — the user's own, or Qt's — leaves
+                # nothing to defend: forget the synced value so a LATER
+                # spurious bare-name reset has no stale full path left to
+                # revert back to (confirmed directly: without this, a
+                # clear() immediately followed by typing landed as the old
+                # path with the new text appended, instead of the field
+                # actually being empty first).
+                self._path_field_synced_to = ""
+                return
+            synced = getattr(self, "_path_field_synced_to", "")
+            if not synced or text == synced:
+                return
+            if text == Path(synced).name:
+                self._sync_path_field(synced)
+        except RuntimeError:
+            pass
 
     def _size_to_screen(self):
         """Open at a size that fits the screen, not at Qt's fixed default.
@@ -464,6 +632,28 @@ class _LnkAwareDialog(QFileDialog):
 
     def show_settled(self):
         """Map the window at its already-chosen size with zero white flash (identical to AddGameDialog and ReviewsDialog)."""
+        prev = _LnkAwareDialog._current_open_picker
+        if prev is not None and prev is not self:
+            # Deferred, not called straight from here: *prev* may itself be
+            # in the middle of its OWN nested exec() loop (window-modal to
+            # a DIFFERENT parent than this one, so both can genuinely be
+            # open at once — a shelved Add Game dialog's own picker,
+            # say). Closing it synchronously, from inside another dialog's
+            # show_settled which is itself often called from inside yet
+            # another exec(), risks exactly the kind of nested-loop
+            # reentrancy Qt does not handle cleanly — confirmed directly:
+            # doing it synchronously here hung the whole event loop in
+            # testing. One tick later, outside whatever call stack got us
+            # here, closes it just as reliably with none of that risk.
+            def _close_prev(p=prev):
+                try:
+                    if p.isVisible():
+                        p.close()
+                except RuntimeError:
+                    pass
+            QTimer.singleShot(0, _close_prev)
+        _LnkAwareDialog._current_open_picker = self
+
         self._apply_window_chrome()
         self._localize_labels()
         if getattr(self, "_sidebar_view", None) is not None:
@@ -512,7 +702,7 @@ class _LnkAwareDialog(QFileDialog):
             self.setLabelText(QFileDialog.DialogLabel.LookIn,
                               t("file_picker.look_in"))
             self.setLabelText(QFileDialog.DialogLabel.FileName,
-                              t("file_picker.file_name"))
+                              t(self._FILENAME_LABEL_KEY))
             self.setLabelText(QFileDialog.DialogLabel.FileType,
                               t("file_picker.file_type"))
             self.setLabelText(QFileDialog.DialogLabel.Accept,
@@ -890,11 +1080,17 @@ class _LnkAwareDialog(QFileDialog):
         QTimer.singleShot(0, _go)
 
     def _clear_name_box(self):
+        """Replace whatever the filename box holds — a stale ".lnk" name
+        after redirecting past a shortcut, in every caller of this — with
+        the CURRENT directory, not blank. Blanking it used to be the whole
+        point (a lingering "Folder.lnk" made no sense once already inside
+        the resolved folder); now that the box always mirrors the current
+        path (see _sync_path_field), reusing that same sync here keeps
+        both jobs done by one call instead of the second undoing the
+        first the moment setDirectory()'s own rootPathChanged fires.
+        """
         try:
-            from PySide6.QtWidgets import QLineEdit
-            edit = self.findChild(QLineEdit, "fileNameEdit")
-            if edit is not None:
-                edit.clear()
+            self._sync_path_field(self.directory().absolutePath())
         except RuntimeError:
             pass
 
@@ -929,6 +1125,9 @@ class FolderPickerDialog(_LnkAwareDialog):
 
     # "Seleziona" is more appropriate than "Apri" for folder selection.
     _ACCEPT_LABEL_KEY = "file_picker.select"
+    # "File name:" makes no sense for a dialog that only ever returns a
+    # folder — see _FILENAME_LABEL_KEY's own docstring on the base class.
+    _FILENAME_LABEL_KEY = "file_picker.folder_path"
 
     def __init__(self, parent, caption: str):
         super().__init__(parent, caption)
@@ -983,6 +1182,10 @@ class SavePathPickerDialog(_LnkAwareDialog):
                 t("file_picker.filter_folders"),      # Cartella
                 t("file_picker.filter_all_files"),
             ])
+            # Instance override, not a class attribute: this dialog's
+            # label depends on *mode*, decided per construction rather
+            # than per subclass — see _FILENAME_LABEL_KEY's own docstring.
+            self._FILENAME_LABEL_KEY = "file_picker.folder_path"
 
 
 def pick_executable(parent, caption: str, name_filter: str = "",

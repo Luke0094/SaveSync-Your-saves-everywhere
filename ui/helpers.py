@@ -2404,6 +2404,42 @@ def clear_dialog_geometries() -> None:
         pass
 
 
+def pixmap_from_bytes(data: bytes) -> QPixmap:
+    """Decode raw image bytes to a QPixmap, falling back to PIL (+
+    pillow_avif) for formats Qt has no plugin for.
+
+    Forum attachment CDNs (f95zone confirmed) serve AVIF under a .png/.jpg
+    URL — QPixmap.loadFromData alone just fails on it, silently, leaving a
+    preview thumbnail blank while the same bytes decode fine through PIL.
+    _download_and_set_image (add_game_dialog.py) already has this fallback
+    for the full download-and-cache path; the smaller preview-only thumbnail
+    loaders (CandidatePreviewDialog, EnrichmentMergeDialog) didn't, which is
+    why a candidate could download correctly yet never show a preview.
+    Returns a null QPixmap if neither decoder can read it.
+    """
+    px = QPixmap()
+    if px.loadFromData(data):
+        return px
+    try:
+        from PIL import Image as _PILImage
+        import io as _io
+        if data[:12][4:8] == b"ftyp" and b"avif" in data[:32]:
+            try:
+                import pillow_avif  # noqa: F401
+            except ImportError:
+                pass
+        pil_img = _PILImage.open(_io.BytesIO(data))
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        buf = _io.BytesIO()
+        pil_img.save(buf, "PNG")
+        px2 = QPixmap()
+        px2.loadFromData(buf.getvalue())
+        return px2
+    except Exception:
+        return QPixmap()
+
+
 def scaled_for_screen(px: QPixmap, w: int, h: int,
                       mode=Qt.AspectRatioMode.KeepAspectRatio) -> QPixmap:
     """*px* fitted to a w×h area, at the screen's real pixel count.

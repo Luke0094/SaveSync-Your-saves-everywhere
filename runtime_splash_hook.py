@@ -6,10 +6,34 @@ Single-instance enforcement via OS-native guards:
   - Linux/macOS: flock on a lock file
 
 Also exposes close_bootloader_splash() for main.py.
+
+This hook runs on EVERY launch of the frozen executable — including the
+copies multiprocessing.Pool spawns for core.engines.wolf_lz4's seed search
+(the frozen build has no separate worker binary; a "worker process" IS
+another launch of the same .exe, with special bootstrap arguments). Without
+the guard below, each of those workers hit the single-instance check here,
+found the mutex already held by the real instance, pinged it to come to the
+foreground, and exited — before main.py's own multiprocessing.freeze_support()
+ever got a chance to run. With one ping per worker per pool retry, that is
+what surfaced as the app camping on top of everything else, including while
+minimized: the "second instance" signal is exactly "bring yourself to the
+front". It also starved the search itself — a worker that exits here never
+reaches _search_range, so the pool sits waiting on results that never
+arrive, which is also why Cancel could not stop it (the code cancelling
+checks only runs once a round of pool.imap_unordered() actually returns).
 """
 import sys
 import os
 import json
+
+
+def _is_multiprocessing_fork() -> bool:
+    """Whether this launch is one of multiprocessing's own worker processes
+    rather than a real second instance of the app — see the module
+    docstring. Mirrors multiprocessing.spawn.is_forking()'s own check
+    (undocumented but stable across Python versions: the parent always
+    passes this as sys.argv[1] when spawning a frozen-app worker)."""
+    return len(sys.argv) >= 2 and sys.argv[1] == '--multiprocessing-fork'
 
 
 def _close_splash():
@@ -174,8 +198,11 @@ def _check_single_instance():
             _show_and_exit(_get_localised_msg())
 
 
-# Execute only once — guard against re-import from main.py
-if not getattr(sys, '_savesync_instance_checked', False):
+# Execute only once — guard against re-import from main.py. Never for a
+# multiprocessing worker: it is not a second instance of the app, and
+# main.py (reached right after this hook) hands it straight to
+# multiprocessing.freeze_support() instead of the real app entry point.
+if not _is_multiprocessing_fork() and not getattr(sys, '_savesync_instance_checked', False):
     _check_single_instance()
     sys._savesync_instance_checked = True
 

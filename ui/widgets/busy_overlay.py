@@ -199,11 +199,22 @@ class BusyOverlay(QWidget):
         self._label.setText(t("common.cancelling"))
         if self._revealed:
             self.repaint()
-        if getattr(self, "on_cancel", None) is not None:
+        handler = getattr(self, "on_cancel", None)
+        if handler is not None:
             try:
-                self.on_cancel()
+                handler()
             except Exception:
                 pass
+            # A registered handler owns stopping the actual work, which is
+            # free to take longer than this sheet's own close delay — a
+            # QThread blocked mid-round of a CPU search, say. Closing on a
+            # fixed guess used to hide the sheet while the work was still
+            # very much running: the dimming (and the only visible sign
+            # anything was still happening) vanished, leaving whatever sat
+            # underneath looking stuck instead of merely still finishing.
+            # The caller closes this once the work actually confirms it
+            # stopped — see cheats_page._on_save_load_finished.
+            return
         QTimer.singleShot(200, self.close_overlay)
 
 

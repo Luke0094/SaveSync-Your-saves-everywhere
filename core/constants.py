@@ -6,12 +6,14 @@ from pathlib import Path
 import logging
 import os
 import platform
+import re
+import string
 
 logger = logging.getLogger(__name__)
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.4.0"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
@@ -68,6 +70,87 @@ SAVE_FOLDER_HINTS = _with_plural_list([
     "profile", "slot", "checkpoint", "autosave", "quicksave",
     "backup", "data",
 ])
+
+
+# Chromium/CEF's OWN fixed internal bookkeeping folder names, inside a
+# "User Data" profile tree — never a game's own data. NOT exhaustive (new
+# ones get added to Chromium over time); the ones actually seen causing a
+# false save-candidate. Deliberately does NOT include "Default" or any
+# other PROFILE name: a profile folder legitimately holds a game's own
+# subfolder for its real data (confirmed on a real Electron game — its
+# saves live at "User Data/Default/<GameName>"), so excluding profile
+# folders themselves would throw out real saves, not just Chromium's own
+# bookkeeping.
+_CHROMIUM_INTERNAL_NAMES = frozenset({
+    # web-platform / per-origin storage
+    "local storage", "session storage", "indexeddb", "databases",
+    "file system", "shared dictionary", "cache storage", "service worker",
+    "videodecodestats", "shared_proto_db", "quota",
+    # caches
+    "cache", "code cache", "gpucache", "shadercache", "grshadercache",
+    "dawncache", "dawngraphitecache", "graphitedawncache", "dawnwebgpucache",
+    "component_crx_cache", "extensions_crx_cache",
+    # browser bookkeeping / telemetry / ML — both underscore and space
+    # spellings kept: real Chromium releases have used both over time, and
+    # a superset here can never falsely exclude a game's own folder (none
+    # of these coincide with a real game title).
+    "stability", "crashpad", "crash reports", "blob_storage", "sessions",
+    "thumbnails", "search logos", "web applications",
+    "history provider cache", "network", "download service",
+    "webrtc logs", "browsermetrics", "module info cache", "widevinecdm",
+    "safe browsing", "sync data", "extension rules", "extension state",
+    "extension scripts", "local extension settings",
+    "sync extension settings", "managed extension settings",
+    "platform notifications", "feature engagement tracker",
+    "site characteristics database", "autofillstrikedatabase",
+    "budgetdatabase", "segmentation_platform",
+    "optimization_guide_hint_cache_store",
+    "optimization_guide_model_and_features_store",
+    "optimization guide predictions", "affiliation database",
+    "data_reduction_proxy_leveldb", "persistentorigintrials",
+    "origin trials", "attributionreporting", "commerce_subscription_db",
+    "subresource filter", "ssl error assistant", "variations seed",
+    "pnacl",
+})
+
+
+def is_chromium_internal_dir(path) -> bool:
+    """Whether *path* is one of Chromium/CEF's OWN internal bookkeeping
+    folders ("Stability", "Crashpad", …), never a game's own data.
+
+    A great many games embed a Chromium-based overlay, launcher or UI (CEF,
+    Electron) — its "User Data" folder is real, common, and its top-level
+    spelling happens to match this project's own "userdata"/"user_data"
+    save-folder hint by naming coincidence. Some of Chromium's internal
+    subfolders are transient too — deleted and recreated across runs,
+    which reads exactly like a "save" the watcher noticed disappear.
+
+    Matched by exact name against Chromium's own fixed vocabulary
+    (_CHROMIUM_INTERNAL_NAMES), never against the whole "User Data" tree —
+    a profile folder ("Default", or any other profile name) is real
+    Chromium structure too, but games routinely nest their OWN save data
+    a level or two inside one (confirmed on a real Electron game: its
+    saves live at "User Data/Default/<GameName>"), so excluding the tree
+    wholesale throws out real saves along with Chromium's bookkeeping.
+    *path* can be the internal folder itself OR a file some levels inside
+    it — every path component between the "User Data" root and *path* is
+    checked, not just *path*'s own immediate name.
+
+    "Local State" is the tree's own signature: every Chromium/CEF profile
+    root writes it, unconditionally, so a folder that merely happens to
+    share a name with one of these ("Crashpad" from something unrelated,
+    say) is left alone unless it is genuinely inside such a tree.
+    """
+    p = Path(path)
+    root = None
+    for parent in p.parents:
+        if parent.name.lower() == "user data" and (parent / "Local State").is_file():
+            root = parent
+            break
+    if root is None:
+        return False
+    return any(part.lower() in _CHROMIUM_INTERNAL_NAMES
+              for part in p.relative_to(root).parts)
 
 # Windows paths to watch (not hardcoded; resolved at runtime)
 # Covers: Unity (LocalLow), Unreal (AppData/Local + Saved), old-school (Documents),
@@ -157,7 +240,8 @@ CAMEL_SPLIT_RE = r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])'
 def strip_version_tokens(name: str) -> str:
     """Remove version/build markers and DLsite product codes from a
     game/folder name: ``v1.2``, ``V0.5.3b``, ``ver 2``, ``version 3.0``,
-    ``b12``, ``build 15``, ``Build-2024.1``, ``[RJ123456]``/``RE``/``VJ``
+    ``b12``, ``build 15``, ``Build-2024.1``, ``v1,27`` (a comma sat where a
+    period belongs — seen on a real release), ``[RJ123456]``/``RE``/``VJ``
     codes — these change across game updates or disappear on other
     stores while the game stays the same, so identity comparisons
     (remote backup folders, search queries) must ignore them. The code
@@ -177,13 +261,54 @@ def strip_version_tokens(name: str) -> str:
     # names, not markers; "v0.5b" (single letter suffix) is still one.
     cleaned = re.sub(
         r'[\s._\-\(\[]*(?<![a-zA-Z0-9])'
-        r'(?:(?:v(?:er(?:sion)?)?|b(?:uild)?)[\s._\-]*\d+(?:[._\-]\d+)*[a-z]?'
+        r'(?:(?:v(?:er(?:sion)?)?|b(?:uild)?)[\s._\-]*\d+(?:[._\-,]\d+)*[a-z]?'
         r'|(?:RJ|RE|VJ)\d{4,10})'
         r'(?![a-zA-Z0-9])[\)\]]*',
         ' ', name, flags=re.IGNORECASE,
     )
     cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(' ._-')
     return cleaned or name
+
+
+def strip_dlsite_code(name: str) -> str:
+    """Remove a DLsite product code (RJ/RE/VJ + 4-10 digits) from *name*,
+    bracketed or not — the same token strip_version_tokens already
+    recognizes, isolated here for callers that want the code gone but the
+    VERSION kept (strip_version_tokens's own drop_version removes both
+    together; _strip_release_noise's bracket stripper only catches a
+    BRACKETED code, e.g. "[RJ123456]" — an unbracketed leading one like
+    "RJ123456 Some Title v1.0" sails straight through it otherwise).
+    """
+    import re
+    if not name:
+        return name
+    cleaned = re.sub(
+        r'[\s._\-\(\[]*(?<![a-zA-Z0-9])(?:RJ|RE|VJ)\d{4,10}(?![a-zA-Z0-9])[\)\]]*',
+        ' ', name, flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(' ._-')
+    return cleaned or name
+
+
+def extract_version_token(name: str) -> str:
+    """The version marker itself out of *name* — "v1.2.3" out of
+    "[GOG] Some Title v1.2.3-CODEX" — or "" when none is found.
+
+    The inverse of strip_version_tokens: that one throws the marker away
+    and keeps the title; this one IS the marker, for the one place that
+    wants to show the version and nothing else (not a DLsite product code
+    — those identify a release, not a version, so unlike
+    strip_version_tokens this deliberately doesn't match them).
+    """
+    import re
+    if not name:
+        return ""
+    m = re.search(
+        r'(?<![a-zA-Z0-9])((?:v(?:er(?:sion)?)?|b(?:uild)?)[\s._\-]*\d+(?:[._\-,]\d+)*[a-z]?)'
+        r'(?![a-zA-Z0-9])',
+        name, flags=re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
 
 
 # The kana voiced/semi-voiced sound marks. Combining characters, but part of
@@ -267,6 +392,79 @@ def version_insensitive_slug(name: str) -> str:
     comparison — so widening it matches more without stranding anything.
     """
     return match_slug(strip_version_tokens(name or ''))
+
+
+_TOKEN_AFTER_BOUNDARY_RE = re.compile(r'[A-Za-z0-9]+')
+
+
+def _looks_like_sequel_marker(token: str) -> bool:
+    """True when *token* (the word right after a matched name prefix)
+    reads as a sequel/entry number rather than a subtitle — "2", "VII"
+    and the like. A digit or a multi-letter roman numeral straight after
+    the shared prefix means the games are related but distinct entries,
+    not the same game under a grown title.
+
+    Reuses game_sources.common's own Roman-numeral table (built for
+    matching search results against sequel titles) rather than a second
+    one here; imported lazily — that module imports from this one at
+    load time, so a top-level import would be circular. Single-letter
+    "I"/"V"/"X" are deliberately not treated as numerals here either,
+    same reasoning as there: in a title they are far more often a real
+    word or initial than the number 1/5/10.
+    """
+    if not token:
+        return False
+    if token.isdigit():
+        return True
+    from core.game_sources.common import _ROMAN_TO_ARABIC
+    return token.lower() in _ROMAN_TO_ARABIC
+
+
+def names_probably_same_game(a: str, b: str) -> bool:
+    """True when two game NAMES (not exe paths) probably name the same
+    game — either an exact match once case/whitespace is ignored, or one
+    is a clean PREFIX of the other.
+
+    The prefix case is for a title that grew between releases: an early
+    build tracked in the library under a short working title, a later one
+    under its full release title with a subtitle appended.
+    strip_version_tokens already handles a trailing VERSION growing; this
+    handles the TITLE itself growing, which is a different kind of change
+    and needs a different check.
+
+    Deliberately checked on the raw names, not on version_insensitive_slug
+    — slugging strips every space and punctuation mark, and a slug prefix
+    check on THAT would happily match two names that only share a leading
+    run of letters, with no word boundary left to say otherwise. Checked
+    here on the lowercased names themselves instead, so the character
+    right after the shorter name can be required to be a real boundary
+    (space, dash, …), not another letter. A shorter name under 3
+    characters is never trusted alone — too little to be real evidence
+    either way.
+
+    A prefix match is also rejected when the word immediately following
+    the shared prefix is a bare number or a short roman numeral (e.g. the
+    shorter name is "Game" and the longer is "Game 2" / "Game II") —
+    that shape names a SEQUEL, a distinct entry in a series, not the same
+    game grown a subtitle.
+    """
+    a_norm = (a or '').strip().lower()
+    b_norm = (b or '').strip().lower()
+    if not a_norm or not b_norm:
+        return False
+    if a_norm == b_norm:
+        return True
+    shorter, longer = (a_norm, b_norm) if len(a_norm) <= len(b_norm) else (b_norm, a_norm)
+    if len(shorter) < 3 or not longer.startswith(shorter):
+        return False
+    boundary = longer[len(shorter):len(shorter) + 1]
+    if boundary.isalnum():
+        return False
+    remainder = longer[len(shorter):].lstrip(string.whitespace + string.punctuation)
+    next_token = _TOKEN_AFTER_BOUNDARY_RE.match(remainder)
+    if next_token and _looks_like_sequel_marker(next_token.group(0)):
+        return False
+    return True
 
 
 # Separator between a name and the tag that distinguishes it from another

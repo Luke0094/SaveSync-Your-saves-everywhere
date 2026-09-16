@@ -21,8 +21,15 @@ logger = logging.getLogger(__name__)
 # or two above it.
 _MAX_UP = 3
 # Directory entries are listed once per folder; a game folder with thousands
-# of files should not turn a yes/no question into a directory walk.
+# of files should not turn a yes/no question into a directory walk. That cap
+# is right for the ROUTINE callers (rendering a library full of cards, one
+# lookup per game) but wrong for the one that only runs when a save is being
+# opened: a rare, deliberate, single-folder action where a marker missed
+# because it sat past entry 400 — in filesystem order, not alphabetical —
+# means a real save comes back "unsupported" instead of just costing an
+# extra moment. See detect_engine's thorough parameter.
 _MAX_ENTRIES = 400
+_MAX_ENTRIES_THOROUGH = 20_000
 
 RPGMAKER = "rpgmaker"
 UNITY = "unity"
@@ -44,6 +51,13 @@ WEBGL = "webgl"
 # is — see _engine_of_folder.
 NWJS = "nwjs"
 ELECTRON = "electron"
+# Not engines at all — save SHAPES that show up across many different real
+# engines (see core.save_editor.registry.ENGINE_PREFERENCES). detect_engine()
+# never produces either: they exist only to be named directly from "Open
+# as…" (ui/pages/cheats_page.py), for a file whose shape a person already
+# recognises but nothing pointed at automatically.
+PROTOBUF = "protobuf"
+KNOWN_HEADER = "known_header"
 
 # Extensions each engine genuinely WRITES SAVES into, and which therefore
 # must not be excluded from detection for a game built with it. One table so
@@ -133,6 +147,8 @@ _LABELS = {
     WEBGL: "WebGL",
     NWJS: "NW.js",
     ELECTRON: "Electron",
+    PROTOBUF: "Protocol Buffers",
+    KNOWN_HEADER: "Known save header",
 }
 
 _cache: dict = {}
@@ -142,12 +158,14 @@ def label(engine: str) -> str:
     return _LABELS.get(engine, "")
 
 
-def _names(folder: Path) -> tuple:
-    """(lowercased names, lowercased suffixes) of one folder, bounded."""
+def _names(folder: Path, thorough: bool = False) -> tuple:
+    """(lowercased names, lowercased suffixes) of one folder, bounded —
+    generously so when *thorough* (see detect_engine)."""
     names, suffixes = set(), set()
+    cap = _MAX_ENTRIES_THOROUGH if thorough else _MAX_ENTRIES
     try:
         for i, child in enumerate(folder.iterdir()):
-            if i >= _MAX_ENTRIES:
+            if i >= cap:
                 break
             names.add(child.name.lower())
             if child.is_file():
@@ -163,8 +181,8 @@ def _names(folder: Path) -> tuple:
 _RPGMAKER_CORE_JS = re.compile(r"(?:rpg|rm[a-z0-9]{0,4})_core\.js")
 
 
-def _engine_of_folder(folder: Path) -> str:
-    names, suffixes = _names(folder)
+def _engine_of_folder(folder: Path, thorough: bool = False) -> str:
+    names, suffixes = _names(folder, thorough=thorough)
     if not names:
         return ""
 
@@ -362,12 +380,22 @@ def _looks_like_webgl(folder: Path, names: set, suffixes: set) -> bool:
     return False
 
 
-def detect_engine(exe_path: str = "", game_dir: str = "") -> str:
+def detect_engine(exe_path: str = "", game_dir: str = "", thorough: bool = False) -> str:
     """The engine a game was built with, or "" when nothing says.
 
     Cheap, and POSITIVE answers are cached: what an executable was built
     with does not change while SaveSync runs, and this is asked once per
     detection run. An unknown answer is not cached — see below.
+
+    *thorough* lifts the per-folder entry cap (_MAX_ENTRIES) that keeps the
+    routine callers — a whole library's worth of cards, one lookup each —
+    from turning into a directory walk. It costs nothing extra there since
+    those folders are essentially always well under the ordinary cap; it
+    matters for the rare, deliberate, single-folder case: opening a save
+    whose engine needs recognising to even pick the right reader (see
+    core/save_editor/save_editor.py's _candidates), where a marker that
+    happened to sit past entry 400 — filesystem order, not alphabetical —
+    would otherwise read as "unknown" and the save as "unsupported".
     """
     key = str(exe_path or game_dir or "")
     if not key:
@@ -388,7 +416,7 @@ def detect_engine(exe_path: str = "", game_dir: str = "") -> str:
     for _ in range(_MAX_UP):
         try:
             if folder.is_dir():
-                engine = _engine_of_folder(folder)
+                engine = _engine_of_folder(folder, thorough=thorough)
                 if engine and engine not in (NWJS, ELECTRON):
                     break
                 if engine:

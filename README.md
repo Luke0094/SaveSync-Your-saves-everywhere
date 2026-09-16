@@ -49,6 +49,15 @@ choice — with an always-on-top overlay so you never have to leave the game.
 - **Launcher URL support** — games launched through `steam://`-style URLs are
   resolved to their real executable
 - **Playtime tracking** per game, with per-session detail on hover
+- **Multiple exe-path versions per game** — a reinstall, an update, or a
+  second copy kept side by side can all be tracked under the same library
+  entry instead of forking into a duplicate. Add, switch between, or remove
+  versions from Add/Edit Game, or answer the in-game prompt raised the
+  moment a tracked game turns up running from a path it hasn't seen before
+  (add it as another version, overwrite the primary, or split it into its
+  own entry). Save paths kept inside the install folder are rebased onto a
+  new version automatically; if the destination already has its own saves,
+  SaveSync asks before either gets overwritten
 
 ### Backups & sync
 - **Versioned local backups** with retention (max count, days, minimum kept,
@@ -245,6 +254,8 @@ have to be there.
 | cryptography | AES-256 credential encryption |
 | keyring | OS-level credential storage |
 | Pillow + pillow-avif-plugin | Cover images (AVIF/WebP included) |
+| lz4 | Wolf RPG's LZ4-compressed save variant |
+| numpy | Vectorised key search for that same variant |
 
 ---
 
@@ -283,14 +294,19 @@ savesync/
 │   │   ├── kirikiri.py            # KiriKiri .ksd (TJS dictionary in UTF-16)
 │   │   ├── tyrano.py              # TyranoScript .sav (JSON behind JS escape())
 │   │   ├── alicesoft.py           # AliceSoft System 4 globals and slots
+│   │   ├── alicesoft_vsf.py       # AliceSoft VSF save-slot summary (date, scene, playtime)
 │   │   ├── artemis.py             # Artemis Engine settings (BOWX container)
 │   │   ├── rags.py                # RAGS .rsv (.NET objects behind fixed AES)
 │   │   ├── wolf.py                # Wolf RPG obfuscation and checksum
+│   │   ├── wolf_lz4.py            # Wolf RPG's LZ4-compressed variant, key found by search
 │   │   ├── sqlite_db.py           # SQLite save databases (Room / Java)
 │   │   ├── playerprefs.py         # Unity PlayerPrefs registry export
 │   │   ├── tads.py                # TADS system.rec slots
 │   │   ├── keyvalue.py            # key = value text configs
-│   │   └── xml_save.py            # Plain XML saves
+│   │   ├── xml_save.py            # Plain XML saves
+│   │   ├── protobuf_raw.py        # Schema-less Protocol Buffers (generic, no magic bytes)
+│   │   ├── struct_header.py       # Generic reader for a fixed, unlabelled binary header
+│   │   └── known_headers.py       # Known fixed-header layouts, one per game (data for struct_header.py)
 │   ├── save_editor/               # Save-file editor: orchestration + adapters
 │   │   ├── save_editor.py         # open_save, detection, backups of edits
 │   │   ├── registry.py            # One description per format: extension, magic, engine
@@ -315,15 +331,22 @@ savesync/
 │   │   ├── rags_format.py         # RAGS .rsv
 │   │   ├── kirikiri_format.py     # KiriKiri .ksd
 │   │   ├── wolf_format.py         # Wolf RPG Editor
+│   │   ├── wolf_lz4_format.py     # Wolf RPG Editor, the LZ4-compressed variant
 │   │   ├── alicesoft_format.py    # AliceSoft System 4
+│   │   ├── alicesoft_vsf_format.py # AliceSoft VSF save-slot summary
 │   │   ├── artemis_format.py      # Artemis
 │   │   ├── tyrano_format.py       # TyranoScript
 │   │   ├── tads_rec_format.py     # TADS TAD-kit system.rec
 │   │   ├── sqlite_format.py       # SQLite (Room / Java desktop)
+│   │   ├── protobuf_format.py     # Schema-less Protocol Buffers, reached via "Open as…"
+│   │   ├── struct_header_format.py # Known fixed-header save, auto-detected by layout match
+│   │   ├── recipe_format.py       # Generic unwrap recipes for unrecognised saves
 │   │   └── crypt/                 # Decryptors used only by the editor
 │   │       ├── unreal_crypt.py    # Unreal saves locked with the game's own key
 │   │       ├── es3.py             # Unity Easy Save 3, including encrypted
 │   │       ├── wolf.py            # Wolf unlock + variable database
+│   │       ├── wolf_lz4.py        # Same database, reached through the LZ4 variant's lock
+│   │       ├── recipes.py         # XOR/LCG keystreams x decompression, tried and gated cheaply
 │   │       ├── game_keys.py       # Remembered decrypt keys, per game
 │   │       └── unityfs.py         # Unity asset bundles, unpacked to find keys
 │   ├── manual_paths.py            # Hand-registered save folders, single or in bulk
@@ -385,7 +408,8 @@ savesync/
 │   ├── splash_animated.py         # Build the animated splash GIF
 │   └── signature.py               # Animated splash variant with the 3D flip reveal
 └── maintenance/                  # Offline repair of stored data — see below
-    └── repair_archives.py         # Diagnose, and only on request repair, archive indexes
+    ├── repair_archives.py         # Diagnose, and only on request repair, archive indexes
+    └── test_recipe_format.py      # Standalone verification for the unwrap recipe battery
 ```
 
 The four directories shown as a single line — `core/game_sources/`, `ui/pages/`,
@@ -540,7 +564,7 @@ Two rules it is built around:
 | RPG Maker 2000/2003 (`.lsd`) — switches, variables, steps | |
 | Adobe Flash shared objects (`.sol`), AMF0 and AMF3 | |
 | QSP (Quest Soft Player) | |
-| Wolf RPG (`.sav`) | AliceSoft gallery lists — numbers with nothing naming what they unlock |
+| Wolf RPG (`.sav`), including the LZ4-compressed variant some builds use | AliceSoft gallery lists — numbers with nothing naming what they unlock |
 | KiriKiri / KAG (`.ksd`) | RPG Developer Bakin (`.sgs`) — an object stream with nothing naming or typing it |
 | TyranoScript / TyranoBuilder (`.sav`) | SRPG Studio — the engine encrypts its saves with a key kept in the game |
 | AliceSoft System 4 global data and numbered slots (`.asd`, `.sav`) | Artemis save slots and across-playthrough data — a tagged tree this cannot follow safely |
@@ -578,6 +602,19 @@ invalidate:
   save* — a run of field codes — so the values are read from the file's own
   structure. The game's `CDataBase.project` is consulted only to put names on
   them, and is optional (`crypt/wolf.py`).
+- **Wolf RPG, the LZ4 variant.** Some builds lock the save with a custom
+  Mersenne Twister keystream instead of (or alongside) the documented
+  scheme — reverse-engineered by instrumenting the game itself with Frida
+  while it loaded its own saves, then verified byte-for-byte against what
+  the game's own code produced in memory. The one thing that reverse
+  engineering did not recover is the formula turning a save's own salt
+  bytes into that keystream's seed, so the seed is instead recovered by
+  search against the save file's own plaintext shape — the same "must
+  decode to the format's own magic" proof every candidate key here is held
+  to, just reached by search rather than lookup. A save from a slot never
+  opened before costs a one-time search (progress shown, cancellable);
+  every later save from that same slot is instant (`engines/wolf_lz4.py`,
+  `crypt/wolf_lz4.py`).
 
 Nothing is guessed in any of these. A candidate key is accepted only when what
 comes out decrypts to the format's own magic — `GVAS` for Unreal, valid JSON
@@ -643,6 +680,32 @@ The two readers that *search* for a key — unpacking a game's archives, or
 scanning its binaries — are left out of the second pass. They are worth
 minutes when something points at them, never on the off-chance.
 
+**The engine the library already knows beats guessing again.** The
+first-pass engine detection re-reads the install folder from scratch by
+default, and when the game is in the library its own confirmed answer is
+trusted instead — re-deriving it and getting a different answer used to mean
+a game the library already had right could still open its own saves as
+"unsupported". Re-derivation, when it does run for this one purpose, also
+scans the install folder without the entry-count cap the same lookup uses
+everywhere else (rendering a whole library of cards is not the moment to
+risk turning into a directory walk; opening one save, deliberately, is).
+
+**"Unsupported" is not the end of it.** Three more live options sit right
+there: check the two searching readers after all — worth the wait now that
+it is a single, deliberate file rather than a blind cost paid on every
+failure — name the engine directly and skip guessing altogether, or ask the
+editor to try breaking the file's obfuscation (see
+[Files nothing recognises](#files-nothing-recognises) below). Whichever of
+the first two works gets written back to the game's own engine field, so
+the same detour is never needed twice — the third never claims to have
+identified an engine, so there is nothing to remember.
+
+The same obfuscation-breaking offer also appears over a save that DID open
+but only read-only: a reader understood it well enough to show its values
+and not well enough to trust writing them back, and a recipe occasionally
+does better. Asking never makes things worse — a recipe that finds nothing
+leaves the read-only reading exactly as it was.
+
 When auto-resolution fires it says so in the log, naming the reader and the
 layout it used.
 
@@ -673,9 +736,11 @@ right-hand column of the table above, named rather than mangled.
 | [Encrypted Unreal saves](#encrypted-unreal-saves) | Recognised by the folder they sit in, not by their contents |
 | [Bakin and SRPG Studio](#bakin-and-srpg-studio) | Named but not edited, and why |
 | [Wolf RPG](#wolf-rpg) | Unlocked, read, locked back; names from the game's database |
+| [Wolf RPG, the LZ4 variant](#wolf-rpg-the-lz4-variant) | A second lock some builds use; its key is found by search, not lookup |
 | [TADS](#tads) | Two layouts, one a NUL-padded line of tokens |
 | [Java](#java) | Bundled-JVM layouts; SQLite progress offered cell by cell |
 | [WebGL](#webgl) | HTML5 shells, and why the wrapper is not the name |
+| [Files nothing recognises](#files-nothing-recognises) | A bounded battery of generic unwrap recipes, tried only when asked |
 
 ##### Ren'Py
 
@@ -899,6 +964,26 @@ packs that database away still gets every value, numbered instead of named. A
 Wolf file with no values in it, such as some games' `System.sav`, is reported
 as unreadable rather than opened and guessed at.
 
+##### Wolf RPG, the LZ4 variant
+
+Some Wolf RPG Editor builds lock their saves a second way instead of (or
+alongside) the documented scheme: a byte in the header says which, and files
+carrying the newer one are unlocked with a custom Mersenne Twister keystream
+rather than the standard obfuscation. Once unlocked and decompressed the
+result is the exact same variable-database shape the standard reader already
+knows — this one only replaces how the bytes get unlocked, not how they are
+read afterward.
+
+The keystream's own seed comes from three salt bytes in the file's clear
+header, run through a formula that reverse-engineering the game recovered
+everything about except the formula itself. Rather than ship a guess, the
+seed is recovered by search: every 32-bit candidate is checked against the
+one thing known for certain — the unlocked stream's own opening shape — and
+the search stops the instant a real one is found. A save from a slot opened
+for the first time costs that search, shown with a progress bar and
+cancellable like an Easy Save 3 password hunt; every later save from that
+same slot reuses the answer and opens at once.
+
 ##### TADS
 
 TADS covers two layouts. The TAD-kit style (picture packs as `.tad` under
@@ -934,6 +1019,31 @@ untouched open/close is byte-for-byte.
 
 It edits files at rest. Nothing is injected into a running game and nothing
 attaches to one.
+
+##### Files nothing recognises
+
+Cracking the Wolf RPG LZ4 variant above by hand — reverse-engineering the
+game's own obfuscation from scratch — is not something SaveSync tries to
+automate generally: that took live instrumentation of a running game, which
+is exactly what this project's own rule (see above) rules out doing
+automatically. What generalises is the *shape* the result turned out to
+have, and several other readers already share: a short, reversible byte
+transform — a repeating XOR key, sometimes an old-fashioned `rand()`-style
+keystream seeded from a byte or two of the file's own header — optionally
+followed by ordinary compression, wrapped around content a normal reader
+would already recognise once it is undone.
+
+Asked for explicitly (see above — never on an already-openable file, and
+never as part of "check every format"), the editor tries a small, bounded
+battery of exactly those recipes: a handful of transforms, each tried at a
+few plausible header lengths, each optionally followed by zlib, raw
+deflate, or LZ4. A transform's result is checked cheaply first — does the
+start of it look like JSON, XML, a zip, SQLite, or plain text — and only a
+real candidate pays for being handed to every registered reader in full,
+which is what decides whether it actually opens: the same byte-exact-or-
+value round trip every save in this editor is held to, proven in both
+directions before anything is offered for editing. Nothing is guessed at;
+a search that finds nothing changes nothing.
 
 </details>
 

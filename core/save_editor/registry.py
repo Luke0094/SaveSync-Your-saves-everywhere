@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .alicesoft_format import AliceSoftFormat
+from .alicesoft_vsf_format import AliceSoftVsfFormat
 from .artemis_format import ArtemisFormat
 from .es3_format import Es3Format
 from .gvas_format import GvasFormat, UnrealEncryptedFormat
@@ -43,6 +44,7 @@ from .lcf_format import LcfFormat
 from .lzstring_json_format import _LzStringJson
 from .naninovel_format import NaninovelFormat
 from .playerprefs_format import PlayerPrefsFormat
+from .protobuf_format import ProtobufFormat
 from .qsp_format import QspFormat
 from .rags_format import RagsFormat
 from .renpy_format import RenpyFormat
@@ -51,10 +53,12 @@ from .rpgmaker_mz_format import RpgMakerMzFormat
 from .rubymarshal_format import RubyMarshalFormat
 from .sol_format import SolFormat
 from .sqlite_format import SqliteFormat
+from .struct_header_format import StructHeaderFormat
 from .sugarcube_format import SugarCubeFormat
 from .tads_rec_format import TadsRecFormat
 from .tyrano_format import TyranoFormat
 from .wolf_format import WolfFormat
+from .wolf_lz4_format import WolfLZ4Format
 from .xml_format import XmlFormat
 
 
@@ -85,6 +89,30 @@ def _is_wolf(data: bytes) -> bool:
         return bool(is_wolf_save(data))
     except Exception:
         return False
+
+
+def _is_wolf_lz4(data: bytes) -> bool:
+    """Cheap only: a tag byte in range. Confirming this format for real
+    costs a seed search (see core.engines.wolf_lz4.find_seed) — far too much
+    to spend on every .sav on the chance it is this one, so this stays a
+    heuristic and the search itself is what actually proves or disproves a
+    file, the moment WolfLZ4Format.load() is tried."""
+    try:
+        from core.engines.wolf_lz4 import is_candidate
+        return bool(is_candidate(data))
+    except Exception:
+        return False
+
+
+def find_header_layout(data: bytes, ext: str):
+    """The known fixed-header layout *data* matches, or None — see
+    core/engines/known_headers."""
+    try:
+        from core.engines.known_headers import KNOWN_LAYOUTS
+        from core.engines.struct_header import find_layout
+        return find_layout(data, ext, KNOWN_LAYOUTS)
+    except Exception:
+        return None
 
 
 _LZSTRING_BODY = re.compile(rb"[A-Za-z0-9+/=\s]+")
@@ -152,6 +180,14 @@ SPECS = (
                sniff=lambda path, data, ext: data[:2] == b"\x04\x08"),
     FormatSpec(GvasFormat, extensions=(".sav",), engines=("unreal",),
                sniff=lambda path, data, ext: data.startswith(b"GVAS")),
+    # A save with a known, documented FIXED header — see
+    # core/engines/known_headers for the list of layouts and
+    # core/engines/struct_header for the reader every one of them is read
+    # through. One more documented header is one more entry there, not a
+    # new reader class or a new line here.
+    FormatSpec(StructHeaderFormat,
+               sniff=lambda path, data, ext: find_header_layout(data, ext)
+               is not None),
     FormatSpec(KirikiriFormat,
                # KiriKiri by its extension, and by its compressed marker
                # whatever it is called. The other two wrappers — plain UTF-16
@@ -167,11 +203,23 @@ SPECS = (
                # Wolf hides behind obfuscation, so only unlocking it can tell.
                sniff=lambda path, data, ext: (ext == ".sav" and len(data) > 0x20
                                               and _is_wolf(data))),
+    # expensive: confirming this one for real costs a seed search (see
+    # _is_wolf_lz4 and core.engines.wolf_lz4.find_seed) — the sniff below is
+    # only the cheap tag-byte gate, ENGINE_PREFERENCES is what keeps this
+    # from being tried on a file that already opened as standard Wolf.
+    FormatSpec(WolfLZ4Format, engines=("wolfrpg",), expensive=True,
+               sniff=lambda path, data, ext: (ext == ".sav" and len(data) > 0x20
+                                              and _is_wolf_lz4(data))),
     FormatSpec(AliceSoftFormat, engines=("alicesoft",),
                # AliceSoft names itself in its first four bytes, which is just
                # as well: it puts the same container behind .asd and behind
                # .sav, and what is INSIDE decides whether it opens at all.
                sniff=lambda path, data, ext: data[:4] in (b"GD\x01\x01", b"PSR\x00")),
+    # A VSF is the save-slot SUMMARY (date, scene description, playtime)
+    # that sits beside the GSAVE above — different container, same engine,
+    # its own 8-byte magic (see core/engines/alicesoft_vsf).
+    FormatSpec(AliceSoftVsfFormat, extensions=(".vsf",), engines=("alicesoft",),
+               sniff=lambda path, data, ext: data[:8] == b"VSF\x00\x00\x00\x00\x00"),
     FormatSpec(UnrealEncryptedFormat, expensive=True,
                # An Unreal save whose game encrypted it says nothing about
                # itself — the magic is under the encryption with everything
@@ -180,6 +228,14 @@ SPECS = (
                # lives there and is something else costs one failed decryption.
                sniff=lambda path, data, ext: (in_unreal_save_folder(path)
                                               and looks_encrypted_unreal(data))),
+    # expensive, and deliberately given no sniff at all: protobuf has no
+    # magic bytes whatsoever (see core/engines/protobuf_raw), so the only
+    # way to tell it apart from unrelated bytes is a real structural parse
+    # of the whole file — never worth that on the off-chance, only when
+    # something has already asked to check every format. Reached ONLY
+    # through Pass 2's full sweep (registry.all_readers), which does not
+    # consult sniff() at all — load() is the entire gate.
+    FormatSpec(ProtobufFormat, expensive=True),
     FormatSpec(ArtemisFormat, engines=("artemis",),
                # Artemis writes settings, global data and slots all into a
                # .dat, and all three name themselves in the first four bytes.
@@ -238,13 +294,23 @@ ENGINE_PREFERENCES = {
     "godot":     (JsonFormat, XmlFormat),
     "unreal":    (GvasFormat,),
     "rpgmaker":  (RpgMakerMzFormat, RpgMakerMvFormat, RubyMarshalFormat),
-    "wolfrpg":   (WolfFormat,),
+    "wolfrpg":   (WolfFormat, WolfLZ4Format),
     "artemis":   (ArtemisFormat,),
-    "alicesoft": (AliceSoftFormat,),
+    "alicesoft": (AliceSoftFormat, AliceSoftVsfFormat),
     "tyrano":    (TyranoFormat,),
     "tads":      (TadsRecFormat,),
     "webgl":     (JsonFormat, SugarCubeFormat),
     "java":      (SqliteFormat, JsonFormat),
+    # Not a game engine detect_engine() ever produces — a save shape, not an
+    # engine, picked only by a person naming it directly from "Open as…"
+    # (see cheats_page.py). Forcing it is what lets ProtobufFormat run at
+    # all outside a full sweep: see its own FormatSpec, expensive=True with
+    # no sniff, for why it is otherwise unreachable on the off-chance.
+    "protobuf":     (ProtobufFormat,),
+    # Same reasoning, for a file whose known-layout match (see
+    # find_header_layout) did not fire automatically — an unusual file size
+    # for an otherwise-documented header, say.
+    "known_header": (StructHeaderFormat,),
 }
 
 # LZString base64 is cheap to try and fails fast, but "looks like base64"
@@ -274,6 +340,20 @@ def engine_preferences(engine: str) -> tuple:
 def shared_across_engines(cls) -> bool:
     """True when the engine's own name is the better label for this reader."""
     return any(s.cls is cls and s.shared_across_engines for s in SPECS)
+
+
+def engine_of(cls) -> str:
+    """The single engine key *cls* means, or "" when it does not name one
+    on its own — a reader shared across several (plain JSON, key=value
+    text: see shared_across_engines) is read by more than that one, so
+    picking its first listed engine would be a guess dressed up as an
+    answer, worse than saying nothing."""
+    for spec in SPECS:
+        if spec.cls is cls:
+            if spec.shared_across_engines or len(spec.engines) != 1:
+                return ""
+            return spec.engines[0]
+    return ""
 
 
 def sniffed(path, data: bytes, ext: str) -> list:
@@ -330,7 +410,7 @@ def expensive_readers() -> frozenset:
     return frozenset(s.cls for s in SPECS if s.expensive)
 
 
-def all_readers() -> tuple:
+def all_readers(include_expensive: bool = False) -> tuple:
     """Every registered reader worth trying blind, in registry order.
 
     For the last-resort pass in open_save: when an engine update changes
@@ -341,7 +421,12 @@ def all_readers() -> tuple:
     care how a reader was reached: it still has to rebuild the file and prove
     it parsed it.
 
-    The searching readers are left out — see expensive_readers, which is
-    where that question is asked and answered rather than counted here.
+    The searching readers are left out by default — see expensive_readers,
+    which is where that question is asked and answered rather than counted
+    here — since a blind, automatic sweep should not pay minutes on the
+    off-chance for every unrelated file that fails to open. *include_expensive*
+    puts them back in for the one caller who is supposed to ask for that
+    explicitly: a person who has already seen "unsupported" and chose to pay
+    the cost rather than pick the engine by hand.
     """
-    return tuple(s.cls for s in SPECS if not s.expensive)
+    return tuple(s.cls for s in SPECS if include_expensive or not s.expensive)

@@ -4,6 +4,7 @@ NVIDIA App-inspired sidebar with Overview, Library, Sync, Backups, Settings.
 """
 import logging
 import platform
+import shutil
 import sys
 import threading
 import time
@@ -371,6 +372,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # (process_name, game_id) → game name. Same role as the dict above —
         # it keeps the question re-summonable by the hotkey until answered.
         self._pending_unverified: dict[tuple, str] = {}
+        # Unanswered "this game moved/reinstalled — how should the new path
+        # be tracked?" prompts: (game_id, new_exe_path) → (game name,
+        # alternates). Unlike _pending_unverified above, tracking already
+        # proceeded on the stem match — this is only kept so the hotkey can
+        # re-summon the question, "it's actually …" corrections included.
+        self._pending_path_changed: dict[tuple, tuple] = {}
+        # Overwrite chose a new exe path whose rebase target already has its
+        # own save content (a genuine second save history, not an empty
+        # reinstall) — (game_id, new_exe_path) → old_exe, kept until the
+        # overlay's "rebase onto it anyway, or leave both where they are"
+        # question is answered. See _apply_path_overwrite.
+        self._pending_overwrite_conflict: dict[tuple, str] = {}
+        # A carried-save-data copy (see _carry_rebased_save_data) found its
+        # target already has its own content — (game_id, new_exe_path) →
+        # {old_path: new_path}, kept until the SAME overlay question
+        # (show_overwrite_saves_conflict) is answered. Told apart from
+        # _pending_overwrite_conflict above by which dict actually holds
+        # the key; see _resolve_overwrite_saves_conflict.
+        self._pending_carry_conflict: dict[tuple, dict] = {}
         # game_id → QTimer for periodic in-game backup
         self._ingame_backup_timers: dict[str, "QTimer"] = {}
         # Pending "both" conflict resolution: chain upload after download
@@ -2437,6 +2457,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.pages.cheats_page import CheatsPage
         page = CheatsPage()
         page.set_load_notice(self._cheats_load_notice)
+        # Silent — a toast every time someone opens a save just to look at
+        # it would be noise; see CheatsPage.backup_requested's own docstring.
+        page.backup_requested.connect(lambda gid: self._backup_game(gid, silent=True))
         old = self._stack.widget(5)
         self._stack.removeWidget(old)
         old.deleteLater()
@@ -2585,6 +2608,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overlay.action_requested.connect(self._on_overlay_action)
         self._overlay.dont_show_again.connect(self._on_suppress_overlay)
         self._overlay.exclusive_blocked.connect(self._on_overlay_blocked_by_fullscreen)
+        self._overlay.path_changed_expired.connect(self._on_path_changed_expired)
 
     def _on_overlay_blocked_by_fullscreen(self, title: str, message: str):
         """Overlay could not show because a game is in exclusive fullscreen.
@@ -2657,6 +2681,35 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if action == "regression_ack":
             game_id, _, _bk = context.partition("|")
             self._pending_regression.pop(game_id, None)
+            return
+        # Same shape ("game_id|new_exe_path"), matched before anything that
+        # would read the context as a plain executable path on its own.
+        if (action in ("path_add_version", "path_overwrite", "path_new_game")
+                or action.startswith("path_reassign:")):
+            game_id, _, new_exe_path = context.partition("|")
+            self._pending_path_changed.pop((game_id, new_exe_path), None)
+            entry = get_library().get_by_id(game_id)
+            if entry:
+                if action == "path_add_version":
+                    self._apply_path_add_version(entry, new_exe_path)
+                elif action == "path_overwrite":
+                    self._apply_path_overwrite(entry, new_exe_path)
+                elif action == "path_new_game":
+                    self._apply_path_new_game(entry, new_exe_path)
+                else:
+                    _, _, alt_id = action.partition(":")
+                    alt_entry = get_library().get_by_id(alt_id)
+                    if alt_entry:
+                        self._apply_path_reassign(entry, alt_entry, new_exe_path)
+                        entry = alt_entry
+                self._show_tracking_toast_if_playing(entry.id)
+            return
+        # Answer to the secondary "the new path already has its own saves"
+        # prompt Overwrite can raise. Same context shape again.
+        if action in ("path_overwrite_confirm", "path_overwrite_keep_both"):
+            game_id, _, new_exe_path = context.partition("|")
+            self._resolve_overwrite_saves_conflict(
+                game_id, new_exe_path, do_rebase=(action == "path_overwrite_confirm"))
             return
         if action == "add_game":
             self._auto_add_game_from_overlay(context)
@@ -3496,6 +3549,36 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._overlay.show_unverified_match(game_name, proc_name, game_id)
             return
 
+        # Overwrite's "the new location already has its own saves" question —
+        # a real decision (rebase onto it vs. leave both alone), so it stays
+        # re-summonable the same way, even though leaving it unanswered is
+        # itself a safe, valid outcome (see _apply_path_overwrite).
+        if self._pending_overwrite_conflict:
+            (game_id, new_exe_path), _old_exe = next(iter(self._pending_overwrite_conflict.items()))
+            entry = get_library().get_by_id(game_id)
+            if entry:
+                self._overlay.show_overwrite_saves_conflict(entry.name, game_id, new_exe_path)
+                return
+            self._pending_overwrite_conflict.pop((game_id, new_exe_path), None)
+
+        # Same question, raised by a carried-save-data copy instead of
+        # Overwrite — see _carry_rebased_save_data. Same re-summon rule.
+        if self._pending_carry_conflict:
+            (game_id, new_exe_path), _conflicts = next(iter(self._pending_carry_conflict.items()))
+            entry = get_library().get_by_id(game_id)
+            if entry:
+                self._overlay.show_overwrite_saves_conflict(entry.name, game_id, new_exe_path)
+                return
+            self._pending_carry_conflict.pop((game_id, new_exe_path), None)
+
+        # A "this game moved/reinstalled" prompt — advisory only (tracking
+        # already proceeded), so lower priority than the decision-required
+        # ones above, but still worth bringing back on request.
+        if self._pending_path_changed:
+            (game_id, new_exe_path), (game_name, alternates) = next(iter(self._pending_path_changed.items()))
+            self._overlay.show_path_changed(game_name, game_id, new_exe_path, alternates)
+            return
+
         # Check if overlay is currently showing a tracking popup for a known game.
         # NOTE: use the module-level get_library — a function-local re-import
         # here would shadow it for the WHOLE method and crash the earlier use
@@ -3834,6 +3917,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # nobody has opened since — the editor itself only ever sees the files
         # somebody goes back to.
         QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._prune_save_edit_copies)
+        # Same idea, same clock, for retention pruning — see
+        # _maybe_run_backup_retention_sweep's own docstring for why this
+        # needs to run on its own schedule rather than only when a game
+        # happens to sync.
+        self._verify_timer.timeout.connect(self._maybe_run_backup_retention_sweep)
+        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS,
+                          self._maybe_run_backup_retention_sweep)
 
     def _setup_startup_self_checks(self):
         """In-app regression guards (no shipped ``tests/`` suite).
@@ -4180,6 +4270,101 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._verify_thread = threading.Thread(target=_run, daemon=True)
         self._verify_thread.start()
 
+    def _maybe_run_backup_retention_sweep(self):
+        """Expire backups whose ``planned_deletion`` has passed, across
+        EVERY game with backups — not just whichever one next happens to
+        sync.
+
+        ``core.backup.BackupManager._enforce_limits`` (max_local_backups /
+        backup_retention_days / min_kept_backups) only ever ran as a side
+        effect of that same game's own create_backup — a game that sits
+        unplayed kept every backup, however old, until the next time it
+        DID get played, at which point everything past the retention
+        window expired in one sweep, all at once. That read as backups
+        vanishing with no warning right when the game was played again,
+        not as gradual, expected housekeeping — reported directly, this
+        is the fix.
+
+        Deliberately NOT "re-run _enforce_limits for every game": that
+        recomputes the sort + protected/unprotected split from scratch
+        per game, every time, for a library that might hold hundreds of
+        games' history. ``planned_deletion`` (see that field on
+        ``BackupEntry``) already carries the answer, computed once by
+        ``_enforce_limits`` at the one moment it's cheap — when THAT
+        game's own backup set just changed — so this only needs a flat
+        scan of the index for a date in the past, deleting directly.
+        Games that don't have that stamp yet (backups from before this
+        existed, or one this sweep hasn't reached before) fall back to
+        the full per-game computation once, to backfill it; every run
+        after that for the same game is the cheap path. Skipped while
+        any game is running, same as the integrity sweep — this is
+        background housekeeping, never worth competing with actual
+        gameplay for disk.
+        """
+        cfg = get_config()
+        if not cfg.get("backup_retention_sweep_enabled", True):
+            return
+        if getattr(self, "_retention_sweep_thread", None) is not None \
+                and self._retention_sweep_thread.is_alive():
+            return
+        if get_monitor().currently_playing():
+            logger.debug("Backup retention sweep postponed — a game is running")
+            return
+
+        days = max(1, int(cfg.get("backup_retention_sweep_interval_days", 1)))
+        last = cfg.get("backup_retention_sweep_last", "") or ""
+        if last:
+            try:
+                from datetime import datetime, timedelta
+                if datetime.utcnow() - datetime.fromisoformat(last) < timedelta(days=days):
+                    return
+            except (ValueError, TypeError):
+                pass        # unreadable stamp — treat as never run
+
+        import threading
+        from datetime import datetime
+
+        def _run():
+            from core.backup import get_backup_manager
+            mgr = get_backup_manager()
+            all_backups = mgr.get_all_backups()
+            if not all_backups:
+                return
+            now = datetime.utcnow()
+            expired_ids = []
+            has_unstamped = False
+            for b in all_backups:
+                if not b.planned_deletion:
+                    has_unstamped = True
+                    continue
+                try:
+                    if datetime.fromisoformat(b.planned_deletion) <= now:
+                        expired_ids.append(b.backup_id)
+                except (ValueError, TypeError):
+                    has_unstamped = True
+            backfilled = 0
+            try:
+                for bid in expired_ids:
+                    mgr.delete_backup(bid)
+                # Same repair BackupManager.repair_legacy_backups does (see
+                # backfill_planned_deletion's own docstring) — reused here
+                # rather than duplicated so "what counts as unstamped"
+                # stays defined in exactly one place.
+                if has_unstamped:
+                    backfilled = mgr.backfill_planned_deletion()
+            except Exception as e:
+                logger.debug(f"Scheduled retention sweep failed: {e}")
+                return
+            get_config().set("backup_retention_sweep_last", now.isoformat())
+            logger.info(
+                f"Scheduled backup retention sweep: {len(expired_ids)} expired, "
+                f"{backfilled} game(s) backfilled, "
+                f"{len(all_backups) - len(expired_ids)} already current"
+            )
+
+        self._retention_sweep_thread = threading.Thread(target=_run, daemon=True)
+        self._retention_sweep_thread.start()
+
     @Slot(int, int)
     def _on_backup_verify_problems(self, bad: int, total: int):
         """Surface a failed sweep where the user will see it."""
@@ -4225,6 +4410,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         monitor.unknown_game_exited.connect(self._on_unknown_game_exited)
         monitor.game_match_unverified.connect(self._on_unverified_match)
         monitor.game_match_unverified_gone.connect(self._on_unverified_match_gone)
+        monitor.game_path_changed.connect(self._on_game_path_changed)
         monitor.start()
 
         # A hand-registered destination waiting for its game is picked up the
@@ -4270,37 +4456,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         lib.game_removed.connect(_on_game_removed)
 
-    def _on_save_changed(self, game_id: str):
-        """Save file changed (watchdog). One job now: DISCOVERY.
-
-        The watchdog is the only thing that reliably sees atomic save
-        writes — the 60s open-file poll misses them. Bridge the folders it
-        just found into _pending_auto_scans so they get PROPOSED at the
-        confirmation panel, and push them live into an already-open panel.
-        This is what makes "I saved but nothing was proposed" work, and it
-        surfaces the real save dir (e.g. game/saves) with nothing hardcoded.
-
-        Deliberately does NOT trigger a backup — that used to happen here,
-        reactively, on every debounced change, independent of
-        backup_interval_sec. Actual backup creation is exclusively
-        _ingame_backup_tick's job now: it runs on the configured interval,
-        already skips via create_backup(force=False) when nothing changed,
-        and (see below) gets started even pre-confirmation the first time
-        discovery surfaces something.
-        """
-        entry = get_library().get_by_id(game_id)
-        if not entry:
-            return
-
-        # 1) Discovery — surface actually-modified folders for confirmation.
+    def _discover_pending_paths_for(self, entry, exe_dir: str):
+        """Scan *exe_dir* for actually-modified save folders and surface
+        them for confirmation, exactly like the watchdog-driven discovery in
+        _on_save_changed (extracted so a newly detected install location —
+        see _on_game_path_changed's "add to this game"/"overwrite" actions —
+        goes through the SAME confirmation surface as any other discovery,
+        rather than writing to save_paths unseen)."""
+        game_id = entry.id
         try:
             from core.watcher import get_pending_save_paths
-            exe_dir = ""
-            if entry.exe_path:
-                try:
-                    exe_dir = str(Path(entry.exe_path).parent)
-                except Exception:
-                    exe_dir = ""
             # Temporal correlation happens INSIDE the watcher now: events
             # rejected by the common-root name filter get buffered and
             # claimed when an attributed save lands in the same instant, so
@@ -4340,7 +4505,38 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     if not entry.save_paths and game_id not in self._ingame_backup_timers:
                         self._start_ingame_backup_timer(entry)
         except Exception as e:
-            logger.debug(f"Watchdog discovery bridge failed for {game_id}: {e}")
+            logger.debug(f"Discovery bridge failed for {game_id}: {e}")
+
+    def _on_save_changed(self, game_id: str):
+        """Save file changed (watchdog). One job now: DISCOVERY.
+
+        The watchdog is the only thing that reliably sees atomic save
+        writes — the 60s open-file poll misses them. Bridge the folders it
+        just found into _pending_auto_scans so they get PROPOSED at the
+        confirmation panel, and push them live into an already-open panel.
+        This is what makes "I saved but nothing was proposed" work, and it
+        surfaces the real save dir (e.g. game/saves) with nothing hardcoded.
+
+        Deliberately does NOT trigger a backup — that used to happen here,
+        reactively, on every debounced change, independent of
+        backup_interval_sec. Actual backup creation is exclusively
+        _ingame_backup_tick's job now: it runs on the configured interval,
+        already skips via create_backup(force=False) when nothing changed,
+        and (see below) gets started even pre-confirmation the first time
+        discovery surfaces something.
+        """
+        entry = get_library().get_by_id(game_id)
+        if not entry:
+            return
+
+        # 1) Discovery — surface actually-modified folders for confirmation.
+        exe_dir = ""
+        if entry.exe_path:
+            try:
+                exe_dir = str(Path(entry.exe_path).parent)
+            except Exception:
+                exe_dir = ""
+        self._discover_pending_paths_for(entry, exe_dir)
 
         # Backup from here is OFF by default and stays that way for polling-only
         # setups. The scheduled _ingame_backup_tick runs on the configured
@@ -4732,6 +4928,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         _cfn = entry.computed_folder_name
         _name_history = list(entry.name_history) if entry.name_history else []
         _note = t('main.auto_in_game')
+        # Still a mystery which entry this really is: file it temporary,
+        # same as an unconfirmed auto-add — see _identity_still_ambiguous.
+        _identity_alts = self._identity_still_ambiguous(game_id)
 
         def _do_backup():
             max_mb = get_config().get("max_backup_size_mb", 512)
@@ -4742,6 +4941,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 computed_folder_name=_cfn,
                 name_history=_name_history,
                 excluded_paths=_excluded,
+                pre_confirmation=bool(_identity_alts),
+                identity_alternates=_identity_alts,
                 return_status=True,
             )
             if created:
@@ -4979,6 +5180,348 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._pending_unverified.pop((proc_name, game_id), None)
         if self._overlay:
             self._overlay.dismiss_unverified_match(proc_name, game_id)
+
+    def _on_game_path_changed(self, entry, new_exe_path: str, alt_ids=None):
+        """*entry* was matched by name/stem but is running from a path that
+        differs from the one on record — offer to track it, overwrite the
+        primary, or split it into its own library entry. Tracking already
+        proceeded (see core/monitor.py's game_path_changed docstring), so
+        this is advisory only, not a gate.
+
+        *alt_ids* are other library entries whose name matched just as well
+        — resolved to (id, name) pairs here and offered on the overlay as
+        "it's actually this one" corrections, for the not-unusual case of
+        more than one entry sharing a common name."""
+        if not entry or not self._overlay:
+            return
+        lib = get_library()
+        alternates = []
+        for gid in (alt_ids or []):
+            if gid == entry.id:
+                continue
+            g = lib.get_by_id(gid)
+            if g:
+                alternates.append((g.id, g.name))
+        # alternates travel with the pending entry, not just the name — a
+        # hotkey re-summon (see _show_manual_forced) must offer the same
+        # "it's actually …" corrections the live prompt did, not a version
+        # that silently lost them.
+        self._pending_path_changed[(entry.id, new_exe_path)] = (entry.name, alternates)
+        self._overlay.show_path_changed(entry.name, entry.id, new_exe_path, alternates)
+
+    def _on_path_changed_expired(self, context: str):
+        """show_path_changed timed out with nobody clicking anything —
+        applies the same safe default a click on "Add to this game" would,
+        EXCEPT the actual save-data copy: that waits for the match to be
+        unambiguous (see show_path_changed's own docstring), so it only
+        runs here when there were no alternates to begin with. The pending
+        entry is deliberately left in _pending_path_changed — this default
+        taking effect is not the same as the question being answered, and
+        the hotkey must still be able to bring it back and correct it."""
+        game_id, _, new_exe_path = context.partition("|")
+        entry = get_library().get_by_id(game_id)
+        if not entry:
+            return
+        pending = self._pending_path_changed.get((game_id, new_exe_path))
+        has_alternates = bool(pending[1]) if pending else False
+        moved = self._rebase_save_paths_to_new_exe(entry, new_exe_path)
+        if not moved:
+            return
+        get_library().update_game(entry)
+        if not has_alternates:
+            self._carry_rebased_save_data(entry, new_exe_path, moved)
+
+    def _identity_still_ambiguous(self, game_id: str) -> list:
+        """The (game_id, name) alternates still on offer for *game_id*'s
+        own name-similarity match, or [] once it's settled — an
+        unanswered show_path_changed prompt with alternates still
+        attached (see _on_game_path_changed). Truthy/falsy like a plain
+        ambiguous/not-ambiguous check, but callers that also need to
+        RECORD the candidates (create_backup's own identity_alternates,
+        so the question survives a restart — see BackupManager's
+        has_identity_pending_backups) get them for free here instead of
+        a second lookup. Resolved at _apply_path_add_version /
+        _apply_path_overwrite / _apply_path_reassign / _apply_path_new_game,
+        or at the save-confirm panel's identity banner
+        (_on_identity_choice_from_scan)."""
+        for (gid, _exe), (_name, alternates) in self._pending_path_changed.items():
+            if gid == game_id and alternates:
+                return alternates
+        return []
+
+    def _recheck_cloud_after_identity_resolved(self, game_id: str):
+        """A launch-time cloud check was withheld while *game_id* was still
+        an identity mystery (see _on_cloud_check_result's own guard, in
+        main_window_cloud.py) — now that it's answered, run it for real,
+        for whichever entry it resolved to. Only when the game is still
+        actually running: a mystery resolved at the save-confirm panel's
+        identity banner, after the session already ended, has nothing live
+        left to prompt about — the ordinary exit-time flow already covers
+        that case on its own."""
+        if any(g.id == game_id for g in get_monitor().currently_playing()):
+            self._check_cloud_on_launch(game_id)
+
+    def _rebase_save_paths_to_new_exe(self, entry, new_exe_path: str, old_exe: str = "") -> dict:
+        """Rebase any save path kept alongside *old_exe* (default:
+        entry.exe_path — pass it explicitly when the primary has already
+        been swapped to *new_exe_path* by the time this runs) onto the same
+        relative spot under *new_exe_path* — the same relative-offset
+        resolution a restore to a different location already uses
+        (core.library.rebase_path_for_new_exe, factored out of the Add/Edit
+        dialog's own exe-change handling). An install-folder-relative save
+        just keeps working after the move; one that already lives somewhere
+        unrelated to the install folder (AppData, Documents, …) needs no
+        rebasing and is left exactly as it was.
+
+        Pure bookkeeping — only SaveSync's own tracking pointer moves here,
+        never any actual file. Returns {old_path: new_path} for every path
+        that actually moved (empty when nothing did, same falsy contract
+        the old bool return had) so a caller that also wants to carry the
+        real save DATA across (see _carry_rebased_save_data) knows exactly
+        which pairs are eligible — a path with no entry here was never
+        install-relative to begin with and must never be touched by that
+        copy either."""
+        old_exe = old_exe or entry.exe_path
+        if not old_exe or not entry.save_paths:
+            return {}
+        from core.library import rebase_path_for_new_exe
+        rebased = []
+        changed = False
+        for p in entry.save_paths:
+            hit = rebase_path_for_new_exe(old_exe, new_exe_path, p)
+            if hit is None:
+                rebased.append(p)
+                continue
+            new_p, chain = hit
+            entry.record_path_chain(new_p, chain)
+            rebased.append(new_p)
+            if new_p != p:
+                changed = True
+        if not changed:
+            return {}
+        full_map = dict(zip(entry.save_paths, rebased))
+        entry.excluded_save_paths = [
+            full_map.get(p, p) for p in (entry.excluded_save_paths or [])
+        ]
+        entry.save_paths = rebased
+        return {p: n for p, n in full_map.items() if p != n}
+
+    def _copy_save_into_empty_target(self, old_path: Path, new_path: Path, force: bool = False):
+        """Carry the actual save DATA from *old_path* to *new_path* — a
+        rebase (see _rebase_save_paths_to_new_exe) only ever repoints
+        SaveSync's own tracking, never touches a file; this is the step
+        that makes the move real for the player too. *force* skips the
+        emptiness re-check — set only by the explicit "yes, overwrite"
+        answer to the conflict this same method raises when it isn't
+        forced (see _carry_rebased_save_data), never on its own say-so."""
+        try:
+            if not old_path.exists():
+                return
+            from core.library import path_has_content
+            if not force and path_has_content(new_path):
+                return
+            if old_path.is_dir():
+                if not any(old_path.iterdir()):
+                    return
+                shutil.copytree(old_path, new_path, dirs_exist_ok=True)
+            elif old_path.is_file() and old_path.stat().st_size > 0:
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old_path, new_path)
+        except OSError as e:
+            logger.warning(f"Could not carry save data from {old_path} to {new_path}: {e}")
+
+    def _carry_rebased_save_data(self, entry, new_exe_path: str, moved: dict):
+        """Copy the real save data for every (old_path, new_path) pair in
+        *moved* — always a subset of entry.save_paths that a rebase just
+        found to be genuinely install-folder-relative (see
+        _rebase_save_paths_to_new_exe's own docstring for why an
+        AppData/Documents-style path never appears here at all). A target
+        that's already empty gets the copy immediately, no questions asked
+        — nothing there to lose. A target that already carries its own
+        content is never touched here: collected instead and handed to
+        the exact same "does this already have its own saves?" ask
+        _apply_path_overwrite uses, so the two paths that can raise it
+        read as one consistent question to the player, not two."""
+        from core.library import path_has_content
+        conflicts: dict = {}
+        for old_p, new_p in moved.items():
+            old_path, new_path = Path(old_p), Path(new_p)
+            if not old_path.exists():
+                continue
+            if path_has_content(new_path):
+                conflicts[old_p] = new_p
+                continue
+            self._copy_save_into_empty_target(old_path, new_path)
+        if conflicts and self._overlay:
+            self._pending_carry_conflict[(entry.id, new_exe_path)] = conflicts
+            self._overlay.show_overwrite_saves_conflict(entry.name, entry.id, new_exe_path)
+
+    def _apply_path_add_version(self, entry, new_exe_path: str):
+        """"Add to this game" — the version itself is already registered by
+        the monitor the moment it was first seen (core/monitor.py's
+        game_path_changed docstring). The rest is the "transfer": rebase
+        install-folder-relative save paths onto the new location, same as
+        a restore does, then carry the actual save DATA across too (see
+        _carry_rebased_save_data) — nothing here asks the user anything
+        unless that copy itself lands on a target that already has its
+        own content, which escalates through the same ask Overwrite uses.
+
+        This IS the identity confirmation when alternates were on offer
+        (the primary button's own click, whatever the dropdown also
+        held) — any backup taken while that was still a mystery gets
+        promoted out of temporary status right here, same game_id."""
+        moved = self._rebase_save_paths_to_new_exe(entry, new_exe_path)
+        if moved:
+            get_library().update_game(entry)
+            self._carry_rebased_save_data(entry, new_exe_path, moved)
+        get_backup_manager().promote_pre_confirmation_backups(
+            entry.id, include_identity_pending=True)
+        self._recheck_cloud_after_identity_resolved(entry.id)
+
+    def _apply_path_overwrite(self, entry, new_exe_path: str):
+        """Replace the primary path outright — the auto-registered version
+        entry is removed rather than kept, per the "overwrite discards it"
+        rule (add-a-version and overwrite would otherwise do the same
+        thing). The primary always swaps immediately; whether save_paths
+        get rebased onto it depends on what's already there:
+
+        - the ordinary case (a plain reinstall/update — nothing of its own
+          at the new location yet) rebases automatically, same as "add to
+          this game";
+        - if the new location already has its OWN save content (e.g. this
+          "version" was already played a while under live tracking), that's
+          a second, independent save history — rebasing onto it would
+          silently start treating the two as the same. Ask first via the
+          overlay (show_overwrite_saves_conflict); unanswered defaults to
+          NOT rebasing (save_paths keep pointing at the old location, which
+          stays tracked in place) rather than risking the wrong one.
+
+        The conflict check isn't limited to CONFIRMED save_paths — a game
+        whose paths were only just discovered by live tracking and never
+        clicked-to-confirm yet (still sitting in _pending_auto_scans) can
+        carry just as real a save history at the old location, and the same
+        question applies: not yet "registered" doesn't mean not real.
+
+        Also an identity confirmation, same as "add to this game" — the
+        save-path question below is separate and may still need asking,
+        but WHICH entry this is was just answered, so any backup taken
+        while that was a mystery is promoted right here regardless of
+        which save-path branch runs next.
+        """
+        get_backup_manager().promote_pre_confirmation_backups(
+            entry.id, include_identity_pending=True)
+        self._recheck_cloud_after_identity_resolved(entry.id)
+        entry.remove_exe_version(new_exe_path)
+        old_exe = entry.exe_path
+        entry.exe_path = new_exe_path
+        entry.record_exe_hints(new_exe_path)
+        from core.library import rebase_targets_have_existing_saves
+        with self._bg_scan_lock:
+            pending = list(self._pending_auto_scans.get(entry.id, []))
+        check_paths = list(dict.fromkeys(list(entry.save_paths or []) + pending))
+        if old_exe and rebase_targets_have_existing_saves(old_exe, new_exe_path, check_paths):
+            get_library().update_game(entry)   # primary swap persists regardless of the answer
+            self._pending_overwrite_conflict[(entry.id, new_exe_path)] = old_exe
+            if self._overlay:
+                self._overlay.show_overwrite_saves_conflict(entry.name, entry.id, new_exe_path)
+            return
+        moved = self._rebase_save_paths_to_new_exe(entry, new_exe_path, old_exe=old_exe)
+        get_library().update_game(entry)
+        if moved:
+            self._carry_rebased_save_data(entry, new_exe_path, moved)
+
+    def _resolve_overwrite_saves_conflict(self, game_id: str, new_exe_path: str, do_rebase: bool):
+        """Answer to show_overwrite_saves_conflict — two different questions
+        can land here, told apart by which pending dict actually holds the
+        key (never both at once: a primary swap and an "add/reassign a
+        version" are mutually exclusive choices for the same context):
+
+        - _pending_overwrite_conflict (from _apply_path_overwrite): rebase
+          onto the new location now (its EXISTING content becomes what's
+          tracked from here on — nothing is copied over it), or leave
+          save_paths exactly where they were (the old location stays
+          tracked, independently of whatever is at the new one).
+        - _pending_carry_conflict (from _carry_rebased_save_data): the
+          tracking pointer already moved: this is only asking whether to
+          copy the OLD save data over the new location's own existing
+          content, or leave that content untouched. "Keep both" here does
+          nothing further — declining the copy already leaves it alone."""
+        key = (game_id, new_exe_path)
+        old_exe = self._pending_overwrite_conflict.pop(key, None)
+        if old_exe is not None:
+            if not do_rebase:
+                return
+            entry = get_library().get_by_id(game_id)
+            if not entry:
+                return
+            if self._rebase_save_paths_to_new_exe(entry, new_exe_path, old_exe=old_exe):
+                get_library().update_game(entry)
+            return
+        conflicts = self._pending_carry_conflict.pop(key, None)
+        if conflicts and do_rebase:
+            for old_p, new_p in conflicts.items():
+                self._copy_save_into_empty_target(Path(old_p), Path(new_p), force=True)
+
+    def _apply_path_new_game(self, entry, new_exe_path: str):
+        """Split the new path off into its own library entry — same
+        name/cover/tags/engine, but its own id and, deliberately, its own
+        FRESH save paths: unlike the other two choices this is a different
+        game as far as tracking goes, so it goes through normal discovery
+        instead of inheriting/rebasing the original's.
+
+        Also solves the identity mystery as "neither" — any backup taken
+        against *entry* while that was still undecided was never really
+        this game's own history; it belongs with the split-off clone
+        instead, moved and promoted there (see BackupManager.adopt_backups'
+        own only_identity_pending), never left stranded on the entry it
+        turned out not to be."""
+        entry.remove_exe_version(new_exe_path)   # stays with the split-off entry, not this one
+        get_library().update_game(entry)
+        from core.library import GameEntry
+        clone = GameEntry(
+            name=entry.name,
+            exe_path=new_exe_path,
+            engine=entry.engine,
+            icon_path=entry.icon_path,
+            tags=list(entry.tags or []),
+        )
+        clone.record_name(entry.name)
+        clone.record_exe_hints(new_exe_path)
+        get_library().add_game(clone)
+        get_backup_manager().adopt_backups(
+            entry.id, clone.id, clone.name, to_exe_path=new_exe_path,
+            only_identity_pending=True)
+        try:
+            exe_dir = str(Path(new_exe_path).parent)
+        except Exception:
+            exe_dir = ""
+        if exe_dir:
+            self._discover_pending_paths_for(clone, exe_dir)
+        self._recheck_cloud_after_identity_resolved(clone.id)
+
+    def _apply_path_reassign(self, wrong_entry, correct_entry, new_exe_path: str):
+        """The auto-tracked match was the wrong one of several library
+        entries sharing a common name — move *new_exe_path* off
+        *wrong_entry* and onto *correct_entry* instead, same as "add to
+        this game" would have done had the right entry been picked first,
+        carried save data included. The wrong entry's OWN real history is
+        never touched — only just auto-registered as a version, never
+        played under that id — but any backup TAKEN during the session
+        while this was still a mystery (see _identity_still_ambiguous) was
+        filed there temporarily and is real, wanted history; it moves
+        across to correct_entry too, promoted out of temporary status by
+        the same move (adopt_backups' only_identity_pending)."""
+        wrong_entry.remove_exe_version(new_exe_path)
+        get_library().update_game(wrong_entry)
+        correct_entry.record_exe_version(new_exe_path)
+        moved = self._rebase_save_paths_to_new_exe(correct_entry, new_exe_path)
+        get_library().update_game(correct_entry)
+        if moved:
+            self._carry_rebased_save_data(correct_entry, new_exe_path, moved)
+        get_backup_manager().adopt_backups(
+            wrong_entry.id, correct_entry.id, correct_entry.name,
+            to_exe_path=correct_entry.exe_path, only_identity_pending=True)
+        self._recheck_cloud_after_identity_resolved(correct_entry.id)
 
     def _on_unknown_game(self, name: str, exe_path: str):
         """Unknown process started: check for cloud saves first; fall back to add-to-library."""
@@ -5300,14 +5843,58 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             )
             return
 
+        # A name-similarity match still unresolved from this same session
+        # (see show_path_changed's alternates) gets one more natural chance
+        # to be settled here — the whole session has been observed by now,
+        # a better moment to ask than mid-game. Any key for this game with
+        # alternates still attached qualifies; there is realistically at
+        # most one per session. Falls back to whatever the identity-pending
+        # backups themselves recorded (BackupManager.identity_pending_info)
+        # when this session's own in-memory pending dict has nothing — the
+        # SAME still-unresolved mystery from a session that ended in an
+        # earlier run of the app, replaying the exe that matched it before,
+        # which produces no NEW show_path_changed event to repopulate it.
+        identity_exe, identity_alternates = "", []
+        for (pid, pexe), (_pname, palts) in self._pending_path_changed.items():
+            if pid == entry.id and palts:
+                identity_exe, identity_alternates = pexe, palts
+                break
+        if not identity_alternates:
+            identity_exe, identity_alternates = get_backup_manager().identity_pending_info(entry.id)
+
         try:
-            self._track_scan_dialog(show_auto_scan_dialog(
+            dlg = show_auto_scan_dialog(
                 self,
                 paths_to_show,
                 game_id=entry.id,
-            ))
+                identity_new_exe_path=identity_exe,
+                identity_alternates=identity_alternates,
+            )
+            if dlg and identity_alternates:
+                dlg.identity_choice.connect(self._on_identity_choice_from_scan)
+            self._track_scan_dialog(dlg)
         except Exception as e:
             logger.error(f"Auto-scan dialog error: {e}")
+
+    def _on_identity_choice_from_scan(self, game_id: str, new_exe_path: str, choice: str):
+        """Answer to the save-confirm panel's "is this actually X?" banner
+        (see AutoScanDialog.show_identity_confirm) — same three outcomes
+        show_path_changed's dropdown offers, just answered here instead:
+        confirmed as the auto-picked entry, reassigned to a named
+        alternate, or split into its own new entry."""
+        entry = get_library().get_by_id(game_id)
+        if not entry:
+            return
+        self._pending_path_changed.pop((game_id, new_exe_path), None)
+        if choice == "confirm":
+            self._apply_path_add_version(entry, new_exe_path)
+        elif choice == "different":
+            self._apply_path_new_game(entry, new_exe_path)
+        else:
+            alt_entry = get_library().get_by_id(choice)
+            if alt_entry:
+                self._apply_path_reassign(entry, alt_entry, new_exe_path)
+        self._show_tracking_toast_if_playing(game_id)
 
     def _update_sidebar_status(self):
         playing = get_monitor().currently_playing()
@@ -5684,13 +6271,38 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _open_add_game_dialog(self, name: str = "", exe_path: str = ""):
         entry = None
+        exact_exe_match = False
+        alt_entries = []
         if exe_path:
             entry = get_library().get_by_exe(exe_path)
+            exact_exe_match = entry is not None
         if entry is None and name:
+            from core.constants import names_probably_same_game
             for g in get_library().all_games():
-                if g.name.strip().lower() == name.strip().lower():
-                    entry = g
-                    break
+                if names_probably_same_game(g.name, name):
+                    if entry is None:
+                        entry = g
+                    else:
+                        alt_entries.append(g)
+
+        if entry is not None and not exact_exe_match and exe_path:
+            # A NAME match, not an exe-path match: this exe is genuinely
+            # new to that entry — likely a different install/version of
+            # the same game (drag-and-drop, manual browse), same shape of
+            # situation core.monitor already handles for a game caught
+            # RUNNING from an unfamiliar path. Handed to that exact same
+            # "add version / overwrite / split into a new entry" system
+            # (see _on_game_path_changed) instead of a second, separate
+            # decision UI: registers the new path as a tracked version
+            # immediately — that system's own default, not gating this on
+            # the overlay being answered — then shows the SAME overlay to
+            # refine or split it off. Nothing left for THIS flow to do;
+            # no AddGameDialog opens for this branch at all.
+            entry.record_exe_version(exe_path)
+            get_library().update_game(entry)
+            self._on_game_path_changed(entry, exe_path, [g.id for g in alt_entries])
+            return
+
         if entry is not None:
             dlg = AddGameDialog(entry=entry, parent=self)
         else:
@@ -6010,15 +6622,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """Create a backup for a game in a background thread to avoid UI freeze.
 
         Always uses entry.save_paths — the user's own confirmed paths — and
-        nothing else. Deliberately NOT provisional-aware: this is the
-        general-purpose backup helper used by broad operations too (e.g.
-        "backup all", which iterates every game's save_paths), and those
-        must never see live-tracking's not-yet-confirmed detections. The
-        provisional mechanism is fully standalone — see
-        _backup_provisional_paths, used only by the game-specific,
-        live-tracking-driven callers (the in-game timer, a save-changed
-        event) — and only for as long as this game has NO confirmed path
-        at all; normal and provisional backups are never mixed.
+        nothing else. Deliberately NOT aware of live-tracking's own
+        not-yet-confirmed PATH detections: this is the general-purpose
+        backup helper used by broad operations too (e.g. "backup all",
+        which iterates every game's save_paths), and those must never see
+        _backup_provisional_paths' own separate mechanism (the in-game
+        timer, a save-changed event, only for as long as this game has NO
+        confirmed path at all — normal and that kind of provisional backup
+        are never mixed).
+
+        It IS aware of one other kind of "not confirmed yet", though: the
+        game's own IDENTITY (see _identity_still_ambiguous) — which
+        library entry a name-similarity match landed on can still be
+        wrong, so a backup taken before that question is answered is
+        filed pre_confirmation too, resolved the same way (promoted, or
+        moved onto the entry the mystery actually resolves to) once it is.
         """
         game_id = job["game_id"]
         force_full = job.get("force", False)
@@ -6042,6 +6660,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         exe_path = entry.exe_path
         computed = entry.computed_folder_name
         excluded = entry.excluded_save_paths
+        # Still a mystery which entry this really is: file it temporary,
+        # same as an unconfirmed auto-add — see _identity_still_ambiguous.
+        # Read BEFORE the identity banner (_check_auto_scan_for_game, right
+        # after this same exit backup) has any chance to resolve it.
+        identity_alts = self._identity_still_ambiguous(game_id)
 
         def _do_backup():
             backup, created = get_backup_manager().create_backup(
@@ -6051,6 +6674,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 force=force_full,
                 computed_folder_name=computed,
                 excluded_paths=excluded,
+                pre_confirmation=bool(identity_alts),
+                identity_alternates=identity_alts,
                 return_status=True,
             )
             with self._backup_lock:
@@ -6330,17 +6955,37 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         for b in get_backup_manager().get_backups_for_game(game_id):
             if (b.cloud_metadata or {}).get("pre_confirmation"):
                 paths.update(b.save_paths or [])
-        if not paths:
+
+        # An identity mystery on its own justifies opening the panel even
+        # with nothing new in the path list — this session's own live
+        # alternates when still around, else whatever the identity-pending
+        # backups themselves recorded (restart-safe — see
+        # BackupManager.identity_pending_info).
+        identity_alternates = self._identity_still_ambiguous(game_id)
+        identity_exe = entry.exe_path if identity_alternates else ""
+        if not identity_alternates:
+            identity_exe, identity_alternates = get_backup_manager().identity_pending_info(game_id)
+
+        if not paths and not identity_alternates:
             return   # nothing provisional left to review (already resolved elsewhere)
         from ui.dialogs.auto_scan_dialog import show_auto_scan_dialog
-        dlg = show_auto_scan_dialog(self, pre_scanned_paths=sorted(paths),
-                                    game_id=game_id, user_initiated=True)
+        dlg = show_auto_scan_dialog(self, pre_scanned_paths=sorted(paths) if paths else None,
+                                    game_id=game_id, user_initiated=True,
+                                    auto_scan=bool(paths),
+                                    identity_new_exe_path=identity_exe,
+                                    identity_alternates=identity_alternates)
+        if dlg and identity_alternates:
+            dlg.identity_choice.connect(self._on_identity_choice_from_scan)
         if not dlg:
             # Every candidate turned out non-selectable (e.g. already
             # excluded) once filtered — still open the panel so the click
             # visibly does something, just empty rather than auto-scanning.
             dlg = show_auto_scan_dialog(self, None, game_id=game_id,
-                                        user_initiated=True, auto_scan=False)
+                                        user_initiated=True, auto_scan=False,
+                                        identity_new_exe_path=identity_exe,
+                                        identity_alternates=identity_alternates)
+            if dlg and identity_alternates:
+                dlg.identity_choice.connect(self._on_identity_choice_from_scan)
         if dlg:
             # Whatever the user does in the panel — confirm (kept paths move to
             # save_paths) or discard everything (provisional backups deleted) —
@@ -6413,8 +7058,30 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     if (not batch
                             and config.get("auto_sync_after_backup", False)
                             and entry.save_paths):
+                        # Not while THIS game is still the one playing: the
+                        # periodic in-game backup timer (see
+                        # _start_ingame_backup_timer) keeps a local safety
+                        # net running throughout a session, but syncing on
+                        # every one of those ticks means real network
+                        # activity firing mid-session, unasked, every
+                        # backup_interval_sec — not what "sync after backup"
+                        # is for. Left as sync_status="pending" (untouched
+                        # here), so the exit backup's own pass through this
+                        # same branch — by then no longer "currently
+                        # playing" — picks it up normally; if that exit
+                        # backup dedup-skips because nothing changed since
+                        # the last in-game tick, the existing "reconcile
+                        # pending sync status" path on a dedup-skip already
+                        # catches it too. A manual/idle backup (this game
+                        # not playing at all) is never held back.
+                        still_playing = any(
+                            g.id == game_id for g in get_monitor().currently_playing())
                         orch = get_orchestrator()
-                        if orch.is_online():
+                        if still_playing:
+                            logger.debug(
+                                f"Auto-sync deferred for {entry.name}: "
+                                f"still playing, will sync at exit")
+                        elif orch.is_online():
                             logger.info(f"Auto-syncing after backup for {entry.name}")
                             orch.sync_game(
                                 entry.id, entry.name, entry.save_paths,

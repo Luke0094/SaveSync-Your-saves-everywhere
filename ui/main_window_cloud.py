@@ -297,6 +297,18 @@ class CloudFlowsMixin:
 
         entry = get_library().get_by_id(game_id)
 
+        # A name-similarity match still hasn't settled which library entry
+        # this running game even IS (see _identity_still_ambiguous) — a
+        # cloud prompt asking to download/restore THIS entry's saves would
+        # be asking about the wrong game as often as not. Held back
+        # entirely (not shown, not even orphan-matched) until the mystery
+        # is answered, at which point _recheck_cloud_after_identity_resolved
+        # runs this same check for real, for whichever entry it resolved to.
+        if entry is not None and self._identity_still_ambiguous(entry.id):
+            if on_resolved:
+                on_resolved(show_toast=True)
+            return
+
         # Hand-added orphan archives: same notification as cloud no_local.
         has_orphan = self._stash_orphan_match(entry) if entry is not None else False
 
@@ -367,11 +379,29 @@ class CloudFlowsMixin:
                         if getattr(entry, "pending_local_wins", False):
                             pass
                         elif not has_local or not has_live_saves:
-                            # Local backups already exist — only prompt a download
-                            # when reconciliation is actually needed (cloud-only
-                            # copy, or local saves changed since the last sync).
+                            # Nothing real to protect locally either way — a
+                            # genuinely cloud_only game, or a "pending" one
+                            # whose local copy has since been wiped/reinstalled.
+                            # Offering to grab the cloud copy is right for both.
                             notification_kind = "sync_prompt"
-                        elif self._local_content_matches_last_backup(entry):
+                        elif entry.sync_status == "pending":
+                            # "pending" means LOCAL is the side that moved past
+                            # the last synced state — mark_played() only ever
+                            # sets it starting FROM "synced" (see its own
+                            # docstring), never as a hint that the cloud might
+                            # independently hold something newer instead; that
+                            # case has its own explicit status ("conflict").
+                            # With real local content actually present, a
+                            # DOWNLOAD prompt has nothing to offer — confirmed
+                            # via a real incident: sync_prompt's primary action
+                            # is a forced direction="down" sync, which would
+                            # have pulled the OLDER cloud copy over local
+                            # content the cloud had simply never seen yet. The
+                            # divergence resolves itself the moment the
+                            # ordinary exit-backup+autosync uploads it, same as
+                            # any other "pending" game — no prompt needed here.
+                            pass
+                        elif self._local_content_matches_known_backup(entry):
                             # "Newer than last sync" is only the mtime saying so —
                             # the content hash still matches the last backup, so
                             # there is nothing new to download. The date-only
@@ -448,15 +478,26 @@ class CloudFlowsMixin:
             logger.debug("Could not resolve local conflict time", exc_info=True)
 
 
-    def _local_content_matches_last_backup(self, entry) -> bool:
-        """True when the CURRENT save contents are identical to the last local
-        backup — only the mtime changed since the last sync.
+    def _local_content_matches_known_backup(self, entry) -> bool:
+        """True when the CURRENT save contents match SOME backup already
+        kept for this game — checked against the WHOLE history, not only
+        the newest one.
 
         Date-only logic (``sync_status == "pending"``) treats any touch as new
         work and re-asks the cloud download at every launch; comparing the
         content hash instead of the dates stops asking when the bytes are
-        already what the cloud holds. Falls back to False (keep asking) when
-        the comparison cannot be made.
+        already something SaveSync has already kept. Falls back to False
+        (keep asking) when the comparison cannot be made.
+
+        Only the newest backup used to be checked — which meant restoring
+        an OLDER one on purpose (Backups page → Restore, picking anything
+        but the top row) left local content matching that older backup
+        while still not matching the newest, so the very next launch fired
+        the cloud prompt right back, as if the deliberate restore had never
+        happened. Matching anywhere in the kept history is what tells that
+        case apart from a genuine external change: a restore reproduces
+        some backup's exact hash, an untracked edit made outside SaveSync
+        does not match anything on file at all.
 
         A file the CURRENT session itself just wrote — an engine rewriting
         its own settings on open is the confirmed case, RPG Maker's is a
@@ -476,11 +517,6 @@ class CloudFlowsMixin:
             backups = bm.get_backups_for_game(entry.id)
             if not backups:
                 return False
-            newest = backups[0]
-            meta = newest.cloud_metadata or {}
-            recorded_hash = meta.get("save_hash") or ""
-            if not recorded_hash:
-                return False
             since = get_monitor().tracked_process_start_time(entry.id)
             if not since:
                 import time as _time
@@ -488,7 +524,12 @@ class CloudFlowsMixin:
             current = bm.current_state_hash(
                 entry.id, entry.save_paths or [],
                 changes_explained_since=since)
-            return bool(current) and current == recorded_hash
+            if not current:
+                return False
+            return any(
+                current == (b.cloud_metadata or {}).get("save_hash", "")
+                for b in backups
+            )
         except Exception:
             logger.debug("Local content check failed", exc_info=True)
             return False

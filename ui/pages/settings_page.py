@@ -221,6 +221,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         if self.isVisible():
             from ui.widgets.busy_overlay import DeferredBusy
             self._deferred_busy = DeferredBusy(self, t("common.please_wait"))
+            self._deferred_busy.set_on_cancel(self._cancel_section_build)
         QTimer.singleShot(0, lambda g=gen: self._pump_sections_step(g))
 
     def _pump_sections_step(self, gen):
@@ -295,6 +296,22 @@ class SettingsPage(PageScrollMixin, QWidget):
         if busy is not None:
             busy.close()
             self._deferred_busy = None
+
+    def _cancel_section_build(self):
+        """Stop the in-flight section build — what Cancel on the
+        please-wait sheet actually means, not just dismissing the sheet
+        while the QTimer chain keeps quietly popping jobs behind it.
+
+        If real jobs were actually thrown away, the page is left knowing
+        it is not _built (see ensure_loaded), so navigating back to
+        Settings restarts the build instead of leaving it permanently
+        half-finished with no further trigger."""
+        had_pending_work = bool(self._section_jobs)
+        self._section_jobs_gen += 1
+        self._section_jobs = []
+        self._stop_deferred_busy()
+        if had_pending_work:
+            self._pending_initial_load = True
 
     def wipe_and_reload(self):
         """Destroy the built sections and re-run the chunk pump (overview

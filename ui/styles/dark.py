@@ -1235,6 +1235,15 @@ QFrame#path_row:hover {
     min-width: 110px;
     background: transparent;
 }
+#path_row_version {
+    color: #e8e8ea;
+    background: #1c1c22;
+    border: 1px solid #2a2a38;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 600;
+}
 #settings_section_lbl {
     color: #6a6a78;
     font-size: 11px;
@@ -2016,7 +2025,14 @@ QPushButton#filter_tab[active="1"]:focus {
 }
 #cheats_pager:hover { background: #33334a; border-color: #6c5ce7; }
 #cheats_pager:disabled { color: #4a4a5e; border-color: #24242e; }
-#cheats_page_lbl { color: #8a8a9a; font-size: 11px; }
+/* Doubles as the page jump field (_PageJumpEdit) — a plain label at rest,
+   an editable box once clicked. */
+#cheats_page_lbl {
+    color: #8a8a9a; font-size: 11px; background: transparent;
+    border: 1px solid transparent; border-radius: 4px; padding: 2px 6px;
+}
+#cheats_page_lbl:hover { background: #1e1e28; }
+#cheats_page_lbl:focus { background: #1e1e28; border-color: #6c5ce7; color: #e8e8ea; }
 #cheats_holding { color: #6c5ce7; font-size: 11px; font-weight: 600; }
 
 

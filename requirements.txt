@@ -15,6 +15,17 @@ cryptography>=41.0.0
 keyring>=24.0.0
 Pillow>=10.0.0
 pillow-avif-plugin>=1.0
+# core.engines.wolf_lz4 (Wolf RPG Editor's LZ4-compressed save variant):
+# lz4 decompresses/recompresses the payload, numpy vectorises the seed
+# search that unlocks it, numba JIT-compiles that same search roughly
+# 3-4x faster, measured — see that module's own docstring for why a
+# search, not a formula. numba's own import stays try/except in code (a
+# source checkout without it still falls back to the numpy path), but is
+# listed here as a real dependency so a normal install/build gets the
+# faster path by default.
+lz4>=4.0.0
+numpy>=1.24.0
+numba>=0.60.0
 
 # ── Test / tools ──────────────────────────────────────────────────────────
 langdetect>=1.0.9

@@ -70,10 +70,10 @@ _PROJECTS = {}
 _PROJECT_KEEP = 32
 
 
-def _needle_offsets(data: bytes, count: int):
+def _needle_offsets(data: bytes, count: int, start: int = START_OFFSET):
     """Every place *count* appears as a little-endian word, in order."""
     needle = struct.pack("<I", count)
-    at = data.find(needle, START_OFFSET)
+    at = data.find(needle, start)
     while at >= 0:
         yield at, count
         at = data.find(needle, at + 1)
@@ -116,15 +116,41 @@ def read_project(path) -> list:
 
     Only used for labels. A game that packs this away simply gets numbered
     labels instead.
+
+    Text is Shift-JIS (cp932) in every standard Wolf RPG Editor project —
+    but a Unicode-mode build (the same kind of build this engine's own
+    save files can flag, see ``_UTF8_FLAG``) writes this file as UTF-8
+    instead, with nothing here that says which up front. Decided once,
+    from whether the very first string strictly decodes as cp932: real
+    cp932 Japanese text decodes cleanly, and multi-byte UTF-8 misread as
+    cp932 reliably fails outright (a stray continuation byte lands
+    somewhere cp932 has no lead byte for) rather than silently decoding
+    into different-but-plausible-looking garbage. Proven on a real
+    Unicode-build project file, not assumed: cp932 raised on the 15th
+    byte of that file's very first name, and the same bytes are clean
+    UTF-8. Deciding this from an actual decode failure, instead of
+    defaulting to ``errors="replace"`` and moving on, is what this
+    format's own "never guess" standard means here — a swallowed decode
+    error used to just produce mojibake labels silently rather than
+    surface that the cp932 assumption was wrong for this build.
     """
     data = Path(path).read_bytes()
     c = _Cursor(data)
 
-    def text() -> str:
-        return c.blob().rstrip(b"\x00").decode("cp932", errors="replace")
-
     if struct.unpack_from("<I", data, 0)[0] > 0xFF:
         raise WolfSaveError("this database is encrypted")
+
+    probe = _Cursor(data)
+    probe.u32()                                   # type count — not the text
+    try:
+        probe.blob().rstrip(b"\x00").decode("cp932")
+        encoding = "cp932"
+    except UnicodeDecodeError:
+        encoding = "utf-8"
+
+    def text() -> str:
+        return c.blob().rstrip(b"\x00").decode(encoding, errors="replace")
+
     types = []
     for _ in range(c.u32()):
         name = text()
@@ -176,35 +202,90 @@ def find_project(save_path) -> "list | None":
 
 
 class WolfValues:
-    """The variable database of one Wolf save, opened for editing."""
+    """The variable database of one Wolf save, opened for editing.
 
-    def __init__(self):
+    *body_offset* is where the variable database's search is allowed to
+    start looking — the standard format's clear header runs to
+    ``START_OFFSET`` (0x14), so the default skips it the same way the module
+    always has. A subclass whose "plain" bytes are something else entirely —
+    an already-decompressed body with no such header of its own, say — passes
+    0 instead. See ``core.save_editor.crypt.wolf_lz4`` for the one that does.
+    """
+
+    def __init__(self, body_offset: int = START_OFFSET):
         self.plain = b""
         self._records = []        # dicts: label, kind, value, offset, length
         self._encoding = "cp932"
         self._db_offset = -1
         self._type_count = 0
         self._parse_end = 0
+        self._body_offset = body_offset
 
     # ── reading ──────────────────────────────────────────────────────────────
 
-    def load(self, raw: bytes, project=None) -> None:
-        self.plain = decrypt(raw)
-        if self.plain[START_OFFSET] != 0x19:
-            raise WolfSaveError("not a Wolf RPG save")
+    def load(self, raw: bytes, project=None, plain: bytes = None,
+             on_tick=None) -> None:
+        """*plain* lets a subclass hand over bytes it unlocked itself —
+        skipping this module's own ``decrypt()`` — while still sharing
+        everything from here down: locating the database, labelling it,
+        editing, splicing edits back in.
+
+        *on_tick*, when given, is checked periodically during ``_locate``'s
+        scan and stops it by returning False — see that method. A save
+        this size genuinely is registered ``expensive`` (see registry.py:
+        "roughly a second per megabyte"), and until this had a way to be
+        interrupted, "roughly a second per megabyte" on a large or
+        mismatched file was also roughly how long Cancel did nothing.
+        """
+        self.plain = plain if plain is not None else decrypt(raw)
+        marker_ok = self.plain[self._body_offset] == 0x19
+        if not marker_ok:
+            # Thin evidence on its own (see is_wolf_save's own docstring: it
+            # only pins three bits), and not load-bearing here either — the
+            # real proof is _locate() below, which requires a database that
+            # parses cleanly end-to-end with field codes in a tight range,
+            # essentially impossible to satisfy by coincidence. A build of
+            # the editor that starts its body with a different constant (or
+            # keeps this one at a different offset) still has the SAME
+            # variable-database layout underneath, so failing here outright
+            # was refusing saves _locate() could have opened correctly.
+            # Logged either way: if this file truly is not Wolf's, _locate()
+            # failing right after makes that clear without the mismatch
+            # being lost to see why.
+            logger.debug(
+                f"Wolf marker mismatch (0x{self.plain[self._body_offset]:02x}, "
+                f"expected 0x19) — trying to locate the database anyway; "
+                f"header={raw[:self._body_offset].hex()}")
         if len(self.plain) > _UTF8_FLAG_AT and self.plain[_UTF8_FLAG_AT] == _UTF8_FLAG:
             self._encoding = "utf-8"
 
-        best = self._locate(len(project) if project else 0)
+        best = self._locate(len(project) if project else 0, on_tick=on_tick)
         if best is None:
+            # A wider window than the marker-mismatch case above: _locate()
+            # scanning the WHOLE file and still finding nothing means the
+            # mismatch is not just the marker constant, it runs through the
+            # body — which needs more than 16 bytes of ground truth to
+            # reason about. Both windows are early-file structural bytes
+            # (offsets, type counts, field codes), well before the actual
+            # values Wolf keeps near the end — safe to log in full.
+            window = 256
+            detail = (
+                f"; marker byte was also 0x{self.plain[self._body_offset]:02x} "
+                f"instead of 0x19" if not marker_ok else ""
+            )
             raise WolfSaveError(
-                "could not find the variable database in this save")
+                f"could not find the variable database in this save "
+                f"(file size={len(raw)}{detail}; "
+                f"first {window} RAW bytes="
+                f"{raw[:window].hex()}; "
+                f"first {window} decrypted bytes="
+                f"{self.plain[self._body_offset:self._body_offset + window].hex()})")
         self._db_offset, self._type_count, self._records = best
         self._label(project)
         logger.info(f"Wolf save: {len(self._records)} values, database at "
                     f"0x{self._db_offset:x} ({self._type_count} types)")
 
-    def _locate(self, want: int):
+    def _locate(self, want: int, on_tick=None):
         """Where the database starts, found by its shape.
 
         *want* is the type count the game's own database says to expect, or 0
@@ -216,17 +297,27 @@ class WolfValues:
         single pass at C speed, in increasing order, which is also the order
         the tie-break wants: the first that parses cleanly is the earliest,
         so it can be returned on the spot.
+
+        *on_tick*, when given, is checked once per CANDIDATE (not once per
+        byte — the regex/needle scan that produces candidates is itself one
+        uninterruptible C call either way) and stops the search by returning
+        False. What actually costs the "second per megabyte" registry.py
+        warns about is this loop calling _parse_db on every candidate a
+        large or non-Wolf file throws up, so checking here is checking
+        where the real time goes.
         """
         data = self.plain
         n = len(data)
         if want > _MAX_TYPES:
             # A game with more types than fit in a byte. Rare enough that the
             # plain search is the right answer rather than a wider pattern.
-            spots = _needle_offsets(data, want)
+            spots = _needle_offsets(data, want, start=self._body_offset)
         else:
             spots = ((m.start(), data[m.start()])
-                     for m in _CANDIDATE.finditer(data, START_OFFSET))
+                     for m in _CANDIDATE.finditer(data, self._body_offset))
         for at, count in spots:
+            if on_tick is not None and on_tick() is False:
+                return None
             if at < 1 or (want and count != want):
                 continue
             try:
@@ -365,8 +456,14 @@ class WolfValues:
         return encrypt(fix_checksum(out))
 
 
-def loads(raw: bytes, save_path=None) -> WolfValues:
-    """Read a Wolf save, using anything the game beside it can tell us."""
+def loads(raw: bytes, save_path=None, on_tick=None) -> WolfValues:
+    """Read a Wolf save, using anything the game beside it can tell us.
+
+    *on_tick*, when given, lets a caller stop the (registry.py-registered
+    ``expensive``) database scan early — see WolfValues.load's own
+    docstring for why that matters.
+    """
     save = WolfValues()
-    save.load(raw, find_project(save_path) if save_path else None)
+    save.load(raw, find_project(save_path) if save_path else None,
+              on_tick=on_tick)
     return save

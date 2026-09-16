@@ -41,11 +41,25 @@ _ASSET_GLOBS = ("*.assets", "level*", "globalgamemanagers")
 # when the plain files above have not answered, because unpacking one costs
 # real time where reading a plain file costs almost none.
 _BUNDLE_GLOBS = ("data.unity3d", "*.bundle")
+# Unity's Addressables system — the default content pipeline since roughly
+# 2020 — ships content as many small bundles under here instead of the
+# handful of loose ones _BUNDLE_GLOBS looks for, so a game built this way
+# (confirmed directly: real bundles found and searched at this exact path)
+# needs its own, recursive search. "StandaloneWindows64" is the per-platform
+# subfolder Addressables names for a Windows build; other platforms use
+# their own, but this reader only ever runs on Windows saves.
+_ADDRESSABLES_GLOB = "StreamingAssets/aa/**/*.bundle"
 # An archive larger than this is left alone: at roughly 11 MB a second it
 # would be minutes on its own, and the settings object being looked for is a
 # few hundred bytes that games do not bury in their largest archive.
 _MAX_BUNDLE_FILE = 64 << 20
 _MAX_BUNDLES = 12
+# Addressables bundles run into the hundreds for a real game and are
+# individually tiny (confirmed directly: 416 bundles, ~240 KB average) — a
+# cap sized for a handful of loose legacy bundles would miss most of them,
+# so this one is sized for that shape instead. Still bounded, and _carry_on
+# is checked before every one regardless.
+_MAX_ADDRESSABLE_BUNDLES = 1000
 # There is no time limit on the search. Unpacking is around 11 MB a second,
 # so a game shipped as archives can take a while — but stopping early means
 # reporting a save as unopenable when the key was there to be found, which is
@@ -242,10 +256,16 @@ def _bundle_files(game_dir: Path):
                         out.append(candidate)
             except OSError:
                 continue
+        try:
+            for candidate in folder.glob(_ADDRESSABLES_GLOB):
+                if candidate.is_file() and candidate.stat().st_size <= _MAX_BUNDLE_FILE:
+                    out.append(candidate)
+        except OSError:
+            continue
     # Smallest first: the settings object is tiny and often in a small
     # bundle, and a miss then costs the least.
     out.sort(key=lambda p: p.stat().st_size)
-    return out[:_MAX_BUNDLES]
+    return out[:_MAX_BUNDLES + _MAX_ADDRESSABLE_BUNDLES]
 
 
 def _bundle_candidates(path: Path, on_tick=None) -> list:

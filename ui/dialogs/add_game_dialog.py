@@ -8,8 +8,6 @@ SaveSync - Add/Edit Game Dialog
 import os
 import threading
 import logging
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -39,7 +37,7 @@ from core.constants import get_folder_name_for_save, get_install_folder_name
 logger = logging.getLogger(__name__)
 
 from ui.image_cache import (_ICON_CACHE_DIR, migrate_icon_cache,
-                            _ensure_cache_compressed)
+                            _ensure_cache_compressed, _file_md5)
 from ui.widgets.search_inputs import _GhostLineEdit, _SuggestPopup
 from ui.widgets.path_row import PathRow
 from ui.dialogs.detect_worker import DetectWorker
@@ -257,6 +255,137 @@ from ui.dialogs.search_flow import SearchFlowMixin
 from ui.widgets.file_pickers import ExePickerDialog as _ExePickerDialog  # noqa: E402
 
 
+class _ExeVersionMenuRow(QWidget):
+    """One row of the exe ▾ version menu: the version label + path on the
+    left, an inline trash icon on the right for every row but the current
+    primary's. A QWidgetAction's default widget, not a plain QAction —
+    a plain action only has one click meaning for the whole row, and this
+    needs two independent ones (apply the row, or delete it) that must
+    never trigger each other."""
+    apply_requested = Signal()
+    delete_requested = Signal()
+
+    def __init__(self, version: str, path: str, is_primary: bool, parent=None):
+        super().__init__(parent)
+        # A bare QWidget does not paint its own QSS `background` at all
+        # without this — confirmed that's exactly why the row rendered as
+        # an unstyled black rectangle: no attribute means Qt falls back to
+        # the OS/style default palette (near-black under a dark desktop
+        # theme) regardless of what this stylesheet says, on top of which
+        # the row's own text failed to read as anything but equally dark —
+        # "black on black". WA_StyledBackground is the fix for the first
+        # half; the second half is not trusting descendant-selector
+        # cascading through a QWidgetAction-hosted widget at all — every
+        # child below sets its OWN colour directly instead (_apply_colors),
+        # and hover is tracked in Python (enter/leaveEvent), not via a
+        # QSS :hover pseudo-state, for the same reason.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("exe_version_menu_row")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._is_primary = is_primary
+        self._version = version
+        self._path = path
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 6, 6, 6)
+        row.setSpacing(8)
+        self._lbl = QLabel()
+        # Ignored, not the QLabel default (Preferred): a label otherwise
+        # reports ITS OWN TEXT's natural width as its sizeHint, which the
+        # layout then honours as a MINIMUM — confirmed directly that this
+        # made the row (and the whole menu, whose width comes FROM these
+        # rows) grow to fit the longest untouched path instead of ever
+        # letting _refresh_label_text's own eliding constrain anything;
+        # the width it elides against was circularly driven by whatever
+        # text it last held. Ignored lets the layout shrink it to
+        # whatever's actually available, which is the whole point here.
+        self._lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(self._lbl, 1)
+        self._check = None
+        if is_primary:
+            self._check = QLabel("✓")
+            row.addWidget(self._check)
+        else:
+            from PySide6.QtWidgets import QToolButton
+            trash = QToolButton()
+            trash.setText("\U0001f5d1")
+            trash.setAutoRaise(True)
+            trash.setCursor(Qt.CursorShape.PointingHandCursor)
+            trash.setToolTip(t('add_game.exe_remove_version_hint'))
+            # A background swap on hover, not a text-color one: 🗑 renders
+            # as a full-colour emoji glyph on Windows (Segoe UI Emoji has
+            # its own baked-in colour table), which ignores a QSS `color`
+            # change entirely — confirmed the same reasoning already
+            # applies elsewhere in this app (#icon_btn's OWN hover rule
+            # changes background-color, same glyph-color limitation). A
+            # red-tinted background reads as "delete" regardless.
+            trash.setStyleSheet(
+                "QToolButton{border:none;background:transparent;border-radius:4px;padding:2px;}"
+                f"QToolButton:hover{{background:{palette('error')};}}"
+            )
+            trash.clicked.connect(self._on_trash_clicked)
+            row.addWidget(trash)
+        self._suppress_apply = False
+        self._apply_colors(hover=False)
+        self._refresh_label_text()
+
+    def _refresh_label_text(self):
+        """Version prefix kept whole, the path elided to whatever's left
+        of the label's OWN actual width — computed here instead of a
+        fixed "last 2 components" guess, so a row that has a lot of
+        genuinely spare width (the menu is sized to the whole exe field,
+        see _show_exe_version_menu) shows more of the path instead of
+        leaving that width empty next to a short, arbitrarily-truncated
+        snippet. Elided from the LEFT: the end of an absolute path (the
+        exe's own folder and filename) is the meaningful part, same
+        reasoning the old fixed-component version already used."""
+        prefix = f"{self._version}  —  " if self._version else ""
+        fm = self._lbl.fontMetrics()
+        avail = max(0, self._lbl.width() - fm.horizontalAdvance(prefix))
+        elided = fm.elidedText(self._path, Qt.TextElideMode.ElideLeft, avail)
+        self._lbl.setText(prefix + elided)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_label_text()
+
+    def _apply_colors(self, hover: bool):
+        # bg_card, not 'transparent', at rest: confirmed directly that
+        # WA_StyledBackground turns "transparent" into an opaque near-black
+        # fallback instead of true pass-through to the menu behind it —
+        # the widget starts participating in the style's own paint system
+        # the moment that attribute is set, and "nothing to paint" isn't
+        # one of the options it falls back to. bg_card matches the SAME
+        # colour _new_small_menu already gives the surrounding QMenu, so
+        # painting it explicitly here looks identical to true transparency
+        # would have, without depending on semantics that don't hold.
+        bg = palette('accent') if hover else palette('bg_card')
+        fg = palette('accent_text') if hover else palette('text')
+        weight = "font-weight:600;" if self._is_primary else "font-weight:400;"
+        self.setStyleSheet(f"#exe_version_menu_row{{background:{bg};border-radius:6px;}}")
+        self._lbl.setStyleSheet(
+            f"color:{fg};background:transparent;font-size:{scaled(11, self)}px;{weight}")
+        if self._check is not None:
+            self._check.setStyleSheet(f"color:{fg};background:transparent;font-weight:700;")
+
+    def enterEvent(self, event):
+        self._apply_colors(hover=True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._apply_colors(hover=False)
+        super().leaveEvent(event)
+
+    def _on_trash_clicked(self):
+        self._suppress_apply = True
+        self.delete_requested.emit()
+
+    def mouseReleaseEvent(self, event):
+        if not self._suppress_apply and self.rect().contains(event.pos()):
+            self.apply_requested.emit()
+        super().mouseReleaseEvent(event)
+
+
 class AddGameDialog(SearchFlowMixin, QDialog):
     game_added = Signal(object)   # GameEntry
     search_finished = Signal(object, object)  # list[GameInfo] | GameInfo | None, error
@@ -293,6 +422,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._image_url_cache: dict[str, str] = {}  # API image URL → local cached path
         self._image_path_to_url: dict[str, str] = {}  # reverse: local cached path → URL
         self._editing_entry: Optional[GameEntry] = entry
+        # Staged extra exe paths ({path: label}), like _save_paths/_removed_paths
+        # above — edited locally in this session, only written onto the entry
+        # (new or existing) on Save, so Cancel discards any additions/removals.
+        self._exe_versions: dict[str, str] = dict(
+            (entry.exe_path_versions or {}) if entry else {})
         self._created_icon_dirs: set[Path] = set()  # Track icon dirs created during this session
         self._session_initial_image_path: Optional[str] = None  # Image at dialog open (set on first search)
         self._session_image_captured: bool = False               # Guards the one-time capture above
@@ -472,6 +606,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 pass
             self._deferred_busy = None
 
+    def _cancel_build(self):
+        """Stop the in-flight section build — what Cancel on the
+        please-wait sheet actually means, not just dismissing the sheet
+        while the QTimer chain keeps quietly stepping the generator."""
+        self._build_gen += 1
+        self._build_iter = None
+        self._stop_deferred_busy()
+
     def _start_async_build(self):
         self._build_gen += 1
         gen = self._build_gen
@@ -481,6 +623,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             from ui.widgets.busy_overlay import DeferredBusy
             self._deferred_busy = DeferredBusy(
                 self, t("common.please_wait"), delay_ms=0)
+            self._deferred_busy.set_on_cancel(self._cancel_build)
         self._build_iter = self._build_sections()
         QTimer.singleShot(0, lambda g=gen: self._async_build_step(g))
 
@@ -594,6 +737,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         else:
             self._exe_edit.setText(_exe_load)
         self._exe_edit.blockSignals(False)
+        # blockSignals above deliberately skips _on_exe_changed (no re-detect
+        # of image/engine on a plain load) — but that also skips the version
+        # readout, the Browse/"+" label, and the ▾/⭐/🗑 version controls it
+        # updates, none of which have any such reason to stay stale here —
+        # an existing multi-version entry loaded straight into an empty,
+        # freshly-built row otherwise leaves those controls exactly as they
+        # were before there was anything to show (see _sync_exe_add_btn_label).
+        self._update_exe_version_label()
+        self._sync_exe_add_btn_label(self._exe_edit.text().strip())
         if entry.appid:
             self._appid_edit.setText(entry.appid)
         backup_interval_min = round(entry.backup_interval_sec / 60)
@@ -878,12 +1030,38 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._engine_edit.textChanged.connect(self._fit_engine_width)
         self._engine_edit.textEdited.connect(self._on_engine_edited)
         self._fit_engine_width()
+        # Read-only, derived from whatever's currently in the exe field —
+        # just the version token itself (not the title), so switching which
+        # exe is primary (Browse/Overwrite) says which version that is
+        # without having to read the raw path. Same chip look as Engine
+        # (read-only is the only difference) — updated in _on_exe_changed.
+        self._exe_version_lbl = QLineEdit()
+        self._exe_version_lbl.setReadOnly(True)
+        self._exe_version_lbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._exe_version_lbl.setCursor(Qt.CursorShape.ArrowCursor)
+        self._exe_version_lbl.setFixedHeight(scaled(22, self, min_px=20))
+        self._exe_version_lbl.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        _ver_font = self._exe_version_lbl.font()
+        _ver_font.setPixelSize(11)
+        _ver_font.setWeight(QFont.Weight.DemiBold)
+        self._exe_version_lbl.setFont(_ver_font)
+        self._exe_version_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._exe_version_lbl.setStyleSheet(
+            f"QLineEdit{{background:{palette('bg_elevated')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:4px;"
+            f"padding:1px 8px;font-size:{scaled(11, self)}px;font-weight:600;}}"
+        )
+        self._exe_version_lbl.setToolTip(t('add_game.exe_version_tooltip'))
+        self._exe_version_lbl.setVisible(False)
         exe_lbl_row = QHBoxLayout()
         exe_lbl_row.setContentsMargins(0, 0, 0, 0)
         exe_lbl_row.setSpacing(8)
         # Engine immediately to the RIGHT of the label — no stretch between.
         exe_lbl_row.addWidget(self._exe_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         exe_lbl_row.addWidget(self._engine_edit, 0, Qt.AlignmentFlag.AlignVCenter)
+        exe_lbl_row.addWidget(self._exe_version_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         exe_lbl_row.addStretch(1)
         exe_col.addLayout(exe_lbl_row)
         exe_row = QHBoxLayout()
@@ -895,16 +1073,68 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._exe_edit.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._exe_edit.textChanged.connect(self._on_exe_changed)
+        self._exe_edit.installEventFilter(self)   # keeps the ▾ centred on resize
         exe_row.addWidget(self._exe_edit, 1)
-        browse_exe = QPushButton(t("add_game.browse"))
-        browse_exe.setFixedSize(scaled(80, self, min_px=72), _field_h)
-        lock_min_size(browse_exe, scaled(80, self, min_px=72), _field_h,
+        # ▾ version picker: floats over the field's own bottom-center edge,
+        # shown only once there's more than one exe path to choose among.
+        # A contextual menu, nothing more to open afterward: clicking a
+        # listed version there applies it as the primary immediately (see
+        # _apply_exe_version_from_menu) — the field itself only ever
+        # changes through an explicit action (this menu, or Browse/+),
+        # never by merely picking something to look at.
+        self._exe_version_btn = QPushButton("\u25be", self._exe_edit)
+        self._exe_version_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _ver_btn_side = scaled(18, self, min_px=16)
+        self._exe_version_btn.setFixedSize(_ver_btn_side, _ver_btn_side)
+        # A real round chip, not a bare glyph floating transparently on the
+        # field \u2014 visible background/border at rest so it reads as an
+        # obvious button sitting there, not something you'd only find by
+        # accident. Deliberately NOT bg_elevated/border_hover (the version
+        # badge's own pair) \u2014 both sit in the same near-black range as the
+        # exe field behind it (#1a1a22 / #2a2a38), so paired together they
+        # read as "quite black" with barely any definition. text_hint is
+        # the first genuinely lighter tone in the palette, so it becomes
+        # the FILL here instead \u2014 the reverse of its usual just-a-hint
+        # role \u2014 with the arrow itself dark for contrast against that
+        # now-lighter chip.
+        self._exe_version_btn.setStyleSheet(
+            f"QPushButton{{border:1px solid {palette('border_hover')};"
+            f"border-radius:{_ver_btn_side // 2}px;background:{palette('text_hint')};"
+            f"color:{palette('bg_card')};font-size:{scaled(9, self)}px;padding:0;}}"
+            f"QPushButton:hover{{color:{palette('accent_text')};background:{palette('accent')};"
+            f"border-color:{palette('accent')};}}"
+        )
+        self._exe_version_btn.setToolTip(t('add_game.exe_version_picker_tooltip'))
+        self._exe_version_btn.clicked.connect(self._show_exe_version_menu)
+        self._exe_version_btn.setVisible(False)
+        # One button, not two: empty field → plain Browse; a path already
+        # set → the add-version/overwrite menu (see _exe_plus_clicked). The
+        # "+" only means something once there's something to branch on, so
+        # a separate ever-present Browse button next to it was redundant.
+        # Starts labeled as plain "Browse" — the field is always empty at
+        # this exact point in construction, whether this becomes a brand
+        # new game or an edit of an existing one (population runs later,
+        # see _queue_initial_populate) — and _on_exe_changed keeps the
+        # label/tooltip in step with the field from then on, so a fresh Add
+        # Game never shows "+"/"track another version" before there is
+        # anything to branch on.
+        add_exe_btn = QPushButton(t("add_game.browse"))
+        _add_exe_w = scaled(96, self, min_px=84)
+        add_exe_btn.setFixedSize(_add_exe_w, _field_h)
+        lock_min_size(add_exe_btn, _add_exe_w, _field_h,
                       policy_h=QSizePolicy.Policy.Fixed,
                       policy_v=QSizePolicy.Policy.Fixed)
-        browse_exe.clicked.connect(lambda: self._browse_exe())
-        exe_row.addWidget(browse_exe)
+        add_exe_btn.setToolTip(t('add_game.exe_browse_tooltip'))
+        add_exe_btn.clicked.connect(self._exe_plus_clicked)
+        self._exe_add_btn = add_exe_btn
+        exe_row.addWidget(add_exe_btn)
+        # No standalone trash button any more — deleting a version is a
+        # per-row action INSIDE the ▾ menu now (see _show_exe_version_menu),
+        # not a second control elsewhere the eye has to find separately.
         exe_col.addLayout(exe_row)
         right_col.addLayout(exe_col)
+        self._refresh_exe_version_controls()
+        self._update_exe_version_label()
 
         # Game ID (appid from launcher URL)
         appid_lbl = QLabel(t("add_game.game_id"))
@@ -2204,6 +2434,177 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             logger.error(f"Error resolving launcher URL: {e}")
             return None, None
 
+    def _new_small_menu(self):
+        """Styled QMenu shared by the exe "+" menu and the version picker —
+        same look as the equivalent menus in game_items.py/overlay.py."""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:10px;padding:6px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:6px;font-size:{scaled(11, self)}px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
+        return menu
+
+    def _staged_all_exe_paths(self) -> list:
+        """(path, label) pairs for THIS session: whatever's in the exe field
+        right now (the primary) first, then every staged extra version.
+        Mirrors GameEntry.all_exe_paths() but reads the live field instead
+        of a saved entry, since a new/being-edited game may not exist yet."""
+        from core.library import derive_exe_version_label
+        out = []
+        seen = set()
+        primary = self._exe_edit.text().strip()
+        if primary:
+            out.append((primary, derive_exe_version_label(primary)))
+            seen.add(primary.casefold())
+        for p, lbl in self._exe_versions.items():
+            key = p.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((p, lbl or derive_exe_version_label(p)))
+        return out
+
+    def _position_exe_version_btn(self):
+        btn = getattr(self, '_exe_version_btn', None)
+        if btn is None:
+            return
+        w, h = self._exe_edit.width(), self._exe_edit.height()
+        bw, bh = btn.width(), btn.height()
+        # As low as this parenting allows without clipping: btn is a CHILD
+        # of _exe_edit, and Qt clips a child to its parent's own rect — a
+        # y past (h - bh) would cut the button's own bottom off rather
+        # than making it hang visibly lower. Flush against the exact
+        # bottom edge is the floor; genuinely floating below the field
+        # would need reparenting it onto whatever contains the exe row
+        # instead, which risks losing scroll-sync with the rest of this
+        # panel's (scrollable) body — a bigger, riskier change than this
+        # one-line move, so left alone for now rather than guessed at.
+        btn.move(max(0, (w - bw) // 2), max(0, h - bh))
+
+    def _refresh_exe_version_controls(self):
+        paths = self._staged_all_exe_paths()
+        multi = len(paths) > 1
+        self._exe_version_btn.setVisible(multi)
+        if multi:
+            self._position_exe_version_btn()
+
+    def _exe_plus_clicked(self):
+        """'+' next to the exe Browse button — plain Browse when there's
+        nothing to branch on yet; once a path is already set, a choice
+        between tracking a second version and replacing the current one."""
+        if not self._exe_edit.text().strip():
+            self._browse_exe()
+            return
+        menu = self._new_small_menu()
+        menu.addAction(t('add_game.exe_add_version'), self._browse_new_exe_version)
+        menu.addAction(t('add_game.exe_overwrite'), lambda: self._browse_exe())
+        menu.exec(self._exe_add_btn.mapToGlobal(self._exe_add_btn.rect().bottomLeft()))
+
+    def _browse_new_exe_version(self):
+        """Pick an exe to track as an EXTRA version. Unlike _browse_exe this
+        never touches the primary field, name, or cover art — it only stages
+        an entry in self._exe_versions for Save to persist."""
+        from core.resolvers import executable_name_filter
+        dlg = _ExePickerDialog(
+            self, t('add_game.select_executable'), executable_name_filter())
+        if dlg.exec() != QFileDialog.DialogCode.Accepted:
+            return
+        _sel = dlg.selectedFiles()
+        path = _sel[0] if _sel else ""
+        if not path:
+            return
+        primary = self._exe_edit.text().strip()
+        if primary and path.casefold() == primary.casefold():
+            return
+        from core.library import derive_exe_version_label
+        self._exe_versions[path] = derive_exe_version_label(path)
+        self._refresh_exe_version_controls()
+
+    @staticmethod
+    def _exe_version_display_label(path: str, stored_label: str) -> str:
+        """The actual VERSION token for *path* ("v2.70b"), not the stored
+        label — confirmed the stored one is frequently just the exe's own
+        immediate parent folder name (derive_exe_version_label only ever
+        checked ONE level up), which for a release nested one folder
+        deeper than its own versioned name ("Some Game Title v2.70b/Some/
+        Game.exe") is just "Some" — the inner folder — carrying no
+        version at all, while the actual version sits on the OUTER folder.
+        find_version_near does the same nested-release walk
+        derive_display_name itself uses (see its own docstring) and
+        returns the version alone, exactly what a menu row needs here —
+        the game's own name is already redundant with the dialog it's
+        sitting in. Falls back to the stored label only when nothing
+        genuinely reads as a version anywhere near the exe at all."""
+        from core.save_detector import find_version_near
+        return find_version_near(path) or stored_label
+
+    def _show_exe_version_menu(self):
+        """▾ picker: every tracked version, one per row, primary checked —
+        AND, on the same row, the trash icon that used to sit in its own
+        button elsewhere in the dialog. One dropdown, one place to look,
+        instead of a version list here and a delete control somewhere
+        else entirely. Sized to the exe field's own width and dropped
+        from its bottom-left, so it visually continues the field it
+        belongs to rather than a narrow menu hanging off a 16px arrow.
+
+        Each row is a small custom widget (QWidgetAction), not a plain
+        QAction: a plain action can only ever have ONE click meaning for
+        the whole row, and this needs two — clicking the row's text
+        applies that version, clicking its own trash icon deletes it —
+        without either one accidentally triggering the other.
+        """
+        paths = self._staged_all_exe_paths()
+        if len(paths) <= 1:
+            return
+        from PySide6.QtWidgets import QWidgetAction
+        menu = self._new_small_menu()
+        menu.setFixedWidth(self._exe_edit.width())
+        primary = self._exe_edit.text().strip()
+        for path, label in paths:
+            is_primary = bool(primary) and path.casefold() == primary.casefold()
+            version = self._exe_version_display_label(path, label)
+            row = _ExeVersionMenuRow(version, path, is_primary=is_primary, parent=menu)
+            row.setToolTip(path)
+            if not is_primary:
+                row.apply_requested.connect(
+                    lambda p=path, m=menu: (self._apply_exe_version_from_menu(p), m.close()))
+                row.delete_requested.connect(
+                    lambda p=path, m=menu: (self._apply_exe_removal(p), m.close()))
+            action = QWidgetAction(menu)
+            action.setDefaultWidget(row)
+            menu.addAction(action)
+        menu.exec(self._exe_edit.mapToGlobal(self._exe_edit.rect().bottomLeft()))
+
+    def _apply_exe_version_from_menu(self, path: str):
+        """Promote *path* (a staged secondary version) to primary. The
+        current primary is staged as a version in its place — nothing
+        tracked is lost, just relabelled which one is "the" exe. Only
+        touches this dialog's own staged fields; textChanged on the exe
+        field (_on_exe_changed) reacts exactly as it would to the field
+        being retyped by hand, and Save's own exe-path-change handling
+        (rebasing save_paths, etc.) takes it from there."""
+        old_primary = self._exe_edit.text().strip()
+        from core.library import derive_exe_version_label
+        self._exe_versions.pop(path, None)
+        if old_primary and old_primary.casefold() != path.casefold():
+            self._exe_versions[old_primary] = derive_exe_version_label(old_primary)
+        self._exe_edit.setText(path)
+        self._refresh_exe_version_controls()
+
+    def _apply_exe_removal(self, path: str):
+        """Drop a tracked version — never reachable for the current
+        primary (its row has no trash icon at all; remove_exe_version
+        can't touch it anyway, see its own docstring — replacing it is
+        what Overwrite, not deletion, is for)."""
+        self._exe_versions = {
+            p: lbl for p, lbl in self._exe_versions.items()
+            if p.casefold() != path.casefold()
+        }
+        self._refresh_exe_version_controls()
+
     def _browse_exe(self, start_dir: str = ""):
         # Qt widget dialog, ONE window: a folder shortcut navigates in place
         # (see _ExePickerDialog) — reopening a fresh native dialog per hop
@@ -2596,9 +2997,56 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         
         threading.Thread(target=resolve, daemon=True).start()
     
+    def _update_exe_version_label(self):
+        """Read-only version readout beside Engine — just the version token
+        itself (e.g. "v1.2.3"), not the title the version picker's own
+        labels carry alongside it (core.save_detector.find_version_near vs.
+        core.library.derive_exe_version_label). Hidden when nothing near
+        the exe names a version at all.
+
+        Checks more than just the immediate parent folder — the same
+        nested-release shape derive_display_name accounts for
+        ("Some Game Title v2.70b/Some/Game.exe" carries its version on the
+        OUTER folder, not the one right next to the exe) applies here too;
+        see find_version_near's own docstring.
+        """
+        if not hasattr(self, '_exe_version_lbl'):
+            return
+        exe_path = self._exe_edit.text().strip()
+        version = ""
+        if exe_path:
+            from core.save_detector import find_version_near
+            version = find_version_near(exe_path)
+        self._exe_version_lbl.setText(version)
+        self._exe_version_lbl.setVisible(bool(version))
+        self._fit_exe_version_width()
+
+    def _sync_exe_add_btn_label(self, exe_path: str):
+        """Plain Browse vs "+"/track-another-version, and the ▾/⭐/🗑 version
+        controls' own visibility — kept together since both answer the
+        same question (is there anything staged to branch on right now?)
+        and both need re-syncing anywhere the exe field's text changes
+        without going through _on_exe_changed itself (see
+        _populate_entry_fields, which blocks that signal on purpose for a
+        plain load — image/engine re-detection would be wrong there, but
+        these two are not optional side effects, they're just display)."""
+        # Same condition _exe_plus_clicked itself branches on: nothing set
+        # yet means the button is still plain Browse, not "+"/"track
+        # another version" — matched here so the label never promises a
+        # menu the click wouldn't actually show.
+        if exe_path:
+            self._exe_add_btn.setText(t("add_game.exe_browse_plus"))
+            self._exe_add_btn.setToolTip(t("add_game.exe_add_tooltip"))
+        else:
+            self._exe_add_btn.setText(t("add_game.browse"))
+            self._exe_add_btn.setToolTip(t("add_game.exe_browse_tooltip"))
+        self._refresh_exe_version_controls()
+
     def _on_exe_changed(self):
         """Handle exe path text changes for auto image detection."""
+        self._update_exe_version_label()
         exe_path = self._exe_edit.text().strip()
+        self._sync_exe_add_btn_label(exe_path)
         if exe_path and Path(exe_path).exists():
             self._detect_btn.setEnabled(True)
             self._auto_detect_image(exe_path)
@@ -2622,6 +3070,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._exe_lbl.setText(t("add_game.exe_path"))
         self._engine_edit.setPlaceholderText(t("common.unknown"))
         self._engine_edit.setToolTip(t("add_game.engine_tooltip"))
+        if hasattr(self, "_exe_version_lbl"):
+            self._exe_version_lbl.setToolTip(t("add_game.exe_version_tooltip"))
         # Empty field → width tracks Unknown/Sconosciuto; filled → engine name.
         self._fit_engine_width()
 
@@ -2660,6 +3110,32 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # visible if the field was briefly too narrow.
         if not self._engine_edit.hasFocus():
             self._engine_edit.setCursorPosition(0)
+
+    def _fit_exe_version_width(self):
+        """Same idea as _fit_engine_width, for the read-only version readout
+        beside it — width follows the version string's own length rather
+        than sitting at one fixed width regardless of "v1" vs "v12.3.45b"."""
+        self._apply_exe_version_width()
+        if not self.isVisible():
+            return
+        if not getattr(self, "_exe_version_fit_deferred", False):
+            self._exe_version_fit_deferred = True
+            QTimer.singleShot(0, self._fit_exe_version_width_deferred)
+
+    def _fit_exe_version_width_deferred(self):
+        self._exe_version_fit_deferred = False
+        self._apply_exe_version_width()
+
+    def _apply_exe_version_width(self):
+        if not hasattr(self, "_exe_version_lbl"):
+            return
+        fm = self._exe_version_lbl.fontMetrics()
+        text = self._exe_version_lbl.text() or "v0"
+        text_w = max(fm.horizontalAdvance(text), fm.boundingRect(text).width())
+        # Same chrome allowance as _apply_engine_width; a lower floor since a
+        # bare version token ("v2") is shorter than any engine name.
+        chrome = 8 + 8 + 1 + 1 + 10
+        self._exe_version_lbl.setFixedWidth(min(max(text_w + chrome, 36), 160))
 
     def _set_engine(self, engine: str, from_user: bool = False):
         """Show *engine* in the compact field, by label when it is a known one."""
@@ -2735,6 +3211,25 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             missing.append(t('add_game.image'))
         return missing
 
+    def _find_duplicate_detected_image(self, path: Path) -> str | None:
+        """Hash *path* against every file already in the carousel; return
+        the existing path with identical content, or None."""
+        try:
+            new_hash = _file_md5(path)
+        except OSError:
+            return None
+        if new_hash is None:
+            return None
+        for existing in getattr(self, '_detected_images', None) or []:
+            if existing == str(path):
+                continue
+            try:
+                if _file_md5(Path(existing)) == new_hash:
+                    return existing
+            except OSError:
+                continue
+        return None
+
     def _download_and_set_image(self, url: str):
         """Download image from URL and set it.
 
@@ -2754,42 +3249,22 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             logger.debug(f"Skipping non-http image URL: {url!r}")
             return
 
+        # Cleared up front: only the Qt-decode-success branch below sets this
+        # again. Without the reset, a download whose format Qt can't decode
+        # (falls through to the PIL/AVIF/raw-bytes branches, none of which
+        # touch _pending_pixmap) left a PREVIOUS successful download's pixmap
+        # sitting here, and _set_web_image happily painted that stale image
+        # over the new one instead of reading the new file from disk.
+        self._pending_pixmap = None
+
         try:
             import uuid
 
-            _UA = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-            # Prefer JPEG/PNG over AVIF when the CDN honours Accept. Some
-            # attachment hosts still force AVIF — pillow_avif handles that
-            # below. Forum attachment CDNs usually require the parent-site
-            # origin as Referer (attachments.example.com → example.com).
-            _parts = urllib.parse.urlsplit(url)
-            _referer = f"{_parts.scheme}://{_parts.netloc}/"
-            _host = (_parts.netloc or "").lower()
-            if _host.startswith("attachments."):
-                _origin = _host.split(".", 1)[-1]
-                _referer = f"https://{_origin}/"
-            # Forum thumbs are tiny; prefer the full attachment when linked.
-            if "/thumb/" in (_parts.path or ""):
-                _full = urllib.parse.urlunsplit(
-                    (_parts.scheme, _parts.netloc,
-                     (_parts.path or "").replace("/thumb/", "/", 1),
-                     _parts.query, _parts.fragment)
-                )
-                url = _full
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": _UA,
-                    "Accept": "image/jpeg,image/png,image/webp,image/*,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": _referer,
-                }
-            )
-            from core.net import open_url as _open_url
+            # Headers + /thumb/-to-full rewrite shared with the candidate-
+            # preview thumbnail fetch (search_enrichment.py) — see
+            # core.net.image_fetch_request for why they're needed.
+            from core.net import open_url as _open_url, image_fetch_request
+            req, url = image_fetch_request(url)
             with _open_url(req, timeout=20) as response:
                 # Verify Content-Type is an image before reading
                 ct = response.headers.get("Content-Type", "")
@@ -2941,6 +3416,27 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     cache_path.write_bytes(image_data)
                     logger.warning(f"No decoder available for format (magic: {magic}) — saved raw")
 
+            # A repeat download of the SAME picture can land under a
+            # different filename than any earlier copy already in the
+            # carousel: the collision check above (around cache_path.exists())
+            # only catches a same-NAME clash, and even then it hashes the
+            # RAW fetch against an on-disk file that already went through
+            # re-encoding above — apples to oranges, so it almost never
+            # matches. That let a repeat fetch of the same URL (e.g.
+            # re-confirming the same candidate across separate sessions)
+            # quietly add a visually-identical, differently-named file every
+            # time — the "duplicated images in the carousel" symptom. Catch
+            # it here by content, against every file already detected,
+            # after all the encode branches above have settled on final
+            # on-disk bytes.
+            _dup = self._find_duplicate_detected_image(cache_path)
+            if _dup and _dup != str(cache_path):
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                cache_path = Path(_dup)
+
             # Apply the downloaded image to the carousel immediately
             self._set_web_image(str(cache_path))
             # Track URL ↔ local path mapping for subsequent unchanged checks
@@ -3020,7 +3516,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             _canon = {tag_merge_key(p): p for p in self._known_tags_pool()}
         except Exception:
             _canon = {}
-        for genre in self._split_tag_text(genres[:5]):  # Limit to 5 raw entries
+        # Every genre the source returned — each source module already caps
+        # its own list sensibly (VNDB 16, webscrape 8-16, Steam uncapped).
+        # A further [:5] slice here used to silently cut off the rest, not
+        # just on first import but on EVERY later re-search too (the slice
+        # runs before the dedup check, so tags past position 5 could never
+        # be added no matter how many times this ran) — the tags beyond the
+        # cut kept reappearing as "new" in the search preview forever, since
+        # they genuinely never got saved.
+        for genre in self._split_tag_text(genres):
             genre = _canon.get(tag_merge_key(genre), genre)
             if tag_merge_key(genre) not in _existing:
                 _existing.add(tag_merge_key(genre))
@@ -3399,6 +3903,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if not icon_dir.exists():
                 continue
             if self._editing_entry:
+                # No baseline captured (_capture_session_initial_image was
+                # never reached — e.g. a future entry point skips it again)
+                # → we genuinely don't know what to keep. Do nothing rather
+                # than guess: comparing every file against a bare None used
+                # to match nothing and delete the WHOLE folder, original
+                # icon included, instead of just this session's downloads.
+                if not self._session_image_captured:
+                    continue
                 initial_path = self._session_initial_image_path
                 for f in icon_dir.iterdir():
                     if f.is_file() and str(f) != initial_path:
@@ -3867,6 +4379,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         ghost), so the arrows can always walk back out of the list. Esc
         closes the popup WITHOUT closing the dialog. Focus loss hides
         it."""
+        if obj is getattr(self, '_exe_edit', None) and event.type() == QEvent.Type.Resize:
+            self._position_exe_version_btn()
+            return False
         if obj is getattr(self, '_tag_input', None):
             if event.type() == QEvent.Type.KeyPress:
                 key = event.key()
@@ -4279,9 +4794,36 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             _prev_save_paths = set(entry.save_paths or [])
             entry.name       = name
             entry.exe_path   = exe
+            if exe and exe != old_exe:
+                entry.record_exe_hints(exe)
+            entry.exe_path_versions = {
+                p: lbl for p, lbl in self._exe_versions.items()
+                if not exe or p.casefold() != exe.casefold()
+            }
 
             # Auto-rebase install-relative paths if executable path changed or relative paths used
             raw_all_paths, raw_excluded_paths = self._get_all_and_excluded_paths()
+            # If the exe moved AND the new location already has its own save
+            # content (a second, independent save history — not an empty
+            # reinstall target), rebasing onto it would silently start
+            # treating the two as the same. Ask once, for all paths together;
+            # declining (or closing the box) leaves every path exactly where
+            # it was, same "keep both" default the in-game overlay uses.
+            _skip_rebase = False
+            if old_exe and exe and old_exe != exe:
+                from core.library import rebase_targets_have_existing_saves
+                if rebase_targets_have_existing_saves(old_exe, exe, raw_all_paths):
+                    reply = question_window_modal(
+                        self, t('add_game.exe_overwrite_conflict_title'),
+                        t('add_game.exe_overwrite_conflict_msg'),
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        default_button=QMessageBox.StandardButton.No,
+                        button_texts={
+                            QMessageBox.StandardButton.Yes: t('add_game.exe_overwrite'),
+                            QMessageBox.StandardButton.No: t('sync.keep_both'),
+                        },
+                    )
+                    _skip_rebase = reply != QMessageBox.StandardButton.Yes
             all_paths = []
             excluded_paths = []
             for p in raw_all_paths:
@@ -4291,31 +4833,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     # User entered a relative path (e.g. saves/ or save/)
                     rebased_p = str(Path(exe).parent / p)
                     entry.record_path_chain(rebased_p, Path(p).as_posix())
-                elif old_exe and exe and old_exe != exe:
+                elif old_exe and exe and old_exe != exe and not _skip_rebase:
                     # Executable path updated to new location/version
-                    try:
-                        old_exe_p = Path(old_exe).resolve()
-                        new_exe_p = Path(exe).resolve()
-                        p_path = Path(p).resolve()
-                        old_parents = [old_exe_p.parent] + list(old_exe_p.parents)
-                        new_parents = [new_exe_p.parent] + list(new_exe_p.parents)
-                        for i, old_parent in enumerate(old_parents):
-                            if i >= len(new_parents):
-                                break
-                            new_parent = new_parents[i]
-                            if len(old_parent.parts) <= 1 or len(new_parent.parts) <= 1:
-                                break
-                            try:
-                                if p_path == old_parent or old_parent in p_path.parents:
-                                    rel = p_path.relative_to(old_parent)
-                                    cand = str(new_parent / rel)
-                                    rebased_p = cand
-                                    entry.record_path_chain(rebased_p, rel.as_posix())
-                                    break
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
+                    from core.library import rebase_path_for_new_exe
+                    hit = rebase_path_for_new_exe(old_exe, exe, p)
+                    if hit is not None:
+                        rebased_p, chain = hit
+                        entry.record_path_chain(rebased_p, chain)
                 all_paths.append(rebased_p)
                 if is_excl:
                     excluded_paths.append(rebased_p)
@@ -4491,6 +5015,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # code and version, which is what a folder of saves kept under
             # the same release name will match on.
             entry.record_exe_hints(exe)
+            entry.exe_path_versions = {
+                p: lbl for p, lbl in self._exe_versions.items()
+                if not exe or p.casefold() != exe.casefold()
+            }
             # Isolate this game's folder from any other library entry sharing the
             # same title (add_game re-checks too, but the icon cache below keys off
             # computed_folder_name, so resolve it here first).

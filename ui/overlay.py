@@ -103,6 +103,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     action_requested  = Signal(str, str)   # action, context
     dismissed         = Signal()
     dont_show_again   = Signal(str)        # exe_path
+    # A show_path_changed prompt timed out with no click — see
+    # _on_expire_action / _auto_hide_due. Carries the same "id|exe_path"
+    # context an explicit action would; unlike action_requested, this is
+    # NEVER emitted for a button click, only a genuine unattended expiry.
+    path_changed_expired = Signal(str)
     # Emitted when exclusive fullscreen prevents the overlay from showing.
     # Carries (title, message) so the caller can provide audio/toast feedback.
     exclusive_blocked = Signal(str, str)
@@ -119,6 +124,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._hide_anim_connected = False
         self._hover_active        = False   # True while mouse is inside overlay
         self._auto_hide_ms        = 0       # the countdown in force, in full
+        # Set by show_path_changed right after it starts a REAL countdown;
+        # fired by _auto_hide_due on a genuine unattended expiry only, then
+        # cleared. show_animated() also clears it on every call, so a stale
+        # callback from a preempted prompt can never fire for whatever the
+        # overlay has moved on to showing.
+        self._on_expire_action    = None
 
         self._auto_hide_timer = QTimer(self)
         self._auto_hide_timer.setSingleShot(True)
@@ -477,6 +488,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         except Exception:
             pass
         self._hover_active = False
+        cb, self._on_expire_action = self._on_expire_action, None
+        if cb:
+            try:
+                cb()
+            except Exception:
+                logger.exception("path-changed expire action failed")
         self.hide_animated()
 
     def enterEvent(self, event):
@@ -1274,12 +1291,16 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._hide_dashboard()
         self._clear_buttons()
 
-    def _show_priority_prompt(self) -> None:
+    def _show_priority_prompt(self, auto_hide_ms: int = 0) -> None:
         """Show a decision-required prompt: holds priority (later
-        notifications defer to it) and never auto-hides."""
+        notifications defer to it). Never auto-hides by default; a caller
+        with a safe, correctable default for "nobody answered" (see
+        show_path_changed) can pass a real timeout instead — the caller is
+        responsible for setting self._on_expire_action beforehand if it
+        wants to react to that expiry."""
         self._position_top_right()
         self._priority_active = True
-        self.show_animated(auto_hide=0)
+        self.show_animated(auto_hide=auto_hide_ms)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -1607,6 +1628,95 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         )
         self._set_suppress_link(
             "dont_show_again", lambda: self._on_action("suppress_cloud_no_local"))
+        self._show_priority_prompt()
+
+    def show_path_changed(self, game_name: str, game_id: str, new_exe_path: str,
+                          alternates: list | None = None):
+        """A stem/name match found *game_name* running from a path that
+        differs from the one on record — its stored exe is presumably gone
+        (a reinstall, an update, a moved folder). Tracking already proceeded
+        on the stem match; this only asks how the new path should be filed.
+
+        Not a decision-required prompt like show_unverified_match: left to
+        expire (or answered "don't ask again") it applies the primary
+        action itself — track it, rebase the save-path pointer — so
+        nothing here withholds tracking while it waits. The pending entry
+        is NOT cleared by that expiry (see main_window's
+        _on_path_changed_expired): the question stays hotkey-resummonable
+        even after the safe default has already taken effect, so a later
+        correction is always possible.
+
+        *alternates* are other library entries the match was ambiguous
+        against — (game_id, game_name) pairs, offered in the dropdown as
+        "it's actually …" corrections alongside Overwrite/Different game,
+        for the not-unusual case of more than one entry sharing a common
+        name. Also decides what an unattended expiry is allowed to do:
+        actually copying the old save DATA into the new location waits
+        for the match to be unambiguous first (no alternates, or an
+        explicit choice) — seeing alternates, expiry moves only the
+        tracking pointer and leaves the physical data copy for later."""
+        context = f"{game_id}|{new_exe_path}"
+        if self._defer_if_priority(
+                lambda: self.show_path_changed(game_name, game_id, new_exe_path, alternates),
+                context=context, is_priority=True):
+            return
+        self._set_mode("cloud")          # same decision-prompt chrome
+        self._context_exe = context
+        self._priority_context = context
+        self._icon_label.setText("📁")
+        self._title.setText(t("app.name"))
+        self._message.setText(
+            f"<b>{t('overlay.path_changed_msg', game=game_name)}</b><br>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
+            f"{t('overlay.path_changed_hint')}</span>"
+        )
+        self._hide_dashboard()
+        self._clear_buttons()
+        menu_items = [
+            (t("overlay.path_overwrite"), "path_overwrite"),
+            (t("overlay.path_new_game"),  "path_new_game"),
+        ]
+        for alt_id, alt_name in (alternates or []):
+            menu_items.append(
+                (t("overlay.path_reassign", game=alt_name), f"path_reassign:{alt_id}"))
+        self._add_split_btn(
+            self._btn_area, t("overlay.path_add_same"), "path_add_version",
+            menu_items=menu_items,
+            primary=True,
+        )
+        self._set_suppress_link(
+            "dont_show_again", lambda: self._on_action("path_add_version"))
+        self._show_priority_prompt(auto_hide_ms=_AUTO_HIDE_MS)
+        self._on_expire_action = lambda: self.path_changed_expired.emit(context)
+
+    def show_overwrite_saves_conflict(self, game_name: str, game_id: str, new_exe_path: str):
+        """Overwrite was chosen, but the path it would rebase saves onto
+        already has its OWN content — a second, independent save history,
+        not an empty reinstall target. Ask before relocating tracking onto
+        it. Unanswered defaults to NOT rebasing (the old location stays
+        tracked as it was) — the safe outcome, never the one that could
+        silently start treating two different saves as the same."""
+        context = f"{game_id}|{new_exe_path}"
+        if self._defer_if_priority(
+                lambda: self.show_overwrite_saves_conflict(game_name, game_id, new_exe_path),
+                context=context, is_priority=True):
+            return
+        self._set_mode("cloud")
+        self._context_exe = context
+        self._priority_context = context
+        self._icon_label.setText("⚠")
+        self._title.setText(t("app.name"))
+        self._message.setText(
+            f"<b>{t('overlay.overwrite_conflict_msg', game=game_name)}</b><br>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
+            f"{t('overlay.overwrite_conflict_hint')}</span>"
+        )
+        self._hide_dashboard()
+        self._clear_buttons()
+        self._add_btn(self._btn_area, t("sync.keep_both"), "path_overwrite_keep_both",
+                      primary=True)
+        self._add_btn(self._btn_area, t("overlay.path_overwrite"), "path_overwrite_confirm")
+        self._hide_suppress_btn()
         self._show_priority_prompt()
 
     def show_unverified_match(self, game_name: str, proc_name: str, game_id: str):
@@ -2186,6 +2296,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
         # Cancel any pending hide first
         self._auto_hide_timer.stop()
+        self._on_expire_action = None
         self._anim.stop()
         if self._hide_anim_connected:
             try:

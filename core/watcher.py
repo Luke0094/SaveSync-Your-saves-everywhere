@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Callable, List, Dict, Set, Optional, Sequence
 
 from PySide6.QtCore import QObject, Signal, Slot
-from core.constants import SAVE_FOLDER_HINTS as _DEFAULT_HINTS, SKIP_FILENAME_STEMS, strip_version_tokens
+from core.constants import (SAVE_FOLDER_HINTS as _DEFAULT_HINTS,
+                            SKIP_FILENAME_STEMS, is_chromium_internal_dir,
+                            strip_version_tokens)
 
 logger = logging.getLogger(__name__)
 
@@ -1038,6 +1040,33 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
         # Ignore files with non-save extensions/filenames
         try:
             file_path = Path(event.src_path)
+            # SaveSync's OWN write-in-progress temp file (see
+            # save_editor.write_without_backup: "<name>.savesync-tmp") —
+            # never a save file, and reacting to it is actively dangerous:
+            # Path.suffix only ever returns the LAST dot-segment, so
+            # "SaveData01.sav.savesync-tmp" has suffix ".savesync-tmp", not
+            # ".tmp" — _IGNORE_EXTENSIONS already lists ".tmp"/".temp" for
+            # exactly this reason, it just never matched. Checked on the
+            # full name, ahead of that suffix lookup, because this is the
+            # one case worth a guaranteed match rather than one more entry
+            # a compound suffix can slip past. Missing this is what let the
+            # watcher open this file on its own thread the instant it was
+            # created, racing write_without_backup's own tmp.replace() a
+            # few milliseconds later on the GUI thread — a real "Access is
+            # denied" on the replace, self-inflicted, seen live in
+            # savesync.log.
+            if file_path.name.endswith(".savesync-tmp"):
+                return
+            # Chromium/CEF/Electron's OWN internal bookkeeping, inside a
+            # "User Data" browser-profile tree many games embed for an
+            # overlay, launcher or in-game UI — "Stability", "Crashpad",
+            # some of it transient, which otherwise reads exactly like a
+            # save the watcher noticed appear and disappear. NOT a check on
+            # the whole "User Data" tree: a game's own real save data can
+            # (and does) sit right inside it, under its profile folder —
+            # see is_chromium_internal_dir's own docstring.
+            if is_chromium_internal_dir(file_path):
+                return
             file_ext = file_path.suffix.lower()
             if file_ext in _IGNORE_EXTENSIONS or file_path.stem.lower() in SKIP_FILENAME_STEMS:
                 return

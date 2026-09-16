@@ -23,12 +23,28 @@ class WolfFormat(_Format):
     def __init__(self):
         self._save = None
         self.source_path = None
+        # Told how long the database scan has been going, and able to call
+        # it off — see open_save. None means let it run. Matters here for
+        # the same reason it does for GVAS's key search: registry.py marks
+        # this reader "expensive" ("roughly a second per megabyte"), and
+        # until _locate() had a way to be interrupted, that was also
+        # roughly how long Cancel did nothing on a large or mismatched file.
+        self.progress = None
+        self._started = None
+
+    def _tick(self) -> bool:
+        if self.progress is None:
+            return True
+        import time
+        if self._started is None:
+            self._started = time.monotonic()
+        return self.progress(time.monotonic() - self._started) is not False
 
     def load(self, data: bytes) -> None:
         from core.engines.wolf import WolfError
         from core.save_editor.crypt.wolf import loads
         try:
-            self._save = loads(data, save_path=self.source_path)
+            self._save = loads(data, save_path=self.source_path, on_tick=self._tick)
         except (WolfError, struct.error, IndexError, ValueError) as e:
             raise SaveEditorError(str(e)) from e
 

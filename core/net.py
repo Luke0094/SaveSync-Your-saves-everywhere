@@ -17,9 +17,55 @@ import logging
 import ssl
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def image_fetch_request(url: str) -> tuple[urllib.request.Request, str]:
+    """Build a Request for fetching a candidate/cover image with the
+    headers real-world hosts actually require, plus the URL it actually
+    points at (the /thumb/ rewrite below can change it — callers that
+    cache by URL need the same string the bytes actually came from).
+
+    A bare, header-less request 403s or silently serves a placeholder on
+    many forum attachment CDNs, which require the parent site as Referer
+    (attachments.example.com -> example.com); those hosts also often force
+    a tiny thumbnail at a /thumb/ path even when the full attachment sits
+    one path segment away. Used by both the confirmed-download path (which
+    had this logic) and the candidate-preview thumbnail fetch (which
+    didn't — a plain request there silently failed on exactly these hosts,
+    so the preview stayed blank even though confirming and downloading for
+    real, through the header-aware path, worked)."""
+    parts = urllib.parse.urlsplit(url)
+    referer = f"{parts.scheme}://{parts.netloc}/"
+    host = (parts.netloc or "").lower()
+    if host.startswith("attachments."):
+        origin = host.split(".", 1)[-1]
+        referer = f"https://{origin}/"
+    if "/thumb/" in (parts.path or ""):
+        url = urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc,
+             (parts.path or "").replace("/thumb/", "/", 1),
+             parts.query, parts.fragment)
+        )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _IMAGE_UA,
+            "Accept": "image/jpeg,image/png,image/webp,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": referer,
+        },
+    )
+    return req, url
 
 _lock = threading.Lock()
 # None = OS default trust store; an SSLContext = the certifi-backed store.

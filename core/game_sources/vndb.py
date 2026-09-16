@@ -134,14 +134,14 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
     raw_desc = entry.get("description") or ""
     clean_desc = re.sub(r'\[/?[a-z]+[^\]]*\]', '', raw_desc).strip()[:800]
 
-    # Tags — only include non-spoiler tags with rating >= 1.5
+    # Tags — every tag VNDB has for this entry, spoiler or not. No rating
+    # threshold either: that used to drop any tag voted as applying less
+    # strongly, which silently excluded real tags (not just an arbitrary
+    # count cap — VNDB entries routinely carry 30-50+ community tags).
     genres: list[str] = []
     for tag in entry.get("tags", []):
-        if (tag.get("spoiler", 0) == 0
-                and tag.get("rating", 0) >= 1.5
-                and tag.get("name")):
+        if tag.get("name"):
             genres.append(tag["name"])
-    genres = genres[:16]
 
     # Developer
     devs = entry.get("developers", [])
@@ -182,26 +182,35 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
     # behind it is not one — VNDB reports those as null, and 0 would read as
     # a damning review rather than as "nobody has said".
     #
+    # "rating" is the Bayesian-adjusted score, which VNDB nulls out below a
+    # minimum vote count (confirmed live against the API: votecount=1 ->
+    # rating=null, average=80) — a lightly-voted entry was silently reading
+    # as "nobody has said" even though it clearly has one. "average" (the
+    # plain mean, no minimum-sample gate) is the fallback.
+    #
     # Only the aggregate is imported. Kana has no written-review endpoint;
     # site reviews are votes that already sit inside votecount, so fetching
     # prose on top would double-count the same opinions.
     vndb_rating = entry.get("rating")
-    stars = (float(vndb_rating) / 20.0) if vndb_rating else 0.0
+    vndb_average = entry.get("average")
+    _score = vndb_rating if vndb_rating is not None else vndb_average
     try:
         votes = int(entry.get("votecount") or 0)
     except (TypeError, ValueError):
         votes = 0
+    stars = (float(_score) / 20.0) if _score is not None and votes > 0 else 0.0
     review_text = ""
-    if stars and vndb_rating is not None:
-        bayes = float(vndb_rating)
-        bits = [f"VNDB Bayesian {bayes:.0f}/100"]
-        raw = entry.get("average")
-        if raw is not None:
+    if stars:
+        bits = []
+        if vndb_rating is not None:
+            bits.append(f"VNDB Bayesian {float(vndb_rating):.0f}/100")
+        if vndb_average is not None:
             try:
-                avg = float(raw)
-                bits.append(f"raw average {avg:.1f}/100")
+                bits.append(f"raw average {float(vndb_average):.1f}/100")
             except (TypeError, ValueError):
                 pass
+        if not bits:
+            bits.append(f"VNDB {float(_score):.0f}/100")
         if votes > 0:
             bits.append(f"{votes:,} votes")
         review_text = " · ".join(bits)

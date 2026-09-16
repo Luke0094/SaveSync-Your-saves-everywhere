@@ -30,6 +30,22 @@ logger = logging.getLogger(__name__)
 
 
 class SearchFlowMixin:
+    def _capture_session_initial_image(self) -> None:
+        """Snapshot the image on the form before this dialog session's
+        FIRST download, once only — every entry point that can trigger a
+        download (web search, direct URL fetch) must call this before
+        doing so. _cleanup_session_icon_dirs (add_game_dialog.py) uses the
+        snapshot to keep that one file and discard everything else this
+        session put in the same folder when the dialog closes unsaved.
+        Missing this call from any one entry point left the flag/path
+        unset, and the cleanup's "keep the original" check then compared
+        every file against None — which never matches a real path — wiping
+        the ENTIRE icon folder, original included, instead of just the
+        session's own downloads."""
+        if not self._session_image_captured:
+            self._session_initial_image_path = self._image_path
+            self._session_image_captured = True
+
     def _web_search(self, enable_web_fallback: bool = False,
                     skip_primary_apis: bool = False,
                     enable_targeted_fallback: Optional[bool] = None,
@@ -87,11 +103,7 @@ class SearchFlowMixin:
         self._original_image_path = self._image_path
         self._original_image_url = self._image_path_to_url.get(self._image_path) if self._image_path else None
 
-        # Capture the image that existed before any search ran in this session (once only).
-        # Used by reject/closeEvent to know which downloaded files to clean up on cancel.
-        if not self._session_image_captured:
-            self._session_initial_image_path = self._image_path
-            self._session_image_captured = True
+        self._capture_session_initial_image()
 
         # Resolve fallback flags and track search phase
         if enable_targeted_fallback is None and enable_generic_fallback is None:
@@ -212,7 +224,10 @@ class SearchFlowMixin:
             except Exception as e:
                 error = e
                 _log.error(f"Web search error: {e}", exc_info=True)
-            self.search_finished.emit(result, error)
+            try:
+                self.search_finished.emit(result, error)
+            except RuntimeError:
+                pass   # dialog destroyed while this background search ran
 
         threading.Thread(target=do_search, daemon=True).start()
 
@@ -348,7 +363,7 @@ class SearchFlowMixin:
 
     # ── Web-search candidate preview (single title or several) ───────────────
 
-    def _show_search_candidates(self, results: list):
+    def _show_search_candidates(self, results: list, *, merge_pool: list | None = None):
         """Open the unified candidate-preview popup for a search outcome —
         one distinct title or several; both go through the SAME dialog now
         (CandidatePreviewDialog), so reviewing a result always shows the
@@ -361,6 +376,13 @@ class SearchFlowMixin:
         restores the form snapshot and reopens this carousel so the user can
         pick another candidate without being stuck.
 
+        *merge_pool*, when given, is what same-tier peer lookup searches
+        instead of *results* — used by the direct-URL fetch, which shows
+        only the one fetched page in the carousel but must still be able to
+        find a same-tier peer among candidates an earlier search already
+        found (otherwise that earlier batch is silently forgotten and the
+        fetched page can never offer a chip merge against it).
+
         Primary-page reachability (soft-promote) is probed on a worker
         thread — never on the GUI thread — and the carousel is refreshed
         when that answer arrives.
@@ -370,15 +392,51 @@ class SearchFlowMixin:
         # candidates that would actually change something (or soft-promote
         # a dead primary). Re-offering Steam after a Steam save + VNDB
         # enrich with nothing new is exactly what this filters out.
-        self._last_search_candidates = list(results)
+        self._last_search_candidates = (
+            list(merge_pool) if merge_pool is not None else list(results))
         self._pending_reachability_results = list(results)
         self._candidate_show_deferred = False
         self._active_candidate_dialog = None
         self._invalidate_primary_reachability()
         probing = self._start_primary_reachability_probe()
 
-        useful = [r for r in results
-                  if self._compute_candidate_diff(r).get('has_changes')]
+        _diffs = [(r, self._compute_candidate_diff(r)) for r in results]
+        for _r, _d in _diffs:
+            logger.info(
+                f"_show_search_candidates: {getattr(_r, 'source', '')!r}/"
+                f"{getattr(_r, 'name', '')!r} has_changes={_d.get('has_changes')} "
+                f"same_origin={_d.get('same_origin')} "
+                f"same_origin_no_diff={_d.get('same_origin_no_diff')} "
+                f"already_applied={_d.get('already_applied')} "
+                f"name_change={_d.get('name_change')} "
+                f"has_material={_d.get('has_material')} "
+                f"fields={list((_d.get('fields') or {}).keys())} "
+                f"new_tags={_d.get('new_tags')!r} new_urls={_d.get('new_urls')!r} "
+                f"new_reviews_n={len(_d.get('new_reviews') or [])} "
+                f"promote_primary={_d.get('promote_primary')} "
+                # Raw review fields straight off the source, before any
+                # "already saved" filtering — answers "did the API even
+                # return a review" independent of whether it counted as new.
+                f"raw_rating={getattr(_r, 'rating', None)!r} "
+                f"raw_review_text={(getattr(_r, 'review_text', '') or '')[:40]!r} "
+                f"raw_vote_count={getattr(_r, 'vote_count', None)!r} "
+                f"raw_reviews_n={len(getattr(_r, 'reviews', None) or [])} "
+                # Settles "year missing from preview" the same way: was a
+                # year even extracted from the source's raw release_date,
+                # and did it survive to result_year (diff computation) —
+                # independent of whether fields['year'] ended up populated
+                # (which additionally requires it to differ from the form).
+                f"raw_release_date={getattr(_r, 'release_date', '') or ''!r} "
+                f"result_year={_d.get('result_year')!r} "
+                f"current_year={self._year_edit.text().strip()!r} "
+                # Name is compared with a plain != (see name_change in
+                # _compute_candidate_diff) — printing both sides settles
+                # "the candidate has a different name but nothing happened"
+                # without guessing whether the two strings actually differ
+                # (whitespace/decoding could make them equal despite looking
+                # different, or genuinely differ despite looking the same).
+                f"current_name={self._name_edit.text().strip()!r}")
+        useful = [r for r, d in _diffs if d.get('has_changes')]
         # Sources that match another candidate on everything except
         # description are skipped on purpose — only one of them is proposed.
         useful = self._dedupe_except_description(useful)
@@ -392,9 +450,14 @@ class SearchFlowMixin:
                 self._status_lbl.setStyleSheet(
                     f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
                 return
-            self._status_lbl.setText(t('add_game.candidate_no_changes'))
-            self._status_lbl.setStyleSheet(
-                f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
+            # Nothing this tier found was worth showing (has_changes=False
+            # for all of them — e.g. VNDB re-confirms data already saved).
+            # That's a verdict on THIS tier's data being redundant, not on
+            # whether the game has more to find elsewhere — cascade exactly
+            # like an explicit reject would, instead of just stopping here
+            # and leaving a later tier (which might have something this one
+            # doesn't, e.g. a review count) never tried.
+            self._candidates_rejected()
             return
         self._open_candidate_carousel(useful)
 
@@ -415,12 +478,18 @@ class SearchFlowMixin:
             self._active_candidate_dialog = dlg
             try:
                 if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected is None:
-                    self._candidates_rejected()
+                    if dlg.explicitly_declined:
+                        self._candidates_rejected()
+                    else:
+                        # Closed via the window's own X, not the No button —
+                        # stop looking entirely rather than cascading to the
+                        # next search tier the way an explicit No does.
+                        self._candidate_selection_cancelled()
                     return
                 snap = self._capture_search_form()
                 if not self._process_search_result(dlg.selected, offer_enrichment=False):
                     return
-                if self._run_same_tier_merge(dlg.selected):
+                if self._run_same_tier_merge(dlg.selected, pre_confirm_name=snap.get('name', '')):
                     self._restore_search_form(snap)
                     useful = self._dedupe_except_description([
                         r for r in (self._last_search_candidates or [])
@@ -482,12 +551,26 @@ class SearchFlowMixin:
                 f"{sorted(codes)}"
             )
 
+    def _candidate_selection_cancelled(self):
+        """The candidate picker was closed via its own window X, not No:
+        stop looking entirely instead of cascading to the next search tier.
+        No's cascade is an explicit "try somewhere else"; closing the window
+        is "never mind" and used to be silently treated the same way."""
+        self._retain_hint_coded_dlsite_urls()
+        self._web_search_active = False
+        self._sync_bg_action_gates()
+        self._emit_bg_status("failed")
+        self._status_lbl.setText(t('add_game.candidate_selection_cancelled'))
+        self._status_lbl.setStyleSheet(
+            f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
+
     def _candidates_rejected(self):
-        """No candidate confirmed (Reject / closed the popup): proceed
-        straight to the next search tier, exactly like declining a single
-        result — no extra "do you want to try the next tier?" prompt, the
-        user already said no once by rejecting. Mirrors the decline branch
-        in _process_search_result."""
+        """No confirmed (the No button): proceed straight to the next
+        search tier, exactly like declining a single result — no extra "do
+        you want to try the next tier?" prompt, the user already said no
+        once by rejecting. Mirrors the decline branch in
+        _process_search_result. Closing the popup's own window instead of
+        clicking No goes to _candidate_selection_cancelled, not here."""
         # Product-code DLsite links outlive a full reject; keyword-only ones
         # do not (see _retain_hint_coded_dlsite_urls).
         self._retain_hint_coded_dlsite_urls()
@@ -596,7 +679,6 @@ class SearchFlowMixin:
         if missing:
             self._status_lbl.setText(
                 t('add_game.fields_still_missing', fields=", ".join(missing)))
-            from ui.helpers import scaled
             fs = scaled(12, self)
             self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
         return True
@@ -674,7 +756,15 @@ class SearchFlowMixin:
             _existing_src_base == _result_src_base
         )
 
-        new_tags = [g for g in (result.genres or []) if g not in current_tags]
+        # Canonical (case/separator-insensitive) comparison, matching
+        # _apply_web_tags's own dedup key — a raw exact-string check here
+        # kept flagging an already-saved tag as "new" whenever a fresh fetch
+        # returned it with different casing/separators (e.g. saved as
+        # "female protagonist", VNDB now returns "Female Protagonist").
+        from core.library import tag_merge_key
+        _current_tag_keys = {tag_merge_key(x) for x in current_tags}
+        new_tags = [g for g in (result.genres or [])
+                    if g and tag_merge_key(g) not in _current_tag_keys]
         new_urls = self._new_result_site_urls(result)
         new_image = bool(result.image_url and not has_image)
         new_reviews = self._new_result_reviews(result)
@@ -730,13 +820,26 @@ class SearchFlowMixin:
             if result_year and result_year != current_year:
                 fields['year'] = {'old': current_year or None, 'new': result_year}
         else:
-            # User-managed game: only show fields that are currently empty (fill)
+            # User-managed game: description only shows as a fill (never a
+            # rewrite of typed text) — but name/year/developer show whenever
+            # they DIFFER, filled or not, purely for display; nothing about
+            # how they're actually applied changes: name is still the only
+            # one of the three unconditionally written on confirm (see
+            # _apply_result_init/_apply_result_overwrite), year/developer
+            # still only fill when empty. The diff is what was invisible
+            # before ("nowhere in the preview was shown the year [[or
+            # developer/name]]" — this dict feeds the candidate-preview meta
+            # line AND the merge dialog's field options), not what gets
+            # applied.
+            if name_change:
+                fields['name'] = {'old': current_name or None, 'new': result.name}
+            if result_year and result_year != current_year:
+                fields['year'] = {'old': current_year or None, 'new': result_year}
+            _rv = getattr(result, 'developer', '') or ''
+            if _rv and _rv != current_dev:
+                fields['developer'] = {'old': current_dev or None, 'new': _rv}
             if not current_desc and result.description:
                 fields['description'] = {'old': None, 'new': result.description}
-            if not current_dev and getattr(result, 'developer', ''):
-                fields['developer'] = {'old': None, 'new': result.developer}
-            if not current_year and result_year:
-                fields['year'] = {'old': None, 'new': result_year}
 
         has_enrich = bool(has_material or (has_existing and bool(fields)))
         has_changes = bool(has_material or promote_primary or (has_existing and bool(fields)))
@@ -747,6 +850,9 @@ class SearchFlowMixin:
             'promote_primary': promote_primary,
             'same_origin': _is_same_origin,
             'same_origin_no_diff': same_origin_no_diff,
+            'already_applied': already_applied,
+            'name_change': name_change,
+            'has_material': has_material,
             'has_enrich': has_enrich,
             'has_changes': has_changes,
             'result_year': result_year,
@@ -755,20 +861,52 @@ class SearchFlowMixin:
             'new_urls': new_urls,
             'new_image': new_image,
             'new_reviews': new_reviews,
+            # What's on the form right now, for the preview to tell "this
+            # candidate's value already matches what I have" (✓, like an
+            # already-saved tag) apart from "this fills a field that was
+            # empty" (+, like a genuinely new tag) — fields[field] alone
+            # only distinguishes a genuine DIFFERENCE from everything else.
+            'current': {
+                'name': current_name, 'description': current_desc,
+                'developer': current_dev, 'year': current_year,
+            },
         }
+
+    def _current_image_url(self) -> str | None:
+        """The source URL the currently-set image came from, if known.
+
+        Both apply paths used to re-download unconditionally whenever a
+        candidate had ANY image_url — even the exact same one already
+        applied, every single re-search. _image_url_cache/_image_path_to_url
+        already tracked url<->local-path but nothing ever consulted them.
+        """
+        path = getattr(self, '_image_path', None)
+        if not path:
+            return None
+        return (getattr(self, '_image_path_to_url', None) or {}).get(path)
 
     def _apply_result_init(self, result):
         """Case B — no existing data: fill all empty fields (union for
-        tags). Name/image/genres are unconditional; description/developer/
-        year only fill if currently empty (a field the user typed by hand
-        even in an otherwise-blank form is never overwritten here)."""
+        tags). Name/genres are unconditional; description/developer/year/
+        image only fill if currently empty (a field the user typed — or an
+        image the user already has — by hand even in an otherwise-blank
+        form is never overwritten here).
+
+        Image used to be the one unconditional exception (downloaded and
+        set as the new current cover whenever the URL merely DIFFERED from
+        today's), which silently swapped an already-set cover on every
+        confirm — exactly the "overwritten, not added" behaviour images are
+        supposed never to have (they're additive, like tags: a differing
+        candidate cover belongs in the merge dialog's checked-by-default
+        chip, not applied here without asking)."""
         current_name = self._name_edit.text().strip()
         current_desc = self._desc_edit.toPlainText().strip()
         current_dev  = self._developer_edit.text().strip()
         current_year = self._year_edit.text().strip()
+        has_image = bool(self._original_image_path or getattr(self, '_image_path', ''))
         if result.name and result.name != current_name:
             self._name_edit.setText(result.name)
-        if result.image_url:
+        if result.image_url and not has_image:
             self._download_and_set_image(result.image_url)
         if result.description and not current_desc:
             self._desc_edit.setPlainText(result.description)
@@ -790,7 +928,7 @@ class SearchFlowMixin:
         absent fields. Tags are always a union (never cleared)."""
         if result.name:
             self._name_edit.setText(result.name)
-        if result.image_url:
+        if result.image_url and result.image_url != self._current_image_url():
             self._download_and_set_image(result.image_url)
         if result.description:
             self._desc_edit.setPlainText(result.description)
@@ -1240,13 +1378,25 @@ class SearchFlowMixin:
         for r in others:
             if r is base_result:
                 continue
+            _r_name = getattr(r, 'name', '') or ''
             src = (getattr(r, 'source', '') or '').split('+')[0]
             if src and _base_src and src == _base_src:
+                logger.info(
+                    f"_same_tier_peers: SKIP {src!r}/{_r_name!r} — "
+                    f"same source as confirmed {_base_src!r}")
                 continue               # same source already declared
-            if self._get_source_tier(src) != _base_tier:
+            _r_tier = self._get_source_tier(src)
+            if _r_tier != _base_tier:
+                logger.info(
+                    f"_same_tier_peers: SKIP {src!r}/{_r_name!r} — "
+                    f"tier {_r_tier!r} != confirmed tier {_base_tier!r} ({_base_src!r})")
                 continue
             if self._payload_fingerprint_except_desc(r) == _base_fp:
+                logger.info(
+                    f"_same_tier_peers: SKIP {src!r}/{_r_name!r} — "
+                    f"identical to confirmed candidate except description")
                 continue               # 1:1 except description → skip
+            logger.info(f"_same_tier_peers: KEEP {src!r}/{_r_name!r} as peer")
             peers.append(r)
         return peers
 
@@ -1280,18 +1430,46 @@ class SearchFlowMixin:
             bits.append(short)
         return " · ".join(bits)
 
-    def _run_same_tier_merge(self, base_result) -> bool:
+    def _run_same_tier_merge(self, base_result, pre_confirm_name: str = '') -> bool:
         """Offer peer enrichment chips. Returns True when the user asked to
-        go back to the candidate carousel (form snapshot must be restored)."""
-        peers = self._same_tier_peers(
-            base_result,
-            getattr(self, '_last_search_candidates', None) or [],
-        )
+        go back to the candidate carousel (form snapshot must be restored).
+
+        *pre_confirm_name* is what the name field held right before this
+        candidate was confirmed (the carousel's form snapshot) — name is
+        applied unconditionally on confirm (never fill-only), so by the time
+        this runs the ORIGINAL name is already gone from the form; this is
+        the only way to still offer "go back to what it was" as a choice."""
+        _pool = getattr(self, '_last_search_candidates', None) or []
+        logger.info(
+            f"_run_same_tier_merge: base={getattr(base_result, 'source', '')!r}/"
+            f"{getattr(base_result, 'name', '')!r} pool_size={len(_pool)}")
+        peers = self._same_tier_peers(base_result, _pool)
         if not peers:
-            return False
-        model = self._build_merge_model(peers)
+            logger.info(
+                "_run_same_tier_merge: no same-tier peers — still checking "
+                "the confirmed candidate's own year/name against what's saved")
+        # base_result is passed even with zero peers: it may still offer its
+        # OWN year as an option (see _build_merge_model) when it came from a
+        # different tier than whatever is currently saved.
+        model = self._build_merge_model(
+            peers, base_result=base_result, pre_confirm_name=pre_confirm_name)
         if not model.get('has_options'):
+            logger.info(
+                "_run_same_tier_merge: peers found "
+                f"({[getattr(p, 'source', '') for p in peers]!r}) but "
+                f"_build_merge_model produced no options (current="
+                f"{model.get('current')!r}) — no dialog")
             return False
+        logger.info(
+            f"_run_same_tier_merge: showing merge dialog — "
+            f"name={len(model.get('name') or [])} "
+            f"description={len(model.get('description') or [])} "
+            f"developer={len(model.get('developer') or [])} "
+            f"year={len(model.get('year') or [])} "
+            f"images={len(model.get('images') or [])} "
+            f"tags={len(model.get('tags') or [])} "
+            f"urls={len(model.get('urls') or [])} "
+            f"reviews={len(model.get('reviews') or [])}")
         dlg = EnrichmentMergeDialog(model, self._source_label, self)
         code = dlg.exec()
         if code == EnrichmentMergeDialog.RESULT_BACK:
@@ -1367,42 +1545,74 @@ class SearchFlowMixin:
         fs = scaled(12, self)
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
 
-    def _build_merge_model(self, collected: list) -> dict:
+    def _build_merge_model(self, collected: list, *, base_result=None,
+                           pre_confirm_name: str = '') -> dict:
         """Per-field option lists for the merge preview.
 
-        The CONFIRMED candidate is authoritative: fields it filled are never
-        offered for replacement — peers only compete for fields still EMPTY.
-        Each peer title is its own section (``vndb::Title::0``), so two VNDB
-        hits stay distinguishable. Tags/URLs expand additively; reviews are
-        one chip per peer (same API source identity still collapses on apply).
+        description is fill-only: the CONFIRMED candidate is authoritative,
+        so it is never offered for replacement — peers only compete for it
+        while still EMPTY. Name, developer, year and image are the
+        exceptions — see their own comments below for why. Each peer title
+        is its own section (``vndb::Title::0``), so two VNDB hits stay
+        distinguishable. Tags/URLs expand additively; reviews are one chip
+        per peer (same API source identity still collapses on apply).
+
+        *base_result*, when given, is the just-confirmed candidate itself —
+        used only to offer ITS OWN year/developer as options (see below); it
+        is never added as a tag/url/review source (those already came from
+        it via the normal apply, offering them again would just duplicate).
+
+        *pre_confirm_name*, when given, is what the name field held right
+        before *base_result* was confirmed — see below.
         """
+        cur_name = self._name_edit.text().strip()
         cur_desc = self._desc_edit.toPlainText().strip()
         cur_dev  = self._developer_edit.text().strip()
         cur_year = self._year_edit.text().strip()
-        cur_tags = {x.lower() for x in (getattr(self, '_tags', []) or [])}
+        from core.library import tag_merge_key
+        cur_tags = {tag_merge_key(x) for x in (getattr(self, '_tags', []) or [])}
         has_img  = bool(self._original_image_path or getattr(self, '_image_path', ''))
+        cur_image_url = self._current_image_url() or ''
 
         peer_keys: list[str] = []
         for i, info in enumerate(collected):
             peer_keys.append(self._peer_section_key(info, i))
 
-        def _opts(getter):
+        def _opts(getter, exclude: str = ''):
             opts, seen = [], set()
+            _excl = (exclude or '').strip().lower()
             for info, pkey in zip(collected, peer_keys):
                 v = (getter(info) or '').strip()
-                if not v or v.lower() in seen:
+                if not v or v.lower() in seen or v.lower() == _excl:
                     continue
                 seen.add(v.lower())
                 opts.append({'source': pkey, 'value': v})
             return opts
 
         model = {
-            'current': {'description': cur_desc, 'developer': cur_dev,
-                        'year': cur_year, 'has_image': has_img},
-            'description': [] if cur_desc else _opts(lambda i: i.description),
-            'developer':   [] if cur_dev  else _opts(lambda i: getattr(i, 'developer', '')),
-            'year':        [] if cur_year else _opts(lambda i: self._extract_result_year(i)),
-            'image':       [] if has_img  else _opts(lambda i: i.image_url),
+            'current': {
+                'name': cur_name, 'description': cur_desc, 'developer': cur_dev,
+                'year': cur_year, 'has_image': has_img,
+            },
+            # Name/description/year are offered even though a value is
+            # already set — only a DIFFERING value shows, and it's never
+            # auto-selected (EnrichmentMergeDialog adds an explicit,
+            # pre-checked "Keep current" chip alongside it) — see that
+            # file's _build(). developer stays fill-only and DOES
+            # auto-select its first offer — extending it the same way would
+            # need the same "keep current" treatment first, not just
+            # dropping the `[] if cur_dev else` guard — now given the same
+            # "keep current" treatment (see EnrichmentMergeDialog._build,
+            # which is already field-agnostic here). Images are NEITHER
+            # of those — a game can hold many covers (the carousel in the
+            # add/edit dialog), so a peer's differing image is additive,
+            # exactly like tags/urls below: checked by default, never
+            # replacing the current cover, just offered alongside it.
+            'name':        _opts(lambda i: getattr(i, 'name', ''), exclude=cur_name),
+            'description': _opts(lambda i: i.description, exclude=cur_desc),
+            'developer':   _opts(lambda i: getattr(i, 'developer', ''), exclude=cur_dev),
+            'year':        _opts(lambda i: self._extract_result_year(i), exclude=cur_year),
+            'images': [],
             'tags': [],
             'urls': [],
             'reviews': [],
@@ -1410,6 +1620,7 @@ class SearchFlowMixin:
         }
         seen_tags = set(cur_tags)
         seen_urls: set[str] = set()
+        seen_images = {cur_image_url} if cur_image_url else set()
         # Review slot is per API source id (steam/vndb…): two VNDB titles
         # share one stored identity, so only the first peer offers reviews.
         seen_review_api: set[str] = set()
@@ -1426,10 +1637,14 @@ class SearchFlowMixin:
                 'label': self._peer_section_label(
                     self._source_label(src_id), title, inspect),
             }
+            if cover and cover not in seen_images:
+                seen_images.add(cover)
+                model['images'].append({'source': pkey, 'value': cover})
             for g in (info.genres or []):
-                if g.lower() in seen_tags:
+                _gk = tag_merge_key(g)
+                if _gk in seen_tags:
                     continue
-                seen_tags.add(g.lower())
+                seen_tags.add(_gk)
                 model['tags'].append({'source': pkey, 'value': g})
             for u in self._new_result_site_urls(info):
                 if u in seen_urls:
@@ -1442,22 +1657,121 @@ class SearchFlowMixin:
             if _revs:
                 seen_review_api.add(src_id)
                 model['reviews'].append({'source': pkey, 'value': _revs})
+
+        # The just-confirmed candidate's OWN year/developer, offered even
+        # with ZERO same-tier peers. Both are fill-only on apply (never
+        # replace a saved value), so a candidate found in a LATER tier than
+        # what's already saved — e.g. a forum result confirmed after Steam —
+        # would otherwise have its differing year/developer silently
+        # discarded with nothing around to ever surface the disagreement:
+        # same-tier peers can only ever come from the SAME search batch as
+        # the confirmed candidate, never from an earlier, separate tier's
+        # search (and _opts above only looks at `collected`, i.e. peers).
+        if base_result is not None:
+            _bkey = self._peer_section_key(base_result, -1)
+
+            def _ensure_base_source_meta():
+                if _bkey in model['source_meta']:
+                    return
+                _bsrc = (getattr(base_result, 'source', '') or 'web').split('+')[0] or 'web'
+                _btitle = (getattr(base_result, 'name', '') or '').strip()
+                _binspect = _inspect_url(base_result)
+                model['source_meta'][_bkey] = {
+                    'inspect_url': _binspect,
+                    'image_url': (getattr(base_result, 'image_url', '') or '').strip(),
+                    'name': _btitle,
+                    'source_id': _bsrc,
+                    'label': self._peer_section_label(
+                        self._source_label(_bsrc), _btitle, _binspect),
+                }
+
+            def _base_offer(field: str, value: str):
+                _v = (value or '').strip()
+                _cur = (model['current'].get(field) or '').strip()
+                if not _v or _v.lower() == _cur.lower():
+                    return
+                if any(o['value'].lower() == _v.lower() for o in model[field]):
+                    return
+                _ensure_base_source_meta()
+                model[field].append({'source': _bkey, 'value': _v})
+
+            _base_offer('year', self._extract_result_year(base_result))
+            _base_offer('developer', getattr(base_result, 'developer', ''))
+            # description doesn't trigger the dialog on its own (has_options
+            # below excludes it — see that comment), but once something else
+            # already opened it, a candidate's own differing description
+            # deserves the same zero-peer path year/developer just got: a
+            # single itch.io hit with no same-tier peers was confirmed for
+            # its name/developer, leaving its description entirely absent
+            # from the picker even though the scrape clearly had one.
+            _base_offer('description', getattr(base_result, 'description', ''))
+
+            # Same zero-peer gap for the cover — additive like the per-peer
+            # loop above (seen_images/model['images']), not exclusive like
+            # the fields above: a confirmed candidate's own image never had
+            # any path to reach model['images'] at all when there were no
+            # same-tier peers to bring it in through that loop.
+            _base_cover = (getattr(base_result, 'image_url', '') or '').strip()
+            if _base_cover and _base_cover not in seen_images:
+                seen_images.add(_base_cover)
+                _ensure_base_source_meta()
+                model['images'].append({'source': _bkey, 'value': _base_cover})
+
+        # The name held right before this candidate was confirmed, offered
+        # as a "go back" option. Name is applied UNCONDITIONALLY on confirm
+        # (_apply_result_init never gates it on "currently empty" the way
+        # description/developer/year are) — so unlike those fields, the
+        # original value is already gone from the form by the time this
+        # runs; pre_confirm_name is the only trace of it left. Without this,
+        # confirming a messy-titled candidate (e.g. a forum thread's raw
+        # post title) left no way back to a cleaner name a better source
+        # had already set — not even a chip, since a candidate reached via
+        # a different tier has no same-tier peer to offer one either.
+        _pcn = (pre_confirm_name or '').strip()
+        if (_pcn and _pcn.lower() != cur_name.lower()
+                and not any(o['value'].lower() == _pcn.lower() for o in model['name'])):
+            # Shaped like _peer_section_key's own "source · title · n" so
+            # _source_header_row's src_id fallback (source.split(" · ")[0])
+            # resolves to the localized label below instead of this raw key.
+            _prev_label = t('add_game.merge_previous_value')
+            _pkey = f"{_prev_label} · {_pcn} · 0"
+            if _pkey not in model['source_meta']:
+                model['source_meta'][_pkey] = {
+                    'inspect_url': '',
+                    'image_url': '',
+                    'name': _pcn,
+                    'source_id': _prev_label,
+                    'label': _prev_label,
+                }
+            model['name'].append({'source': _pkey, 'value': _pcn})
+
+        # description does NOT get to trigger the dialog on its own — a
+        # differing description alone was never material enough to resurface
+        # a candidate in the carousel either (see has_material above), so
+        # it shouldn't be enough to pop the merge dialog by itself. Once
+        # something else justifies showing it, the description chip is
+        # still offered as one of the things to pick.
         model['has_options'] = any([
-            model['description'], model['developer'], model['year'],
-            model['image'], model['tags'], model['urls'], model['reviews'],
+            model['name'], model['developer'], model['year'],
+            model['images'], model['tags'], model['urls'], model['reviews'],
         ])
         return model
 
     def _apply_merge_selection(self, sel: dict):
         """Write ONLY the pieces the user picked in the merge preview."""
+        if sel.get('name'):
+            self._name_edit.setText(sel['name'])
         if sel.get('description'):
             self._desc_edit.setPlainText(sel['description'])
         if sel.get('developer'):
             self._developer_edit.setText(sel['developer'])
         if sel.get('year'):
             self._year_edit.setText(sel['year'])
-        if sel.get('image'):
-            self._download_and_set_image(sel['image'])
+        # Additive, like tags/urls below — each checked image is downloaded
+        # and added to the carousel (_set_web_image never removes an
+        # existing one), never a replacement of the current cover.
+        for _img_url in sel.get('images', []) or []:
+            self._download_and_set_image(_img_url)
         if sel.get('tags'):
             self._apply_web_tags(sel['tags'])
         if sel.get('reviews'):
@@ -1516,6 +1830,10 @@ class SearchFlowMixin:
         no metadata) — so the user can correct the link and retry."""
         if self._has_shelvable_work():
             return
+        # Must happen before ANY download this session, same as _web_search
+        # — this entry point (paste-a-link) is exactly the one that used to
+        # skip the capture entirely, since it never calls _web_search().
+        self._capture_session_initial_image()
         prefill = (self._url_input.text().strip()
                    or (self._store_urls[0] if self._store_urls else ""))
         dlg = _UrlFetchDialog(self, prefill)
@@ -1524,7 +1842,15 @@ class SearchFlowMixin:
             # found"), never start the tier cascade a rejected API
             # result would.
             self._current_search_phase = 'generic'
-            self._show_search_candidates([dlg.info])
+            # Carousel shows only the just-fetched page, but same-tier
+            # merge peers must still be searchable against whatever an
+            # earlier search already found — otherwise _last_search_
+            # candidates gets clobbered down to this one page and the
+            # "keep what I already have" chip merge can never fire for a
+            # direct-URL fetch (see _show_search_candidates docstring).
+            _existing = list(getattr(self, '_last_search_candidates', None) or [])
+            _pool = _existing + [dlg.info] if dlg.info not in _existing else _existing
+            self._show_search_candidates([dlg.info], merge_pool=_pool)
 
 
 class _UrlFetchDialog(QDialog):

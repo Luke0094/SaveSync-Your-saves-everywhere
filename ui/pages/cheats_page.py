@@ -17,9 +17,10 @@ from pathlib import Path
 
 from typing import Optional
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QScrollArea, QSizePolicy, QSpinBox,
+from PySide6.QtGui import QIntValidator
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                               QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QPushButton, QScrollArea, QSizePolicy, QSpinBox,
                                QStackedWidget, QVBoxLayout, QWidget)
 
 from core.library import get_library
@@ -392,18 +393,67 @@ class _DropZone(QFrame, ThemedMixin):
             return
         super().mousePressEvent(event)
 
+# How long a save open may run before the "please wait" overlay says more
+# than that — see _open_editor_body / _on_save_load_progress. Past this it
+# is very likely a real search (a seed brute force, unpacking archives,
+# scanning a binary for a key), not just the ordinary case of opening a
+# file, so it is worth being explicit that this specific open is the slow
+# kind rather than leaving the person wondering if the app has stalled.
+_DECRYPT_HINT_AFTER_S = 3.0
+
+
+class _PageJumpEdit(QLineEdit):
+    """The pager's own "page n of m · t values" text, doubling as the page
+    jump control — no separate spinbox sitting beside it repeating the same
+    number. Looks like a plain label at rest (see #cheats_page_lbl: no
+    border, no background).
+
+    Only the page NUMBER is ever actually editable, not the whole
+    sentence: a QIntValidator (set by _pager) keeps every other character
+    out as it's typed, and focusing the field swaps the descriptive text
+    out for just the bare current page number first — so what's on screen
+    while editing is a clean number, never "page 3 of 1112 · 44,464
+    values" with a digit poked into the middle of it. The full sentence
+    comes back through the caller's own render, via editingFinished
+    (Enter, or simply clicking away) — see _jump_from_label.
+    """
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        m = re.search(r"\d+", self.text())
+        if m:
+            self.setText(m.group())
+        self.selectAll()
+
+
 class _SaveLoadWorker(QThread):
     finished = Signal(object, object)  # (doc, exception)
     progress = Signal(float)
 
-    def __init__(self, path: Path, game_dir: Optional[Path], parent=None):
+    def __init__(self, path: Path, game_dir: Optional[Path], parent=None, engine: str = "",
+                 full_sweep: bool = False, try_recipes: bool = False):
         super().__init__(parent)
         self._path = path
         self._game_dir = game_dir
+        self._engine = engine
+        self._full_sweep = full_sweep
+        self._try_recipes = try_recipes
         self._is_cancelled = False
+        # Only Wolf LZ4's search ever looks at this (see open_save's own
+        # cancel_token docstring) — built unconditionally anyway since it
+        # costs nothing before something actually registers a pool with
+        # it, and cancel() below needs somewhere to signal regardless of
+        # which format ends up being the one that's searching.
+        from core.engines.wolf_lz4 import CancelToken
+        self._cancel_token = CancelToken()
 
     def cancel(self):
         self._is_cancelled = True
+        # Stops a Wolf LZ4 search immediately (terminates its worker pool)
+        # instead of leaving it to notice _is_cancelled at its next
+        # scheduled check, which — see the module this token comes from —
+        # can otherwise be a long wait of its own on a slow chunk.
+        self._cancel_token.cancel()
 
     def run(self):
         # Set from inside run(): setPriority only applies to a RUNNING
@@ -426,7 +476,10 @@ class _SaveLoadWorker(QThread):
             return not self._is_cancelled
 
         try:
-            doc = open_save(self._path, game_dir=self._game_dir, progress=_prog_tick)
+            doc = open_save(self._path, game_dir=self._game_dir, progress=_prog_tick,
+                            engine=self._engine, full_sweep=self._full_sweep,
+                            try_recipes=self._try_recipes,
+                            cancel_token=self._cancel_token)
             if self._is_cancelled:
                 self.finished.emit(None, SaveEditorError(t("cheats.loading_cancelled")))
             else:
@@ -440,6 +493,21 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     """Pick a game, pick a save, edit what is inside it."""
 
     STEP_PICK, STEP_SAVES, STEP_EDIT = 0, 1, 2
+
+    # A real snapshot through the normal backup system, taken the moment a
+    # save successfully loads for editing — BEFORE the person has touched
+    # a single field. Whatever happens next (a bad edit, a write that fails
+    # partway, a value that turns out to corrupt something), this is a
+    # known-good point already sitting in the backup history to fall back
+    # to. Deliberately not tied to save()/write_without_backup's own
+    # backup_original() — that only ever protects the one file being
+    # written, on the editor's own internal copy-aside, not a real backup a
+    # person can see, restore or has synced. Main window wires this to a
+    # SILENT backup (see _backup_game) — a toast every time someone opens a
+    # save just to look at it would be noise, and create_backup's own dedup
+    # already skips the write entirely when nothing has changed since the
+    # last one.
+    backup_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -559,10 +627,16 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # Own page size on the pager row (with ← n/m →), not beside search.
         self._games_size_combo = PageSizeCombo(
             SCOPE_CHEATS_GAMES, self._on_games_page_size_changed)
-        bar, self._games_prev, self._games_page_lbl, self._games_next = self._pager(
+        (bar, self._games_first, self._games_prev, self._games_page_lbl,
+         self._games_next, self._games_last) = self._pager(
             self._games_size_combo)
+        self._games_first.clicked.connect(lambda: self._jump_games(0))
         self._games_prev.clicked.connect(lambda: self._step_games(-1))
         self._games_next.clicked.connect(lambda: self._step_games(1))
+        self._games_last.clicked.connect(lambda: self._jump_games(-1))
+        self._games_page_lbl.editingFinished.connect(
+            lambda: self._jump_from_label(
+                self._games_page_lbl, self._jump_games))
         col.addLayout(bar)
         self._drop = _DropZone()
         self._drop.chosen.connect(self._open_loose)
@@ -605,42 +679,110 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # editor's, so the two read the same way. Page size sits on this row.
         self._saves_size_combo = PageSizeCombo(
             SCOPE_CHEATS_SAVES, self._on_saves_page_size_changed)
-        bar, self._file_prev, self._file_page_lbl, self._file_next = self._pager(
+        (bar, self._file_first, self._file_prev, self._file_page_lbl,
+         self._file_next, self._file_last) = self._pager(
             self._saves_size_combo)
+        self._file_first.clicked.connect(lambda: self._jump_saves(0))
         self._file_prev.clicked.connect(lambda: self._step_saves(-1))
         self._file_next.clicked.connect(lambda: self._step_saves(1))
+        self._file_last.clicked.connect(lambda: self._jump_saves(-1))
+        self._file_page_lbl.editingFinished.connect(
+            lambda: self._jump_from_label(
+                self._file_page_lbl, self._jump_saves))
         col.addLayout(bar)
         return page
 
     @staticmethod
     def _pager(size_combo=None):
-        """The ← n/m → strip: the layout and its three widgets.
+        """The « ← n/m → » strip: the layout and its widgets.
 
         Each list that needs one keeps its own, with its own page number: a
         counter shared between the save list and the editor would jump about
         as you moved from one to the other and back. Optional *size_combo*
         sits on the right of the same row.
+
+        *first*/*last* jump straight to either end — one step with ← / →
+        each is a lot of clicks on a save with tens of thousands of values.
+        *lbl* (a ``_PageJumpEdit``, not a plain label) IS the page jump
+        control — no separate spinbox duplicating the same number beside
+        it, and a QIntValidator here keeps it a NUMBER field, not the
+        whole sentence made freely editable: focusing it swaps the
+        descriptive text for just the current page number, typing can
+        only ever produce digits, and that call site's editingFinished
+        handler (Enter, or simply clicking away) jumps there. Looks
+        exactly like the label it replaces at rest — see #cheats_page_lbl's
+        border/background in the stylesheets.
         """
         bar = QHBoxLayout()
         bar.setSpacing(8)
-        prev, nxt = QPushButton("←"), QPushButton("→")
-        for btn in (prev, nxt):
+        first, prev = QPushButton("«"), QPushButton("←")
+        nxt, last = QPushButton("→"), QPushButton("»")
+        for btn in (first, prev, nxt, last):
             btn.setObjectName("cheats_pager")
             btn.setFixedSize(scaled(28, btn), scaled(24, btn))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        lbl = QLabel("")
+        lbl = _PageJumpEdit("")
         lbl.setObjectName("cheats_page_lbl")
+        lbl.setFrame(False)
+        # Only a page NUMBER can ever be typed — this only ever touches
+        # actual keystrokes/paste, never the descriptive text a render()
+        # sets programmatically (setText bypasses a validator entirely),
+        # so "page 3 of 1112 · …" still displays fine at rest.
+        lbl.setValidator(QIntValidator(1, 999_999_999, lbl))
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # Keep "pagina n di m · …" readable — without Minimum the page-size
         # combo used to compress this label until the numbers clipped.
         lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         bar.addStretch(1)
+        bar.addWidget(first)
         bar.addWidget(prev)
         bar.addWidget(lbl)
         bar.addWidget(nxt)
+        bar.addWidget(last)
         bar.addStretch(1)
         if size_combo is not None:
             bar.addWidget(size_combo)
-        return bar, prev, lbl, nxt
+        return bar, first, prev, lbl, nxt, last
+
+    @staticmethod
+    def _jump_from_label(edit, jump) -> None:
+        """Parse a page number out of *edit*'s own text and hand it to
+        *jump* (0-based) — shared by all three pagers' editingFinished, so
+        this fires on Enter AND on simply clicking away.
+
+        _PageJumpEdit's own focusInEvent already swaps the field down to
+        just the bare page number before anyone can type — the validator
+        set in _pager keeps it that way — so this is normally reading a
+        clean number, not picking one out of a sentence. The regex search
+        (rather than a plain int() on the whole field) is a second line of
+        defence, not the mechanism: nothing currently reaches this with
+        anything else in the field, but failing closed on the rare case it
+        somehow did is cheap and exact int() is not. No digits at all is
+        not a page to guess at — left alone, and the caller's own next
+        render restores the descriptive text regardless of whether a jump
+        happened.
+        """
+        m = re.search(r"\d+", edit.text())
+        if not m:
+            return
+        page = max(1, int(m.group()))
+        jump(page - 1)
+        edit.clearFocus()
+
+    @staticmethod
+    def _fit_page_label(edit) -> None:
+        """Grow *edit* to fit its OWN current text — called right after
+        every setText() with the descriptive "page n of m · t values"
+        sentence. A QLineEdit's sizeHint (Minimum size policy set in
+        _pager, so it can grow but never shrinks below it) is a fixed,
+        content-independent default, unlike the QLabel this field
+        replaced — which sized itself to whatever text it was given
+        automatically. Left alone, a longer sentence than that default
+        (a locale whose wording simply runs longer, or a page/count high
+        enough to add digits) just gets clipped inside the same fixed
+        width instead of the field actually growing to show it."""
+        width = edit.fontMetrics().horizontalAdvance(edit.text())
+        edit.setMinimumWidth(width + scaled(16, edit))
 
     def _build_edit(self) -> QWidget:
         page = QWidget()
@@ -686,6 +828,19 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._edit_hint.setObjectName("form_hint")
         self._edit_hint.setWordWrap(True)
         col.addWidget(self._edit_hint)
+        # Shown only over a read-only reading (see _on_save_load_finished):
+        # an explicit, opt-in offer to try the generic unwrap recipe
+        # battery on this same file, in case it does better than whatever
+        # reader already understood it well enough to read but not to
+        # trust writing back. Never shown over a save the recipe battery
+        # itself already produced — retrying a retry offers nothing.
+        self._recipe_retry_btn = QPushButton(t("cheats.try_recipes_readonly"))
+        self._recipe_retry_btn.setObjectName("form_link_btn")
+        self._recipe_retry_btn.setFlat(True)
+        self._recipe_retry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._recipe_retry_btn.setVisible(False)
+        self._recipe_retry_btn.clicked.connect(self._retry_with_recipes)
+        col.addWidget(self._recipe_retry_btn)
         self._hold_lbl = QLabel("")
         self._hold_lbl.setObjectName("cheats_holding")
         self._hold_lbl.setVisible(False)
@@ -696,9 +851,14 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # A save can hold hundreds of values; one endless scroll is not a
         # list anyone reads. The filter narrows what is paged, so a search
         # and a page number are the same tool.
-        pager, self._prev_btn, self._page_lbl, self._next_btn = self._pager()
+        (pager, self._first_btn, self._prev_btn, self._page_lbl,
+         self._next_btn, self._last_btn) = self._pager()
+        self._first_btn.clicked.connect(lambda: self._jump_page(0))
         self._prev_btn.clicked.connect(lambda: self._step_page(-1))
         self._next_btn.clicked.connect(lambda: self._step_page(1))
+        self._last_btn.clicked.connect(lambda: self._jump_page(-1))
+        self._page_lbl.editingFinished.connect(
+            lambda: self._jump_from_label(self._page_lbl, self._jump_page))
         col.addLayout(pager)
         return page
 
@@ -711,6 +871,14 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._subtitle.setText(t("cheats.subtitle"))
             if refresh_pick:
                 self._refresh_games()
+        elif step == self.STEP_EDIT and getattr(self, "_fields_incomplete", False):
+            # A cancelled field-row build left the current page short —
+            # re-entering the editor for the same open doc is otherwise
+            # the one path that does not naturally re-render it (unlike
+            # STEP_PICK above, or STEP_SAVES, which only shows through
+            # picking a game and so already rebuilds fresh every time).
+            self._fields_incomplete = False
+            self._render_page()
         self._sync_title()
 
     def _sync_title(self):
@@ -734,6 +902,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _go_back(self):
         step = self._stack.currentIndex()
         if step == self.STEP_EDIT:
+            # A load still actively showing its "please wait" overlay must
+            # not be left to land after we've already navigated away — see
+            # _abandon_in_flight_save_load's own docstring for exactly the
+            # bug that leaves. A SHELVED load is deliberately left running
+            # (respect_shelved defaults to True) — that is the point of
+            # shelving it in the first place.
+            self._abandon_in_flight_save_load()
             # Walking away from the editor stops holding: a loop rewriting a
             # file for a screen nobody is looking at is not something to
             # leave running.
@@ -782,6 +957,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._games_page += delta
         self._refresh_games()
 
+    def _jump_games(self, index: int):
+        self._games_page = index if index >= 0 else 1 << 30
+        self._refresh_games()
+
     def _refresh_games(self):
         with guarded_render(SCOPE_CHEATS_GAMES):
             self._refresh_games_inner()
@@ -807,19 +986,31 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._games_page_lbl.setText(t("cheats.page_of_games",
                                        page=self._games_page + 1,
                                        pages=pages, total=len(found)))
+        self._fit_page_label(self._games_page_lbl)
+        self._games_first.setEnabled(self._games_page > 0)
         self._games_prev.setEnabled(self._games_page > 0)
         self._games_next.setEnabled(self._games_page < pages - 1)
+        self._games_last.setEnabled(self._games_page < pages - 1)
         if not found:
             self._cancel_row_insert()
             self._add_note(self._games_col, t("cheats.no_games"))
             return
-        from core.engines.game_engine import engine_display
+        from core.engines.game_engine import engine_for_game, engine_display
         jobs = []
         for g in found[start:start + per_page]:
             def _build(g=g):
                 n = len(g.save_paths or [])
-                stored_eng = getattr(g, "engine", "") or ""
-                eng = engine_display(stored_eng) if stored_eng else ""
+                # engine_for_game, not the raw stored field: it falls back to
+                # detecting off the exe on disk when nothing was saved yet —
+                # the same live check _open_game (below) and the library page
+                # already do, so a game the library shows an engine for
+                # doesn't turn up "Unknown" here just because nothing was
+                # ever written to entry.engine.
+                detected_eng = engine_for_game(g)
+                # Same "Unknown" placeholder the Add/Edit Game engine field
+                # shows when empty — a blank engine used to mean nothing was
+                # written here at all, as if the row had no opinion on it.
+                eng = engine_display(detected_eng) if detected_eng else t("common.unknown")
                 row = _Row(g.name, t("cheats.n_paths", count=n) if n else
                            t("cheats.no_paths"), engine=eng)
                 row.clicked.connect(lambda e=g: self._open_game(e))
@@ -946,20 +1137,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._files.clear()
         self._entry = None
         self._loose = None
-        worker = getattr(self, "_save_load_worker", None)
-        if worker is not None:
-            try:
-                worker.cancel()
-            except Exception:
-                pass
-            self._save_load_worker = None
-        busy = getattr(self, "_save_load_busy", None)
-        if busy is not None:
-            try:
-                busy.close_overlay()
-            except Exception:
-                pass
-            self._save_load_busy = None
+        # Hard reset (deep idle / switching games — see this method's own
+        # docstring): even a deliberately-shelved load should not survive
+        # this one, unlike _go_back's ordinary "the person navigated away".
+        self._abandon_in_flight_save_load(respect_shelved=False)
         self._close_load_notice()
         if hasattr(self, "_folder_combo"):
             self._folder_combo.blockSignals(True)
@@ -1095,8 +1276,11 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._file_page_lbl.setText(t("cheats.page_of_saves",
                                       page=self._file_page + 1,
                                       pages=pages, total=len(files)))
+        self._fit_page_label(self._file_page_lbl)
+        self._file_first.setEnabled(self._file_page > 0)
         self._file_prev.setEnabled(self._file_page > 0)
         self._file_next.setEnabled(self._file_page < pages - 1)
+        self._file_last.setEnabled(self._file_page < pages - 1)
 
         jobs = []
         if not files:
@@ -1153,6 +1337,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._file_page += delta
         self._render_saves_page()
 
+    def _jump_saves(self, index: int):
+        self._file_page = index if index >= 0 else 1 << 30
+        self._render_saves_page()
+
     def _restore(self, copy: Path, target: Path):
         try:
             restore_backup(copy, target)
@@ -1184,13 +1372,19 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
 
         A save does not always live with its game — Unity writes them under
         the user's profile — and one format has to look in the game's own
-        files to open the save at all.
+        files to open the save at all. Without a library entry (a loose
+        save), the save's OWN folder still works as a starting point:
+        detect_engine walks UP from whatever it is given (see
+        core.engines.game_engine.detect_engine), so a save kept inside or
+        near the install folder is found the same way a library game's exe
+        would find it — engine detection is not exclusive to the library.
         """
         exe = getattr(self._entry, "exe_path", "") if self._entry else ""
-        if not exe:
+        anchor = exe or (str(self._loose) if self._loose else "")
+        if not anchor:
             return None
         try:
-            parent = Path(exe).parent
+            parent = Path(anchor).parent
             return parent if parent.is_dir() else None
         except (OSError, ValueError):
             return None
@@ -1228,15 +1422,72 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                     return g.name
         return ""
 
-    def _open_editor(self, path: Path):
+    def _abandon_in_flight_save_load(self, respect_shelved: bool = True):
+        """Cancel any save load still in flight and make sure it can never
+        act again, even after this call returns.
+
+        ``worker.cancel()`` is cooperative, not immediate — the docstring
+        on ``_SaveLoadWorker.cancel`` is explicit that a search can still
+        be mid-round for a couple more seconds — so its ``finished``
+        signal WILL still fire later. Without bumping ``_save_load_gen``
+        here too, that late arrival passes ``_on_save_load_finished``'s
+        own staleness check (which compares against exactly this counter)
+        and is treated as a normal, current completion: it overwrites
+        ``self._doc`` and forces ``show_step(STEP_EDIT)`` again, for
+        whatever page the person navigated to in the meantime. That is
+        the exact shape of a real bug this method exists to close: back
+        out of the editor while a load is still running, land wherever
+        "back" was supposed to go, and get yanked into a half-populated
+        editor a moment later because the abandoned load finished after
+        all. Every caller that leaves STEP_EDIT (or wipes the page's
+        state outright) needs this, not just the one that starts a new
+        load — see ``_go_back`` and ``wipe_and_reload``.
+
+        *respect_shelved*: a load put in the sidebar (``BusyOverlay``'s
+        shelvable mode) is DELIBERATELY left running so the rest of the
+        app stays usable while it finishes — that is the entire point of
+        shelving, and leaving the editor page is not supposed to cancel
+        it. True (the default — right for ``_go_back``, an ordinary
+        "the person navigated away") leaves a shelved load completely
+        alone: worker, overlay and generation counter untouched, so
+        ``_on_save_load_finished`` still treats its eventual arrival as
+        current and does what shelved completion already correctly does
+        (updates the sidebar notice, does not force ``STEP_EDIT`` — see
+        that method's own ``shelved`` handling). False is for an actual
+        hard reset (``wipe_and_reload``, run on deep idle / switching
+        games) where even a shelved load should not survive.
+        """
+        busy = getattr(self, "_save_load_busy", None)
+        if respect_shelved and busy is not None and getattr(busy, "_shelved", False):
+            return
+        worker = getattr(self, "_save_load_worker", None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+            self._save_load_worker = None
+        if busy is not None:
+            try:
+                busy.close_overlay()
+            except Exception:
+                pass
+            self._save_load_busy = None
+        self._save_load_gen = getattr(self, "_save_load_gen", 0) + 1
+
+    def _open_editor(self, path: Path, forced_engine: str = "", full_sweep: bool = False,
+                     try_recipes: bool = False):
         resolved_path = Path(path).resolve()
         # Fast path: if the document for this exact save file is already in memory
         # and has not been modified externally, display it immediately without reloading!
+        # Skipped for a forced-engine/full-sweep/recipe retry — that fast path
+        # would just hand back the same state instead of trying again.
         try:
             mtime = resolved_path.stat().st_mtime_ns
         except OSError:
             mtime = 0
-        if (self._doc is not None
+        if (not forced_engine and not full_sweep and not try_recipes
+                and self._doc is not None
                 and mtime  # a failed stat (locked mid-write) reads as 0 —
                            # never serve the cache off that, always reload
                 and getattr(self, "_loaded_path", None) == resolved_path
@@ -1256,24 +1507,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             except Exception:
                 pass
 
-        # Cancel any previous in-flight worker
-        prev_worker = getattr(self, "_save_load_worker", None)
-        if prev_worker is not None:
-            try:
-                prev_worker.cancel()
-            except Exception:
-                pass
-            self._save_load_worker = None
-
-        prev_busy = getattr(self, "_save_load_busy", None)
-        if prev_busy is not None:
-            try:
-                prev_busy.close_overlay()
-            except Exception:
-                pass
-            self._save_load_busy = None
-
-        self._save_load_gen = getattr(self, "_save_load_gen", 0) + 1
+        # Not respect_shelved: this is about to become the tracked worker
+        # and overlay regardless (both fields are about to be overwritten
+        # below), so a shelved load left alone here would just be orphaned
+        # under a gen this new load is about to reuse — see
+        # _abandon_in_flight_save_load's own docstring. Starting a genuinely
+        # new load always needs a fresh generation of its own.
+        self._abandon_in_flight_save_load(respect_shelved=False)
         gen = self._save_load_gen
 
         # Enter the edit step immediately so the page never feels frozen,
@@ -1293,6 +1533,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._close_load_notice()
         self._subtitle.setText(t("common.please_wait"))
         self._edit_hint.setText("")
+        self._recipe_retry_btn.setVisible(False)
         self._save_btn.setEnabled(False)
         self._field_filter.clear()
         self._group_combo.blockSignals(True)
@@ -1300,9 +1541,109 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._group_combo.blockSignals(False)
         self.show_step(self.STEP_EDIT)
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda p=resolved_path, g=gen: self._open_editor_body(p, g))
+        QTimer.singleShot(0, lambda p=resolved_path, g=gen:
+                          self._open_editor_body(p, g, forced_engine, full_sweep, try_recipes))
 
-    def _open_editor_body(self, path: Path, gen: int = 0):
+    def _retry_with_recipes(self):
+        """The read-only escalation: "this file was read, but SaveSync
+        isn't sure it's safe to write back — try to break its obfuscation?"
+        — see cheats.try_recipes_readonly, shown only over a read-only
+        reading. Reuses the exact same load path the unsupported-file
+        menu's own recipe item does, so both escalations share one code
+        path end to end (see open_save's try_recipes contract)."""
+        path = getattr(self, "_loaded_path", None)
+        if path is None:
+            return
+        self._open_editor(path, full_sweep=True, try_recipes=True)
+
+    def _show_unsupported_dialog(self, path: Path, message: str):
+        """The "not a save format SaveSync can read" notice, with its manual
+        escape hatch attached to its OWN button rather than chained after a
+        second, disconnected popup — a QMessageBox has to close on any
+        button click before anything else can show, which is exactly what
+        made "Open as…" feel like two unrelated dialogs instead of one menu
+        opening off the button that offers it. Same icon-and-text layout a
+        QMessageBox uses, just a plain QDialog underneath so "Open as…" can
+        pop its QMenu straight from itself while the notice is still up.
+        """
+        from PySide6.QtWidgets import QStyle
+
+        dlg = QDialog(self)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setWindowTitle(t("cheats.title"))
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(20, 20, 20, 16)
+        outer.setSpacing(16)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        icon_lbl = QLabel()
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        icon_px = scaled(32, self)
+        icon_lbl.setPixmap(icon.pixmap(icon_px, icon_px))
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+        body.addWidget(icon_lbl, 0)
+        lbl = QLabel(message)
+        lbl.setWordWrap(True)
+        lbl.setMinimumWidth(scaled(340, self))
+        lbl.setMaximumWidth(scaled(420, self))
+        body.addWidget(lbl, 1)
+        outer.addLayout(body)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch(1)
+        open_btn = QPushButton(t("cheats.open_as"))
+        open_btn.setMinimumWidth(scaled(90, self))
+        open_btn.clicked.connect(
+            lambda: self._exec_unsupported_menu(path, open_btn, dlg))
+        btn_row.addWidget(open_btn)
+        ok_btn = QPushButton(t("common.ok"))
+        ok_btn.setMinimumWidth(scaled(90, self))
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(ok_btn)
+        outer.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _exec_unsupported_menu(self, path: Path, anchor_btn, dlg):
+        """Both ways forward, in one menu anchored right under the "Open
+        as…" button that raised it: check the few readers the automatic
+        pass leaves out for cost, or name the engine directly and skip
+        guessing. Picking either closes the notice dialog and retries."""
+        from PySide6.QtWidgets import QMenu
+        from core.engines.game_engine import known_engines, label as engine_label
+
+        def _pick(retry):
+            dlg.accept()
+            retry()
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:6px;padding:4px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:4px;font-size:{scaled(11, self)}px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
+        menu.addAction(
+            t("cheats.try_full_sweep"),
+            lambda checked=False, p=path: _pick(
+                lambda: self._open_editor(p, full_sweep=True)))
+        menu.addAction(
+            t("cheats.try_recipes"),
+            lambda checked=False, p=path: _pick(
+                lambda: self._open_editor(p, full_sweep=True, try_recipes=True)))
+        menu.addSeparator()
+        for eng in known_engines():
+            menu.addAction(
+                engine_label(eng) or eng,
+                lambda checked=False, e=eng, p=path: _pick(
+                    lambda: self._open_editor(p, forced_engine=e)))
+        menu.exec(anchor_btn.mapToGlobal(anchor_btn.rect().bottomLeft()))
+
+    def _open_editor_body(self, path: Path, gen: int = 0, forced_engine: str = "",
+                          full_sweep: bool = False, try_recipes: bool = False):
         if gen != getattr(self, "_save_load_gen", 0):
             return
 
@@ -1310,26 +1651,59 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         overlay = BusyOverlay(self, t("common.please_wait"), shelvable=True)
         overlay._reveal_after_s = 0
         overlay.reveal()
+        # Most opens land in a second or two even for a format whose unlock
+        # can, in the worst case, search (Wolf LZ4's seed formula, a quick
+        # Easy Save 3 / Unreal key hit) — the generic "please wait" covers
+        # that. Past _DECRYPT_HINT_AFTER_S, this is very likely the actual
+        # expensive path (formula miss + brute force, unpacking a game's
+        # archives, scanning a binary for a key), which can run minutes —
+        # worth saying so explicitly rather than leaving the same one-line
+        # message sitting there unchanged. See _on_save_load_progress.
+        overlay._decrypt_hint_shown = False
         self._save_load_busy = overlay
 
-        worker = _SaveLoadWorker(path, self._game_dir(), self)
+        # An explicit "open as..." choice wins over everything else — the
+        # user is answering the question auto-detection couldn't. Otherwise
+        # the library's own answer, when there is one — see open_save()'s
+        # docstring: trusted over re-detecting it from game_dir, which is
+        # what left a game the library already knew the engine for opening
+        # its own saves as "unsupported".
+        known_engine = forced_engine
+        if not known_engine and self._entry is not None:
+            from core.engines.game_engine import engine_for_game
+            known_engine = engine_for_game(self._entry)
+        worker = _SaveLoadWorker(path, self._game_dir(), self, engine=known_engine,
+                                 full_sweep=full_sweep, try_recipes=try_recipes)
         self._save_load_worker = worker
 
         overlay.on_shelve = lambda: self._shelved_load_start(overlay, worker)
-        overlay._cancel_btn.clicked.connect(worker.cancel)
+        # Registering on_cancel (rather than wiring the button straight to
+        # worker.cancel) is what tells the overlay someone else owns
+        # closing it — worker.cancel() only asks the search to stop; it can
+        # still be mid-round for a couple more seconds, and the overlay now
+        # stays up saying so instead of vanishing early (see
+        # BusyOverlay._on_cancel). _on_save_load_finished closes it for
+        # real once worker.finished actually arrives, cancelled or not.
+        overlay.on_cancel = worker.cancel
         worker.progress.connect(lambda el: self._on_save_load_progress(el, overlay))
-        worker.finished.connect(lambda doc, err, p=path, ov=overlay, wk=worker, g=gen: (
-            self._on_save_load_finished(doc, err, p, ov, wk, g)
-        ))
+        worker.finished.connect(
+            lambda doc, err, p=path, ov=overlay, wk=worker, g=gen, fe=forced_engine, tr=try_recipes: (
+                self._on_save_load_finished(doc, err, p, ov, wk, g, fe, tr)
+            ))
         worker.start()
 
     def _on_save_load_progress(self, elapsed: float, overlay):
+        if (overlay is not None and not getattr(overlay, "_decrypt_hint_shown", True)
+                and elapsed >= _DECRYPT_HINT_AFTER_S):
+            overlay._decrypt_hint_shown = True
+            overlay.set_base_text(t("common.please_wait_decrypt"))
         if overlay is not None and not getattr(overlay, "_shelved", False):
             overlay.tick(elapsed)
         elif overlay is not None and getattr(overlay, "_shelved", False):
             self._shelved_load_tick(elapsed)
 
-    def _on_save_load_finished(self, doc, err, path: Path, overlay, worker, gen: int = 0):
+    def _on_save_load_finished(self, doc, err, path: Path, overlay, worker, gen: int = 0,
+                               forced_engine: str = "", try_recipes: bool = False):
         if gen != getattr(self, "_save_load_gen", 0):
             try:
                 overlay.close_overlay()
@@ -1359,7 +1733,15 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                     else t("cheats.loading_failed"),
                     hide_after_ms=4000)
             if err is not None and not cancelled and not shelved:
-                warning_window_modal(self, t("cheats.title"), explain(err))
+                # "err_unreadable" is the one genuine "nothing recognised
+                # this at all" case — the others (empty file, can't read,
+                # a KNOWN format SaveSync deliberately won't edit, …) have
+                # a specific reason a different engine wouldn't fix, so the
+                # offer to try one only makes sense here.
+                if getattr(err, "key", "") == "cheats.err_unreadable":
+                    self._show_unsupported_dialog(path, explain(err))
+                else:
+                    warning_window_modal(self, t("cheats.title"), explain(err))
             self.show_step(self.STEP_SAVES)
             return
 
@@ -1369,21 +1751,50 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._loaded_mtime = path.stat().st_mtime_ns
         except OSError:
             self._loaded_mtime = 0
+        # Snapshot NOW, before any field can be touched — see
+        # backup_requested's own docstring for why this is a real backup
+        # and not just the editor's own copy-aside.
+        if self._entry is not None:
+            self.backup_requested.emit(self._entry.id)
+        # A manual pick or full sweep that worked is worth remembering: the
+        # next save from this game should not need the same detour. Only
+        # when it actually says something auto-detection didn't already
+        # have right — a shared/generic reader (plain JSON, key=value text)
+        # names no engine of its own, and re-guessing from that would be a
+        # downgrade, not a correction.
+        if self._entry is not None:
+            from core.save_editor import registry as _fmt_registry
+            learned = forced_engine or _fmt_registry.engine_of(type(doc._fmt))
+            if learned and learned != (self._entry.engine or ""):
+                self._entry.engine = learned
+                get_library().update_game(self._entry)
         if notice is not None and shelved:
             notice.hide_cancel()
             notice.finish(t("cheats.loading_done", name=path.name),
                           hide_after_ms=0)
             notice.set_activatable(True)
         ro = bool(getattr(self._doc, "read_only", False))
+        from core.save_editor.recipe_format import RecipeFormat
+        is_recipe_doc = isinstance(getattr(self._doc, "_fmt", None), RecipeFormat)
         if ro:
             self._subtitle.setText(t("cheats.editing_read_only",
                                      name=path.name, engine=self._doc.engine))
-            self._edit_hint.setText(t("cheats.read_only_hint",
-                                      engine=self._doc.engine))
+            hint = t("cheats.read_only_hint", engine=self._doc.engine)
+            # try_recipes was already asked for on THIS load and still came
+            # back read-only — the escalation ran and found nothing better,
+            # which is worth saying rather than looking identical to never
+            # having tried.
+            if try_recipes:
+                hint = f"{t('cheats.recipes_no_better')} {hint}"
+            self._edit_hint.setText(hint)
+            # Never offered over a save the recipe battery itself already
+            # produced — retrying a retry offers nothing.
+            self._recipe_retry_btn.setVisible(not is_recipe_doc)
         else:
             self._subtitle.setText(t("cheats.editing",
                                      name=path.name, engine=self._doc.engine))
             self._edit_hint.setText(t("cheats.edit_hint"))
+            self._recipe_retry_btn.setVisible(False)
         self._save_btn.setEnabled(not ro)
         self._save_btn.setToolTip(
             t("cheats.read_only_hint", engine=self._doc.engine) if ro else "")
@@ -1553,8 +1964,11 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         start = self._page * _PAGE_SIZE
         self._page_lbl.setText(t("cheats.page_of", page=self._page + 1,
                                  pages=pages, total=len(fields)))
+        self._fit_page_label(self._page_lbl)
+        self._first_btn.setEnabled(self._page > 0)
         self._prev_btn.setEnabled(self._page > 0)
         self._next_btn.setEnabled(self._page < pages - 1)
+        self._last_btn.setEnabled(self._page < pages - 1)
         if not fields:
             self._cancel_row_insert()
             self._add_note(self._fields_col, t("cheats.no_values"))
@@ -1609,6 +2023,15 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _step_page(self, delta: int):
         self._page += delta
+        self._render_page()
+        self._reset_idle_save_timer()
+
+    def _jump_page(self, index: int):
+        """Go straight to page *index* (0-based) — or the last page, for
+        any negative index, without needing the page count up front:
+        _render_page's own clamp finds it. Backs «, », and the editable
+        page number alike."""
+        self._page = index if index >= 0 else 1 << 30
         self._render_page()
         self._reset_idle_save_timer()
 
@@ -1700,7 +2123,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             if was_holding and self._hold is not None:
                 self._hold.start()
             return
-        self._subtitle.setText(t("cheats.applied", name=kept.name))
+        # kept is None when there was nothing left to copy aside — the file
+        # this doc loaded from was already gone (renamed, moved) by the
+        # time save() ran; see backup_original's own docstring. The write
+        # itself still happened, so this is still a real "applied", just
+        # named from the doc's own loaded path rather than the copy.
+        applied_name = kept.name if kept is not None else self._loaded_path.name
+        self._subtitle.setText(t("cheats.applied", name=applied_name))
         running = self._playing()
         # Marks persist across game stop/start; the loop needs Apply first,
         # then runs only while THIS game is up.
@@ -1819,11 +2248,24 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._deferred_busy = None
 
     def _cancel_row_insert(self):
-        """Invalidate any in-flight chunk pump and drop the please-wait."""
+        """Invalidate any in-flight chunk pump and drop the please-wait.
+
+        If real work was actually thrown away (the queue was not already
+        empty) AND this was the field-row list specifically, the page is
+        left knowing the current page of fields is incomplete — see
+        show_step, which re-renders it when the edit step is re-entered.
+        The game list (STEP_PICK) and save list (STEP_SAVES) this same gen
+        counter also covers already self-heal: re-entering either re-runs
+        the action that built them in the first place (_refresh_games(),
+        picking a game), not just a bare step switch."""
+        had_pending_work = bool(getattr(self, "_row_insert_queue", None))
+        was_field_rows = self._row_insert_on_done is not None
         self._row_insert_gen = getattr(self, "_row_insert_gen", 0) + 1
         self._row_insert_queue = []
         self._row_insert_on_done = None
         self._stop_deferred_busy()
+        if had_pending_work and was_field_rows:
+            self._fields_incomplete = True
 
     def _begin_async_rows(self, jobs: list, on_done=None):
         """Insert list rows in QTimer chunks (same pattern as library cards).
@@ -1847,6 +2289,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             from ui.widgets.busy_overlay import DeferredBusy
             self._deferred_busy = DeferredBusy(
                 self, t("common.please_wait"), delay_ms=200)
+            self._deferred_busy.set_on_cancel(self._cancel_row_insert)
         QTimer.singleShot(0, lambda g=gen: self._async_row_step(g))
 
 

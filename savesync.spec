@@ -150,6 +150,8 @@ a = Analysis(
         'core.save_editor.crypt', 'core.save_editor.crypt.es3',
         'core.save_editor.crypt.game_keys', 'core.save_editor.crypt.unityfs',
         'core.save_editor.crypt.unreal_crypt', 'core.save_editor.crypt.wolf',
+        'core.save_editor.crypt.wolf_lz4', 'core.save_editor.wolf_lz4_format',
+        'core.save_editor.crypt.recipes', 'core.save_editor.recipe_format',
         'core.engines', 'core.engines.game_engine',
         'core.engines.alicesoft', 'core.engines.artemis',
         'core.engines.gvas', 'core.engines.kirikiri',
@@ -157,7 +159,7 @@ a = Analysis(
         'core.engines.naninovel', 'core.engines.qsp',
         'core.engines.rags', 'core.engines.renpy', 'core.engines.renpy_save',
         'core.engines.rubymarshal', 'core.engines.sol', 'core.engines.tyrano',
-        'core.engines.wolf', 'core.engines.sqlite_db',
+        'core.engines.wolf', 'core.engines.wolf_lz4', 'core.engines.sqlite_db',
         'core.engines.playerprefs', 'core.engines.tads',
         'core.engines.keyvalue', 'core.engines.xml_save',
         'ui.pages.cheats_page',
@@ -173,17 +175,43 @@ a = Analysis(
         'ui.pages.settings_page', 'ui.widgets.hotkey_edit',
         'ui.widgets.file_list_widget', 'ui.styles.theme',
         'ui.styles.arrow_icons', 'ui.splash_screen',
+        # ui.styles.arrow_icons never imports QtSvg directly — it writes SVG
+        # files to disk and references them from QSS via image: url(...),
+        # letting Qt's own image-plugin dispatch decode them at paint time.
+        # PyInstaller's plugin collector ties the imageformats/qsvg plugin to
+        # the QtSvg module specifically (it does NOT bundle every file under
+        # plugins/imageformats/ just because QtGui is used — qsvg.dll links
+        # against Qt6Svg.dll, which is only pulled in when QtSvg itself is
+        # seen as used). With nothing in the app ever importing QtSvg, a
+        # frozen build silently drops both Qt6Svg.dll and qsvg.dll, so every
+        # chevron/arrow icon (candidate-preview, image carousel, tag nav,
+        # exe-version picker) paints as an empty rectangle — works fine from
+        # source (full pip install has every plugin on disk) but breaks only
+        # in the .exe. This hiddenimport is what pulls both in.
+        'PySide6.QtSvg',
         'hotkeys', 'pynput', 'pynput.keyboard._win32', 'pynput.mouse._win32',
         'i18n', 'dateutil', 'dateutil.parser',
         'keyring.backends', 'keyring.backends.Windows',
         'google.auth.transport.requests', 'google_auth_oauthlib.flow',
         'googleapiclient.discovery', 'cryptography.hazmat.primitives.ciphers.aead',
         'PIL', 'pillow_avif', 'jaraco.functools', 'jaraco.context', 'jaraco.text',
+        # core.engines.wolf_lz4: lz4.block decompresses/recompresses the
+        # payload, numpy vectorises its seed search, numba JIT-compiles
+        # that same search roughly 3-4x faster when present — all three
+        # lazy-imported inside the module, same reason as the crypto
+        # entries above (numba's own import is try/except, but is a real
+        # requirements.txt dependency now, so analysis needs to see it
+        # too). core.save_editor.crypt.recipes additionally lazy-imports
+        # lz4.frame (never lz4.block — a generic recipe has no out-of-band
+        # size to give a block decoder).
+        'lz4', 'lz4.block', 'lz4.frame', 'numpy', 'numba',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(ROOT / 'runtime_splash_hook.py')],
-    excludes=['matplotlib', 'numpy', 'scipy', 'cv2', 'pytest'],
+    # numpy used to be excluded here as unused dead weight — it is not
+    # anymore, see core.engines.wolf_lz4's seed search above.
+    excludes=['matplotlib', 'scipy', 'cv2', 'pytest'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

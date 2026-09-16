@@ -719,6 +719,20 @@ class BackupEntry:
     verify_state: str = ""
     verify_at: str = ""       # ISO datetime of the last check
     verify_detail: str = ""   # short reason when not "ok"
+    # When this backup will expire on age alone, stamped by _enforce_limits
+    # at the same moment it already computes exactly that (see that
+    # method's own comment): "" when this backup is currently protected by
+    # min_kept_backups and so has no expiry at all. Exists so the periodic
+    # retention sweep (_maybe_run_backup_retention_sweep) can be a cheap
+    # scan for "is this date in the past" across the whole index instead of
+    # re-deriving every game's protected/unprotected split from scratch on
+    # every run — see FINDINGS/session notes on why that per-game
+    # re-derivation, multiplied across a whole library on a timer, was the
+    # thing worth avoiding. Absent from older index files, which is exactly
+    # what "" means here too: not yet computed, treated as protected until
+    # the next _enforce_limits run (this game's next backup, or the next
+    # daily sweep) stamps it for real.
+    planned_deletion: str = ""
 
     def chain_for(self, save_path: str) -> str:
         """The install-relative chain recorded for *save_path*, if any."""
@@ -1499,6 +1513,7 @@ class BackupManager(QObject):
         name_history: list[str] | None = None,
         excluded_paths: list[str] | None = None,
         pre_confirmation: bool = False,
+        identity_alternates: list | None = None,
         return_status: bool = False,
         skip_mtime_preflight: bool = False,
         content_chains_override: list[str] | None = None,
@@ -1532,6 +1547,23 @@ class BackupManager(QObject):
                 or discarded (discard_pre_confirmation_backups) when the
                 detections are rejected/suppressed. Same store and same
                 rotation limits as ordinary backups.
+            identity_alternates: Set (with pre_confirmation also True) when
+                the reason this backup is temporary isn't an unconfirmed
+                PATH but an unconfirmed IDENTITY — a name-similarity match
+                that could be one of several library entries (see
+                main_window's _identity_still_ambiguous). [(game_id, name),
+                …] candidates, stored on the backup itself so the question
+                survives an app restart even after the live overlay's own
+                in-memory state is gone. Marks the backup identity_pending,
+                which every promote/discard/resolve helper below excludes
+                by default — landing on the wrong entry's rotation limit
+                before the mystery is answered could silently evict that
+                entry's own real older backups to make room, which is
+                worse than leaving a handful of zips temporary a while
+                longer. Only main_window's actual identity-resolution
+                call sites (_apply_path_add_version, _apply_path_overwrite,
+                and adopt_backups' own only_identity_pending) ever touch
+                these on purpose.
             skip_mtime_preflight: When True, skip the light mtime/count check
                 (caller already ran ``is_backup_current`` / an equivalent scan).
             content_chains_override / save_chains_override: When set, used
@@ -1768,6 +1800,11 @@ class BackupManager(QObject):
             }
             if pre_confirmation:
                 metadata["pre_confirmation"] = True
+            if identity_alternates:
+                metadata["identity_pending"] = True
+                metadata["identity_alternates"] = [
+                    {"id": gid, "name": name} for gid, name in identity_alternates if gid
+                ]
             if orphan:
                 metadata["orphan"] = True
                 # The folders the zip was actually READ from. save_paths on an
@@ -2995,6 +3032,14 @@ class BackupManager(QObject):
         used when rows are deleted outside a full confirmation, so the
         surviving detections stay pending until the user actually confirms them.
 
+        An identity_pending backup (see create_backup's own
+        identity_alternates) is never touched here, promoted or
+        discarded, even if its own paths happen to appear in
+        *discarded_paths* — this method resolves a PATH confirmation
+        round, and that is a different question from the identity one,
+        answered only at main_window's actual identity-resolution call
+        sites.
+
         Returns (promoted_count, discarded_count).
         """
         discarded_set = set(discarded_paths or [])
@@ -3004,7 +3049,8 @@ class BackupManager(QObject):
             for entry in self._index:
                 if entry.game_id != game_id:
                     continue
-                if not (entry.cloud_metadata or {}).get("pre_confirmation"):
+                meta = entry.cloud_metadata or {}
+                if not meta.get("pre_confirmation") or meta.get("identity_pending"):
                     continue
                 if discarded_set and discarded_set.intersection(entry.save_paths or []):
                     to_discard.append(entry.backup_id)
@@ -3026,10 +3072,22 @@ class BackupManager(QObject):
         return promoted, len(to_discard)
 
     def promote_pre_confirmation_backups(self, game_id: str,
-                                         note: str = "") -> int:
+                                         note: str = "",
+                                         include_identity_pending: bool = False) -> int:
         """Turn every temporary (pre-confirmation) backup of *game_id* into a
         definitive one: the user just confirmed the auto-detected save paths,
         so the session backups protecting them are now regular history.
+
+        include_identity_pending: also promote backups held for an
+        unconfirmed IDENTITY, not just an unconfirmed path (see
+        create_backup's own identity_alternates) — False by default,
+        deliberately: an ordinary path-confirmation flow (auto-scan panel's
+        Apply, Edit Game's Save) must never promote one of these on its
+        own, since promoting keeps it (and its rotation-limit pressure) on
+        whichever entry the identity mystery's auto-pick landed on, which
+        may not even be the right one. True only at the genuine
+        identity-resolution call sites (main_window's _apply_path_add_version
+        / _apply_path_overwrite) — landing there IS the answer.
 
         *note*, when given, replaces the backups' provisional note so the UI
         stops labelling them as pending. Rotation limits are re-enforced
@@ -3041,11 +3099,17 @@ class BackupManager(QObject):
             for entry in self._index:
                 if entry.game_id != game_id:
                     continue
-                if (entry.cloud_metadata or {}).get("pre_confirmation"):
-                    entry.cloud_metadata.pop("pre_confirmation", None)
-                    if note:
-                        entry.note = note
-                    promoted += 1
+                meta = entry.cloud_metadata or {}
+                if not meta.get("pre_confirmation"):
+                    continue
+                if meta.get("identity_pending") and not include_identity_pending:
+                    continue
+                entry.cloud_metadata.pop("pre_confirmation", None)
+                entry.cloud_metadata.pop("identity_pending", None)
+                entry.cloud_metadata.pop("identity_alternates", None)
+                if note:
+                    entry.note = note
+                promoted += 1
         if promoted:
             self._save_game_index(game_id)
             self._enforce_limits(game_id)
@@ -3059,12 +3123,19 @@ class BackupManager(QObject):
         the auto-detected paths they covered were rejected or suppressed,
         so per the confirmation contract their session backups go with them.
         Definitive backups are never touched. Returns the number deleted.
-        """
+
+        Never touches an identity_pending backup (see create_backup's own
+        identity_alternates) — there is no "rejected" answer for an
+        unresolved identity mystery, only an eventual one of
+        main_window's actual identity-resolution outcomes, and deleting
+        real session saves because of it would be a straight data loss
+        with no way back."""
         with _index_lock:
             temp_ids = [
                 b.backup_id for b in self._index
                 if b.game_id == game_id
                 and (b.cloud_metadata or {}).get("pre_confirmation")
+                and not (b.cloud_metadata or {}).get("identity_pending")
             ]
         for bid in temp_ids:
             self.delete_backup(bid)
@@ -3136,7 +3207,8 @@ class BackupManager(QObject):
 
     def adopt_backups(self, from_game_id: str, to_game_id: str,
                       to_game_name: str, to_exe_path: str = "",
-                      to_folder_name: str = "") -> int:
+                      to_folder_name: str = "",
+                      only_identity_pending: bool = False) -> int:
         """Re-file every backup of *from_game_id* under *to_game_id*.
 
         A save folder registered by hand starts as a placeholder entry: real
@@ -3150,12 +3222,28 @@ class BackupManager(QObject):
         Deliberately a MOVE, not a copy: two indexes claiming the same
         backup_id would resurface it as a duplicate on the next scan.
 
+        only_identity_pending: only move backups held for an unconfirmed
+        IDENTITY (see create_backup's own identity_alternates) — for the
+        case of a game whose IDENTITY, not its save paths, was ambiguous
+        (see main_window's _apply_path_reassign / _apply_path_new_game):
+        *from_game_id* here is a real library entry that may carry its
+        own long-settled backup history of its own game — and possibly
+        even its OWN, unrelated unconfirmed-path backups from the other
+        provisional mechanism — none of which belong to whoever the
+        identity mystery resolves to. Only the session's own
+        identity-pending backups do. Every moved one is also promoted
+        (both flags cleared) as part of the move — landing on the
+        correct entry IS the confirmation, so there is nothing left
+        pending afterwards.
+
         Returns how many backups were re-filed.
         """
         if not from_game_id or not to_game_id or from_game_id == to_game_id:
             return 0
         with _index_lock:
-            moving = [b for b in self._index if b.game_id == from_game_id]
+            moving = [b for b in self._index if b.game_id == from_game_id
+                      and (not only_identity_pending
+                           or (b.cloud_metadata or {}).get("identity_pending"))]
             old_folder = self._game_folder_for_entry(moving[0]) if moving else ""
         if not moving:
             return 0
@@ -3204,6 +3292,11 @@ class BackupManager(QObject):
                         if b.cloud_metadata and b.cloud_metadata.get("orphan"):
                             b.cloud_metadata = dict(b.cloud_metadata)
                             b.cloud_metadata.pop("orphan", None)
+                        if only_identity_pending and b.cloud_metadata:
+                            b.cloud_metadata = dict(b.cloud_metadata)
+                            b.cloud_metadata.pop("pre_confirmation", None)
+                            b.cloud_metadata.pop("identity_pending", None)
+                            b.cloud_metadata.pop("identity_alternates", None)
             moved += 1
 
         if moved:
@@ -3227,6 +3320,36 @@ class BackupManager(QObject):
             key=lambda b: b.created_dt,
             reverse=True,
         )
+
+    def has_identity_pending_backups(self, game_id: str) -> bool:
+        """True when *game_id* still has at least one temporary backup
+        held for an unresolved IDENTITY mystery (see create_backup's own
+        identity_alternates) — durable across app restarts, unlike the
+        live overlay's own in-memory pending state (main_window's
+        _pending_path_changed), since the answer lives on the backup
+        entries themselves. The card badge and every promote/discard/
+        resolve guard read this rather than that in-memory dict."""
+        with _index_lock:
+            return any(
+                b.game_id == game_id and (b.cloud_metadata or {}).get("identity_pending")
+                for b in self._index
+            )
+
+    def identity_pending_info(self, game_id: str) -> tuple[str, list]:
+        """(new_exe_path, [(game_id, name), …]) the most recent
+        identity-pending backup for *game_id* recorded — lets a re-opened
+        save-confirm panel offer the same "it's actually X" choices, and
+        resolve them the same way _apply_path_reassign /
+        _apply_path_new_game do, after a restart, when the live overlay's
+        own in-memory alternates (and its new_exe_path) are long gone.
+        ("", []) when there is nothing identity-pending to report."""
+        for b in self.get_backups_for_game(game_id):   # already newest-first
+            alts = (b.cloud_metadata or {}).get("identity_alternates")
+            if alts:
+                return b.exe_path or "", [
+                    (a.get("id", ""), a.get("name", "")) for a in alts if a.get("id")
+                ]
+        return "", []
 
     def get_backups_for_folder(self, folder_name: str) -> list[BackupEntry]:
         """Return backups whose stable storage FOLDER (name-derived) matches
@@ -4667,7 +4790,34 @@ class BackupManager(QObject):
         except Exception as e:
             logger.warning(f"Orphan-title noise repair failed: {e}")
             failures += 1
+        # Fifth repair pass: backups from before planned_deletion existed
+        # (or that the daily retention sweep hasn't reached yet — see
+        # BackupEntry.planned_deletion's own docstring) carry no expiry
+        # stamp at all. Left alone, the sweep only backfills a game's stamp
+        # the next time ITS OWN pass happens to reach it — folding the
+        # backfill into the same self-check that already repairs other
+        # legacy metadata means it also runs from the manual ⚕️ button and
+        # the weekly scheduled sweep, not only the daily retention one.
+        try:
+            stamped = self.backfill_planned_deletion()
+            repaired += stamped
+        except Exception as e:
+            logger.warning(f"planned_deletion backfill failed: {e}")
+            failures += 1
         return repaired, failures
+
+    def backfill_planned_deletion(self) -> int:
+        """Stamp ``planned_deletion`` on every backup missing it. Returns
+        the number of GAMES touched (each ``_enforce_limits`` call handles
+        every backup for that game in one pass, and may also delete any
+        that are already overdue — the same as it would on its own normal
+        schedule, just not deferred until that game's next backup).
+        """
+        with _index_lock:
+            game_ids = {b.game_id for b in self._index if not b.planned_deletion}
+        for game_id in game_ids:
+            self._enforce_limits(game_id)
+        return len(game_ids)
 
     def repair_stale_backup_folders(self) -> int:
         """Move each library game's backups that still live under an OLD
@@ -5144,6 +5294,15 @@ class BackupManager(QObject):
         """Remove oldest backups when limits are exceeded.
         Always keeps at least `min_kept_backups` most recent backups regardless
         of age, so the user never loses all history.
+
+        Also stamps ``planned_deletion`` on every backup that survives this
+        pass — see that field's own docstring on ``BackupEntry`` for why:
+        this is the one place that already sorts and classifies this
+        game's whole backup set (protected-by-min_kept vs. not), so
+        computing each survivor's future expiry date here, once, is what
+        lets the periodic retention sweep be a cheap index scan instead of
+        repeating this same per-game computation for every game on a
+        timer.
         """
         config = get_config()
         max_backups    = config.get("max_local_backups",    MAX_LOCAL_BACKUPS)
@@ -5153,11 +5312,34 @@ class BackupManager(QObject):
         # Hold _index_lock for the entire read-modify cycle to prevent races
         zip_paths_to_delete: list[str] = []
         folder_hint = ""
+        stamped = False
         with _index_lock:
             game_backups = [b for b in self._index if b.game_id == game_id]
             to_delete = self.compute_deletions(game_backups, max_backups, retention_days, min_kept)
 
+            # Stamp survivors regardless of whether anything is being
+            # deleted right now — a freshly-created backup needs its own
+            # planned_deletion set the same way, and an existing one whose
+            # protected/unprotected status just changed (new siblings
+            # pushed it out of the min_kept window, or in) needs it
+            # recomputed. The same sort + "newest min_kept" split
+            # compute_deletions already did, reused rather than redone.
+            survivors = [b for b in game_backups if b.backup_id not in to_delete]
+            protected_ids: set[str] = set()
+            if min_kept > 0:
+                by_age = sorted(survivors, key=lambda b: b.created_dt)
+                newest = by_age[-min_kept:] if len(by_age) >= min_kept else by_age
+                protected_ids = {b.backup_id for b in newest}
+            for b in survivors:
+                new_val = ("" if b.backup_id in protected_ids else
+                          (b.created_dt + timedelta(days=retention_days)).isoformat())
+                if b.planned_deletion != new_val:
+                    b.planned_deletion = new_val
+                    stamped = True
+
             if not to_delete:
+                if stamped:
+                    self._save_game_index(game_id)
                 return
 
             # Derived BEFORE the rows go: if this prune empties the folder,

@@ -358,6 +358,12 @@ class ProcessMonitor(QObject):
     # prompt down, it now asks about something that no longer exists.
     # (process_name, game_id)
     game_match_unverified_gone = Signal(str, str)
+    # A stem/name match found the game running from a DIFFERENT, readable
+    # exe path than the one on record (its stored exe is presumably gone —
+    # a reinstall, an update, a moved folder). Tracking proceeds regardless
+    # (the stem match already confirmed it); this only offers the overlay's
+    # "how should this be tracked" choice. (GameEntry, new_exe_path)
+    game_path_changed     = Signal(object, str, object)  # GameEntry, exe_path, alt_ids
     # Worker-thread → GUI-thread hop for the process snapshot (see _poll)
     _snapshot_ready       = Signal(object)         # dict[ProcessKey, dict]
 
@@ -377,6 +383,7 @@ class ProcessMonitor(QObject):
         # built once per library change, per-process answers memoized.
         self._exe_lookup: Optional[dict] = None
         self._stem_lookup: Optional[dict] = None
+        self._name_lookup: Optional[dict] = None
         self._proc_match_cache: dict = {}
         self._proc_resolved_cache: dict = {}
         # (process_name, game_id) pairs already put to the user this session,
@@ -385,6 +392,10 @@ class ProcessMonitor(QObject):
         # Prompts still awaiting an answer: ProcessKey → (process_name, game_id).
         # Lets an unanswered prompt be withdrawn when its process exits.
         self._unverified_pending: dict = {}
+        # (game_id, new_exe_path.casefold()) pairs already raised via
+        # game_path_changed this session, so a moved/reinstalled game is
+        # asked about once, not on every poll it's seen running.
+        self._path_changed_prompted: set = set()
         self._suppressed_raw: set = set()
         self._suppressed_resolved: set = set()
         # Cross-poll snapshot cache: (pid, create_time) → verdict dict
@@ -898,6 +909,7 @@ class ProcessMonitor(QObject):
     def _invalidate_entry_lookup(self, *_args):
         self._exe_lookup = None
         self._stem_lookup = None
+        self._name_lookup = None
         self._proc_match_cache.clear()
 
     def prune_caches(self):
@@ -923,9 +935,18 @@ class ProcessMonitor(QObject):
 
     def _build_entry_lookup(self):
         from core.resolvers import fuzzy_slug as _slug
+        from core.constants import version_insensitive_slug
         exe_lookup: dict[str, str] = {}      # lowered / resolved path → id
         stem_lookup: dict[str, list] = {}    # slug(stem) → [(id, resolved)]
+        name_lookup: dict[str, list] = {}    # version_insensitive_slug(name) → [id, ...]
         for g in get_library().all_games():
+            name_slug = version_insensitive_slug(g.name)
+            if name_slug:
+                # A list, not a single id — two entries can share the exact
+                # same name on purpose (the "different game" split keeps the
+                # original title), so the second one must stay reachable
+                # here too rather than being silently shadowed by the first.
+                name_lookup.setdefault(name_slug, []).append(g.id)
             if not g.exe_path:
                 continue
             exe_lookup.setdefault(g.exe_path.lower(), g.id)
@@ -939,6 +960,7 @@ class ProcessMonitor(QObject):
                 stem_lookup.setdefault(stem, []).append((g.id, resolved))
         self._exe_lookup = exe_lookup
         self._stem_lookup = stem_lookup
+        self._name_lookup = name_lookup
 
     def _resolve_proc_exe(self, exe: str) -> str:
         cached = self._proc_resolved_cache.get(exe)
@@ -992,7 +1014,8 @@ class ProcessMonitor(QObject):
         if cached is not None:
             gid, verified = cached
             return (lib.get_by_id(gid) if gid else None), verified
-        if self._exe_lookup is None or self._stem_lookup is None:
+        if (self._exe_lookup is None or self._stem_lookup is None
+                or self._name_lookup is None):
             self._build_entry_lookup()
 
         def _remember(gid, verified: bool = True):
@@ -1027,6 +1050,14 @@ class ProcessMonitor(QObject):
                     if self._match_rejected(proc_key, gid_c):
                         return None
                     return _remember(gid_c, self._match_confirmed(proc_key, gid_c))
+                if (g_resolved and exe_resolved
+                        and g_resolved.casefold() != exe_resolved.casefold()):
+                    # is_different_program() only let this through because
+                    # the STORED path no longer exists — a moved/reinstalled
+                    # game, not a different one. Tracking proceeds on the
+                    # stem match either way; this just decides whether to
+                    # also raise the "how should this be tracked" prompt.
+                    self._maybe_signal_path_changed(gid_c, exe_resolved)
                 return _remember(gid_c, True)
 
             # Exact stem — same stem but a DIFFERENT (still existing) path
@@ -1052,7 +1083,100 @@ class ProcessMonitor(QObject):
                         hit = _consider(gid_c, g_resolved)
                         if hit is not None:
                             return hit
+
+        # 4) Derived display name, folder-walked from the resolved exe path
+        # the same way Add Game itself derives one, matched against a
+        # known game's own name. The last resort, and deliberately outside
+        # the stem-length gate above (tier 3 never even runs for a stem
+        # this short) — exists specifically for a game whose packaging
+        # changes its MAIN EXECUTABLE NAME between versions, confirmed
+        # real: an NW.js game shipped a project-named exe in one release
+        # and the framework's own generic "nw.exe" (stem length 2) in the
+        # next, so no stem rule, however slack, could ever bridge them —
+        # there is nothing in common to be slack ABOUT.
+        #
+        # Treated exactly like tier 3's own path-changed case, not the
+        # separate "name only, path unreadable" unverified flow: the path
+        # IS readable here, it just shares nothing with what's on record,
+        # which is tier 3's "stem match, different path" shape, not its
+        # "no path evidence at all" one. game_path_changed's own overlay
+        # (add this version / overwrite / split into a new entry) is
+        # exactly the right question for a title-only match too — a
+        # second, separate confirmation on top of it would just be
+        # friction for something that, in practice, is rare (two
+        # unrelated games sharing an exact title).
+        exe_resolved = self._resolve_proc_exe(exe) if exe else ""
+        if exe_resolved:
+            from core.save_detector import derive_display_name
+            from core.constants import version_insensitive_slug, names_probably_same_game
+            derived = derive_display_name(exe_resolved)
+            derived_slug = version_insensitive_slug(derived)
+            if len(derived_slug) >= 4:
+                slug_hits = (self._name_lookup.get(derived_slug) or []) if self._name_lookup else []
+                gid_c = slug_hits[0] if slug_hits else None
+                alt_ids: list = list(slug_hits[1:])
+                if gid_c is None:
+                    # Exact slug missed — a title that GREW between
+                    # releases shares no slug with its own earlier self at
+                    # all, so the fast dict lookup above can't catch it; a
+                    # linear scan here is fine; this tier only ever runs
+                    # once per unique (name, exe) pair, cached from then
+                    # on. More than one library entry can share the same
+                    # common name (not unusual with long-running series) —
+                    # every match past the first is kept as an alternate
+                    # instead of discarded, so the overlay can still offer
+                    # it even though the first one found is what gets
+                    # auto-tracked by default.
+                    for g in lib.all_games():
+                        if names_probably_same_game(g.name, derived):
+                            if gid_c is None:
+                                gid_c = g.id
+                            else:
+                                alt_ids.append(g.id)
+                if gid_c is not None:
+                    self._maybe_signal_path_changed(gid_c, exe_resolved, alt_ids)
+                    return _remember(gid_c, True)
         return _remember(None)
+
+    def _maybe_signal_path_changed(self, game_id: str, new_exe_path: str,
+                                    alt_ids=()):
+        """Raise game_path_changed for (*game_id*, *new_exe_path*) once, and
+        only when that path isn't already known (primary or a registered
+        version) — an already-answered or already-tracked path stays quiet
+        on every subsequent poll.
+
+        The path is registered as a tracked version RIGHT HERE, before the
+        overlay even shows — so "add it as another path" is what happens by
+        default whether or not the prompt is ever answered (leaving a game
+        untracked just because nobody clicked a button mid-session is worse
+        than a label the user didn't ask for). The overlay's explicit
+        choices refine this afterward: Overwrite drops it back out in favour
+        of the new primary, and "different game" moves it onto its own
+        entry instead. Both are corrections to a safe default, not races
+        against a default that hasn't happened yet.
+
+        *alt_ids* are OTHER library entries whose name also matched — the
+        auto-tracked *game_id* is only the first one found, not necessarily
+        the right one when a common name is shared by more than one entry
+        in the library. Passed through untouched so the overlay can offer
+        them as "it's actually this one" corrections alongside its usual
+        choices.
+        """
+        entry = get_library().get_by_id(game_id)
+        if entry is None:
+            return
+        key = (game_id, new_exe_path.casefold())
+        if key in self._path_changed_prompted:
+            return
+        known = {p.casefold() for p in (entry.exe_path_versions or {}).keys()}
+        if entry.exe_path:
+            known.add(entry.exe_path.casefold())
+        if new_exe_path.casefold() in known:
+            return
+        self._path_changed_prompted.add(key)
+        entry.record_exe_version(new_exe_path)
+        get_library().update_game(entry)
+        self.game_path_changed.emit(entry, new_exe_path, list(alt_ids))
 
     def _prompt_unverified_match(self, entry: GameEntry, proc_name: str,
                                  proc_key: Optional[tuple] = None):

@@ -952,4 +952,15 @@ def main():
 
 
 if __name__ == "__main__":
+    # Must run before anything else: in a frozen build, a
+    # multiprocessing.Pool worker (see core.engines.wolf_lz4's seed search)
+    # is another launch of this same .exe, arriving with special bootstrap
+    # arguments in sys.argv rather than a normal one. freeze_support() is
+    # what recognises that and hands off to the worker bootstrap instead of
+    # running the app a second time — runtime_splash_hook.py already knows
+    # to let a worker launch reach this point instead of treating it as a
+    # real second instance (see that module's own docstring). A no-op on
+    # every other launch, frozen or not.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

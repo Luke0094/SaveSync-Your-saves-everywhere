@@ -74,6 +74,62 @@ def store_key(kind: str, place, key: str) -> None:
         logger.debug(f"{kind}: a key could not be stored ({e})")
 
 
+def stored_value(kind: str, place, name: str) -> str:
+    """One NAMED value remembered for this game and engine, or "".
+
+    Distinct from stored_key/store_key above: those hold the ONE key a
+    whole game needs (an Easy Save 3 password, an Unreal key). Some engines
+    need more than one remembered fact per game instead — Wolf RPG's LZ4
+    variant recovers one keystream seed per save-SLOT salt, not one seed
+    for the whole game, so "the key" is really a small, growing table. Both
+    live in the same per-(kind, game) file rather than a second one, which
+    is what keeps this "the same game_keys system" rather than a parallel
+    store next to it.
+    """
+    try:
+        path = _key_file(kind, place)
+        if not path.is_file():
+            return ""
+        values = json.loads(path.read_text(encoding="utf-8")).get("values") or {}
+        return str(values.get(name) or "")
+    except Exception as e:
+        logger.debug(f"{kind}: a stored value could not be read ({e})")
+        return ""
+
+
+def store_value(kind: str, place, name: str, value: str) -> None:
+    """Remember *value* under *name* for this game — see stored_value.
+
+    Merges into whatever the file already holds (its "key", and any other
+    named values) rather than replacing it — a game with several save
+    slots adds one entry per slot's salt over time, and each write must
+    leave the others exactly as they were.
+    """
+    if not value:
+        return
+    try:
+        path = _key_file(kind, place)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        values = dict(existing.get("values") or {})
+        values[name] = value
+        body_data = {"game": str(game_identity(place)), "values": values}
+        if existing.get("key"):
+            body_data["key"] = existing["key"]
+        body = json.dumps(body_data, ensure_ascii=False, indent=1)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(path)
+        logger.info(f"{kind}: remembered {name} for {game_identity(place).name}")
+    except OSError as e:
+        logger.debug(f"{kind}: a value could not be stored ({e})")
+
+
 def key_from_file(place, filename: str) -> str:
     """A key the player dropped beside their save, as published tools write it."""
     try:

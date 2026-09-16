@@ -555,6 +555,7 @@ class ReviewsDialog(QDialog):
         if self.isVisible():
             from ui.widgets.busy_overlay import DeferredBusy
             self._review_busy = DeferredBusy(self, t("common.please_wait"))
+            self._review_busy.set_on_cancel(self._cancel_review_insert)
         self._pending_reviews = page_items
         QTimer.singleShot(0, lambda g=gen: self._insert_review_step(g))
 
@@ -580,6 +581,14 @@ class ReviewsDialog(QDialog):
         if busy is not None:
             busy.close()
             self._review_busy = None
+
+    def _cancel_review_insert(self):
+        """Stop the in-flight card insert — what Cancel on the please-wait
+        sheet actually means, not just dismissing the sheet while the
+        QTimer chain keeps quietly popping cards behind it."""
+        self._review_gen += 1
+        self._pending_reviews = []
+        self._stop_review_busy()
 
     def _render_pager(self, total_pages: int):
         # The combo is reparented before the row is wiped: it belongs to the

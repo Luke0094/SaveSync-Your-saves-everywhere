@@ -124,6 +124,49 @@ class PathRow(QFrame):
                 pass
         threading.Thread(target=_compute, daemon=True).start()
 
+    def _version_label_for_path(self) -> str:
+        """Which tracked exe VERSION's own install folder *self._path*
+        physically sits under, or "" when it doesn't sit under any of
+        them (an AppData/Documents-style path, genuinely shared across
+        every version the same way — nothing here to disambiguate) or
+        the game only has one tracked exe to begin with (nothing to
+        disambiguate FROM). An absolute path only ever means one thing on
+        its own; once a game has more than one install folder, though,
+        which one a given save lives under stops being obvious from the
+        path text alone."""
+        if not self._game_id:
+            return ""
+        try:
+            from core.library import get_library
+            entry = get_library().get_by_id(self._game_id)
+            if not entry:
+                return ""
+            exe_paths = entry.all_exe_paths()
+            if len(exe_paths) <= 1:
+                return ""
+            p_resolved = Path(self._path).resolve()
+        except (OSError, ValueError):
+            return ""
+        for exe_path, label in exe_paths:
+            try:
+                exe_dir = Path(exe_path).resolve().parent
+                p_resolved.relative_to(exe_dir)
+                # The actual version token, not the stored label — that
+                # label frequently IS just the exe's own immediate parent
+                # folder name (derive_exe_version_label only ever checked
+                # one level up), which for a release nested one folder
+                # deeper than its own versioned name carries no version at
+                # all. find_version_near does the same nested-release walk
+                # derive_display_name itself uses and returns the version
+                # alone — confirmed against a real nested-release install
+                # where the stored label was just the inner folder's bare
+                # name, with the actual version one folder further up.
+                from core.save_detector import find_version_near
+                return find_version_near(exe_path) or label
+            except (OSError, ValueError):
+                continue
+        return ""
+
     def _build(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)
@@ -149,6 +192,17 @@ class PathRow(QFrame):
                             else t('auto_scan.registry_key_tooltip'))
         path_lbl.setMinimumWidth(scaled(60, self))
         path_lbl.setWordWrap(False)
+
+        # Version badge — only for a path that lives INSIDE a specific
+        # tracked version's own install folder (see _version_label_for_path),
+        # never shown at all for a single-version game or a path that's
+        # genuinely shared across every version the same way.
+        version_lbl = None
+        _ver = self._version_label_for_path()
+        if _ver:
+            version_lbl = QLabel(_ver)
+            version_lbl.setObjectName("path_row_version")
+            version_lbl.setToolTip(t('add_game.path_version_tooltip', version=_ver))
 
         # Size info — computed asynchronously to avoid blocking the GUI
         # thread with rglob on large save directories.
@@ -180,6 +234,8 @@ class PathRow(QFrame):
 
         row.addWidget(self.checkbox)
         row.addWidget(path_lbl, 1)
+        if version_lbl is not None:
+            row.addWidget(version_lbl)
         row.addWidget(info_lbl)
         row.addWidget(open_btn)
         row.addWidget(rm_btn)

@@ -48,7 +48,7 @@ def library_card_size(host=None) -> tuple[int, int]:
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".ico", ".avif"}
 
-STATUS_ICONS  = {"synced":"✓","pending":"⟳","conflict":"⚠","local_only":"💾","cloud_only":"☁","no_saves":"—","provisional":"◌","playing":"▶"}
+STATUS_ICONS  = {"synced":"✓","pending":"⟳","conflict":"⚠","local_only":"💾","cloud_only":"☁","no_saves":"—","provisional":"◌","ambiguous":"❔","playing":"▶"}
 
 # Each sort criterion's own "natural" direction — what its underlying
 # comparison already produces before any user-chosen reversal. Newest/most
@@ -59,6 +59,9 @@ _STATUS_PALETTE_KEY = {
     "synced": "success", "pending": "warning", "conflict": "error",
     "local_only": "info", "cloud_only": "cloud", "no_saves": "text_hint",
     "provisional": "provisional",
+    # Same family as "provisional" — restorable, held back from cloud
+    # upload — but for a different reason (see _display_sync_status).
+    "ambiguous": "warning",
     # Not a sync state: it REPLACES one for as long as a game is running.
     # See _display_sync_status.
     "playing": "accent",
@@ -82,16 +85,28 @@ def _display_sync_status(entry, playing: bool = False) -> str:
     Filters and sorting do NOT pass this: "playing" is a thing the card
     shows, not a bucket a game belongs to.
 
-    Identical to entry.sync_status/"local_only" whenever the game has
-    confirmed save_paths. When it doesn't, "no_saves" is upgraded to
-    "provisional" if live tracking has already produced at least one
-    provisional (pre-confirmation) backup for this game — there IS
-    restorable data, the user just hasn't confirmed which paths to keep.
-    A genuinely untouched game (nothing detected at all) still reads
-    "no_saves".
+    "ambiguous" wins over everything but "playing" — a name-similarity
+    match still hasn't settled which library entry this game even IS
+    (see main_window's _identity_still_ambiguous /
+    BackupManager.has_identity_pending_backups), which matters more than
+    whatever sync_status the auto-picked entry happens to carry.
+
+    Otherwise identical to entry.sync_status/"local_only" whenever the
+    game has confirmed save_paths. When it doesn't, "no_saves" is
+    upgraded to "provisional" if live tracking has already produced at
+    least one provisional (pre-confirmation) backup for this game —
+    there IS restorable data, the user just hasn't confirmed which paths
+    to keep. A genuinely untouched game (nothing detected at all) still
+    reads "no_saves".
     """
     if playing:
         return "playing"
+    try:
+        from core.backup import get_backup_manager
+        if get_backup_manager().has_identity_pending_backups(entry.id):
+            return "ambiguous"
+    except Exception:
+        pass
     if entry.save_paths:
         return entry.sync_status or "local_only"
     try:
@@ -673,6 +688,20 @@ class _PlayRatingStrip(QWidget):
     def rating(self) -> StarRating:
         return self._rating
 
+    def set_rating(self, value: float):
+        """Set the rating AND reposition immediately.
+
+        The rating is absolute-positioned (setGeometry), not layout-managed,
+        so its own updateGeometry()/update() calls on a text change (e.g.
+        unrated "—" to a real number, which is wider) do nothing on their
+        own — _place() only otherwise runs from resizeEvent or a playtime
+        hover. Without this, going from no rating to a number left the
+        widget at its old, narrower box until the next incidental resize or
+        hover recalculated it, showing the new number briefly misplaced.
+        """
+        self._rating.set_value(value)
+        self._place()
+
     def _on_play_hover(self, _hovering: bool):
         self._place()
 
@@ -913,7 +942,7 @@ class _GameItemMixin:
         # Straight to the save editor for THIS game — the page's search step
         # is skipped, which is the point of coming from here.
         menu.addAction(t("cheats.menu"),         lambda: self.cheats_requested.emit(self._entry.id))
-        if _display_sync_status(self._entry) == "provisional":
+        if _display_sync_status(self._entry) in ("provisional", "ambiguous"):
             menu.addAction(t("library.review_provisional"),
                             lambda: self.review_provisional_requested.emit(self._entry.id))
         menu.addSeparator()
@@ -1742,7 +1771,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._name_lbl.setToolTip(_disp_name)
         self._apply_status()   # self._entry already == entry (set above)
         self._playtime_lbl.set_entry(entry)
-        self._rating.set_value(entry.average_rating())
+        self._play_strip.set_rating(entry.average_rating())
         self._apply_card_style()
 
     def update_locale(self):

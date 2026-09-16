@@ -81,6 +81,19 @@ _DEFAULTS: dict[str, Any] = {
     # restore is attempted. Runs in the background, well after startup.
     "backup_verify_enabled": True,
     "backup_verify_interval_days": 7,
+    # Periodic retention sweep: re-applies max_local_backups /
+    # backup_retention_days / min_kept_backups for EVERY game with backups,
+    # not just the one that happens to sync next. Without this, a game you
+    # do not play for a while accrues no pruning at all until its next
+    # backup event — at which point everything past the retention window
+    # expires in one batch, all at once, which can look like backups
+    # vanished for no reason (see FINDINGS/session notes: exactly this,
+    # reported directly). Daily by default so expiry is gradual, one
+    # backup crossing the line at a time, the way it would have looked if
+    # the game had been played every day all along.
+    "backup_retention_sweep_enabled": True,
+    "backup_retention_sweep_interval_days": 1,
+    "backup_retention_sweep_last": "",  # ISO datetime of the last completed run
     # Data-integrity checks (core.self_checks): index zip-existence, legacy
     # metadata repair, archive CRC, config snapshots. Read through get() with
     # defaults since they were added late; declared here so a corrupted file
@@ -175,6 +188,8 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "save_correlation_window_ms": lambda x: isinstance(x, int) and 100 <= x <= 10000,
     "backup_verify_enabled": lambda x: isinstance(x, bool),
     "backup_verify_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    "backup_retention_sweep_enabled": lambda x: isinstance(x, bool),
+    "backup_retention_sweep_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
     "self_checks": lambda x: isinstance(x, bool),
     "self_checks_frequency": lambda x: isinstance(x, int) and 1 <= x <= 365,
     "last_self_check": lambda x: isinstance(x, (int, float)) and x >= 0,

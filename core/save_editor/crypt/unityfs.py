@@ -11,13 +11,19 @@ so the blocks are decompressed, joined and handed back for searching. That
 keeps this a hundred lines instead of a library.
 
 Three compressions appear in the wild and all three are handled: none, LZMA
-(the standard library does it) and LZ4, whose block format is simple enough
-to decode here — see _lz4_block. Anything else is declined rather than
-guessed at.
+(the standard library does it) and LZ4 (the ``lz4`` package does it — a
+project dependency already, for wolf_lz4, so there is no longer a reason to
+hand-roll this one the way an earlier version of this module did: that was
+~60 lines of a literal/back-reference walker in pure Python, replaced with
+one call into the same C decoder, measured 5x+ faster on top of being less
+code to maintain — see git history / FINDINGS.md if the old version is ever
+wanted for reference). Anything else is declined rather than guessed at.
 """
 import logging
 import lzma
 import struct
+
+import lz4.block
 
 logger = logging.getLogger(__name__)
 
@@ -45,62 +51,21 @@ class UnityFsError(Exception):
 
 
 def _lz4_block(src: bytes, out_size: int) -> bytes:
-    """LZ4 block format — literals and back-references, nothing else.
-
-    Written out here because the format is small and the alternative is a
-    dependency: a token byte splits into how many literal bytes follow and
-    how many bytes to copy from what has already been produced, with 0xf in
-    either half meaning "read more length bytes until one is not 0xff".
+    """Unity's raw LZ4 block — the same shape ``core.engines.wolf_lz4``
+    already depends on the ``lz4`` package for, so this is a thin wrapper
+    rather than a second decoder: ``uncompressed_size`` is documented as a
+    MAXIMUM, not a guarantee ("less data may be returned" on a short/wrong
+    stream — the same gap wolf_lz4.decompress's own docstring already
+    guards against), so the exact-length check below is load-bearing, not
+    a formality.
     """
-    out = bytearray()
-    i, n = 0, len(src)
-    while i < n:
-        token = src[i]
-        i += 1
-        lit = token >> 4
-        if lit == 15:
-            while i < n:
-                b = src[i]
-                i += 1
-                lit += b
-                if b != 255:
-                    break
-        if lit:
-            out += src[i:i + lit]
-            i += lit
-        if i >= n:
-            break
-        if i + 2 > n:
-            raise UnityFsError("a back-reference runs past the block")
-        offset = src[i] | (src[i + 1] << 8)
-        i += 2
-        if offset == 0:
-            raise UnityFsError("a back-reference points nowhere")
-        length = token & 0x0F
-        if length == 15:
-            while i < n:
-                b = src[i]
-                i += 1
-                length += b
-                if b != 255:
-                    break
-        length += 4                       # the format's minimum match
-        start = len(out) - offset
-        if start < 0:
-            raise UnityFsError("a back-reference points before the start")
-        if offset >= length:
-            out.extend(out[start:start + length])
-        else:
-            # Overlapping match (run of bytes): repeat pattern with chunk extension
-            while length > 0:
-                chunk = min(length, offset)
-                out.extend(out[start:start + chunk])
-                length -= chunk
-        if len(out) > _MAX_UNPACKED:
-            raise UnityFsError("the block unpacks to more than we will hold")
+    try:
+        out = lz4.block.decompress(src, uncompressed_size=out_size or -1)
+    except lz4.block.LZ4BlockError as e:
+        raise UnityFsError(f"the LZ4 block will not unpack: {e}") from e
     if out_size and len(out) != out_size:
         raise UnityFsError(f"unpacked to {len(out)} bytes, not {out_size}")
-    return bytes(out)
+    return out
 
 
 def _decompress(data: bytes, kind: int, out_size: int) -> bytes:

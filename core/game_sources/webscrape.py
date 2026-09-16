@@ -1185,7 +1185,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     genres: list[str] = []
     kw = _meta("keywords", "og:video:tag", "genre")
     if kw:
-        genres = [k.strip() for k in re.split(r'[,;|]', kw) if k.strip()][:8]
+        genres = [k.strip() for k in re.split(r'[,;|]', kw) if k.strip()]
 
     # Game-related JSON-LD type keywords (ignore Article/BreadcrumbList/WebSite)
     _GAME_LD_TYPES = ("game", "videogame", "softwareapplication", "product", "creativework")
@@ -1610,8 +1610,8 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
             if _tag and _tag.casefold() not in _seen_t:
                 _seen_t.add(_tag.casefold())
                 genres.append(_tag)
-            if len(genres) >= 16:
-                break
+            if len(genres) >= 64:
+                break   # safety bound against a pathological page, not a content cap
 
     # Safety net: whatever path produced the description, a leftover leading
     # "Overview:" / "Description:"-style label is never part of the text.
@@ -1692,7 +1692,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         description=description,
         image_url=image_url,
         release_date=release_date,
-        genres=genres[:16],
+        genres=genres,
         developer=developer,
         publisher='',
         store_url=_store_link or url,

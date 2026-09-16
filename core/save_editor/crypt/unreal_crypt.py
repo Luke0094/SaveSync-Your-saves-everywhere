@@ -238,6 +238,12 @@ def find_key(raw: bytes, binaries, on_tick=None) -> tuple:
     A byte array is looked for at sixteen-byte steps before finer ones. That
     is where a compiler puts a constant of this size, and starting anywhere
     else would spend the first several minutes in the least likely places.
+
+    The byte-array scan tries a JIT-compiled AES decrypt first (see
+    ``_aes_numba`` — roughly an order of magnitude faster than the
+    ``cryptography``-per-candidate loop this falls back to, measured the
+    same way wolf_lz4's seed search was), transparently: same inputs, same
+    result, just faster when numba is installed.
     """
     if not looks_encrypted(raw):
         return "", ""
@@ -246,6 +252,14 @@ def find_key(raw: bytes, binaries, on_tick=None) -> tuple:
 
     def carry_on() -> bool:
         return on_tick is None or on_tick() is not False
+
+    try:
+        from core.save_editor.crypt._aes_numba import (_HAVE_NUMBA,
+                                                        find_key_numba)
+    except ImportError:
+        _HAVE_NUMBA = False
+
+    first, second = raw[:_BLOCK], raw[_BLOCK:_BLOCK * 2]
 
     for path in binaries:
         try:
@@ -264,6 +278,15 @@ def find_key(raw: bytes, binaries, on_tick=None) -> tuple:
                 return key.hex(), how
         for stride in _STRIDES:
             for size in _KEY_SIZES:
+                if _HAVE_NUMBA:
+                    off, mode = find_key_numba(blob, size, stride, first,
+                                               second, MAGIC, carry_on=carry_on)
+                    if off < 0:
+                        continue
+                    how = "ecb" if mode == 1 else "cbc"
+                    logger.info(f"Unreal: {size}-byte key found in "
+                                f"{Path(path).name} at 0x{off:x}")
+                    return blob[off:off + size].hex(), how
                 # Inclusive end: last valid window starts at len(blob) - size.
                 for off in range(0, max(0, len(blob) - size + 1), stride):
                     if not (off & _TICK_MASK) and not carry_on():

@@ -114,7 +114,7 @@ _in_unreal_save_folder = registry_module.in_unreal_save_folder
 _looks_encrypted_unreal = registry_module.looks_encrypted_unreal
 
 
-def _candidates(path: Path, data: bytes, game_dir=None) -> list:
+def _candidates(path: Path, data: bytes, game_dir=None, engine: str = "") -> list:
     """Formats worth trying for this file, best guess first.
 
     Four passes, narrowest evidence first, and the order between them is the
@@ -135,20 +135,44 @@ def _candidates(path: Path, data: bytes, game_dir=None) -> list:
     out = []
     ext = path.suffix.lower()
 
-    engine = ""
-    if game_dir:
+    eng = (engine or "").strip()
+    # The library's OWN answer wins over guessing again from the install
+    # folder: it may have been detected off files that no longer sit beside
+    # this exe (or the on-disk heuristic simply misses this game's layout),
+    # and re-deriving it here regardless used to mean a game the library
+    # already knew the engine for could still open "unsupported" — the
+    # engine-preferred readers below were never even offered the file.
+    if not eng and game_dir:
         try:
             from core.engines.game_engine import detect_engine
-            engine = detect_engine(game_dir=str(game_dir)) or ""
+            # thorough=True: this runs once, for one folder, only when a
+            # save is actually being opened — not the routine per-card
+            # lookup the entry cap exists to protect, so there is nothing to
+            # lose by scanning properly here.
+            eng = detect_engine(game_dir=str(game_dir), thorough=True) or ""
         except Exception:
-            engine = ""
-    if engine:
-        out.extend(registry_module.engine_preferences(engine))
+            eng = ""
+    engine_readers = set(registry_module.engine_preferences(eng)) if eng else set()
+    out.extend(engine_readers)
 
     if ext in _BY_EXTENSION:
         out.append(_BY_EXTENSION[ext])
 
-    out.extend(registry_module.sniffed(path, data, ext))
+    # A reader that SEARCHES for a key or a seed (FormatSpec.expensive) must
+    # never be reached on a cheap magic/tag-byte match alone — confirmed
+    # directly: an unrelated AliceSoft save whose byte 8 happened to equal
+    # Wolf LZ4's tag value launched a real, unbounded 2^32 seed search on a
+    # file with nothing to do with Wolf RPG Editor, through this exact path.
+    # It is still tried here when the ENGINE itself already confirms it
+    # belongs (already in engine_readers above) — this only removes the
+    # blind, no-confirmation route, matching how Pass 1/Pass 2 below and
+    # recipe_format._candidate_readers already treat every expensive reader.
+    expensive = registry_module.expensive_readers()
+    for cls in registry_module.sniffed(path, data, ext):
+        if cls in expensive and cls not in engine_readers:
+            continue
+        out.append(cls)
+
     out.extend(registry_module.lzstring_readers(data))
     out.extend(registry_module.fallback_readers())
 
@@ -218,7 +242,12 @@ class SaveDocument:
         """Write the edits back, keeping the original first.
 
         Returns the path of the copy that was set aside — the thing "undo"
-        needs. Writing happens only after that copy exists.
+        needs — or None when there was nothing left to copy (see
+        backup_original: the file this editor loaded from is gone from
+        under it — renamed, moved, deleted by something else since load).
+        The write itself still happens either way: the edit is fully known
+        already, in memory, and a missing "before" copy is not a reason to
+        refuse it.
         """
         if self.read_only:
             raise SaveEditorError(
@@ -279,16 +308,48 @@ def why_not(path) -> str:
     return known[1] if known else ""
 
 
-def open_save(path, game_dir=None, progress=None) -> SaveDocument:
+def open_save(path, game_dir=None, progress=None, engine: str = "",
+             full_sweep: bool = False, try_recipes: bool = False,
+             cancel_token=None) -> SaveDocument:
     """Open *path* for editing, or explain why it cannot be.
 
     *game_dir* is where the game itself is installed, when that is known. A
     save does not always sit with its game — Unity puts them under the user's
     profile — and one format needs to look in the game's own files.
 
+    *engine* is what the LIBRARY already knows this game is built with, when
+    it knows one — trusted over re-detecting it from *game_dir* (see
+    _candidates), since a caller with a library entry already has the more
+    reliable answer.
+
+    *full_sweep* puts the SEARCHING readers (Wolf RPG, Easy Save 3, encrypted
+    Unreal — see registry.expensive_readers) into the last-resort blind pass
+    too. They are left out of it by default, at real cost in minutes on a
+    file that is not theirs, so this is for the one moment that cost is worth
+    paying: offered to the user only after "unsupported" — see
+    ui/pages/cheats_page.py — as the automatic alternative to picking the
+    engine by hand.
+
+    *try_recipes* asks a small, bounded battery of generic unwrap recipes to
+    look at the file too (see recipe_format.RecipeFormat) — implies
+    *full_sweep* regardless of which one the caller actually set. Tried at
+    two points, both after detection proper has already run to completion
+    and found nothing better: a file some reader understood but could not
+    prove safe to write back (still returned as read-only if no recipe
+    improves on it), and a file nothing recognised at all. Detection itself
+    (_detect, below) knows nothing of this flag or of recipes — see
+    try_recipe_battery, the only thing that does.
+
     *progress* is for the one format whose search can run long: it is called
     with the seconds elapsed and stops the search by returning False. Every
     other format ignores it.
+
+    *cancel_token*, when given a ``core.engines.wolf_lz4.CancelToken``, lets
+    the caller stop that same search immediately from another thread —
+    *progress* returning False is only ever noticed between rounds, which
+    can itself be a long wait; terminating the search's own worker pool
+    directly is what actually cuts that short. Only Wolf LZ4 uses this
+    today; every other format ignores it, same as progress.
     """
     # Unity's PlayerPrefs are a save that is not a file: SaveSync proposes
     # them as "registry:HKCU\..." and backs them up already, so the same
@@ -314,6 +375,68 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         if not data:
             raise SaveEditorError("the file is empty", "cheats.err_empty")
 
+    try:
+        doc = _detect(p, data, registry, game_dir, progress, engine,
+                       full_sweep or try_recipes, cancel_token)
+    except SaveEditorError as exc:
+        # Only the truly generic "nothing recognised this at all" raise
+        # escalates — every other named raise below (a known format that is
+        # understood but deliberately not editable) is not a mystery a
+        # recipe could resolve, so it is left to propagate as it always did.
+        if try_recipes and exc.key == "cheats.err_unreadable":
+            recovered = try_recipe_battery(data, p, game_dir, registry)
+            if recovered is not None:
+                return recovered
+        raise
+    if try_recipes and doc.read_only:
+        recovered = try_recipe_battery(data, p, game_dir, registry)
+        if recovered is not None:
+            return recovered
+    return doc
+
+
+def try_recipe_battery(data: bytes, p: Path, game_dir, registry: str):
+    """Try the generic unwrap recipe battery and return a fully writable
+    SaveDocument built from whatever it finds, or None when nothing a
+    registered reader could confirm turned up.
+
+    Called only from open_save, above — never from _detect, and never
+    automatically: both call sites are gated on try_recipes having been
+    explicitly asked for (see ui/pages/cheats_page.py for where that
+    actually comes from). A hit still has to pass the same lock-direction
+    proof (verify_value_round_trip) every other writable save does; a miss
+    changes nothing about whatever open_save was about to do anyway (return
+    a read-only doc, or raise).
+    """
+    from .recipe_format import RecipeFormat
+    fmt = RecipeFormat()
+    fmt.source_path = p
+    try:
+        fmt.load(data)
+    except Exception:
+        return None
+    try:
+        if not fmt.verify_value_round_trip():
+            return None
+    except Exception:
+        return None
+    fields = fmt.fields()
+    if not fields:
+        return None
+    doc = SaveDocument(
+        path=p, format_name=fmt.name, engine=(fmt.engine or ""),
+        fields=fields, read_only=False, _fmt=fmt, _original=data,
+        _registry=registry)
+    doc._baseline = doc._value_snapshot()
+    return doc
+
+
+def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
+            engine: str, full_sweep: bool, cancel_token=None) -> SaveDocument:
+    """Everything open_save used to do directly, moved here unchanged in
+    substance so that generic-unwrap escalation is reached only by
+    open_save wrapping this function's result or exception — never from
+    inside it. Raises SaveEditorError, same keys and messages as always."""
     def prepare(cls):
         """A reader, told where the file came from.
 
@@ -330,17 +453,28 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
             fmt.game_dir = game_dir
         if progress is not None and hasattr(fmt, "progress"):
             fmt.progress = progress
+        if cancel_token is not None and hasattr(fmt, "cancel_token"):
+            fmt.cancel_token = cancel_token
         return fmt
 
-    def engine_label_for(cls):
-        label = cls.engine
+    def engine_label_for(cls, fmt):
+        # fmt.engine, not cls.engine: a format whose class default is only
+        # a shape ("Known save header") can say more once it has actually
+        # seen the file — see StructHeaderFormat, which sets self.engine
+        # from whichever known layout matched. Every other format's fmt.engine
+        # already resolves to its own cls.engine when it never overrides it,
+        # so this changes nothing for them.
+        label = fmt.engine
         # When the library knows the game's engine, prefer that label for
         # formats that are shared across engines (plain JSON, key/value text)
         # so a WebGL or Java title is not shown as a generic "JSON" save.
-        if game_dir and registry_module.shared_across_engines(cls):
+        if registry_module.shared_across_engines(cls):
             try:
-                from core.engines.game_engine import detect_engine, label as eng_label
-                detected = detect_engine(game_dir=str(game_dir))
+                from core.engines.game_engine import label as eng_label
+                detected = (engine or "").strip()
+                if not detected and game_dir:
+                    from core.engines.game_engine import detect_engine
+                    detected = detect_engine(game_dir=str(game_dir))
                 if detected in ("webgl", "tads", "java"):
                     label = eng_label(detected) or label
             except Exception:
@@ -355,7 +489,7 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         if not fields and cls is not JsonFormat and not issubclass(cls, JsonFormat):
             return None
         doc = SaveDocument(
-            path=p, format_name=cls.name, engine=engine_label_for(cls),
+            path=p, format_name=fmt.name, engine=engine_label_for(cls, fmt),
             fields=fields, read_only=read_only, _fmt=fmt, _original=data,
             _registry=registry)
         doc._baseline = doc._value_snapshot()
@@ -377,7 +511,14 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
         logger.info(f"{p.name}: {cls.name} {why} — read-only")
         readonly_doc = doc
 
-    tried = [PlayerPrefsFormat] if registry else _candidates(p, data, game_dir)
+    tried = [PlayerPrefsFormat] if registry else _candidates(p, data, game_dir, engine)
+    # Readers reached because the CALLER said this is the engine — the
+    # library's own answer, or a person naming it directly via "Open as…"
+    # (see ui/pages/cheats_page.py). A rejection there is not "this format
+    # tried its luck and moved on" like the rest of the sweep; it is "the
+    # one answer we were actually told turned out not to read", which is
+    # worth seeing without turning on debug logging.
+    named = set(registry_module.engine_preferences(engine)) if engine else set()
 
     for cls in tried:
         fmt = prepare(cls)
@@ -388,7 +529,12 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
             # is entirely normal. Worth a line all the same: without it, a
             # mistake inside a reader is indistinguishable from a file that
             # simply was not that format.
-            logger.debug(f"{p.name}: not {cls.name} ({type(e).__name__}: {e})")
+            if cls in named:
+                logger.warning(
+                    f"{p.name}: told this is {engine!r}, but {cls.name} "
+                    f"could not read it ({type(e).__name__}: {e})")
+            else:
+                logger.debug(f"{p.name}: not {cls.name} ({type(e).__name__}: {e})")
             continue
         # A format that proved byte-exactness during load (json_format,
         # naninovel, tads_rec: they compared dump()==data on the file they
@@ -570,7 +716,8 @@ def open_save(path, game_dir=None, progress=None) -> SaveDocument:
     # off-chance (see FormatSpec.expensive).
     already = set(tried)
     sweep_limit = registry_module.max_sweep_bytes()
-    sweep = registry_module.all_readers() if len(data) <= sweep_limit else ()
+    sweep = (registry_module.all_readers(include_expensive=full_sweep)
+             if len(data) <= sweep_limit else ())
     if not sweep:
         logger.debug(
             f"{p.name}: {len(data) >> 20} MB is past the backup size limit "
@@ -741,13 +888,28 @@ def _slot_dir(path: Path, create: bool = True) -> Path:
 
 
 def backup_original(path, contents: bytes = None) -> Path:
-    """Put a dated copy of *path* aside and return where it went.
+    """Put a dated copy of *path* aside and return where it went, or None
+    when there was nothing to copy.
 
     *contents* is for a save that is not a file — a registry key, whose
     "original" is the export taken when it was opened. Everything else about
     keeping copies, naming them and pruning them is the same either way.
+
+    *path* itself missing, with *contents* not given either, returns None
+    rather than raising: the file an editor loaded from can be renamed or
+    removed by something else after the fact — a person tidying up a copy
+    they marked ``.broken`` by hand is exactly this case — and that is not
+    a reason to block the actual write save() is about to make, which is
+    already fully known in memory. Only "also keep a copy of what used to
+    be there" has nothing left to do; restore_backup already leans on this
+    same distinction (see its own ``if t.exists():`` guard) rather than
+    calling this unconditionally.
     """
     p = Path(path)
+    if contents is None and not p.exists():
+        logger.warning(f"No original to keep for {p.name} — it was not "
+                       f"there any more when the write was about to happen")
+        return None
     d = _slot_dir(p)
     # Milliseconds AND a collision guard: saving and then undoing happen
     # within the same second, and a second-resolution name would have the

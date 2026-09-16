@@ -355,6 +355,19 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
                     current.append(v)
             setattr(existing, list_key, current)
 
+    # Exe-path versions: union like tags/name_history, not gated by the
+    # path strategy below — this is accumulating KNOWLEDGE (every install
+    # either machine has ever seen this game running from), not a single
+    # current-state fact the way exe_path/save_paths are. A local label
+    # wins on a path both sides know, since it was derived the same way
+    # either side would derive it.
+    imported_versions = imported_dict.get("exe_path_versions") or {}
+    if imported_versions:
+        merged_versions = dict(existing.exe_path_versions or {})
+        for path, label in imported_versions.items():
+            merged_versions.setdefault(path, label)
+        existing.exe_path_versions = merged_versions
+
     # Descriptive metadata: fill only fields that are empty locally
     for fill_key in ("description", "developer", "release_year",
                      "store_url", "category", "info_source", "engine"):

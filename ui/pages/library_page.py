@@ -454,8 +454,9 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         self._rebuild_view()
 
     def on_page_leave(self):
-        """Stop any deferred busy when leaving page."""
-        self._stop_deferred_busy()
+        """Stop any deferred busy AND the chunk insert it was covering —
+        closing just the sheet left the QTimer chain running unseen."""
+        self._cancel_insert()
 
     def wipe_and_reload(self):
         """Drop every built widget and re-arm the initial load: the next
@@ -722,12 +723,37 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         from ui.widgets.busy_overlay import DeferredBusy
         self._deferred_busy = DeferredBusy(
             self, t("common.please_wait"), delay_ms=0)
+        self._deferred_busy.set_on_cancel(self._cancel_insert)
 
     def _stop_deferred_busy(self):
         busy = getattr(self, "_deferred_busy", None)
         if busy is not None:
             busy.close()
             self._deferred_busy = None
+
+    def _cancel_insert(self):
+        """Stop any in-flight chunk insert — what Cancel on the please-wait
+        sheet actually means, not just dismissing the sheet while the
+        QTimer chain keeps quietly appending cards behind it. Same two
+        lines already repeated at every OTHER place that invalidates an
+        in-flight insert (a rebuild, a page-size change); wiring it as the
+        sheet's on_cancel is what was missing, not a new mechanism.
+
+        If real work was actually thrown away (the queue was not already
+        empty), the page is left knowing its render is incomplete — see
+        _pending_initial_load — so the NEXT time it is shown it picks up
+        where cancelling left off instead of silently staying half-built
+        forever. A cancel that lands after the queue had already drained
+        naturally (nothing left to lose) does not force a needless rebuild
+        on the next visit.
+        """
+        had_pending_work = bool(getattr(self, "_insert_queue", None))
+        self._insert_gen = getattr(self, "_insert_gen", 0) + 1
+        self._insert_queue = []
+        self._stop_deferred_busy()
+        if had_pending_work:
+            self._pending_initial_load = True
+            self._initial_load_scheduled = False
 
     def _async_insert_step(self, gen: int):
         """One chunk of cards, then yield back to the event loop."""
@@ -1052,7 +1078,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         elif criterion == "playtime":
             result = sorted(games, key=lambda g: g.playtime_seconds, reverse=True)
         elif criterion == "status":
-            order = {"conflict": 0, "pending": 1, "local_only": 2, "synced": 3, "cloud_only": 4, "no_saves": 5, "provisional": 6}
+            order = {"ambiguous": 0, "conflict": 1, "pending": 2, "local_only": 3, "synced": 4, "cloud_only": 5, "no_saves": 6, "provisional": 7}
             result = sorted(games, key=lambda g: order.get(_display_sync_status(g), 9))
         elif criterion == "last_backup":
             result = sorted(games, key=lambda g: g.last_backed_up or "", reverse=True)

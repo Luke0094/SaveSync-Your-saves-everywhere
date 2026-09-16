@@ -81,6 +81,10 @@ class CandidatePreviewDialog(QDialog):
         self._thumb_cache: dict[str, bytes] = {}
         self._thumb_token = 0
         self.selected = None   # set to the confirmed GameInfo on accept
+        # True only for an explicit No click — lets the caller tell "No, try
+        # another source" apart from closing the window outright, which
+        # means stop looking entirely, not keep cascading through tiers.
+        self.explicitly_declined = False
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t('add_game.candidate_preview_title'))
         self._apply_window_chrome()
@@ -285,10 +289,14 @@ class CandidatePreviewDialog(QDialog):
         self._idx = max(0, min(self._idx, n - 1)) if n else 0
         c = self._candidates[self._idx] if n else None
 
+        # Disabled rather than hidden for a single candidate — the chevron
+        # dims to the muted colour instead of vanishing, matching the
+        # "arrows simply disabled for a single result" contract the search
+        # flow documents (search_flow.py's _on_search_finished). Hiding them
+        # here made a genuine multi-candidate result look single whenever a
+        # same-tier peer got deduped down to one useful entry.
         self._prev_btn.setEnabled(self._idx > 0)
         self._next_btn.setEnabled(n > 0 and self._idx < n - 1)
-        self._prev_btn.setVisible(n > 1)
-        self._next_btn.setVisible(n > 1)
 
         if not c:
             self._counter_lbl.setText(t('add_game.search_not_found'))
@@ -316,6 +324,8 @@ class CandidatePreviewDialog(QDialog):
         else:
             self._counter_lbl.setText(t('add_game.candidate_found_single'))
 
+        _current = diff.get('current') or {}
+
         # ── Name (strikethrough old if the result renames the title) ────
         _name_field = fields.get('name')
         if _name_field and _name_field.get('old'):
@@ -323,6 +333,14 @@ class CandidatePreviewDialog(QDialog):
                 f"<span style='color:{palette('text_muted')};text-decoration:line-through;"
                 f"font-weight:400;font-size:{scaled(12, self)}px;'>{_h.escape(_name_field['old'])}</span><br>"
                 f"{_h.escape(_name_field.get('new') or c.name or '?')}"
+            )
+        elif (c.name or '').strip().lower() == (_current.get('name') or '').strip().lower() and c.name:
+            # Same "already have it" signal as a matching tag/year/developer
+            # — a small checkmark beside the title, not a full-size prefix,
+            # since this is also the card's main heading.
+            self._name_lbl.setText(
+                f"<span style='color:{palette('text_muted')};font-weight:400;"
+                f"font-size:{scaled(12, self)}px;'>&#10003;</span> {_h.escape(c.name or '?')}"
             )
         else:
             self._name_lbl.setText(_h.escape(c.name or '?'))
@@ -337,7 +355,7 @@ class CandidatePreviewDialog(QDialog):
             self._inspect_btn.setEnabled(True)
             self._inspect_btn.setVisible(True)
         else:
-            self._inspect_btn.clear()
+            self._inspect_btn.setText("")
             self._inspect_btn.setToolTip(t("add_game.candidate_inspect_tooltip"))
             self._inspect_btn.setEnabled(False)
             self._inspect_btn.setVisible(False)
@@ -361,44 +379,84 @@ class CandidatePreviewDialog(QDialog):
                     f"<span style='color:{palette('text_muted')};text-decoration:line-through;'>"
                     f"{_h.escape(_old_snip)}</span><br>{_h.escape(_snip)}"
                 )
+            elif _new_desc.strip().lower() == (_current.get('description') or '').strip().lower():
+                # Same signal as an already-saved tag/year/developer.
+                self._desc_lbl.setText(
+                    f"<span style='color:{palette('text_muted')};'>&#10003; </span>{_h.escape(_snip)}"
+                )
             else:
-                self._desc_lbl.setText(_h.escape(_snip))
+                # Fills a field that was empty — same "new" signal as a new tag.
+                self._desc_lbl.setText(
+                    f"<span style='color:{palette('accent')};'>+ </span>{_h.escape(_snip)}"
+                )
             self._desc_lbl.setVisible(True)
         else:
             self._desc_lbl.setVisible(False)
 
         # ── Developer / Year meta row ────────────────────────────────────
-        # Only fields the confirm path would write — no fallback to scraped
-        # values that enrich/init will skip (looked "identified" but unsaved).
-        def _meta_piece(label_key: str, field_key: str) -> str:
+        # This card identifies the CANDIDATE — it shows whatever the source
+        # actually carries, whether or not that value would change anything
+        # on confirm (fields[field_key] only exists when it DIFFERS from the
+        # form). Only the chip-selection step in the merge dialog is where
+        # an already-matching value is excluded from what's offered.
+        def _meta_piece(label_key: str, field_key: str, raw_value: str = '') -> str:
             _f = fields.get(field_key)
-            _new = ((_f.get('new') if _f else '') or '').strip()
+            _new = ((_f.get('new') if _f else '') or '').strip() or (raw_value or '').strip()
             if not _new:
                 return ''
             _lbl = _h.escape(t(label_key))
-            if _f.get('old'):
+            _old = ((_f.get('old') if _f else '') or '').strip()
+            if _old:
                 return (
                     f"<b>{_lbl}:</b> "
                     f"<span style='color:{palette('text_muted')};text-decoration:line-through;'>"
-                    f"{_h.escape(_f['old'])}</span> {_h.escape(_new)}"
+                    f"{_h.escape(_old)}</span> {_h.escape(_new)}"
                 )
-            return f"<b>{_lbl}:</b> {_h.escape(_new)}"
+            _cur_val = (_current.get(field_key) or '').strip()
+            if _cur_val and _cur_val.lower() == _new.lower():
+                # Already saved, same value — same signal as a matching tag.
+                return (
+                    f"<b>{_lbl}:</b> "
+                    f"<span style='color:{palette('text_muted')};'>&#10003; {_h.escape(_new)}</span>"
+                )
+            # Fills a field that was empty — same "new" signal as a new tag.
+            return (
+                f"<b>{_lbl}:</b> "
+                f"<span style='color:{palette('accent')};'>+ {_h.escape(_new)}</span>"
+            )
 
-        _dev_piece = _meta_piece('add_game.developer', 'developer')
-        _yr_piece  = _meta_piece('add_game.year', 'year')
+        _dev_piece = _meta_piece('add_game.developer', 'developer', getattr(c, 'developer', '') or '')
+        _yr_piece  = _meta_piece('add_game.year', 'year', diff.get('result_year') or '')
         _meta_bits = [p for p in (_dev_piece, _yr_piece) if p]
         self._meta_lbl.setText('&nbsp;&nbsp;&nbsp;'.join(_meta_bits))
         self._meta_lbl.setVisible(bool(_meta_bits))
 
         # ── Reviews — count + up to 3 samples on ONE line ──────────────
         # Vertical stacking ate the room the description and tags need;
-        # the reviews panel is where they are read in full.
+        # the reviews panel is where they are read in full. Same rule as
+        # developer/year above: show the candidate's OWN verdict even when
+        # it's identical to one already saved (new_reviews filters those
+        # out — that's for the merge chip, not for identifying the source).
         _new_reviews = diff.get('new_reviews') or []
+        _reviews_already_saved = not _new_reviews
+        if not _new_reviews:
+            if hasattr(c, 'as_reviews'):
+                _new_reviews = c.as_reviews() or []
+            elif hasattr(c, 'as_review'):
+                _one = c.as_review()
+                _new_reviews = [_one] if _one else []
         if _new_reviews:
             from core.library import reviews_display_count
+            _count_txt = (
+                t('reviews.preview_saved', count=reviews_display_count(_new_reviews))
+                if _reviews_already_saved else
+                t('reviews.preview_count', count=reviews_display_count(_new_reviews))
+            )
+            _check = "&#10003; " if _reviews_already_saved else ""
+            _count_color = palette('text_muted') if _reviews_already_saved else palette('accent')
             _bits = [
                 f"<b>{_h.escape(t('reviews.preview'))}:</b> "
-                f"{_h.escape(t('reviews.preview_count', count=reviews_display_count(_new_reviews)))}"
+                f"<span style='color:{_count_color};'>{_check}{_h.escape(_count_txt)}</span>"
             ]
             for _r in _new_reviews[:3]:
                 _score = float(_r.get('rating') or 0)
@@ -414,18 +472,42 @@ class CandidatePreviewDialog(QDialog):
         else:
             self._review_lbl.setVisible(False)
 
-        # ── Tags — always additive (union, never struck through) ─────────
+        # ── Tags — identification card: a COMPACT sample, not the full set.
+        # This popup only identifies the candidate at a glance; the actual
+        # per-tag picking (including every tag past the sample) happens in
+        # the merge dialog's chips. A tag already saved gets a ✓ instead of
+        # being dropped from the sample entirely — only the merge/apply
+        # step excludes it from what's added. New tags sort first so the
+        # cap never hides them behind ones already known.
+        _TAG_SAMPLE = 8
         _all_genre_tags = list(c.genres or [])
         _new_tags = diff.get('new_tags') or []
-        if diff.get('has_existing') and not diff.get('is_overwrite') and _all_genre_tags:
-            _display_tags, _prefix = _new_tags, ('+ ' if _new_tags else '')
-        else:
-            _display_tags, _prefix = _all_genre_tags, ''
-        if _display_tags:
-            self._tags_lbl.setText(
-                f"<b>{_h.escape(t('library.tags'))}:</b> {_prefix}"
-                f"{_h.escape(', '.join(_display_tags[:10]))}"
-            )
+        if _all_genre_tags:
+            from core.library import tag_merge_key
+            _new_keys = {tag_merge_key(x) for x in _new_tags}
+            _seen_keys: set[str] = set()
+            _new_pieces, _known_pieces = [], []
+            for _tag in _all_genre_tags:
+                _key = tag_merge_key(_tag)
+                if _key in _seen_keys:
+                    continue
+                _seen_keys.add(_key)
+                _esc = _h.escape(_tag)
+                if _key in _new_keys:
+                    _new_pieces.append(f"<span style='color:{palette('accent')};'>+ {_esc}</span>")
+                else:
+                    _known_pieces.append(
+                        f"<span style='color:{palette('text_muted')};'>&#10003; {_esc}</span>")
+            _ordered = _new_pieces + _known_pieces
+            _pieces = _ordered[:_TAG_SAMPLE]
+            _remaining = len(_ordered) - len(_pieces)
+            _line = f"<b>{_h.escape(t('library.tags'))}:</b> " + ", ".join(_pieces)
+            if _remaining > 0:
+                _line += (
+                    f" <span style='color:{palette('text_muted')};'>"
+                    f"{_h.escape(t('add_game.candidate_tags_more', count=_remaining))}</span>"
+                )
+            self._tags_lbl.setText(_line)
             self._tags_lbl.setVisible(True)
         else:
             self._tags_lbl.setVisible(False)
@@ -453,6 +535,7 @@ class CandidatePreviewDialog(QDialog):
 
     def _on_reject(self):
         self.selected = None
+        self.explicitly_declined = True
         self.reject()
 
     def _on_inspect(self):
@@ -470,11 +553,8 @@ class CandidatePreviewDialog(QDialog):
 
         def _fetch(u=url, tok=token):
             try:
-                import urllib.request
-                from core.net import open_url as _open_url
-                req = urllib.request.Request(
-                    u, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                )
+                from core.net import open_url as _open_url, image_fetch_request
+                req, _resolved = image_fetch_request(u)
                 with _open_url(req, timeout=10) as r:
                     data = r.read()
             except Exception:
@@ -494,9 +574,9 @@ class CandidatePreviewDialog(QDialog):
         self._set_thumb(data)
 
     def _set_thumb(self, data: bytes):
-        px = QPixmap()
-        if px.loadFromData(data):
-            from ui.helpers import scaled_for_screen
+        from ui.helpers import pixmap_from_bytes, scaled_for_screen
+        px = pixmap_from_bytes(data)
+        if not px.isNull():
             self._thumb_lbl.setPixmap(scaled_for_screen(px, 112, 70))
 
 
@@ -617,7 +697,7 @@ class EnrichmentMergeDialog(QDialog):
     _ELIDE = 60   # preview length inside a chip
     _IMG_W, _IMG_H = 96, 60
 
-    _FIELDS = ('description', 'developer', 'year', 'image')
+    _FIELDS = ('name', 'description', 'developer', 'year')
 
     _thumb_ready = Signal(str, bytes)   # image url, downloaded bytes
 
@@ -629,7 +709,8 @@ class EnrichmentMergeDialog(QDialog):
         self._tag_boxes: list[tuple[QPushButton, str]] = []
         self._url_boxes: list[tuple[QPushButton, str]] = []
         self._review_boxes: list[tuple[QPushButton, list]] = []
-        self._img_chips: dict[str, QPushButton] = {}   # image url → select chip
+        self._img_boxes: list[tuple[QPushButton, str]] = []  # (chip, url) — additive, like tags
+        self._img_chips: dict[str, QPushButton] = {}   # image url → thumbnail chip
         self._header_thumbs: dict[str, QLabel] = {}    # cover url → header preview
         # source key → every chip offered under that source (for header toggle)
         self._source_chips: dict[str, list[QPushButton]] = {}
@@ -685,10 +766,10 @@ class EnrichmentMergeDialog(QDialog):
 
     def _field_title(self, field: str) -> str:
         return {
+            'name':        t('add_game.name'),
             'description': t('library.description'),
             'developer':   t('add_game.developer'),
             'year':        t('add_game.year'),
-            'image':       t('add_game.image'),
         }[field]
 
     @staticmethod
@@ -826,9 +907,15 @@ class EnrichmentMergeDialog(QDialog):
         chip.setChecked(checked)
         return chip
 
-    def _image_chip(self, url: str, checked: bool = False,
+    def _image_chip(self, url: str, checked: bool = True,
                     title: str = "") -> QPushButton:
-        """Checkable cover thumbnail — readable without relying on memory."""
+        """Checkable cover thumbnail — readable without relying on memory.
+
+        Additive like a tag chip, not exclusive: a game can hold many
+        covers (the add/edit dialog's own carousel), so picking one image
+        was never a reason to rule out another — each stays independently
+        checkable, default ON, and every checked one gets added rather than
+        one replacing whatever's already there."""
         chip = QPushButton("🖼")
         chip.setCheckable(True)
         chip.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -843,9 +930,8 @@ class EnrichmentMergeDialog(QDialog):
             f"QPushButton:checked{{border:2px solid {palette('accent')};"
             f"background:{palette('bg_card')};}}"
         )
-        group = self._field_groups.setdefault("image", _ChipGroup())
-        group.add(chip)
         chip.setChecked(checked)
+        self._img_boxes.append((chip, url))
         self._img_chips[url] = chip
         return chip
 
@@ -868,21 +954,91 @@ class EnrichmentMergeDialog(QDialog):
         col.setSpacing(4)
         col.setContentsMargins(0, 0, 8, 0)
 
-        # ── One section per source, chips inside ──────────────────────────
-        # Only fields the confirmed candidate left EMPTY reach this dialog
-        # (see _build_merge_model), so every field chip is a filler offer:
-        # the first source's chip starts selected, clicking it off (or all
-        # off) means "leave the field empty". Filled fields never appear —
-        # they stay whatever the confirmed source set.
-        by_source: dict = {}
+        # ── One section PER FIELD for the exclusive single-value fields ───
+        # Name/description/developer/year only ever have ONE slot on the
+        # form, so every option for a given field — "Keep current" plus
+        # every differing value any source offered — lives together under
+        # one heading instead of being scattered across different
+        # per-source rows (where "Keep current" had no field label at all
+        # and its sibling alternative could be several rows away, under an
+        # unrelated source header — not selecting it did mean "keep the
+        # original", but nothing on screen made that legible). All chips
+        # for a field share one _ChipGroup (see _field_chip): picking any
+        # one — including "Keep current" — deselects the rest.
+        #
+        # When the field already has a value, "Keep current" starts
+        # checked and no alternative is auto-picked — the confirmed
+        # candidate's own field is never silently swapped for a peer's
+        # without the user deliberately choosing it. When the field is
+        # still EMPTY (no "Keep current" to anchor on), the first offered
+        # value auto-fills instead, same as before.
+        _current = self._model.get('current') or {}
+        _prev_label = t('add_game.merge_previous_value')
         for field in self._FIELDS:
-            for opt in self._model.get(field, []):
-                by_source.setdefault(opt['source'], {}).setdefault(field, []).append(opt['value'])
-        for kind in ('tags', 'urls', 'reviews'):
+            opts = self._model.get(field) or []
+            if not opts:
+                continue
+            cur_val = (_current.get(field) or '').strip()
+            header = QLabel(self._field_title(field))
+            header.setStyleSheet(
+                f"color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;"
+                f"letter-spacing:0.5px;padding:8px 0 2px;"
+            )
+            col.addWidget(header)
+            flow = _FlowLayout(spacing=6)
+            host = QWidget()
+            host.setLayout(flow)
+
+            # Name is the one field in this group applied UNCONDITIONALLY on
+            # confirm (see _apply_result_init) — so by the time this dialog
+            # opens, "current" is already the just-applied candidate's own
+            # name, not something the user chose. Defaulting to "Keep
+            # current" here would default to silently accepting that rename.
+            # When a "previous name" option exists (the pre_confirm_name
+            # snapshot, source-labelled _prev_label), default to THAT
+            # instead — nothing changes unless the user deliberately opts
+            # back into the new name. Every other field here is fill-only
+            # (never auto-applied without asking), so "Keep current" staying
+            # the default for them is correct as-is.
+            _default_value = None
+            if field == 'name':
+                for opt in opts:
+                    _sm = (self._model.get("source_meta") or {}).get(opt['source']) or {}
+                    if _sm.get('source_id') == _prev_label:
+                        _default_value = opt['value']
+                        break
+
+            first_taken = False
+            if cur_val:
+                chip = self._field_chip(
+                    field, t('add_game.merge_keep_current', value=self._short(cur_val)),
+                    '', tooltip=cur_val, checked=(_default_value is None),
+                )
+                flow.addWidget(chip)
+                first_taken = _default_value is None
+            for opt in opts:
+                src_meta = (self._model.get("source_meta") or {}).get(opt['source']) or {}
+                src_id = src_meta.get('source_id') or ''
+                src_label = self._src_label(src_id) if src_id else ''
+                text = self._short(opt['value']) + (f"  ·  {src_label}" if src_label else '')
+                is_default = _default_value is not None and opt['value'] == _default_value
+                chip = self._field_chip(
+                    field, text, opt['value'], tooltip=opt['value'],
+                    checked=is_default or (not first_taken and _default_value is None),
+                )
+                first_taken = True
+                flow.addWidget(chip)
+            col.addWidget(host)
+
+        # ── One section per source for the ADDITIVE kinds ──────────────────
+        # Images/tags/urls/reviews are not exclusive — a game can hold many
+        # of each — so they stay grouped by source (their identity matters:
+        # which page a review or tag came from), each defaulting to checked
+        # (deselect what you don't want).
+        by_source: dict = {}
+        for kind in ('images', 'tags', 'urls', 'reviews'):
             for opt in self._model.get(kind, []):
                 by_source.setdefault(opt['source'], {}).setdefault(kind, []).append(opt['value'])
-
-        _field_first_taken = {f: False for f in self._FIELDS}
 
         for source, offers in by_source.items():
             col.addWidget(self._source_header_row(source))
@@ -891,26 +1047,13 @@ class EnrichmentMergeDialog(QDialog):
             host.setLayout(flow)
             src_chips: list[QPushButton] = []
             peer_title = ((self._model.get("source_meta") or {}).get(source) or {}).get("name") or ""
-            # Cover select chip first — identity at a glance before text fields.
-            for value in offers.get('image', []):
-                checked = not _field_first_taken['image']
-                _field_first_taken['image'] = True
-                chip = self._image_chip(value, checked=checked, title=peer_title)
+            # Cover chip(s) first — identity at a glance before text fields.
+            # Additive: every offered cover defaults to checked, same as a
+            # tag, since a game can hold more than one (see _image_chip).
+            for value in offers.get('images', []):
+                chip = self._image_chip(value, checked=True, title=peer_title)
                 flow.addWidget(chip)
                 src_chips.append(chip)
-            for field in self._FIELDS:
-                if field == 'image':
-                    continue
-                for value in offers.get(field, []):
-                    checked = not _field_first_taken[field]
-                    _field_first_taken[field] = True
-                    chip = self._field_chip(
-                        field,
-                        self._field_title(field) + ": " + self._short(value),
-                        value, tooltip=value, checked=checked,
-                    )
-                    flow.addWidget(chip)
-                    src_chips.append(chip)
             for tag in offers.get('tags', []):
                 chip = _merge_chip(tag)
                 chip.setChecked(True)
@@ -968,14 +1111,12 @@ class EnrichmentMergeDialog(QDialog):
 
     def _start_thumb_downloads(self):
         """Fetch cover previews off the GUI thread (same opener as candidate)."""
-        import urllib.request as _url_req
-        from core.net import open_url as _open_url
-        _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        from core.net import open_url as _open_url, image_fetch_request
         urls = set(self._img_chips) | set(self._header_thumbs)
         for url in urls:
             def _dl(u=url):
                 try:
-                    req = _url_req.Request(u, headers={"User-Agent": _UA})
+                    req, _resolved = image_fetch_request(u)
                     with _open_url(req, timeout=10) as r:
                         data = r.read(2_000_000)
                     if data:
@@ -986,10 +1127,10 @@ class EnrichmentMergeDialog(QDialog):
 
     def _on_thumb_ready(self, url: str, data: bytes):
         try:
-            px = QPixmap()
-            if not px.loadFromData(data):
+            from ui.helpers import pixmap_from_bytes, scaled_for_screen
+            px = pixmap_from_bytes(data)
+            if px.isNull():
                 return
-            from ui.helpers import scaled_for_screen
             chip = self._img_chips.get(url)
             if chip is not None:
                 thumb = scaled_for_screen(px, self._IMG_W, self._IMG_H)
@@ -1004,10 +1145,13 @@ class EnrichmentMergeDialog(QDialog):
             pass   # dialog already closed
 
     def selection(self) -> dict:
-        """Chosen pieces: description/developer/year/image mapped to the
-        picked value or None (keep current / skip), plus tag, url and review
-        lists — reviews arrive already flattened, a whole source at a time."""
+        """Chosen pieces: name/description/developer/year mapped to the
+        picked value or None (keep current / skip), plus image, tag, url and
+        review lists — reviews arrive already flattened, a whole source at
+        a time; images are additive like tags, never a single exclusive
+        pick."""
         sel = {
+            'images': [v for cb, v in self._img_boxes if cb.isChecked()],
             'tags': [v for cb, v in self._tag_boxes if cb.isChecked()],
             'urls': [v for cb, v in self._url_boxes if cb.isChecked()],
             'reviews': [r for cb, group in self._review_boxes

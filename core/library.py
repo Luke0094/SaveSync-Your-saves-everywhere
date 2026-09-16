@@ -29,6 +29,101 @@ def tag_merge_key(tag: str) -> str:
     return re.sub(r"[\s_\-]+", " ", (tag or "").casefold()).strip()
 
 
+def derive_exe_version_label(path: str) -> str:
+    """A short label for an exe *path* — the install folder's name with
+    release noise stripped but the version kept, e.g. "Some Title v1.2.3"
+    out of a folder like "[GOG] Some Title v1.2.3-CODEX". Same raw source
+    GameEntry.record_exe_hints already treats as "where a release keeps its
+    code and version" (the install folder), run through the one existing
+    clean-but-keep-the-version helper so it reads like a version, not a raw
+    folder name. Module-level (not a GameEntry method) so the Add/Edit Game
+    dialog can preview a label before an entry even exists yet."""
+    try:
+        raw = Path(path).parent.name
+    except (OSError, ValueError):
+        return ""
+    if not raw:
+        return ""
+    try:
+        from core.constants import strip_dlsite_code
+        from core.game_sources.common import _strip_release_noise
+        # DLsite codes come off first, bracketed or not — _strip_release_noise
+        # on its own only catches a BRACKETED one ("[RJ123456]"); a bare
+        # leading "RJ123456 Some Title v1.0" would otherwise sail through
+        # whole, unlike every other game whose code happens to be bracketed.
+        return _strip_release_noise(strip_dlsite_code(raw), drop_version=False)
+    except Exception:
+        return raw
+
+
+def rebase_path_for_new_exe(old_exe: str, new_exe: str, path: str):
+    """If *path* sits inside the OLD exe's directory tree at some ancestor
+    level (a save folder kept alongside the game, e.g. "install/www/save"),
+    return (rebased_path, relative_chain) locating the same relative spot
+    under the NEW exe's tree — the same "reinstalled/moved" case the Add/Edit
+    dialog already rebases by hand when its own exe field changes. Returns
+    None when no such relationship is found — a save living somewhere
+    unrelated to the install folder (AppData, Documents, …) doesn't move
+    just because the exe did, and is already correct as-is.
+    """
+    try:
+        old_exe_p = Path(old_exe).resolve()
+        new_exe_p = Path(new_exe).resolve()
+        p_path = Path(path).resolve()
+    except (OSError, ValueError):
+        return None
+    old_parents = [old_exe_p.parent] + list(old_exe_p.parents)
+    new_parents = [new_exe_p.parent] + list(new_exe_p.parents)
+    for i, old_parent in enumerate(old_parents):
+        if i >= len(new_parents):
+            break
+        new_parent = new_parents[i]
+        if len(old_parent.parts) <= 1 or len(new_parent.parts) <= 1:
+            break
+        try:
+            if p_path == old_parent or old_parent in p_path.parents:
+                rel = p_path.relative_to(old_parent)
+                return str(new_parent / rel), rel.as_posix()
+        except Exception:
+            continue
+    return None
+
+
+def path_has_content(target: Path) -> bool:
+    """True when *target* already holds something real — a non-empty
+    directory, or a file with actual bytes in it. Shared by every "is this
+    rebase target actually empty?" check (rebase_targets_have_existing_saves,
+    and main_window's own carry-the-save-data-across-a-move step) so they
+    agree on what "empty" means."""
+    try:
+        if target.is_dir():
+            return any(target.iterdir())
+        if target.is_file():
+            return target.stat().st_size > 0
+    except OSError:
+        pass
+    return False
+
+
+def rebase_targets_have_existing_saves(old_exe: str, new_exe: str, save_paths) -> bool:
+    """True when rebasing *save_paths* from *old_exe* to *new_exe* would land
+    on a location that already has its OWN save content — a genuine second,
+    independent save history (e.g. the "new" version has already been played
+    a while under live tracking), not just an empty reinstall target. Used to
+    decide whether transferring save tracking onto the new exe needs a
+    confirmation first, or can happen automatically like the ordinary case.
+    """
+    if not old_exe or not save_paths:
+        return False
+    for p in save_paths:
+        hit = rebase_path_for_new_exe(old_exe, new_exe, p)
+        if hit is None:
+            continue
+        if path_has_content(Path(hit[0])):
+            return True
+    return False
+
+
 VALID_SYNC_STATUSES = frozenset(
     {"synced", "pending", "conflict", "local_only", "cloud_only", "no_saves"}
 )
@@ -193,6 +288,14 @@ class GameEntry:
     # lists drift apart the first time one of them does. A stale key costs
     # nothing.
     save_path_chains: dict = field(default_factory=dict)
+    # Additional exe paths this game is also known to run from — a reinstall
+    # to a new folder, a second build, a different storefront copy. {path:
+    # label}. exe_path above stays the PRIMARY path — everything that already
+    # keys off it (get_by_exe, the monitor's _exe_lookup, …) is untouched;
+    # this dict only holds the extra ones. Same "stale key costs nothing"
+    # rationale as save_path_chains: a version whose install folder is gone
+    # stays listed (and removable) rather than silently vanishing.
+    exe_path_versions: dict = field(default_factory=dict)
     # One-shot: the user chose "keep local saves" for a game whose cloud folder
     # already holds another machine's data. The NEXT sync must be forced to
     # upload (local wins) — a plain "auto" sync could otherwise DOWNLOAD a
@@ -258,6 +361,43 @@ class GameEntry:
         out = [c for c in (self.save_path_chains or {}).values() if c]
         if self.save_chain and self.save_chain not in out:
             out.append(self.save_chain)
+        return out
+
+    def record_exe_version(self, path: str, label: str = ""):
+        """Register *path* as an additional (non-primary) exe path this game
+        is also known to run from."""
+        if not path or path == self.exe_path:
+            return
+        self.exe_path_versions = dict(self.exe_path_versions or {})
+        self.exe_path_versions[str(path)] = label or derive_exe_version_label(path)
+
+    def remove_exe_version(self, path: str):
+        """Drop *path* from the extra-versions list. Never touches the
+        primary exe_path — that one is replaced via Overwrite instead."""
+        if not self.exe_path_versions:
+            return
+        self.exe_path_versions = {
+            p: lbl for p, lbl in self.exe_path_versions.items()
+            if str(p).casefold() != str(path).casefold()
+        }
+
+    def all_exe_paths(self) -> list:
+        """Every exe path this game is known to run from, as (path, label)
+        tuples — the primary first, then every registered version. Stale
+        (no-longer-existing) paths are kept, same as save_path_chains: a
+        version whose install folder is gone should stay listed and
+        removable, not silently disappear."""
+        out: list = []
+        seen: set[str] = set()
+        if self.exe_path:
+            out.append((self.exe_path, derive_exe_version_label(self.exe_path)))
+            seen.add(self.exe_path.casefold())
+        for p, lbl in (self.exe_path_versions or {}).items():
+            key = str(p).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((p, lbl or derive_exe_version_label(p)))
         return out
 
     def record_exe_hints(self, exe_path: str = ""):
