@@ -111,6 +111,15 @@ hiddenimports += [
     # (never lz4.block — a generic recipe has no out-of-band size to give
     # a block decoder).
     'lz4', 'lz4.block', 'lz4.frame', 'numpy', 'numba',
+    # Same fix as the Windows spec, same reason: ui.styles.arrow_icons
+    # writes SVG files and lets Qt's image-plugin dispatch decode them via
+    # QSS image: url(...) — nothing ever imports QtSvg directly.
+    # PyInstaller's plugin collector ties imageformats/libqsvg.so to the
+    # QtSvg module specifically, not to QtGui, so without this every
+    # chevron/arrow icon silently paints as an empty rectangle in the
+    # frozen build (works from source, where the full pip install has
+    # every plugin on disk).
+    'PySide6.QtSvg',
 ]
 
 a = Analysis(                                    # noqa: F821

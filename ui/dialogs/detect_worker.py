@@ -78,13 +78,16 @@ class DetectWorker(QThread):
             # already handled by detect_save_paths).
             if self._general_scan and not is_live:
                 try:
-                    from core.save_detector import general_scan_paths, expand_selectable_paths
-                    from core.constants import SAVE_FOLDER_HINTS
-                    from core.config_manager import get_config as _get_cfg
+                    from core.save_detector import (general_scan_paths,
+                                                    expand_selectable_paths,
+                                                    effective_save_hints)
 
                     # User-configurable "save folder suggestions" from Settings
                     # drive scoring confidence here — same as detect_save_paths.
-                    hints = _get_cfg().get("save_folder_hints", SAVE_FOLDER_HINTS)
+                    # effective_save_hints(), not a bare config.get: the built-in
+                    # defaults must survive even if Settings' own stored list was
+                    # cleared (see that function's docstring).
+                    hints = effective_save_hints()
                     detected_paths.extend(general_scan_paths(
                         self._game_name, self._exe_path, hints, detected_paths,
                         should_stop=lambda: self._should_stop,

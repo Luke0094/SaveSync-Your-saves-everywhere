@@ -230,6 +230,19 @@ def search_steam(game_name: str, appid: Optional[str] = None,
     best = _find_best_match(scored_as, all_items, "name")
     if best:
         best_appid = best.get("id")
+        # A caller-given appid whose _appdetails lookup failed falls through
+        # to here rather than returning early — a reasonable fallback (the
+        # game may still be findable by name under a different appid, e.g.
+        # a delisted/region-blocked one superseded by a new listing) IF the
+        # name search actually turns up something else. When it resolves to
+        # the SAME appid that just failed, recursing repeats the identical
+        # failing lookup with nothing having changed: unbounded recursion
+        # (no counter, no visited-set) until Python's recursion limit raises
+        # RecursionError, uncaught, out of whatever multi-source search was
+        # in progress. Stop here instead — that appid is confirmed dead.
+        if best_appid and appid and str(best_appid) == str(appid):
+            logger.info(f"Steam: best name match resolves to the same failed appid {appid} — giving up")
+            return None
         if best_appid:
             logger.info(f"Steam best match: {best.get('name')} (appid={best_appid})")
             info = search_steam(game_name, str(best_appid),

@@ -366,7 +366,7 @@ class GameEntry:
     def record_exe_version(self, path: str, label: str = ""):
         """Register *path* as an additional (non-primary) exe path this game
         is also known to run from."""
-        if not path or path == self.exe_path:
+        if not path or str(path).casefold() == (self.exe_path or "").casefold():
             return
         self.exe_path_versions = dict(self.exe_path_versions or {})
         self.exe_path_versions[str(path)] = label or derive_exe_version_label(path)

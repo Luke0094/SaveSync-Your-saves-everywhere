@@ -24,6 +24,19 @@ fi
 "${PY}" -m pip download -r requirements.txt -d offline_deps
 CODE=$?
 
+# langdetect has no wheel on PyPI, only a source dist -- pip download would
+# otherwise vendor the .tar.gz, and installing FROM an sdist needs
+# setuptools as a build dependency at install time, which is exactly the
+# one thing --no-index --find-links can't fall back to PyPI for. Building
+# the (universal, pure-Python) wheel here instead sidesteps that: the
+# target machine then just installs a wheel, no build step, no setuptools
+# needed. Same fix tests/download_offline_deps.sh already uses.
+if [ ${CODE} -eq 0 ]; then
+    rm -f offline_deps/langdetect-*.tar.gz
+    "${PY}" -m pip wheel langdetect --no-deps -w offline_deps
+    CODE=$?
+fi
+
 echo
 if [ ${CODE} -eq 0 ]; then
     echo "[OK] offline_deps/ populated. Copy the whole project folder"

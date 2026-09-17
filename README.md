@@ -169,7 +169,8 @@ pip install pyinstaller
 pyinstaller --clean savesync.spec
 ```
 
-Output: `dist/SaveSync.exe` (single file, animated splash, no console).
+Output: `dist/SaveSync-<version>-win-<arch>.exe` (e.g.
+`SaveSync-1.4.1-win-AMD64.exe`) — single file, animated splash, no console.
 Always pass `--clean` — the spec injects custom Tcl into the splash and stale
 build caches would ship the old version.
 
@@ -183,6 +184,20 @@ pip install pyinstaller
 Output: `dist/SaveSync-<version>-<arch>.AppImage` — one file, executable,
 no installation. `appimagetool` is fetched into `build/` if it is not on
 PATH; nothing is installed system-wide.
+
+**Why the two end up different sizes:** both are "one file you double-click",
+but they get there differently. The Windows build is PyInstaller's *onefile*
+mode — UPX (LZMA) compresses each DLL individually, then everything is
+packed into one `.exe` that unpacks itself into a temp folder at launch. The
+Linux build is deliberately *onedir*, not onefile — an AppImage already
+extracts/mounts itself when it runs, so a onefile build inside one would mean
+extracting twice on every launch. PyInstaller instead lays out a plain,
+uncompressed directory tree, and `squashfs` (zstd) compresses that whole tree
+into the single `.AppImage` as the last packaging step. Per-binary UPX vs.
+whole-tree squashfs, over what can also be differently-sized upstream
+binaries between platforms (e.g. numba's bundled LLVM), is why the two
+outputs aren't a fair byte-for-byte comparison even when both carry the same
+dependencies.
 
 ### Linux and macOS
 
@@ -736,7 +751,7 @@ right-hand column of the table above, named rather than mangled.
 | [Encrypted Unreal saves](#encrypted-unreal-saves) | Recognised by the folder they sit in, not by their contents |
 | [Bakin and SRPG Studio](#bakin-and-srpg-studio) | Named but not edited, and why |
 | [Wolf RPG](#wolf-rpg) | Unlocked, read, locked back; names from the game's database |
-| [Wolf RPG, the LZ4 variant](#wolf-rpg-the-lz4-variant) | A second lock some builds use; its key is found by search, not lookup |
+| [Wolf RPG, the LZ4 variant](#wolf-rpg-the-lz4-variant) | A second lock some builds use; its key is now a closed-form formula, search only as a fallback |
 | [TADS](#tads) | Two layouts, one a NUL-padded line of tokens |
 | [Java](#java) | Bundled-JVM layouts; SQLite progress offered cell by cell |
 | [WebGL](#webgl) | HTML5 shells, and why the wrapper is not the name |
@@ -975,14 +990,22 @@ knows — this one only replaces how the bytes get unlocked, not how they are
 read afterward.
 
 The keystream's own seed comes from three salt bytes in the file's clear
-header, run through a formula that reverse-engineering the game recovered
-everything about except the formula itself. Rather than ship a guess, the
-seed is recovered by search: every 32-bit candidate is checked against the
-one thing known for certain — the unlocked stream's own opening shape — and
-the search stops the instant a real one is found. A save from a slot opened
-for the first time costs that search, shown with a progress bar and
-cancellable like an Easy Save 3 password hunt; every later save from that
-same slot reuses the answer and opens at once.
+header, run through a formula — recovered by running the game's own
+(anti-disassembly-obfuscated) code through an emulator rather than reading
+it by hand, then confirmed exactly, zero mismatches, against thousands of
+emulated data points and every real save this project has ground truth
+for. Each of the 3 salt bytes turns out to contribute to the seed on its
+own, as a pure XOR function of its own byte with no carries — the closed
+form runs instantly, no search, no cache, no game needed, and covers every
+build tested so far.
+
+The 2^32 brute-force search that originally found that formula's own
+validation data is kept only as a defensive fallback: on a salt the
+formula's output fails to verify against the file's own decrypted shape —
+none seen yet — SaveSync falls back to searching every 32-bit candidate
+against that same shape, shown with a progress bar and cancellable like an
+Easy Save 3 password hunt, and remembers the answer so a repeat search
+(same slot, same salt) is never needed either.
 
 ##### TADS
 

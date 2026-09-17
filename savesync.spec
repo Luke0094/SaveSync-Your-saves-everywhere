@@ -5,7 +5,7 @@ PyInstaller spec for SaveSync.
 Build command:
     pyinstaller savesync.spec
 
-Output: dist/SaveSync.exe
+Output: dist/SaveSync-<version>-win-<arch>.exe (e.g. SaveSync-1.4.1-win-AMD64.exe)
 
 La limitazione della singola istanza viene gestita su TRE livelli indipendenti (Defense in Depth):
   1. Livello Tcl (nello script di Splash) — Eseguito DURANTE l'estrazione dei file temporanei, prima che Python esista.
@@ -14,13 +14,27 @@ La limitazione della singola istanza viene gestita su TRE livelli indipendenti (
      Utilizza un Named Mutex nativo su Windows e flock su sistemi Unix (meccanismo autoritativo definitivo).
   3. Livello main.py (_acquire_lock) — Meccanismo di fallback per quando l'applicazione viene eseguita direttamente dai sorgenti.
 """
+import re
 import sys
 import sys as _sys
+import platform as _platform
 from pathlib import Path
 import PyInstaller.building.splash_templates as _splash_tpl
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+
+# Same versioned-name shape as the AppImage side (packaging/build_appimage.sh
+# names its output SaveSync-<version>-<arch>.AppImage from this same
+# APP_VERSION constant) so both builds are recognizable as the same release
+# sitting side by side in dist/, not a mystery "SaveSync.exe" next to a
+# versioned AppImage.
+_version_src = (ROOT / 'core' / 'constants.py').read_text(encoding='utf-8')
+_version_match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)', _version_src)
+APP_VERSION = _version_match.group(1) if _version_match else '0.0.0'
+_WIN_ARCH = _platform.machine() or 'x64'          # e.g. AMD64 — uname -m's Windows counterpart
+EXE_NAME = f'SaveSync-{APP_VERSION}-win-{_WIN_ARCH}'
+print(f"[spec] SaveSync {APP_VERSION} — win-{_WIN_ARCH}")
 
 # ── Controllo Tcl Singola Istanza (Iniettato direttamente nello splash script) ──
 # Il processo Python principale (tramite runtime_splash_hook) mantiene aperto un handle sul file sentinella.
@@ -284,6 +298,27 @@ splash = Splash(
 # Ripristino immediato della funzione originale per evitare conflitti o effetti collaterali su build successive
 _splash_tpl.build_script = _original_build_script
 
+# ── UPX ──────────────────────────────────────────────────────────────────────
+# upx=True below only ever does anything if PyInstaller can find a real upx.exe
+# — otherwise it degrades silently (CONF['upx_available'] and kwargs.get('upx'),
+# see PyInstaller/building/api.py), no error, no warning in the normal build
+# output. That silent case is what this repo was actually shipping: nothing on
+# PATH provided upx, so every DLL landed in the .exe with only the fallback
+# zlib pass PyInstaller always applies, never UPX's much stronger LZMA packing
+# — most visible on the Qt DLLs and on llvmlite's ~115 MB libLLVM, which is
+# what pushed the .exe past the AppImage after numba was added.
+# packaging/tools/upx/ is a vendored copy (not on PATH, not installed
+# system-wide) so the build doesn't depend on the machine having UPX set up —
+# CONF is the documented way a spec sets build-phase config (see
+# PyInstaller/config.py's own docstring), so this line is what makes
+# `pyinstaller savesync.spec` alone enough, no extra --upx-dir flag needed.
+from PyInstaller.config import CONF as _CONF
+from PyInstaller.configure import _check_upx_availability as _check_upx
+_UPX_DIR = str(ROOT / 'packaging' / 'tools' / 'upx')
+_CONF['upx_dir'] = _UPX_DIR
+_CONF['upx_available'] = _check_upx(_UPX_DIR)
+print(f"[spec] UPX: {'found at ' + _UPX_DIR if _CONF['upx_available'] else 'NOT found — building without it'}")
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -293,7 +328,7 @@ exe = EXE(
     splash,
     splash.binaries,
     [],
-    name='SaveSync',
+    name=EXE_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

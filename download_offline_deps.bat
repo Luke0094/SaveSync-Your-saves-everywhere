@@ -10,12 +10,23 @@ setlocal
 cd /d "%~dp0"
 
 where py >nul 2>nul
-if %errorlevel%==0 (
-    py -3 -m pip download -r requirements.txt -d offline_deps
-) else (
-    python -m pip download -r requirements.txt -d offline_deps
-)
+if %errorlevel%==0 (set PY=py -3) else (set PY=python)
+
+%PY% -m pip download -r requirements.txt -d offline_deps
 set EXITCODE=%errorlevel%
+
+REM langdetect has no wheel on PyPI, only a source dist -- pip download
+REM would otherwise vendor the .tar.gz, and installing FROM an sdist needs
+REM setuptools as a build dependency at install time, which is exactly the
+REM one thing --no-index --find-links can't fall back to PyPI for. Building
+REM the (universal, pure-Python) wheel here instead sidesteps that: the
+REM target machine then just installs a wheel, no build step, no setuptools
+REM needed. Same fix tests\download_offline_deps.bat already uses.
+if not %EXITCODE%==0 goto skipwheel
+del /q offline_deps\langdetect-*.tar.gz >nul 2>nul
+%PY% -m pip wheel langdetect --no-deps -w offline_deps
+set EXITCODE=%errorlevel%
+:skipwheel
 
 echo.
 if %EXITCODE%==0 (

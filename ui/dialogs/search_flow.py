@@ -489,7 +489,11 @@ class SearchFlowMixin:
                 snap = self._capture_search_form()
                 if not self._process_search_result(dlg.selected, offer_enrichment=False):
                     return
-                if self._run_same_tier_merge(dlg.selected, pre_confirm_name=snap.get('name', '')):
+                if self._run_same_tier_merge(
+                        dlg.selected, pre_confirm_name=snap.get('name', ''),
+                        pre_confirm_description=snap.get('desc', ''),
+                        pre_confirm_developer=snap.get('dev', ''),
+                        pre_confirm_year=snap.get('year', '')):
                     self._restore_search_form(snap)
                     useful = self._dedupe_except_description([
                         r for r in (self._last_search_candidates or [])
@@ -769,18 +773,21 @@ class SearchFlowMixin:
         new_image = bool(result.image_url and not has_image)
         new_reviews = self._new_result_reviews(result)
 
-        fills_empty = bool(
-            (result.description and not current_desc)
-            or new_image
-            or (getattr(result, 'developer', '') and not current_dev)
-            or (result_year and not current_year)
-        )
+        # Name, description, developer and year are ALL applied
+        # unconditionally now (see _apply_result_init) — a candidate that
+        # merely REPLACES an already-saved value for any of them is
+        # material news, the same as a rename always was, not just one
+        # that fills a field that was empty. Image stays fill-only/
+        # additive (new_image, unchanged): a game can hold several covers,
+        # so a differing one is never "the" news on its own.
         name_change = bool(result.name and result.name != current_name)
-        # Material news: empty-field fills, additive tags/urls/reviews, or a
-        # confirmed rename. A different description while one is already
-        # saved is NOT material — that used to force primary overwrite.
+        desc_change = bool(result.description and result.description != current_desc)
+        _rdev_ = getattr(result, 'developer', '') or ''
+        dev_change = bool(_rdev_ and _rdev_ != current_dev)
+        year_change = bool(result_year and result_year != current_year)
         has_material = bool(
-            fills_empty or name_change or new_tags or new_urls or new_reviews
+            new_image or name_change or desc_change or dev_change or year_change
+            or new_tags or new_urls or new_reviews
         )
 
         already_applied = bool(
@@ -820,17 +827,15 @@ class SearchFlowMixin:
             if result_year and result_year != current_year:
                 fields['year'] = {'old': current_year or None, 'new': result_year}
         else:
-            # User-managed game: description only shows as a fill (never a
-            # rewrite of typed text) — but name/year/developer show whenever
-            # they DIFFER, filled or not, purely for display; nothing about
-            # how they're actually applied changes: name is still the only
-            # one of the three unconditionally written on confirm (see
-            # _apply_result_init/_apply_result_overwrite), year/developer
-            # still only fill when empty. The diff is what was invisible
-            # before ("nowhere in the preview was shown the year [[or
-            # developer/name]]" — this dict feeds the candidate-preview meta
-            # line AND the merge dialog's field options), not what gets
-            # applied.
+            # User-managed game: name, description, developer and year all
+            # show whenever they DIFFER, filled or not — matching how all
+            # four are actually applied now (see _apply_result_init: all
+            # unconditional, image the only field left that's fill-only).
+            # This dict feeds the candidate-preview meta line AND the merge
+            # dialog's field options — it used to show only what a fill-only
+            # apply could ever change ("nowhere in the preview was shown
+            # the year/developer/name/description" was the original report
+            # that started fixing this, field by field).
             if name_change:
                 fields['name'] = {'old': current_name or None, 'new': result.name}
             if result_year and result_year != current_year:
@@ -838,8 +843,9 @@ class SearchFlowMixin:
             _rv = getattr(result, 'developer', '') or ''
             if _rv and _rv != current_dev:
                 fields['developer'] = {'old': current_dev or None, 'new': _rv}
-            if not current_desc and result.description:
-                fields['description'] = {'old': None, 'new': result.description}
+            _rd = result.description or ''
+            if _rd and _rd != current_desc:
+                fields['description'] = {'old': current_desc or None, 'new': _rd}
 
         has_enrich = bool(has_material or (has_existing and bool(fields)))
         has_changes = bool(has_material or promote_primary or (has_existing and bool(fields)))
@@ -886,39 +892,52 @@ class SearchFlowMixin:
         return (getattr(self, '_image_path_to_url', None) or {}).get(path)
 
     def _apply_result_init(self, result):
-        """Case B — no existing data: fill all empty fields (union for
-        tags). Name/genres are unconditional; description/developer/year/
-        image only fill if currently empty (a field the user typed — or an
-        image the user already has — by hand even in an otherwise-blank
-        form is never overwritten here).
+        """Case B — no existing data: fill all empty fields, tags/reviews
+        unconditional (nothing to protect yet). Name, description,
+        developer AND year are ALL unconditional — each one replaces the
+        field outright, with the previous value recoverable in the merge
+        dialog (see _build_merge_model's pre_confirm_* injection, and
+        EnrichmentMergeDialog's "Previous" default for all four). Image
+        stays fill-only/additive-chip, never auto-swapped — a game can
+        genuinely hold several covers, unlike these four single-value
+        fields where there is exactly one slot and "go back to what it
+        was" is the only safety net that makes sense. Tags and reviews
+        stay unconditional ONLY while the form is still blank (has_existing
+        False below); once there's something to protect, both move to the
+        merge dialog's checked-by-default chips instead — same reasoning
+        as image.
 
-        Image used to be the one unconditional exception (downloaded and
-        set as the new current cover whenever the URL merely DIFFERED from
-        today's), which silently swapped an already-set cover on every
-        confirm — exactly the "overwritten, not added" behaviour images are
-        supposed never to have (they're additive, like tags: a differing
-        candidate cover belongs in the merge dialog's checked-by-default
-        chip, not applied here without asking)."""
+        Tags/reviews for an EXISTING game used to have the SAME bug year/
+        developer/description just got fixed for: applied here
+        unconditionally, so a candidate confirmed with zero same-tier peers
+        had its whole tag/review list silently unioned in with no way to
+        see or decline any one of them before it was already written — and
+        the merge dialog then correctly showed nothing pending, since there
+        was nothing left to offer."""
         current_name = self._name_edit.text().strip()
         current_desc = self._desc_edit.toPlainText().strip()
         current_dev  = self._developer_edit.text().strip()
         current_year = self._year_edit.text().strip()
         has_image = bool(self._original_image_path or getattr(self, '_image_path', ''))
+        has_existing = bool(current_desc or has_image or getattr(self, '_tags', None)
+                            or current_dev or current_year)
         if result.name and result.name != current_name:
             self._name_edit.setText(result.name)
         if result.image_url and not has_image:
             self._download_and_set_image(result.image_url)
-        if result.description and not current_desc:
+        if result.description and result.description != current_desc:
             self._desc_edit.setPlainText(result.description)
-        if result.genres:
+        if result.genres and not has_existing:
             self._apply_web_tags(result.genres)
-        if getattr(result, 'developer', '') and not current_dev:
-            self._developer_edit.setText(result.developer)
+        _rdev = getattr(result, 'developer', '') or ''
+        if _rdev and _rdev != current_dev:
+            self._developer_edit.setText(_rdev)
         _ry = self._extract_result_year(result)
-        if _ry and not current_year:
+        if _ry and _ry != current_year:
             self._year_edit.setText(_ry)
         self._merge_result_urls(result)
-        self._merge_result_review(result)
+        if not has_existing:
+            self._merge_result_review(result)
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
 
@@ -1430,15 +1449,20 @@ class SearchFlowMixin:
             bits.append(short)
         return " · ".join(bits)
 
-    def _run_same_tier_merge(self, base_result, pre_confirm_name: str = '') -> bool:
+    def _run_same_tier_merge(self, base_result, pre_confirm_name: str = '',
+                             pre_confirm_description: str = '',
+                             pre_confirm_developer: str = '',
+                             pre_confirm_year: str = '') -> bool:
         """Offer peer enrichment chips. Returns True when the user asked to
         go back to the candidate carousel (form snapshot must be restored).
 
-        *pre_confirm_name* is what the name field held right before this
-        candidate was confirmed (the carousel's form snapshot) — name is
-        applied unconditionally on confirm (never fill-only), so by the time
-        this runs the ORIGINAL name is already gone from the form; this is
-        the only way to still offer "go back to what it was" as a choice."""
+        *pre_confirm_name*, *pre_confirm_description*, *pre_confirm_developer*
+        and *pre_confirm_year* are what those four fields held right before
+        this candidate was confirmed (the carousel's form snapshot) — all
+        four are applied unconditionally on confirm (never fill-only), so
+        by the time this runs the ORIGINAL values are already gone from
+        the form; this is the only way to still offer "go back to what it
+        was" as a choice for any of them."""
         _pool = getattr(self, '_last_search_candidates', None) or []
         logger.info(
             f"_run_same_tier_merge: base={getattr(base_result, 'source', '')!r}/"
@@ -1449,10 +1473,13 @@ class SearchFlowMixin:
                 "_run_same_tier_merge: no same-tier peers — still checking "
                 "the confirmed candidate's own year/name against what's saved")
         # base_result is passed even with zero peers: it may still offer its
-        # OWN year as an option (see _build_merge_model) when it came from a
-        # different tier than whatever is currently saved.
+        # OWN image/tags/reviews as options (see _build_merge_model) when it
+        # came from a different tier than whatever is currently saved.
         model = self._build_merge_model(
-            peers, base_result=base_result, pre_confirm_name=pre_confirm_name)
+            peers, base_result=base_result, pre_confirm_name=pre_confirm_name,
+            pre_confirm_description=pre_confirm_description,
+            pre_confirm_developer=pre_confirm_developer,
+            pre_confirm_year=pre_confirm_year)
         if not model.get('has_options'):
             logger.info(
                 "_run_same_tier_merge: peers found "
@@ -1546,24 +1573,32 @@ class SearchFlowMixin:
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
 
     def _build_merge_model(self, collected: list, *, base_result=None,
-                           pre_confirm_name: str = '') -> dict:
+                           pre_confirm_name: str = '',
+                           pre_confirm_description: str = '',
+                           pre_confirm_developer: str = '',
+                           pre_confirm_year: str = '') -> dict:
         """Per-field option lists for the merge preview.
 
-        description is fill-only: the CONFIRMED candidate is authoritative,
-        so it is never offered for replacement — peers only compete for it
-        while still EMPTY. Name, developer, year and image are the
-        exceptions — see their own comments below for why. Each peer title
-        is its own section (``vndb::Title::0``), so two VNDB hits stay
-        distinguishable. Tags/URLs expand additively; reviews are one chip
-        per peer (same API source identity still collapses on apply).
+        Name, description, developer AND year are ALL applied
+        unconditionally on confirm now (see _apply_result_init) and all
+        four get a "Previous" option here so the value they replaced is
+        still reachable — never fill-only, never silently gone with
+        nothing to revert to. Image is the one exception left (additive
+        chip, never auto-swapped — a game can hold several covers). Each
+        peer title is its own section (``vndb::Title::0``), so two VNDB
+        hits stay distinguishable. Tags/URLs expand additively; reviews
+        are one chip per peer (same API source identity still collapses
+        on apply).
 
         *base_result*, when given, is the just-confirmed candidate itself —
-        used only to offer ITS OWN year/developer as options (see below); it
-        is never added as a tag/url/review source (those already came from
-        it via the normal apply, offering them again would just duplicate).
+        its own tags/reviews/cover still need offering here (see below),
+        since those stay additive rather than unconditional; it is never
+        added as a tag/url/review source a SECOND time for anything that
+        already came in through the normal apply.
 
-        *pre_confirm_name*, when given, is what the name field held right
-        before *base_result* was confirmed — see below.
+        *pre_confirm_name*, *pre_confirm_description*, *pre_confirm_developer*
+        and *pre_confirm_year*, when given, are what those four fields held
+        right before *base_result* was confirmed — see below.
         """
         cur_name = self._name_edit.text().strip()
         cur_desc = self._desc_edit.toPlainText().strip()
@@ -1594,20 +1629,16 @@ class SearchFlowMixin:
                 'name': cur_name, 'description': cur_desc, 'developer': cur_dev,
                 'year': cur_year, 'has_image': has_img,
             },
-            # Name/description/year are offered even though a value is
-            # already set — only a DIFFERING value shows, and it's never
-            # auto-selected (EnrichmentMergeDialog adds an explicit,
-            # pre-checked "Keep current" chip alongside it) — see that
-            # file's _build(). developer stays fill-only and DOES
-            # auto-select its first offer — extending it the same way would
-            # need the same "keep current" treatment first, not just
-            # dropping the `[] if cur_dev else` guard — now given the same
-            # "keep current" treatment (see EnrichmentMergeDialog._build,
-            # which is already field-agnostic here). Images are NEITHER
-            # of those — a game can hold many covers (the carousel in the
-            # add/edit dialog), so a peer's differing image is additive,
-            # exactly like tags/urls below: checked by default, never
-            # replacing the current cover, just offered alongside it.
+            # Name/description/developer/year are all offered even though a
+            # value is already set — only a DIFFERING peer value shows, and
+            # it's never auto-selected (EnrichmentMergeDialog adds an
+            # explicit chip alongside it — "Keep current", or "Previous"
+            # when one exists, since all four are applied unconditionally;
+            # see that file's _build()). Images are NEITHER exclusive nor
+            # unconditional — a game can hold many covers (the carousel in
+            # the add/edit dialog), so a peer's differing image is
+            # additive, exactly like tags/urls below: checked by default,
+            # never replacing the current cover, just offered alongside it.
             'name':        _opts(lambda i: getattr(i, 'name', ''), exclude=cur_name),
             'description': _opts(lambda i: i.description, exclude=cur_desc),
             'developer':   _opts(lambda i: getattr(i, 'developer', ''), exclude=cur_dev),
@@ -1658,15 +1689,15 @@ class SearchFlowMixin:
                 seen_review_api.add(src_id)
                 model['reviews'].append({'source': pkey, 'value': _revs})
 
-        # The just-confirmed candidate's OWN year/developer, offered even
-        # with ZERO same-tier peers. Both are fill-only on apply (never
-        # replace a saved value), so a candidate found in a LATER tier than
-        # what's already saved — e.g. a forum result confirmed after Steam —
-        # would otherwise have its differing year/developer silently
-        # discarded with nothing around to ever surface the disagreement:
-        # same-tier peers can only ever come from the SAME search batch as
-        # the confirmed candidate, never from an earlier, separate tier's
-        # search (and _opts above only looks at `collected`, i.e. peers).
+        # The just-confirmed candidate's OWN cover/tags/reviews, offered
+        # even with ZERO same-tier peers. All three stay additive rather
+        # than unconditional (see _apply_result_init), so a candidate found
+        # in a LATER tier than what's already saved — e.g. a forum result
+        # confirmed after Steam — would otherwise have them with nothing
+        # around to ever offer them as a choice: same-tier peers can only
+        # ever come from the SAME search batch as the confirmed candidate,
+        # never from an earlier, separate tier's search (and the per-peer
+        # loop above only looks at `collected`, i.e. peers).
         if base_result is not None:
             _bkey = self._peer_section_key(base_result, -1)
 
@@ -1685,26 +1716,15 @@ class SearchFlowMixin:
                         self._source_label(_bsrc), _btitle, _binspect),
                 }
 
-            def _base_offer(field: str, value: str):
-                _v = (value or '').strip()
-                _cur = (model['current'].get(field) or '').strip()
-                if not _v or _v.lower() == _cur.lower():
-                    return
-                if any(o['value'].lower() == _v.lower() for o in model[field]):
-                    return
-                _ensure_base_source_meta()
-                model[field].append({'source': _bkey, 'value': _v})
-
-            _base_offer('year', self._extract_result_year(base_result))
-            _base_offer('developer', getattr(base_result, 'developer', ''))
-            # description doesn't trigger the dialog on its own (has_options
-            # below excludes it — see that comment), but once something else
-            # already opened it, a candidate's own differing description
-            # deserves the same zero-peer path year/developer just got: a
-            # single itch.io hit with no same-tier peers was confirmed for
-            # its name/developer, leaving its description entirely absent
-            # from the picker even though the scrape clearly had one.
-            _base_offer('description', getattr(base_result, 'description', ''))
+            # Name/description/developer/year no longer need a "base result's
+            # own differing value" injection here (there used to be a
+            # _base_offer helper doing exactly that for year/developer/
+            # description) — all four are unconditionally applied by
+            # _apply_result_init now, so the candidate's own value is
+            # already sitting in model['current'] by the time this runs.
+            # What's still missing without help is the PREVIOUS value each
+            # one just replaced — see _offer_previous_value below, which
+            # covers all four uniformly.
 
             # Same zero-peer gap for the cover — additive like the per-peer
             # loop above (seen_images/model['images']), not exclusive like
@@ -1717,43 +1737,77 @@ class SearchFlowMixin:
                 _ensure_base_source_meta()
                 model['images'].append({'source': _bkey, 'value': _base_cover})
 
-        # The name held right before this candidate was confirmed, offered
-        # as a "go back" option. Name is applied UNCONDITIONALLY on confirm
-        # (_apply_result_init never gates it on "currently empty" the way
-        # description/developer/year are) — so unlike those fields, the
-        # original value is already gone from the form by the time this
-        # runs; pre_confirm_name is the only trace of it left. Without this,
+            # Same gap for tags and reviews — _apply_result_init no longer
+            # unions the confirmed candidate's OWN genres/review into the
+            # form unconditionally for an existing game (see that method):
+            # they used to be written before this dialog ever ran, so the
+            # per-peer loop above — which only ever looked at `collected`,
+            # i.e. OTHER candidates — had nothing left to offer for the one
+            # candidate that was actually just confirmed. Same additive,
+            # checked-by-default treatment as a peer's tags/review.
+            _base_src_id = (getattr(base_result, 'source', '') or 'web').split('+')[0] or 'web'
+            for g in (getattr(base_result, 'genres', None) or []):
+                _gk = tag_merge_key(g)
+                if _gk in seen_tags:
+                    continue
+                seen_tags.add(_gk)
+                _ensure_base_source_meta()
+                model['tags'].append({'source': _bkey, 'value': g})
+            if _base_src_id not in seen_review_api:
+                _base_revs = self._new_result_reviews(base_result)
+                if _base_revs:
+                    seen_review_api.add(_base_src_id)
+                    _ensure_base_source_meta()
+                    model['reviews'].append({'source': _bkey, 'value': _base_revs})
+
+        # The value held right before this candidate was confirmed, offered
+        # as a "go back" option — for name, description, developer AND
+        # year, all four applied UNCONDITIONALLY on confirm
+        # (_apply_result_init never gates any of them on "currently empty"
+        # the way image still is), so unlike image the original value is
+        # already gone from the form by the time this runs;
+        # pre_confirm_name/pre_confirm_description/pre_confirm_developer/
+        # pre_confirm_year are the only trace of it left. Without this,
         # confirming a messy-titled candidate (e.g. a forum thread's raw
-        # post title) left no way back to a cleaner name a better source
-        # had already set — not even a chip, since a candidate reached via
-        # a different tier has no same-tier peer to offer one either.
-        _pcn = (pre_confirm_name or '').strip()
-        if (_pcn and _pcn.lower() != cur_name.lower()
-                and not any(o['value'].lower() == _pcn.lower() for o in model['name'])):
+        # post title, or its own rewritten blurb/developer/year) left no
+        # way back to a cleaner value a better source had already set —
+        # not even a chip, since a candidate reached via a different tier
+        # has no same-tier peer to offer one either.
+        def _offer_previous_value(field: str, cur_val: str, pre_confirm_val: str):
+            _pv = (pre_confirm_val or '').strip()
+            if not _pv or _pv.lower() == cur_val.lower():
+                return
+            if any(o['value'].lower() == _pv.lower() for o in model[field]):
+                return
             # Shaped like _peer_section_key's own "source · title · n" so
             # _source_header_row's src_id fallback (source.split(" · ")[0])
             # resolves to the localized label below instead of this raw key.
             _prev_label = t('add_game.merge_previous_value')
-            _pkey = f"{_prev_label} · {_pcn} · 0"
+            _pkey = f"{_prev_label} · {_pv} · {field}"
             if _pkey not in model['source_meta']:
                 model['source_meta'][_pkey] = {
                     'inspect_url': '',
                     'image_url': '',
-                    'name': _pcn,
+                    'name': _pv,
                     'source_id': _prev_label,
                     'label': _prev_label,
                 }
-            model['name'].append({'source': _pkey, 'value': _pcn})
+            model[field].append({'source': _pkey, 'value': _pv})
 
-        # description does NOT get to trigger the dialog on its own — a
-        # differing description alone was never material enough to resurface
-        # a candidate in the carousel either (see has_material above), so
-        # it shouldn't be enough to pop the merge dialog by itself. Once
-        # something else justifies showing it, the description chip is
-        # still offered as one of the things to pick.
+        _offer_previous_value('name', cur_name, pre_confirm_name)
+        _offer_previous_value('description', cur_desc, pre_confirm_description)
+        _offer_previous_value('developer', cur_dev, pre_confirm_developer)
+        _offer_previous_value('year', cur_year, pre_confirm_year)
+
+        # Description/developer/year now count toward has_options too, same
+        # reasoning as name: all four are unconditionally applied on
+        # confirm, so a differing value is no longer a soft "fill if you
+        # like" — it already replaced whatever was there, and the ONLY way
+        # back to the previous value is this dialog actually opening.
         model['has_options'] = any([
-            model['name'], model['developer'], model['year'],
-            model['images'], model['tags'], model['urls'], model['reviews'],
+            model['name'], model['description'], model['developer'],
+            model['year'], model['images'], model['tags'], model['urls'],
+            model['reviews'],
         ])
         return model
 

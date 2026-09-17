@@ -3567,7 +3567,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             (game_id, new_exe_path), _conflicts = next(iter(self._pending_carry_conflict.items()))
             entry = get_library().get_by_id(game_id)
             if entry:
-                self._overlay.show_overwrite_saves_conflict(entry.name, game_id, new_exe_path)
+                self._overlay.show_overwrite_saves_conflict(
+                    entry.name, game_id, new_exe_path, is_data_copy=True)
                 return
             self._pending_carry_conflict.pop((game_id, new_exe_path), None)
 
@@ -5354,7 +5355,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._copy_save_into_empty_target(old_path, new_path)
         if conflicts and self._overlay:
             self._pending_carry_conflict[(entry.id, new_exe_path)] = conflicts
-            self._overlay.show_overwrite_saves_conflict(entry.name, entry.id, new_exe_path)
+            self._overlay.show_overwrite_saves_conflict(
+                entry.name, entry.id, new_exe_path, is_data_copy=True)
 
     def _apply_path_add_version(self, entry, new_exe_path: str):
         """"Add to this game" — the version itself is already registered by

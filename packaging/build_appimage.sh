@@ -28,9 +28,16 @@ die() { printf '\n\033[1;31m!!\033[0m %s\n' "$1" >&2; exit 1; }
 # SAVESYNC_PYTHON names one explicitly. Build machines commonly have
 # several — a system python, a pyenv one, the virtualenv that actually
 # holds PySide6 — and "whichever comes first on PATH" is the wrong answer
-# often enough to be worth an override.
+# often enough to be worth an override. /opt/ssenv is tried before the bare
+# python3/python fallback for exactly that reason: on this build host, the
+# plain "python3" on PATH has PyInstaller and PySide6 (so the checks below
+# alone don't catch it) but not numpy/numba/lz4, and PyInstaller does not
+# fail the build over a hiddenimport it can't resolve -- it silently drops
+# the module (core.engines.wolf_lz4, in this case) and everything that
+# imports it, and exits 0. /opt/ssenv is where requirements.txt is actually
+# installed, so it is what "just run the script" should mean here.
 PY="${SAVESYNC_PYTHON:-}"
-for cand in python3 python; do
+for cand in /opt/ssenv/bin/python3 python3 python; do
     [ -n "${PY}" ] && break
     if command -v "${cand}" >/dev/null 2>&1 \
        && "${cand}" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
@@ -43,6 +50,19 @@ done
     || die "PyInstaller is not installed for ${PY} (pip install pyinstaller)"
 "${PY}" -c 'import PySide6' 2>/dev/null \
     || die "PySide6 is not installed for ${PY} (pip install -r requirements.txt)"
+# core.engines.wolf_lz4 imports numpy and lz4 unconditionally (numba is the
+# only soft one there, with its own try/except fallback). If ${PY} doesn't
+# have them, PyInstaller does NOT fail the build over it -- it just quietly
+# drops that whole module, and everything that imports it, from the frozen
+# app and exits 0. That shipped a real AppImage with no Wolf RPG save
+# support at all and no error anywhere, from running this script with a
+# plain system python3 instead of the venv that actually has requirements.txt
+# installed -- so this checks it explicitly rather than trusting a silent,
+# much-smaller build to mean "smaller," not "broken".
+"${PY}" -c 'import numpy' 2>/dev/null \
+    || die "numpy is not installed for ${PY} (pip install -r requirements.txt) -- without it PyInstaller silently drops core.engines.wolf_lz4 (Wolf RPG saves) rather than failing the build"
+"${PY}" -c 'import lz4' 2>/dev/null \
+    || die "lz4 is not installed for ${PY} (pip install -r requirements.txt) -- without it PyInstaller silently drops core.engines.wolf_lz4 (Wolf RPG saves) rather than failing the build"
 
 VERSION="$("${PY}" - <<'PYEOF'
 import re, pathlib

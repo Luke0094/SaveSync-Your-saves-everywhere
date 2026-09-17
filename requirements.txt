@@ -37,4 +37,4 @@ PyYAML>=6.0
 # Build EXE (from project root):
 #   pyinstaller savesync.spec
 #
-# Output: dist/SaveSync/SaveSync.exe
+# Output: dist/SaveSync-<version>-win-<arch>.exe

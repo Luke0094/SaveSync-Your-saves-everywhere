@@ -5,7 +5,7 @@ instead of — the one ``core.engines.wolf`` implements. A byte at offset 8 tags
 this module handles tags 1 and 3 (see ``TAG_VALUES``), reverse-engineered by
 decrypting the game itself with Frida while it loaded its own saves,
 verified byte-for-byte against what the game's own code actually wrote to
-memory (see the project's ``FINDINGS.md`` for the full derivation; this
+memory (see the project's ``intel/wolf_lz4_findings.md`` for the full derivation; this
 module is the "so what" of that write-up).
 
 The scheme, once unwound: three salt bytes from the file's own (clear)
@@ -27,7 +27,7 @@ eventually found not by reading it but by emulating it: Ghidra's own
 p-code emulator ran the real ``FUN_0047caf0`` body directly (no live game
 needed) for chosen salt bytes, and the resulting seed was read back out of
 the emulated stack. What that revealed (see ``derive_seed`` below and
-FINDINGS.md's "chasing the formula" section for the full derivation): each
+intel/wolf_lz4_findings.md's "chasing the formula" section for the full derivation): each
 salt byte contributes to the seed completely independently, as an exact
 GF(2)-linear — pure XOR, no carries — function of that byte alone. No
 byte-packing, FNV, or carried multiplier ever reproduced it because none of
@@ -87,7 +87,7 @@ HEADER_LEN = 0x14
 _SALT_OFFSETS = (0, 1, 5)
 _KS_LEN = 128
 # The rotation between natural MT draw order and the order the game actually
-# consumes them in. Empirically determined (see FINDINGS.md) — the
+# consumes them in. Empirically determined (see intel/wolf_lz4_findings.md) — the
 # underlying cause is pointer arithmetic inside the obfuscated twist loop
 # that was not traced by hand, but the offset itself is exact, checked
 # against 512 live-captured bytes, not merely plausible.
@@ -190,14 +190,14 @@ def _apply(data: bytearray, seed: int) -> None:
 # Some builds run one more step after FUN_0047caf0 (encrypt) and before the
 # file hits disk: FUN_00523b40 swaps two SWAP_LEN-byte spans of the
 # already-encrypted buffer with each other — confirmed live, by hooking that
-# function directly and diffing its argument before/after (see FINDINGS.md,
+# function directly and diffing its argument before/after (see intel/wolf_lz4_findings.md,
 # "Session 2 continued"). It is a pure positional swap, not a checksum or a
 # second cipher pass — undoing it is applying the same swap again, since
 # swapping twice is the identity.
 #
 # The two span offsets are NOT a fixed position and NOT a simple function of
 # content length (two same-length real saves had different offsets — see
-# FINDINGS.md), and the formula that actually picks them was never
+# intel/wolf_lz4_findings.md), and the formula that actually picks them was never
 # recovered. What both real captures this was checked against DID share:
 # the offsets are small, and there is a strong, cheap oracle for "did I just
 # undo the right swap" — decrypting and decompressing lands on the same
@@ -206,7 +206,7 @@ def _apply(data: bytearray, seed: int) -> None:
 
 _SWAP_LEN = 20
 # Absolute file-offset upper bound for either span. Five real captures (see
-# FINDINGS.md's span table, normalised to absolute file offsets) put span1
+# intel/wolf_lz4_findings.md's span table, normalised to absolute file offsets) put span1
 # in [20, 49] and span2 in [92, 117] — this is 4x+ headroom over that
 # spread, not an arbitrary number. A save whose real offsets fall outside
 # this range will simply not be found (find_swap_spans returns None, and
@@ -216,7 +216,7 @@ _SWAP_SEARCH_MAX_OFFSET = 512
 # ── swap offsets, closed form ────────────────────────────────────────────────
 #
 # Recovered the same way the salt->seed formula was (see derive_seed's own
-# section, and FINDINGS.md's "fully solve the save" session): emulating the
+# section, and intel/wolf_lz4_findings.md's "fully solve the save" session): emulating the
 # real FUN_00523b40 directly and treating it as an oracle - feeding it
 # real save buffers with individual bytes changed and watching what moved.
 # The result is as clean as the seed formula turned out to be: both spans
@@ -278,7 +278,7 @@ def _plausible_wolf_body(payload: bytes) -> bool:
     payload has the marker at offset 0, not wolf's own START_OFFSET, and a
     bare marker-byte check alone is not selective enough on its own — it let
     through 10 different wrong swap-offset pairs for one real file before
-    this fuller shape check was added (see FINDINGS.md)."""
+    this fuller shape check was added (see intel/wolf_lz4_findings.md)."""
     if len(payload) < 4 or payload[0] != _BODY_MARKER:
         return False
     length = payload[1] | (payload[2] << 8)
@@ -348,7 +348,7 @@ def find_swap_spans(data: bytes, seed: int, max_offset: int = _SWAP_SEARCH_MAX_O
     what found the formula's own validation data in the first place.
 
     Has a real, confirmed false-positive risk the closed form does not:
-    for one real save (``SaveData05.sav`` — see FINDINGS.md), this search
+    for one real save (``SaveData05.sav`` — see intel/wolf_lz4_findings.md), this search
     returns ``(33, 93)`` even with the STRONG (real ``WolfValues``-parse)
     validator — a pair that decodes to a payload passing that check while
     still being silently wrong at 2733 scattered byte positions. The true
@@ -371,7 +371,7 @@ def find_swap_spans(data: bytes, seed: int, max_offset: int = _SWAP_SEARCH_MAX_O
     (``crypt.wolf_lz4``, via ``crypt.wolf``'s variable-database ``_locate``)
     should always pass one: ``_plausible_wolf_body`` only proves the first
     ~15 bytes are shaped right, which real testing (not theorised — see
-    FINDINGS.md) found is NOT always enough to rule out a wrong offset
+    intel/wolf_lz4_findings.md) found is NOT always enough to rule out a wrong offset
     pair when the swap lands past whatever LZ4 token emits those bytes.
     This module's own default stays the cheap check, both so it has no
     hard dependency on ``crypt.wolf`` and because ``find_seed``'s own
@@ -604,7 +604,7 @@ def lock(header: bytes, seed: int, payload: bytes, swap_spans=None) -> bytes:
     "correct by construction" whenever the compressed payload stayed the
     same length, which was never actually true (disproven directly: 24
     real captured saves sharing the exact same compressed length have 24
-    DIFFERENT swap offsets — see FINDINGS.md). What that evidence actually
+    DIFFERENT swap offsets — see intel/wolf_lz4_findings.md). What that evidence actually
     reflected, now that the real rule is known (see ``derive_swap_spans``):
     every one of those 24 was a genuinely SEPARATE save action, each with
     its OWN freshly-generated random header — nothing to do with length.
@@ -645,7 +645,7 @@ def lock(header: bytes, seed: int, payload: bytes, swap_spans=None) -> bytes:
 # Recovered by emulation, not by reading the (anti-disassembly-obfuscated)
 # code by hand: Ghidra's own p-code emulator ran the real FUN_0047caf0 body
 # directly (no live game needed) for chosen salt bytes and the resulting
-# seed was read back out of the emulated stack (see FINDINGS.md's "Session
+# seed was read back out of the emulated stack (see intel/wolf_lz4_findings.md's "Session
 # 3"/"chasing the formula" sections for the full derivation). What that
 # revealed: each of the 3 salt bytes contributes to the seed completely
 # independently, and each contribution is an exact GF(2)-linear (pure XOR,
@@ -734,7 +734,7 @@ def verify_seed(data: bytes, seed: int, validator=None) -> bool:
     this tries the closed-form ``derive_swap_spans`` next, and only then
     ``find_swap_spans`` (a search, and one with a known false-positive risk
     — see that function's own module comment) before giving up. Real
-    current saves need this — see FINDINGS.md. The search fallback only
+    current saves need this — see intel/wolf_lz4_findings.md. The search fallback only
     runs for a candidate that already passed the cheap 3/4-byte filter in
     ``_search_range``/``_numba_scan``, so it stays rare enough not to
     matter for the 2^32 search's overall cost (see find_seed's docstring
@@ -869,7 +869,7 @@ def find_seed(data: bytes, progress=None, workers: int = 0, cancel_token=None,
     That puts a worst-case, cold search (a salt never seen before, on no
     cache hit) at very roughly 40-55 minutes on comparable hardware, not
     the ~10 minutes this docstring used to claim — that earlier figure was
-    itself only ever an estimate (see FINDINGS.md), never actually
+    itself only ever an estimate (see intel/wolf_lz4_findings.md), never actually
     benchmarked until this round of fixes. A faster or slower machine, or
     one with more physical cores, moves this roughly proportionally.
 
@@ -933,7 +933,7 @@ _NAME_LEN_MAX = 127  # generous for a game's own title; see core.engines.wolf
 # above): the byte physically sitting there came from the OTHER span, and
 # no amount of re-reading the same wrong position recovers it. Confirmed
 # empirically, not theorised — decrypting the two real captured files this
-# project has ground truth for (FINDINGS.md) with their REAL keystreams
+# project has ground truth for (intel/wolf_lz4_findings.md) with their REAL keystreams
 # shows the true marker at base 10 in BOTH, and BOTH real swap spans
 # overlap that exact window: System.sav's span (32,96) clips the window's
 # 3rd byte, SaveData02.sav's span (20,95) covers all three. That is why a
@@ -942,7 +942,7 @@ _NAME_LEN_MAX = 127  # generous for a game's own title; see core.engines.wolf
 # and verify_seed confirms it the moment it's handed the answer directly.
 #
 # The fix tried here is deliberately narrow, not a general joint
-# seed+offset search (FINDINGS.md already rules that out as infeasible:
+# seed+offset search (intel/wolf_lz4_findings.md already rules that out as infeasible:
 # 2^32 x ~39,000 is not a real number). It only re-checks the ONE
 # documented, twice-confirmed anchor position (_MARKER_CHECK_OFFSET=10)
 # against a SMALL grid of "what if a swap already happened here" read
@@ -954,7 +954,7 @@ _NAME_LEN_MAX = 127  # generous for a game's own title; see core.engines.wolf
 #
 # Grid bounds: re-derived from 52 real swap events recovered by directly
 # diffing the project's own captured before/after buffers (no seed or
-# search needed for that — see FINDINGS.md), not guessed or grown from
+# search needed for that — see intel/wolf_lz4_findings.md), not guessed or grown from
 # just the original two. Of those 52, only 18 actually have the anchor
 # base (10) landing inside span a — the true trigger condition this hedge
 # exists for, since a scan whose anchor DOESN'T collide with the swap

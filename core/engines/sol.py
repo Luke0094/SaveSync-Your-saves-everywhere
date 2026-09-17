@@ -128,6 +128,7 @@ class SolFile:
         self._data = data
         self._values = []
         self._strings = []                        # AMF3 string reference table
+        self._last_string_was_ref = False          # set by _a3_string on every call
         try:
             while r.pos < len(data) and len(self._values) < _MAX_VALUES:
                 if self.amf_version == 3:
@@ -149,6 +150,12 @@ class SolFile:
 
     def _a3_string(self, r: _Reader) -> str:
         header = r.u29()
+        # Exposed via self._last_string_was_ref (not the return value — this
+        # is called from several places that only want the text: array/
+        # object keys, class/member names) for the ONE caller that needs to
+        # know: _read_amf3's own top-level string case, which records an
+        # editable value. See set_value's AMF3 string branch for why.
+        self._last_string_was_ref = not (header & 1)
         if not (header & 1):                      # a reference to an earlier one
             idx = header >> 1
             return self._strings[idx] if idx < len(self._strings) else ""
@@ -157,9 +164,9 @@ class SolFile:
             self._strings.append(text)
         return text
 
-    def _record(self, name, kind, value, start, end):
+    def _record(self, name, kind, value, start, end, **extra):
         self._values.append({"name": name, "kind": kind, "value": value,
-                             "start": start, "end": end})
+                             "start": start, "end": end, **extra})
 
     def _read_value(self, r: _Reader, name: str, depth: int = 0):
         if depth > 12:
@@ -226,7 +233,9 @@ class SolFile:
         elif marker in (_A3_FALSE, _A3_TRUE):
             self._record(name, "bool", marker == _A3_TRUE, start, r.pos)
         elif marker == _A3_STRING:
-            self._record(name, "str", self._a3_string(r), start, r.pos)
+            text = self._a3_string(r)
+            self._record(name, "str", text, start, r.pos,
+                        str_is_ref=self._last_string_was_ref)
         elif marker in (_A3_UNDEFINED, _A3_NULL):
             pass
         elif marker == _A3_DATE:
@@ -291,9 +300,37 @@ class SolFile:
             elif v["kind"] == "bool":
                 v["new"] = bytes([_A3_TRUE if value else _A3_FALSE])
             else:
+                # AMF3 keeps ONE string-reference table for the whole file,
+                # built purely by read-order: every literal string adds a
+                # slot, every reference occurrence (a back-pointer to an
+                # earlier slot) adds none. This occurrence is always
+                # rewritten as a fresh literal (never a reference — a
+                # reference would point at a string that is no longer what
+                # we mean), which is safe when the ORIGINAL occurrence was
+                # already a literal (same table shape, just a new value at
+                # the same slot). It is NOT safe when the original was a
+                # reference: inserting a literal there adds a table slot
+                # that never existed in the original file, shifting the
+                # index of every later reference in the file by one — an
+                # untouched, unrelated property elsewhere can silently
+                # start reading a completely different string. Confirmed
+                # by direct reproduction, not theoretical: editing a
+                # reference occurrence changed an untouched later property
+                # sharing the referenced string's slot.
+                #
+                # There is no splice-only fix for this (it would need
+                # renumbering the whole table and rewriting every later
+                # reference — full AMF reconstruction, exactly what this
+                # module's splice-based design exists to avoid), so this
+                # refuses rather than silently corrupting something else.
+                if v.get("str_is_ref"):
+                    raise SolError(
+                        "this string occurrence is a reference to another "
+                        "value elsewhere in the file (AMF3 string table) — "
+                        "editing it here would corrupt whichever other "
+                        "value shares it; edit the original occurrence "
+                        "instead")
                 raw = str(value).encode("utf-8")
-                # Written as a literal, never as a reference: a reference
-                # would point at a string that is no longer what we mean.
                 v["new"] = (bytes([_A3_STRING])
                             + write_u29((len(raw) << 1) | 1) + raw)
         else:

@@ -200,10 +200,23 @@ class SyncWorker(QThread):
             progress_callback=_on_progress,
         )
 
-        # After any successful sync, refresh the master index so it
-        # reflects downloads as well as uploads.  Limit enforcement only
-        # applies when new backups were uploaded.
-        if result.success and (result.files_uploaded > 0 or result.files_downloaded > 0):
+        # Refresh the master index whenever anything actually transferred —
+        # NOT gated on result.success (sync_backups' own internal remote
+        # index.json update, a few lines above where it returns, uses this
+        # same looser condition on purpose: one failed file in a batch of
+        # several does not undo the ones that genuinely went up). Without
+        # this, a partial failure — say 2 of 3 backups uploaded, the 3rd
+        # hit a network error — left result.success False and skipped this
+        # refresh entirely, even though list_cloud_backups() below re-fetches
+        # the REAL remote index.json (already correctly updated inside
+        # sync_backups to include exactly the 2 that succeeded) rather than
+        # trusting result's own bookkeeping — so running this here after a
+        # partial failure is accurate, not a risk. Skipping it just left the
+        # LOCAL index stale until some later, fully-successful sync happened
+        # to refresh it, and every sync until then treated already-uploaded
+        # backups as still needing to be checked from scratch.
+        # Limit enforcement only applies when new backups were uploaded.
+        if result.files_uploaded > 0 or result.files_downloaded > 0:
             try:
                 from core.config_manager import get_config
                 from core.constants import MAX_LOCAL_BACKUPS, BACKUP_RETENTION_DAYS, MIN_KEPT_BACKUPS

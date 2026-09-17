@@ -1689,16 +1689,30 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._show_priority_prompt(auto_hide_ms=_AUTO_HIDE_MS)
         self._on_expire_action = lambda: self.path_changed_expired.emit(context)
 
-    def show_overwrite_saves_conflict(self, game_name: str, game_id: str, new_exe_path: str):
+    def show_overwrite_saves_conflict(self, game_name: str, game_id: str, new_exe_path: str,
+                                      is_data_copy: bool = False):
         """Overwrite was chosen, but the path it would rebase saves onto
         already has its OWN content — a second, independent save history,
         not an empty reinstall target. Ask before relocating tracking onto
         it. Unanswered defaults to NOT rebasing (the old location stays
         tracked as it was) — the safe outcome, never the one that could
-        silently start treating two different saves as the same."""
+        silently start treating two different saves as the same.
+
+        *is_data_copy* tells apart the two calling situations, which do
+        DIFFERENT things on "Overwrite" despite sharing this one prompt
+        (see _resolve_overwrite_saves_conflict in main_window.py for how
+        the answer itself is told apart): False (_apply_path_overwrite)
+        moves which location is TRACKED, no bytes touched — the default
+        hint describes exactly that, "track the new one from now on".
+        True (_carry_rebased_save_data) is asked AFTER tracking already
+        moved — "Overwrite" here means shutil.copytree the OLD save data
+        into the new location, merging it with what's already there, a
+        real file copy the tracking-pointer wording never mentions and
+        would otherwise leave the player agreeing to blind."""
         context = f"{game_id}|{new_exe_path}"
         if self._defer_if_priority(
-                lambda: self.show_overwrite_saves_conflict(game_name, game_id, new_exe_path),
+                lambda: self.show_overwrite_saves_conflict(
+                    game_name, game_id, new_exe_path, is_data_copy),
                 context=context, is_priority=True):
             return
         self._set_mode("cloud")
@@ -1706,10 +1720,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._priority_context = context
         self._icon_label.setText("⚠")
         self._title.setText(t("app.name"))
+        _hint_key = "overlay.overwrite_conflict_hint_copy" if is_data_copy \
+            else "overlay.overwrite_conflict_hint"
         self._message.setText(
             f"<b>{t('overlay.overwrite_conflict_msg', game=game_name)}</b><br>"
             f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
-            f"{t('overlay.overwrite_conflict_hint')}</span>"
+            f"{t(_hint_key)}</span>"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -2282,6 +2298,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             msg_plain = re.sub(r'<[^>]+>', '', msg).strip()
             # Nothing is on screen — a hidden overlay must never hold priority.
             self._priority_active = False
+            self._flush_deferred_notifs()
             self.exclusive_blocked.emit(title, msg_plain)
             logger.info("Overlay skipped — exclusive fullscreen active")
             return
@@ -2491,6 +2508,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # Nothing is on screen — a hidden overlay must never hold priority,
         # nor keep a pointer raised for a panel that is no longer there.
         self._priority_active = False
+        self._flush_deferred_notifs()
         self._cursor_timer.stop()
         SystemCursor.release("overlay")
         self.exclusive_blocked.emit(title, msg_plain)

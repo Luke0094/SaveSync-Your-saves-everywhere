@@ -795,7 +795,12 @@ def _parse_forum_description(text: str) -> dict:
         # prose swallowed after the last comma, never a real tag. Stray
         # quotes around the list (spoiler text nodes) are shed per token.
         _toks = (t.strip(' \'"“”‘’') for t in re.split(r'[,;/|]', tagstr))
-        out['tags'] = [t for t in _toks if t and len(t) <= 40][:16]
+        # No count cap — see _apply_web_tags/vndb.py/webscrape.py's own caps,
+        # all removed this session per "all tags should be imported anyway":
+        # a cap here silently dropped everything past position 16 forever,
+        # not just on first import (re-search kept finding the same
+        # never-saved tags and offering them as "new" again).
+        out['tags'] = [t for t in _toks if t and len(t) <= 40]
     return out
 
 
@@ -1314,6 +1319,17 @@ def _dedupe_candidates(cands: list[tuple["GameInfo", float]],
                 if url and k_url and url == k_url:
                     is_dup = True      # same source + identical link
                     break
+                if not url and not k_url:
+                    # Neither has a link to compare at all (common for a
+                    # generic/forum "web" hit with no store page) — `url and
+                    # k_url` above is falsy for BOTH, so it never fires, and
+                    # without this the pair fell through to "different
+                    # link: keep both" even when they're actually the same
+                    # content clone. Same 1:1-subset check the cross-source
+                    # branch below already uses for exactly this judgment.
+                    if slug and k_slug and slug == k_slug and _is_enrichment_subset(info, k_info):
+                        is_dup = True
+                        break
                 continue               # same source, different link: keep both
             # Different sources: only collapse same-title 1:1 content clones.
             if not slug or not k_slug or slug != k_slug:

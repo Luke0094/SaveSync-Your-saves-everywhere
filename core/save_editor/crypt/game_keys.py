@@ -56,16 +56,35 @@ def stored_key(kind: str, place) -> str:
 
 
 def store_key(kind: str, place, key: str) -> None:
-    """Remember *key* as this game's, so it is never worked out twice."""
+    """Remember *key* as this game's, so it is never worked out twice.
+
+    Merges into whatever the file already holds rather than replacing it —
+    same reason store_value below reads-then-writes: a (kind, place) file
+    can hold both this single key AND store_value's own "values" table (see
+    its docstring), and a plain overwrite here would silently wipe that
+    table the moment store_key next ran for that same file. Every caller
+    today uses "kind" values (es3/unreal for store_key, wolfrpg_lz4 for
+    store_value) that never collide on the same file, so this has not
+    fired in practice — but nothing about store_key's OWN logic should
+    depend on that staying true forever, any more than store_value's does.
+    """
     if not key:
         return
     try:
         path = _key_file(kind, place)
         path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        body_data = {"game": str(game_identity(place)), "key": key}
+        if existing.get("values"):
+            body_data["values"] = existing["values"]
         # The game's folder is written beside the key so a person can read
         # the file: a directory of hashes says nothing on its own.
-        body = json.dumps({"game": str(game_identity(place)), "key": key},
-                          ensure_ascii=False, indent=1)
+        body = json.dumps(body_data, ensure_ascii=False, indent=1)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)

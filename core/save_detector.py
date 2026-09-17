@@ -32,6 +32,47 @@ import i18n
 # Resolve SaveSync's own data dir once — never detect it as a game save path
 _OWN_DATA_DIR = str(USER_DATA_DIR.resolve()).lower()
 
+# _is_valid_save_context's strict gate: a folder's OWN NAME must be an EXACT
+# match against this (not just contain one of these words, the way the
+# coarser effective_save_hints() check above it does) before a generic-named
+# game or a no-game-context path is trusted at all. Deliberately narrower
+# than, and NOT sourced from, the user-extensible Settings hint list — this
+# is the precision boundary that check exists to enforce, not something a
+# Settings edit should be able to loosen. Was defined twice, verbatim, in
+# the two branches that use it; consolidated here.
+_STRONG_SAVE_FOLDER_NAMES = ('saves', 'save', 'savedata', 'save_data', 'savegame', 'save_game')
+
+
+def effective_save_hints() -> list[str]:
+    """SAVE_FOLDER_HINTS plus whatever the user added in Settings, deduped
+    case-insensitively — the built-in defaults are ALWAYS present in the
+    result no matter what is stored in config, so clearing the Settings
+    textbox (accidentally or on purpose) can never leave detection with
+    zero hint words.
+
+    This matters because config.get(key, default)'s own fallback only
+    covers the key being entirely ABSENT: Settings persists this key on
+    every save, even as an empty list, and ConfigManager.get is a plain
+    dict.get underneath — once the key exists, its stored value (empty or
+    not) wins over the fallback default forever. Without this union, a
+    save/clear-then-save in Settings would silently turn off save-folder
+    auto-detection for every game. Treating the stored list as ADDITIONS
+    on top of the fixed baseline, never a replacement, also means the
+    baseline entries are effectively read-only: the user can extend
+    detection from Settings, but cannot narrow it below the defaults."""
+    try:
+        extra = get_config().get("save_folder_hints", []) or []
+    except Exception:
+        extra = []
+    out = list(SAVE_FOLDER_HINTS)
+    seen = {h.lower() for h in out}
+    for h in extra:
+        hl = (h or "").strip().lower()
+        if hl and hl not in seen:
+            seen.add(hl)
+            out.append(hl)
+    return out
+
 # Module-level cancel support for long-running scans.
 # Set by UI when the user clicks cancel; checked by _scan_dir between
 # directory iterations so the thread exits promptly.
@@ -1698,6 +1739,11 @@ def _registry_save_paths(game_name: str, hkcu_only: bool = False) -> list[str]:
     
     slug = match_slug(game_name)
     found: list[str] = []
+    # Hoisted: same config read every EnumValue otherwise. 'user' restores
+    # this check's original word list exactly — see the matching comment
+    # in _is_valid_save_context for why it's added here rather than folded
+    # into the shared effective_save_hints() list itself.
+    _hints = (*effective_save_hints(), 'user')
 
     def _scan_key(hkey, sub_key: str, depth: int = 0):
         if depth > 3:  # Limit depth to avoid scanning too deep
@@ -1723,8 +1769,7 @@ def _registry_save_paths(game_name: str, hkcu_only: bool = False) -> list[str]:
                                     if p.is_dir() and len(expanded) > 3:
                                         # Additional validation: check if path contains save-related terms
                                         path_lower = str(p).lower()
-                                        save_indicators = ['save', 'data', 'user', 'profile', 'progress']
-                                        if any(indicator in path_lower for indicator in save_indicators):
+                                        if any(indicator in path_lower for indicator in _hints):
                                             found.append(str(p))
                                 idx += 1
                             except OSError:
@@ -1972,12 +2017,39 @@ def _is_valid_save_context(path: Path, game_name: str, exe_path: Optional[str] =
     if has_game_context and not is_generic_name:
         return True
 
-    if is_generic_name:
-        save_indicators = ['save', 'data', 'user', 'profile', 'progress']
-    else:
-        save_indicators = ['save', 'data', 'user', 'profile', 'progress']
-
-    has_save_indicator = any(indicator in path_str for indicator in save_indicators)
+    # Deliberately the SAME word list regardless of is_generic_name — this
+    # is only a coarse first gate (line below: reject outright if NONE of
+    # these appear anywhere in the path). The actual "require much
+    # stronger evidence for a generic name" promise is kept by a separate,
+    # genuinely strict check further down (folder name must be an EXACT
+    # strong_save_folders match, not just contain one of these words, plus
+    # a depth/location restriction) — that check returns definitively
+    # either way, so this gate's word list never gets to be the deciding
+    # factor for a generic name. An if/else assigning the identical list
+    # here used to imply a distinction that didn't exist; collapsed.
+    #
+    # Sourced from the same user-extensible list Settings' "Save folder
+    # hints" edits (see effective_save_hints) instead of a separate
+    # hardcoded copy — this was the third verbatim copy of the same 5-word
+    # list in this file, and the only one that ignored a user's own
+    # customization entirely.
+    #
+    # "user" (bare, not just "userdata"/"user_data") is added back on top
+    # of that shared list, not folded into it: the original hardcoded copy
+    # here had it, effective_save_hints()'s SAVE_FOLDER_HINTS never did
+    # (checked — it predates this consolidation and was already curated
+    # without it), and the two lists differing on that one word was
+    # deliberate divergence, not an oversight this cleanup gets to erase.
+    # "user" alone matches practically any Windows profile path
+    # ("C:\Users\<name>\..."), which is exactly why it does NOT belong in
+    # the shared list that also drives general-scan folder SCORING
+    # elsewhere (it would score nearly everything as save-like there) —
+    # but as one more word in this specific coarse reject-gate, where a
+    # match still has to clear a much stricter check afterward before
+    # anything is actually accepted, it only restores this function's own
+    # prior behavior.
+    has_save_indicator = any(indicator in path_str
+                             for indicator in (*effective_save_hints(), 'user'))
 
     # A folder in AppData/Documents that exactly matches the game slug is always
     # a valid candidate — games like "sol" store saves directly in
@@ -1992,9 +2064,8 @@ def _is_valid_save_context(path: Path, game_name: str, exe_path: Optional[str] =
     if is_generic_name:
         # Must be in a very specific save directory structure
         folder_name = path.name.lower()
-        strong_save_folders = ['saves', 'save', 'savedata', 'save_data', 'savegame', 'save_game']
-        
-        if folder_name not in strong_save_folders:
+
+        if folder_name not in _STRONG_SAVE_FOLDER_NAMES:
             return False
         
         # And must be reasonably close to exe or in standard location
@@ -2018,9 +2089,8 @@ def _is_valid_save_context(path: Path, game_name: str, exe_path: Optional[str] =
     # If no game context, be much stricter
     # Only allow if it's a very clear save directory structure
     folder_name = path.name.lower()
-    strong_save_folders = ['saves', 'save', 'savedata', 'save_data', 'savegame', 'save_game']
-    
-    if folder_name in strong_save_folders:
+
+    if folder_name in _STRONG_SAVE_FOLDER_NAMES:
         # Additional check: must be in a reasonable location
         if exe_path:
             exe_dir = Path(exe_path).parent
@@ -2111,7 +2181,7 @@ def detect_save_paths(
     if not game_name:
         game_name = ""
     config = get_config()
-    hints  = config.get("save_folder_hints", SAVE_FOLDER_HINTS)
+    hints  = effective_save_hints()
     # Entry trace. Called every live-tracking poll for a running game (as
     # often as every 60s) as well as the rarer full/manual scans — routine
     # either way, and the caller already logs at INFO when a poll actually
@@ -2615,9 +2685,9 @@ def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3,
     """
     from core.backup import _BACKUP_SKIP_DIRS
     from core.registry_saves import is_registry_path as _is_reg
-    # Configured hints (not the hardcoded constant) drive the install-root
-    # subfolder pick below, like the rest of detection.
-    _hints = get_config().get("save_folder_hints", SAVE_FOLDER_HINTS)
+    # Configured hints (not the hardcoded constant alone) drive the
+    # install-root subfolder pick below, like the rest of detection.
+    _hints = effective_save_hints()
 
     # Virtual registry entries pass through untouched (dedupe only): there
     # is no subtree to expand and no files to inspect.

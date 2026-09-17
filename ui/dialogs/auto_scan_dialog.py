@@ -300,13 +300,18 @@ class ScanWorkerThread(QThread):
                     # (appid is already handled by detect_save_paths).
                     if self.general_scan and not pid:
                         try:
-                            from core.save_detector import general_scan_paths, expand_selectable_paths
-                            from core.constants import SAVE_FOLDER_HINTS, CAMEL_SPLIT_RE
+                            from core.save_detector import (general_scan_paths,
+                                                            expand_selectable_paths,
+                                                            effective_save_hints)
+                            from core.constants import CAMEL_SPLIT_RE
                             import re as _re
 
                             # User-configurable "save folder suggestions" from Settings
                             # drive scoring confidence here — same as detect_save_paths.
-                            hints = get_config().get("save_folder_hints", SAVE_FOLDER_HINTS)
+                            # effective_save_hints(), not a bare config.get: the built-in
+                            # defaults must survive even if Settings' own stored list was
+                            # cleared (see that function's docstring).
+                            hints = effective_save_hints()
 
                             # Extra search terms: exe stem + CamelCase split
                             extra_terms = []

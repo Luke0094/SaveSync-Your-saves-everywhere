@@ -326,13 +326,25 @@ class CandidatePreviewDialog(QDialog):
 
         _current = diff.get('current') or {}
 
+        # A raw candidate title (forum thread names especially — see the
+        # f95zone examples throughout this dialog's own history) can run
+        # 80-100+ characters with no natural break word-wrap can lean on,
+        # pushing the card wider than its fixed layout instead of wrapping.
+        # Same fix as the description snippet below: a hard cap with an
+        # ellipsis, just a shorter one since this is a heading, not a body
+        # of text.
+        def _snip_title(text: str, limit: int = 100) -> str:
+            text = (text or '').strip()
+            return text if len(text) <= limit else text[:limit].rstrip() + '…'
+
         # ── Name (strikethrough old if the result renames the title) ────
         _name_field = fields.get('name')
         if _name_field and _name_field.get('old'):
             self._name_lbl.setText(
                 f"<span style='color:{palette('text_muted')};text-decoration:line-through;"
-                f"font-weight:400;font-size:{scaled(12, self)}px;'>{_h.escape(_name_field['old'])}</span><br>"
-                f"{_h.escape(_name_field.get('new') or c.name or '?')}"
+                f"font-weight:400;font-size:{scaled(12, self)}px;'>"
+                f"{_h.escape(_snip_title(_name_field['old'], 60))}</span><br>"
+                f"{_h.escape(_snip_title(_name_field.get('new') or c.name or '?'))}"
             )
         elif (c.name or '').strip().lower() == (_current.get('name') or '').strip().lower() and c.name:
             # Same "already have it" signal as a matching tag/year/developer
@@ -340,10 +352,11 @@ class CandidatePreviewDialog(QDialog):
             # since this is also the card's main heading.
             self._name_lbl.setText(
                 f"<span style='color:{palette('text_muted')};font-weight:400;"
-                f"font-size:{scaled(12, self)}px;'>&#10003;</span> {_h.escape(c.name or '?')}"
+                f"font-size:{scaled(12, self)}px;'>&#10003;</span> {_h.escape(_snip_title(c.name or '?'))}"
             )
         else:
-            self._name_lbl.setText(_h.escape(c.name or '?'))
+            self._name_lbl.setText(_h.escape(_snip_title(c.name or '?')))
+        self._name_lbl.setToolTip(c.name or '')
 
         self._source_lbl.setText(_h.escape(src_label))
 
@@ -989,19 +1002,21 @@ class EnrichmentMergeDialog(QDialog):
             host = QWidget()
             host.setLayout(flow)
 
-            # Name is the one field in this group applied UNCONDITIONALLY on
-            # confirm (see _apply_result_init) — so by the time this dialog
-            # opens, "current" is already the just-applied candidate's own
-            # name, not something the user chose. Defaulting to "Keep
-            # current" here would default to silently accepting that rename.
-            # When a "previous name" option exists (the pre_confirm_name
-            # snapshot, source-labelled _prev_label), default to THAT
-            # instead — nothing changes unless the user deliberately opts
-            # back into the new name. Every other field here is fill-only
-            # (never auto-applied without asking), so "Keep current" staying
-            # the default for them is correct as-is.
+            # Name, description, developer AND year are ALL applied
+            # UNCONDITIONALLY on confirm now (see _apply_result_init) — so
+            # by the time this dialog opens, "current" is already the
+            # just-applied candidate's own value, not something the user
+            # chose. Defaulting to "Keep current" here would default to
+            # silently accepting that change. When a "previous value"
+            # option exists (the pre_confirm_* snapshot, source-labelled
+            # _prev_label), default to THAT instead — nothing changes
+            # unless the user deliberately opts back into the new value.
+            # Image is the one field left that's still fill-only (never
+            # auto-applied without asking), so "Keep current" staying the
+            # default there is correct as-is — it isn't even in
+            # self._FIELDS, so this loop never reaches it.
             _default_value = None
-            if field == 'name':
+            if field in ('name', 'description', 'developer', 'year'):
                 for opt in opts:
                     _sm = (self._model.get("source_meta") or {}).get(opt['source']) or {}
                     if _sm.get('source_id') == _prev_label:

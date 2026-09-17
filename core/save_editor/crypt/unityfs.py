@@ -16,8 +16,9 @@ project dependency already, for wolf_lz4, so there is no longer a reason to
 hand-roll this one the way an earlier version of this module did: that was
 ~60 lines of a literal/back-reference walker in pure Python, replaced with
 one call into the same C decoder, measured 5x+ faster on top of being less
-code to maintain — see git history / FINDINGS.md if the old version is ever
-wanted for reference). Anything else is declined rather than guessed at.
+code to maintain — see git history / intel/wolf_lz4_findings.md if the old
+version is ever wanted for reference). Anything else is declined rather
+than guessed at.
 """
 import logging
 import lzma
@@ -143,7 +144,13 @@ def unpack(data: bytes, stop_after: bytes = b"", on_tick=None) -> bytes:
         r.align(16)
 
     if flags & _INFO_AT_END:
-        raw_info = data[-info_packed:]
+        # info_packed == 0 here would make data[-0:] return the WHOLE
+        # buffer instead of an empty slice (Python quirk: -0 == 0) — a
+        # degenerate bundle would then feed the entire file to _decompress
+        # as "info", which fails there anyway (read-only path: worst case
+        # is key search failing on that bundle, not data loss), but there's
+        # no reason to rely on that when an explicit empty slice is exact.
+        raw_info = data[-info_packed:] if info_packed else b""
     else:
         raw_info = data[r.i:r.i + info_packed]
         r.i += info_packed

@@ -44,6 +44,23 @@ class TadsRec:
 
     def dump(self) -> bytes:
         body = " ".join(self._tokens).encode("ascii")
+        if len(body) > self._size:
+            # A slot is a FIXED-size buffer (load() rejects anything else —
+            # see its own "not a TADS record" gate on non-2048 sizes with no
+            # padding to spare), edited in place with the padding shrinking
+            # to absorb growth. There's no reserve past that for a value
+            # that grows enough to eat the padding entirely — e.g. a score
+            # or counter pushed to a much longer digit string. Silently
+            # writing a longer-than-original buffer here would have gone
+            # straight to disk with no check: save_editor.py's write path
+            # calls dump() and writes the bytes directly, no round-trip
+            # verification in between. Raising here, before any bytes are
+            # written, is what actually stops that — the caller sees a
+            # clear failure instead of a corrupted save.
+            raise TadsError(
+                f"edited value(s) grew the record by "
+                f"{len(body) - self._size} byte(s) past its original "
+                f"{self._size}-byte size — this slot has no room left")
         if self._size > len(body):
             return body + (b"\x00" * (self._size - len(body)))
         return body

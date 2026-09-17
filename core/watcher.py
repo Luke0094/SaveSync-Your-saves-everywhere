@@ -564,8 +564,8 @@ def _unattributed_savelike_strength(file_path: Path) -> int:
         if _matches_common_save_patterns(file_path):
             return 2
         try:
-            from core.config_manager import get_config
-            hints = get_config().get("save_folder_hints", _DEFAULT_HINTS)
+            from core.save_detector import effective_save_hints
+            hints = effective_save_hints()
         except Exception:
             hints = list(_DEFAULT_HINTS)
         parent_name = file_path.parent.name.lower()
@@ -968,8 +968,8 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 import time as _time
                 if _SaveHandler._hints_cache is None:
                     try:
-                        from core.config_manager import get_config
-                        _SaveHandler._hints_cache = get_config().get("save_folder_hints", _DEFAULT_HINTS)
+                        from core.save_detector import effective_save_hints
+                        _SaveHandler._hints_cache = effective_save_hints()
                     except Exception:
                         _SaveHandler._hints_cache = list(_DEFAULT_HINTS)
                     _SaveHandler._hints_cache_time = _time.time()
@@ -1146,8 +1146,11 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 now = _time.time()
                 with _CACHE_LOCK:
                     if _SaveHandler._hints_cache is None or (now - _SaveHandler._hints_cache_time) > _SaveHandler._HINTS_CACHE_TTL:
-                        from core.config_manager import get_config
-                        _SaveHandler._hints_cache = get_config().get("save_folder_hints", _DEFAULT_HINTS)
+                        try:
+                            from core.save_detector import effective_save_hints
+                            _SaveHandler._hints_cache = effective_save_hints()
+                        except Exception:
+                            _SaveHandler._hints_cache = list(_DEFAULT_HINTS)
                         _SaveHandler._hints_cache_time = now
                     _hints = list(_SaveHandler._hints_cache)
                 if any(hint in parent_name for hint in _hints):
