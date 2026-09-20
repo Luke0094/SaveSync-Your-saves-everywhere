@@ -53,6 +53,7 @@ from .rpgmaker_mz_format import RpgMakerMzFormat
 from .rubymarshal_format import RubyMarshalFormat
 from .sol_format import SolFormat
 from .sqlite_format import SqliteFormat
+from .steamid_aes_format import SteamIdAesFormat
 from .struct_header_format import StructHeaderFormat
 from .sugarcube_format import SugarCubeFormat
 from .tads_rec_format import TadsRecFormat
@@ -79,6 +80,27 @@ def looks_encrypted_unreal(data: bytes) -> bool:
     try:
         from core.save_editor.crypt.unreal_crypt import looks_encrypted
         return looks_encrypted(data)
+    except Exception:
+        return False
+
+
+def in_steamid_keyed_save_folder(path) -> bool:
+    """Whether *path* sits under one of the games crypt/steamid_aes_recipes
+    knows a SteamID-key recipe for — the cheap pre-filter for
+    SteamIdAesFormat, whose file itself is fully encrypted and says nothing
+    on its own (see crypt/steamid_aes)."""
+    try:
+        from core.save_editor.crypt.steamid_aes_recipes import RECIPES
+        haystack = str(path).lower()
+        return any(r.folder_marker.lower() in haystack for r in RECIPES)
+    except Exception:
+        return False
+
+
+def looks_like_steamid_keyed_save(data: bytes) -> bool:
+    try:
+        from core.save_editor.crypt.steamid_aes import looks_like_save
+        return looks_like_save(data)
     except Exception:
         return False
 
@@ -228,6 +250,16 @@ SPECS = (
                # lives there and is something else costs one failed decryption.
                sniff=lambda path, data, ext: (in_unreal_save_folder(path)
                                               and looks_encrypted_unreal(data))),
+    # A SteamID-keyed save (see crypt/steamid_aes) also says nothing about
+    # itself — fully encrypted, keyed by the player's own SteamID64 rather
+    # than a key the game carries — so this too is found by where it sits
+    # rather than by its bytes. Not expensive: the key is DERIVED (or tried
+    # against a handful of local Steam accounts), never brute-force
+    # searched for, so a wrong match here costs a few deterministic decrypt
+    # attempts, not a scan.
+    FormatSpec(SteamIdAesFormat, extensions=(".sav",),
+               sniff=lambda path, data, ext: (in_steamid_keyed_save_folder(path)
+                                              and looks_like_steamid_keyed_save(data))),
     # expensive, and deliberately given no sniff at all: protobuf has no
     # magic bytes whatsoever (see core/engines/protobuf_raw), so the only
     # way to tell it apart from unrelated bytes is a real structural parse

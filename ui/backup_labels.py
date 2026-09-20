@@ -5,6 +5,7 @@ from typing import Any
 
 ORIGIN_LABELS = {
     "local": "💻 Local",
+    "p2p": "📥 P2P",
     "onedrive": "☁ OneDrive",
     "google_drive": "☁ Google Drive",
     "dropbox": "☁ Dropbox",

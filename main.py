@@ -931,11 +931,26 @@ def main():
         except (ImportError, AttributeError):
             pass
 
-        window.show()
-        # Re-apply window icon after show() as a final refresh for Windows.
-        _wi = app.windowIcon()
-        if not _wi.isNull():
-            window.setWindowIcon(_wi)
+        # --minimized is baked into the registered autostart command by
+        # core.startup._get_exe when "Start minimized to tray" is on — a
+        # manual double-click launch never carries it, so the window always
+        # opens normally then. The window (and its tray icon, set up in
+        # MainWindow.__init__ regardless of visibility) exists either way;
+        # skipping show() here is the same state a later hide-to-tray puts
+        # it in, and the tray's own restore handles both alike.
+        #
+        # Never skip it with no tray to hide into (see MainWindow._setup_tray
+        # and closeEvent's identical guard) — some Linux desktops have none,
+        # and an unshown window there has no taskbar entry either, so
+        # skipping show() would strand the app with no way to reach it at
+        # all short of killing the process.
+        _tray_available = getattr(window, "_tray", None) is not None
+        if "--minimized" not in sys.argv or not _tray_available:
+            window.show()
+            # Re-apply window icon after show() as a final refresh for Windows.
+            _wi = app.windowIcon()
+            if not _wi.isNull():
+                window.setWindowIcon(_wi)
 
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.setUrlHandler("savesync", window, "handleSavesyncUrl")

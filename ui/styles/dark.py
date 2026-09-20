@@ -1665,6 +1665,16 @@ QPushButton#file_list_toggle {
 QPushButton#file_list_toggle:hover {
     color: #b0b0b8;
 }
+QPushButton#file_list_select_all {
+    color: #6a6a78;
+    font-size: 11px;
+    padding: 2px 4px;
+    border: none;
+    background: transparent;
+}
+QPushButton#file_list_select_all:hover {
+    color: #7c6ff0;
+}
 #library_empty {
     color: #6a6a78;
     font-size: 13px;

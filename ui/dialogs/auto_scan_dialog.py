@@ -374,10 +374,19 @@ class SavePathItem(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Game name header
+        # Game name header — plain label. Selecting/deselecting is per SAVE
+        # PATH, not per game: each path's own FileListWidget has its own
+        # select-all/clear-all for the files under THAT path, which is the
+        # group size that control actually belongs to (see
+        # FileListWidget._select_all_btn) — a whole game's worth of
+        # unrelated paths is a much bigger, unrelated group.
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(4)
         header = QLabel(f"\U0001f3ae {self.game_name}")
         header.setObjectName("auto_scan_game_header")
-        layout.addWidget(header)
+        header_row.addWidget(header, 1)
+        layout.addLayout(header_row)
 
         # Path checkboxes with delete buttons + file browser
         self.file_lists = []  # FileListWidget per path

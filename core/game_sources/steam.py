@@ -157,7 +157,8 @@ def _review_fields(app_data: dict, appid: str) -> dict:
 
 
 def search_steam(game_name: str, appid: Optional[str] = None,
-                 region: str = "us") -> Optional[GameInfo]:
+                 region: str = "us",
+                 _tried: Optional[frozenset] = None) -> Optional[GameInfo]:
     """Search Steam Store API.
 
     Free, no API key required.
@@ -166,8 +167,15 @@ def search_steam(game_name: str, appid: Optional[str] = None,
     *region* is the store to ask for the details of a known *appid* — the one
     the game was found in, when the caller knows. It never changes the name's
     language, only which catalogue is asked first; see _appdetails.
+
+    *_tried* is internal: every appid whose _appdetails lookup already failed
+    somewhere in this recursion chain, so a cycle (A's name search resolves
+    to B, B's resolves back to A) is caught even though no single hop repeats
+    the same appid it just failed on.
     """
+    tried = _tried or frozenset()
     if appid:
+        tried = tried | {str(appid)}
         app_data = _appdetails(str(appid), region)
         if app_data:
             full_name = app_data.get("name", "")
@@ -235,18 +243,20 @@ def search_steam(game_name: str, appid: Optional[str] = None,
         # game may still be findable by name under a different appid, e.g.
         # a delisted/region-blocked one superseded by a new listing) IF the
         # name search actually turns up something else. When it resolves to
-        # the SAME appid that just failed, recursing repeats the identical
+        # an appid already tried in this chain — the same one that just
+        # failed, or one further back (A -> B -> A) — recursing repeats a
         # failing lookup with nothing having changed: unbounded recursion
-        # (no counter, no visited-set) until Python's recursion limit raises
-        # RecursionError, uncaught, out of whatever multi-source search was
-        # in progress. Stop here instead — that appid is confirmed dead.
-        if best_appid and appid and str(best_appid) == str(appid):
-            logger.info(f"Steam: best name match resolves to the same failed appid {appid} — giving up")
+        # until Python's recursion limit raises RecursionError, uncaught,
+        # out of whatever multi-source search was in progress. Stop here
+        # instead — that appid is confirmed dead for this chain.
+        if best_appid and str(best_appid) in tried:
+            logger.info(f"Steam: best name match resolves to an already-tried appid {best_appid} — giving up")
             return None
         if best_appid:
             logger.info(f"Steam best match: {best.get('name')} (appid={best_appid})")
             info = search_steam(game_name, str(best_appid),
-                                region=item_region.get(best_appid, "us"))
+                                region=item_region.get(best_appid, "us"),
+                                _tried=tried)
             # The name the game was FOUND under, kept alongside the one the
             # store details return. Those differ whenever the search matched
             # a localised catalogue — a Japanese title is found under it and

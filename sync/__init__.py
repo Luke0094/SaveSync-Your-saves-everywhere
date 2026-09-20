@@ -914,8 +914,10 @@ class SyncOrchestrator(QObject):
         # right after re-adding a game, before any save path exists) used to
         # clear the flag too early; the next auto-sync then downloaded the
         # old cloud history the user had just declined.
-        if result.success and (
-                result.files_uploaded > 0 or result.files_downloaded > 0):
+        # Not gated on result.success — see the matching comment on the local
+        # index refresh above: a partial batch failure still moved real bytes
+        # for the files that succeeded, and that bookkeeping should reflect it.
+        if result.files_uploaded > 0 or result.files_downloaded > 0:
             try:
                 from core.library import get_library as _gl
                 _e3 = _gl().get_by_id(game_id)
@@ -924,7 +926,7 @@ class SyncOrchestrator(QObject):
             except Exception:
                 pass
         # Stamp the machine_id on cloud_metadata so other machines can detect cross-machine syncs
-        if result.success:
+        if result.files_uploaded > 0 or result.files_downloaded > 0:
             try:
                 from core.library import get_library as _gl
                 from core.machine import get_machine_id as _mid

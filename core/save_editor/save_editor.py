@@ -152,7 +152,16 @@ def _candidates(path: Path, data: bytes, game_dir=None, engine: str = "") -> lis
             eng = detect_engine(game_dir=str(game_dir), thorough=True) or ""
         except Exception:
             eng = ""
-    engine_readers = set(registry_module.engine_preferences(eng)) if eng else set()
+    # A tuple, not a set: ENGINE_PREFERENCES' order (MZ before MV before
+    # Marshal, for "rpgmaker" — the most-specific-first funnel this whole
+    # function's docstring promises) is the entire reason this pass exists
+    # separately from the sniffed-bytes pass below. A set here would still
+    # dedup correctly but iterates in whatever order the classes happen to
+    # hash into on THIS run — silently different across an unrelated code
+    # change elsewhere in the process, which previously cost the file that
+    # is not the first-tried reader's own two harmless-looking "could not
+    # read it" warnings before the actually-correct reader was ever reached.
+    engine_readers = tuple(registry_module.engine_preferences(eng)) if eng else ()
     out.extend(engine_readers)
 
     if ext in _BY_EXTENSION:
@@ -168,8 +177,9 @@ def _candidates(path: Path, data: bytes, game_dir=None, engine: str = "") -> lis
     # blind, no-confirmation route, matching how Pass 1/Pass 2 below and
     # recipe_format._candidate_readers already treat every expensive reader.
     expensive = registry_module.expensive_readers()
+    engine_reader_set = set(engine_readers)
     for cls in registry_module.sniffed(path, data, ext):
-        if cls in expensive and cls not in engine_readers:
+        if cls in expensive and cls not in engine_reader_set:
             continue
         out.append(cls)
 
@@ -253,6 +263,13 @@ class SaveDocument:
             raise SaveEditorError(
                 "this save can be read but not rewritten safely",
                 "cheats.err_read_only")
+        # Validate before spending a backup-rotation slot: dump() is a pure,
+        # cheap splice (no I/O), and it's exactly where checks like TADS's
+        # padding-overflow raise TadsError. Without this, a failing write
+        # still ran backup_original first — copying the original aside and
+        # pruning old backups past the cap — for a write that then never
+        # happened, silently evicting a real backup on every failed retry.
+        self._fmt.dump()
         if self._registry:
             # Nothing to copy aside on disk, so the copy IS the export: the
             # key exactly as it stands, written where a file's backup would
@@ -308,6 +325,44 @@ def why_not(path) -> str:
     return known[1] if known else ""
 
 
+def read_source(path) -> tuple:
+    """The raw bytes behind *path*, whether it is a real file or one of the
+    "registry:HKCU\\..." virtual paths Unity's PlayerPrefs use — plus the
+    display Path and the registry string (empty for a real file). Returns
+    ``(data, p, registry)``.
+
+    Split out of open_save so a caller that wants to snapshot the untouched
+    save BEFORE detection/decompression even attempts to look at it (see
+    ui.pages.cheats_page._SaveLoadWorker) can get exactly the bytes about to
+    be handed to a reader, without duplicating the registry-vs-file branch
+    or repeating open_save's own empty/unreadable checks.
+    """
+    # Unity's PlayerPrefs are a save that is not a file: SaveSync proposes
+    # them as "registry:HKCU\..." and backs them up already, so the same
+    # export is what gets edited here. Everything downstream then works on
+    # bytes exactly as it does for a file.
+    from core.registry_saves import (export_registry_key, is_registry_path,
+                                     registry_display)
+    registry = str(path) if is_registry_path(str(path)) else ""
+    if registry:
+        p = Path(registry_display(registry).replace("\\", "/"))
+        data = export_registry_key(registry)
+        if not data:
+            raise SaveEditorError(
+                "that registry key could not be read, or holds nothing")
+        return data, p, registry
+    p = Path(path)
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise SaveEditorError(f"cannot read {p.name}: {e}",
+                              "cheats.err_cannot_read", name=p.name,
+                              reason=str(e)) from e
+    if not data:
+        raise SaveEditorError("the file is empty", "cheats.err_empty")
+    return data, p, registry
+
+
 def open_save(path, game_dir=None, progress=None, engine: str = "",
              full_sweep: bool = False, try_recipes: bool = False,
              cancel_token=None) -> SaveDocument:
@@ -351,29 +406,7 @@ def open_save(path, game_dir=None, progress=None, engine: str = "",
     directly is what actually cuts that short. Only Wolf LZ4 uses this
     today; every other format ignores it, same as progress.
     """
-    # Unity's PlayerPrefs are a save that is not a file: SaveSync proposes
-    # them as "registry:HKCU\..." and backs them up already, so the same
-    # export is what gets edited here. Everything downstream then works on
-    # bytes exactly as it does for a file.
-    from core.registry_saves import (export_registry_key, is_registry_path,
-                                     registry_display)
-    registry = str(path) if is_registry_path(str(path)) else ""
-    if registry:
-        p = Path(registry_display(registry).replace("\\", "/"))
-        data = export_registry_key(registry)
-        if not data:
-            raise SaveEditorError(
-                "that registry key could not be read, or holds nothing")
-    else:
-        p = Path(path)
-        try:
-            data = p.read_bytes()
-        except OSError as e:
-            raise SaveEditorError(f"cannot read {p.name}: {e}",
-                                  "cheats.err_cannot_read", name=p.name,
-                                  reason=str(e)) from e
-        if not data:
-            raise SaveEditorError("the file is empty", "cheats.err_empty")
+    data, p, registry = read_source(path)
 
     try:
         doc = _detect(p, data, registry, game_dir, progress, engine,
@@ -520,7 +553,7 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
     # worth seeing without turning on debug logging.
     named = set(registry_module.engine_preferences(engine)) if engine else set()
 
-    for cls in tried:
+    for i, cls in enumerate(tried):
         fmt = prepare(cls)
         try:
             fmt.load(data)
@@ -530,9 +563,30 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
             # mistake inside a reader is indistinguishable from a file that
             # simply was not that format.
             if cls in named:
-                logger.warning(
-                    f"{p.name}: told this is {engine!r}, but {cls.name} "
-                    f"could not read it ({type(e).__name__}: {e})")
+                # Every format's load() wraps its own "this file simply is
+                # not mine" case as SaveEditorError (see e.g.
+                # RpgMakerMzFormat.load catching RpgMakerError) — that, and
+                # ONLY that, is the routine, expected-to-happen rejection
+                # an engine with more than one preferred reader in order
+                # (RPG Maker's MZ/MV/Marshal trio) produces on every
+                # reader except the one that actually matches. Anything
+                # else escaping a reader — a TypeError, an AttributeError,
+                # whatever a real bug in that reader throws — was never
+                # caught and translated by the reader itself, so it is
+                # NOT "try the next one and move on" material regardless
+                # of how many readers are still queued: it stays a WARNING
+                # every time, the same as the true last-reader-failed case
+                # below, because something in that reader is actually
+                # broken and downgrading it would bury that.
+                more_named_left = any(c in named for c in tried[i + 1:])
+                if isinstance(e, SaveEditorError) and more_named_left:
+                    logger.info(
+                        f"{p.name}: {cls.name} is not it — trying the next "
+                        f"reader for {engine!r} ({type(e).__name__}: {e})")
+                else:
+                    logger.warning(
+                        f"{p.name}: told this is {engine!r}, but {cls.name} "
+                        f"could not read it ({type(e).__name__}: {e})")
             else:
                 logger.debug(f"{p.name}: not {cls.name} ({type(e).__name__}: {e})")
             continue
@@ -904,12 +958,33 @@ def backup_original(path, contents: bytes = None) -> Path:
     be there" has nothing left to do; restore_backup already leans on this
     same distinction (see its own ``if t.exists():`` guard) rather than
     calling this unconditionally.
+
+    Skips taking a new copy that would be byte-identical to ANY already
+    kept for *path*, not just the most recent one. save() calls this
+    before every write — the "clean state" snapshot it exists to protect —
+    so Apply with nothing actually changed since the last save, or the
+    first save right after a restore with no further edits, would
+    otherwise pile up duplicate copies. Checking only the newest missed
+    the case where the content that's now on disk matches an OLDER slot
+    instead: restore slot 2, decide that was the wrong one, restore slot 1
+    — the file now matches slot 1 again, which is no longer the newest
+    entry in the list, so comparing against only the newest would still
+    have created a fresh duplicate of it.
     """
     p = Path(path)
     if contents is None and not p.exists():
         logger.warning(f"No original to keep for {p.name} — it was not "
                        f"there any more when the write was about to happen")
         return None
+    existing = list_backups(p)
+    if existing:
+        try:
+            current = contents if contents is not None else p.read_bytes()
+            for old_file, _when in existing:
+                if old_file.read_bytes() == current:
+                    return old_file
+        except OSError:
+            pass
     d = _slot_dir(p)
     # Milliseconds AND a collision guard: saving and then undoing happen
     # within the same second, and a second-resolution name would have the
@@ -926,7 +1001,11 @@ def backup_original(path, contents: bytes = None) -> Path:
         dest.write_bytes(contents)
     (d / "origin.txt").write_text(str(p), encoding="utf-8")
     prune_backups(p)
-    logger.info(f"Kept the original of {p.name} at {dest.name}")
+    # Routine — this runs on every open and every save now, so at INFO it
+    # drowned out everything else in the log for no actionable reason. A
+    # failed snapshot (below, and this function's own OSError paths) is
+    # the only outcome anyone needs to see.
+    logger.debug(f"Kept the original of {p.name} at {dest.name}")
     return dest
 
 
@@ -1038,25 +1117,25 @@ def list_backups(path) -> list:
 
 
 def restore_backup(backup, target) -> None:
-    """Put a kept copy back. The file being replaced is itself kept first, so
-    an undo can be undone."""
+    """Put a kept copy back.
+
+    The file being replaced is NOT kept first: restoring is what someone
+    reaches for precisely because the current state is broken (a bad edit,
+    a corrupted write), so backing it up here would spend a rotation slot
+    — and risk evicting a genuinely good older copy — on the very state
+    the restore exists to get away from. The kept copy being restored FROM
+    stays in the list either way, so restoring the wrong one is still
+    reversible from that same list.
+    """
     b, t = Path(backup), Path(target)
     if not b.is_file():
         raise SaveEditorError("that copy is no longer there",
                               "cheats.err_copy_gone")
-    # Read the copy's contents NOW, before backup_original() below. That call
-    # keeps the file we're about to overwrite as a new copy, which runs
-    # prune_backups() — and if THIS copy is the oldest one and the slot is
-    # already full, pruning deletes it out from under us. Restoring the
-    # oldest kept copy used to fail with FileNotFoundError for exactly that
-    # reason.
     try:
         payload = b.read_bytes()
     except OSError as e:
         raise SaveEditorError("that copy could not be read",
                               "cheats.err_copy_gone") from e
-    if t.exists():
-        backup_original(t)
     # write_bytes rather than copy2: the restored file must read as a fresh
     # write. copy2 would carry the copy's old mtime across, making the restore
     # look like nothing changed to everything that keys off mtime — the
@@ -1069,3 +1148,21 @@ def restore_backup(backup, target) -> None:
     except OSError:
         pass
     logger.info(f"Restored {t.name} from {b.name}")
+
+
+def delete_backup(backup) -> None:
+    """Drop one kept copy on request, outside the usual age/count rules.
+
+    Nothing else references a kept copy by path once it is listed (see
+    list_backups — a plain glob of the slot folder, no index to update),
+    so removing the file is the whole operation.
+    """
+    b = Path(backup)
+    try:
+        b.unlink()
+    except FileNotFoundError:
+        pass        # already gone — the requested end state either way
+    except OSError as e:
+        raise SaveEditorError("that copy could not be deleted",
+                              "cheats.err_copy_gone") from e
+    logger.info(f"Deleted kept copy {b.name}")

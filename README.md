@@ -13,6 +13,8 @@
 SaveSync watches the games you play, finds their save folders on its own, keeps
 versioned local backups, and mirrors everything to the cloud provider of your
 choice — with an always-on-top overlay so you never have to leave the game.
+Saves can also go straight to a friend, P2P, with no server or cloud provider
+involved at all.
 
 ---
 
@@ -90,6 +92,9 @@ choice — with an always-on-top overlay so you never have to leave the game.
   always asks (keep local / keep cloud / keep both)
 - **Quick restore from the overlay** — browse local *and* cloud backups without
   leaving the game; cloud entries download transparently
+- **Direct P2P transfer** — send a specific backup straight to another
+  SaveSync install, no server or cloud provider involved (see
+  [P2P save transfer](#p2p-save-transfer))
 
 ### Library
 - **Card and list views** with search (by title or developer), folder tree with
@@ -313,7 +318,7 @@ savesync/
 │   │   ├── artemis.py             # Artemis Engine settings (BOWX container)
 │   │   ├── rags.py                # RAGS .rsv (.NET objects behind fixed AES)
 │   │   ├── wolf.py                # Wolf RPG obfuscation and checksum
-│   │   ├── wolf_lz4.py            # Wolf RPG's LZ4-compressed variant, key found by search
+│   │   ├── wolf_lz4.py            # Wolf RPG's LZ4 variant — key + swap, closed-form
 │   │   ├── sqlite_db.py           # SQLite save databases (Room / Java)
 │   │   ├── playerprefs.py         # Unity PlayerPrefs registry export
 │   │   ├── tads.py                # TADS system.rec slots
@@ -355,12 +360,15 @@ savesync/
 │   │   ├── sqlite_format.py       # SQLite (Room / Java desktop)
 │   │   ├── protobuf_format.py     # Schema-less Protocol Buffers, reached via "Open as…"
 │   │   ├── struct_header_format.py # Known fixed-header save, auto-detected by layout match
+│   │   ├── steamid_aes_format.py  # Steam saves keyed by the player's own SteamID64
 │   │   ├── recipe_format.py       # Generic unwrap recipes for unrecognised saves
 │   │   └── crypt/                 # Decryptors used only by the editor
 │   │       ├── unreal_crypt.py    # Unreal saves locked with the game's own key
 │   │       ├── es3.py             # Unity Easy Save 3, including encrypted
 │   │       ├── wolf.py            # Wolf unlock + variable database
 │   │       ├── wolf_lz4.py        # Same database, reached through the LZ4 variant's lock
+│   │       ├── steamid_aes.py     # AES-256 keyed from a SteamID64 (generic reader)
+│   │       ├── steamid_aes_recipes.py # Per-game recipe table for the reader above
 │   │       ├── recipes.py         # XOR/LCG keystreams x decompression, tried and gated cheaply
 │   │       ├── game_keys.py       # Remembered decrypt keys, per game
 │   │       └── unityfs.py         # Unity asset bundles, unpacked to find keys
@@ -369,6 +377,9 @@ savesync/
 │   ├── skip_dirs.py               # Shared skip-list of noise directories
 │   ├── backup.py                  # Versioned zip backups, retention, dedup
 │   ├── pending_batch_jobs.py      # Persisted multi-operation batch queues
+│   ├── p2p/                       # Direct P2P save transfer (BitTorrent + DHT mailbox)
+│   │   ├── __init__.py
+│   │   └── transfer.py            # ReceiveSession, send_backup — see "P2P save transfer" below
 │   ├── resolvers.py               # Launcher URLs, executable resolution
 │   ├── exe_scan.py                # Folder scan for installed game executables
 │   ├── game_api.py                # Web metadata search orchestration
@@ -416,7 +427,7 @@ savesync/
     │                              # busy overlay, pinned notes, screen capture
     └── dialogs/                   # Add/edit game, auto-scan, restore, conflicts,
                                    # exe scan, manual paths, game search, cloud
-                                   # verify, config import, credits
+                                   # verify, config import, P2P send/receive, credits
 ├── tools/                        # Build-time asset generation, nothing else
 │   ├── generate_icon.py           # Build the multi-size app .ico
 │   ├── generate_splash.py         # Build the static splash PNG
@@ -491,6 +502,52 @@ together — that already settles whose folder it is.
 A save that goes *backwards* without SaveSync doing it (a launcher's own cloud
 sync, another tool) is reported separately: it isn't a conflict, so the prompt
 offers to restore the newest backup, with acknowledgement in the dropdown.
+
+---
+
+## P2P save transfer
+
+Sends one backup archive straight to another SaveSync install, peer to peer
+— no server either side has to run, and no cloud provider involved at all.
+
+**Sending.** Click ➡️ on a specific backup (Backups page). SaveSync creates a
+torrent for that file and seeds it, then waits for the token the receiver
+gives you to be redeemed.
+
+**Receiving.** Open 📥 (bottom left of the sidebar) to generate a one-time
+token and hand it to whoever is sending. You see who's sending what
+(`"<name> wants to send you save.zip"`) and must accept before anything
+downloads. A token is discarded after one use.
+
+**Finding each other with no server.** The receiver's token IS the 32-byte
+seed for a keypair generated fresh for that transfer. The sender derives the
+same keypair from it and writes the magnet link plus their identity into a
+BitTorrent DHT "mutable item" (BEP44) addressed by that keypair; the
+receiver, already watching that same address, reads it straight back. Only
+the public DHT every BitTorrent client already uses is involved — nothing
+touches a server SaveSync runs.
+
+| What travels where | Why |
+|---|---|
+| DHT mailbox: magnet link, sender name/machine id, game name, filename, size | BEP44 items cap out around 1000 bytes — only room for what's needed to decide *before* downloading |
+| `manifest.json` inside the torrent itself | The full backup entry (save paths, exe path, chains) — no size cap, read only after accepting |
+
+**After accept**, the save files into the Backups page as an archive — the
+same no-library-game shape "Aggiungi percorso" already produces — tagged
+with its own `📥 P2P` badge, restorable immediately. No need to add the game
+to the library or match it to one up front: the same automatic name-matching
+that already links an unrecognised cloud archive to a game handles this
+identically.
+
+**Retention** is a separate cap from the regular backup policy, since a save
+someone keeps sending you isn't the same kind of history as your own games'
+backups: max archives per game (default **3**) and days kept (default **7**,
+newest always protected), shared across whoever sends that game rather than
+counted per sender, pruned on the same scheduled sweep the regular backup
+retention already runs on.
+
+Relevant files: `core/p2p/transfer.py` (the DHT-mailbox + BitTorrent
+mechanics), `ui/dialogs/p2p_send_dialog.py`, `ui/dialogs/p2p_receive_dialog.py`.
 
 ---
 
@@ -621,15 +678,19 @@ invalidate:
   Mersenne Twister keystream instead of (or alongside) the documented
   scheme — reverse-engineered by instrumenting the game itself with Frida
   while it loaded its own saves, then verified byte-for-byte against what
-  the game's own code produced in memory. The one thing that reverse
-  engineering did not recover is the formula turning a save's own salt
-  bytes into that keystream's seed, so the seed is instead recovered by
-  search against the save file's own plaintext shape — the same "must
-  decode to the format's own magic" proof every candidate key here is held
-  to, just reached by search rather than lookup. A save from a slot never
-  opened before costs a one-time search (progress shown, cancellable);
-  every later save from that same slot is instant (`engines/wolf_lz4.py`,
-  `crypt/wolf_lz4.py`).
+  the game's own code produced in memory. Two separate closed-form formulas
+  — both recovered by emulating the game's own obfuscated code as an
+  oracle, both confirmed against real saves — cover it end to end: one
+  derives the keystream's seed from 3 salt bytes in the file's clear
+  header, the other derives where the write path's post-encrypt byte-swap
+  lands from 2 other header bytes (the old search-based way to find that
+  swap had a real, confirmed correctness bug — more than one offset could
+  look valid, and the wrong one silently corrupted field values). Both run
+  instantly, no search, no game needed. The 2^32 brute-force search that
+  originally validated the seed formula is kept only as a defensive
+  fallback, for a file neither formula's output verifies against — none
+  seen yet — and even then, a slot's own search result is cached, so a
+  repeat is never needed either (`engines/wolf_lz4.py`, `crypt/wolf_lz4.py`).
 
 Nothing is guessed in any of these. A candidate key is accepted only when what
 comes out decrypts to the format's own magic — `GVAS` for Unreal, valid JSON
@@ -751,7 +812,7 @@ right-hand column of the table above, named rather than mangled.
 | [Encrypted Unreal saves](#encrypted-unreal-saves) | Recognised by the folder they sit in, not by their contents |
 | [Bakin and SRPG Studio](#bakin-and-srpg-studio) | Named but not edited, and why |
 | [Wolf RPG](#wolf-rpg) | Unlocked, read, locked back; names from the game's database |
-| [Wolf RPG, the LZ4 variant](#wolf-rpg-the-lz4-variant) | A second lock some builds use; its key is now a closed-form formula, search only as a fallback |
+| [Wolf RPG, the LZ4 variant](#wolf-rpg-the-lz4-variant) | A second lock some builds use; both its key and its write-time byte-swap are now closed-form formulas, search only as a fallback |
 | [TADS](#tads) | Two layouts, one a NUL-padded line of tokens |
 | [Java](#java) | Bundled-JVM layouts; SQLite progress offered cell by cell |
 | [WebGL](#webgl) | HTML5 shells, and why the wrapper is not the name |
@@ -989,23 +1050,36 @@ result is the exact same variable-database shape the standard reader already
 knows — this one only replaces how the bytes get unlocked, not how they are
 read afterward.
 
-The keystream's own seed comes from three salt bytes in the file's clear
-header, run through a formula — recovered by running the game's own
-(anti-disassembly-obfuscated) code through an emulator rather than reading
-it by hand, then confirmed exactly, zero mismatches, against thousands of
-emulated data points and every real save this project has ground truth
-for. Each of the 3 salt bytes turns out to contribute to the seed on its
-own, as a pure XOR function of its own byte with no carries — the closed
-form runs instantly, no search, no cache, no game needed, and covers every
-build tested so far.
+Two separate closed-form formulas make this run without ever touching the
+game, both recovered the same way: running the game's own
+(anti-disassembly-obfuscated) code through an emulator as an oracle rather
+than reading it by hand, then confirmed exactly against real saves, not
+just internally consistent.
 
-The 2^32 brute-force search that originally found that formula's own
-validation data is kept only as a defensive fallback: on a salt the
-formula's output fails to verify against the file's own decrypted shape —
-none seen yet — SaveSync falls back to searching every 32-bit candidate
-against that same shape, shown with a progress bar and cancellable like an
+The keystream's own seed comes from three salt bytes in the file's clear
+header. Each contributes to the seed on its own, as a pure XOR function of
+its own byte with no carries — confirmed against thousands of emulated data
+points and every real save this project has ground truth for, zero
+mismatches — so the closed form runs instantly, no search, no cache, no
+game needed, and covers every build tested so far.
+
+Separately, the write path also applies a post-encrypt byte-swap whose two
+20-byte span positions used to only be locatable by search — which turned
+out, on one real file, to have a genuine correctness bug: more than one
+offset pair can pass even the search's strongest validator, and the wrong
+one silently corrupts thousands of scattered field values with no error
+raised. Those two span positions turn out to be a plain, disjoint,
+wraparound function of two OTHER bytes already sitting in the same clear
+header — no seed, no decryption, no search needed to find them either, and
+confirmed against the exact file the old search got wrong.
+
+The 2^32 brute-force search that originally found the seed formula's own
+validation data (and the older, occasionally-wrong swap search) is kept
+only as a defensive fallback: on a salt or header neither formula's output
+verifies against the file's own decrypted shape — none seen yet — SaveSync
+falls back to searching, shown with a progress bar and cancellable like an
 Easy Save 3 password hunt, and remembers the answer so a repeat search
-(same slot, same salt) is never needed either.
+(same slot) is never needed either.
 
 ##### TADS
 
@@ -1223,9 +1297,10 @@ Other automatic I/O habits worth knowing:
 | `backup_archives_too` | true | Include archives — save folders added by hand, with no game in the library — in Backup All and Sync All |
 | `sync_timeout` | 120s | How long a single cloud operation may take before it is abandoned (10–600) |
 | `auto_backup` | false | Back up on a timer regardless of what is running |
-| `minimize_to_tray` | true | Closing the window leaves SaveSync in the tray instead of quitting |
+| `minimize_to_tray` | true | Don't close SaveSync when you click ✕ — keeps it running in the tray instead of quitting |
 | `hide_to_tray_on_game_launch` | true | Get out of the way when a game starts |
 | `launch_on_startup` | true | Register for launch at login — HKCU `Run` on Windows, an XDG `.desktop` in `~/.config/autostart` on Linux, a LaunchAgent on macOS |
+| `start_minimized_on_startup` | false | That autostart launch skips the window and goes straight to the tray; a manual double-click always opens it normally |
 | `overlay_hotkey` | `alt+ctrl+s` | Global shortcut that opens the in-game overlay |
 | `show_overlay_on_launch` / `_backup` / `_cloud` / `_unknown` | true | Which events the overlay speaks up for |
 | `check_for_updates` | true | Look for a newer release (`update_check_interval_sec`, 0 = at startup only) |
@@ -1252,7 +1327,7 @@ the current state (`pre_restore` / `pre_import`) so you can undo.
 
 One ordered list of checks, run from exactly two places — automatically on
 the schedule you set (`self_checks_frequency`, default 7 days) and on demand
-from the ⚕️ button on the Backups page. Both run the same four:
+from the ⚕️ button on the Backups page. Both run the same five:
 
 | Check | What it does |
 |-------|--------------|
@@ -1260,6 +1335,7 @@ from the ⚕️ button on the Backups page. Both run the same four:
 | legacy metadata repair | rebuilds the manifest / save hash on backups made before per-file manifests, so the dedup preflight stops treating those games as permanently changed |
 | archive verification | opens every zip and CRC-checks its contents — the only check that proves a backup can actually be restored |
 | config snapshots | a sandbox restore over a full rotated history |
+| settings integrity | the OS autostart registration against what `launch_on_startup` wants — repairs a stale entry left by an old build (its path/filename baked in changes every update) or removes one left behind after the setting was turned off |
 
 Progress appears in the sidebar, and past 30 seconds the notice offers a
 **Cancel**: cancellation is cooperative and lands between archives, so a

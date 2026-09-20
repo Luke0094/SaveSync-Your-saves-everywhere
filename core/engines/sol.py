@@ -111,6 +111,7 @@ class SolFile:
         self.name = ""
         self.amf_version = 0
         self._values = []        # name, kind, value, start, end
+        self._referenced_str_slots = set()
 
     # ── reading ──────────────────────────────────────────────────────────────
 
@@ -145,6 +146,15 @@ class SolFile:
             # found before it is still valid, and everything stays editable
             # by splice — nothing is rebuilt from a partial understanding.
             logger.debug(".sol walk stopped early")
+        # Slots that some reference occurrence points back to. A literal
+        # occurrence that created one of these slots is just as unsafe to
+        # edit by splice as the reference itself would be (see set_value) —
+        # rewriting the literal changes what the reference decodes to.
+        self._referenced_str_slots = {
+            v["str_slot"] for v in self._values
+            if v.get("kind") == "str" and v.get("str_is_ref")
+            and v.get("str_slot") is not None
+        }
         if not self._values:
             raise SolError("no editable values in this shared object")
 
@@ -158,10 +168,14 @@ class SolFile:
         self._last_string_was_ref = not (header & 1)
         if not (header & 1):                      # a reference to an earlier one
             idx = header >> 1
+            self._last_string_slot = idx
             return self._strings[idx] if idx < len(self._strings) else ""
         text = r.take(header >> 1).decode("utf-8", errors="replace")
         if text:
             self._strings.append(text)
+            self._last_string_slot = len(self._strings) - 1
+        else:
+            self._last_string_slot = None          # empty strings never enter the table
         return text
 
     def _record(self, name, kind, value, start, end, **extra):
@@ -235,7 +249,8 @@ class SolFile:
         elif marker == _A3_STRING:
             text = self._a3_string(r)
             self._record(name, "str", text, start, r.pos,
-                        str_is_ref=self._last_string_was_ref)
+                        str_is_ref=self._last_string_was_ref,
+                        str_slot=self._last_string_slot)
         elif marker in (_A3_UNDEFINED, _A3_NULL):
             pass
         elif marker == _A3_DATE:
@@ -330,6 +345,11 @@ class SolFile:
                         "editing it here would corrupt whichever other "
                         "value shares it; edit the original occurrence "
                         "instead")
+                if v.get("str_slot") in self._referenced_str_slots:
+                    raise SolError(
+                        "this string is referenced elsewhere in the file "
+                        "(AMF3 string table) — editing it here would "
+                        "corrupt whichever other value shares it")
                 raw = str(value).encode("utf-8")
                 v["new"] = (bytes([_A3_STRING])
                             + write_u29((len(raw) << 1) | 1) + raw)

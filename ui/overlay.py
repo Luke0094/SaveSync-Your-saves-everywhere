@@ -1893,14 +1893,36 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             except Exception as e:
                 logger.debug(f"Deferred notification replay failed: {e}")
 
-    def clear_priority_for(self, exe_path: str) -> None:
+    def clear_priority_for(self, exe_path: str, game_id: str = "") -> None:
         """Release a decision-required priority prompt when ITS subject process
         has exited, so later notifications (including hotkey-invoked ones) stop
         being deferred behind a prompt that can never be answered — the wedge
         that silently blocked all further detection. Replays anything queued
-        behind it. A blank *exe_path* clears unconditionally."""
-        if self._priority_active and (not exe_path or exe_path == self._priority_context):
-            logger.debug(f"Releasing priority prompt — subject exited: {exe_path!r}")
+        behind it. A blank *exe_path* clears unconditionally.
+
+        Several priority prompts (show_path_changed, show_overwrite_saves_
+        conflict, show_save_reverted) key _priority_context on a composite
+        "a|b" string rather than a bare exe path, so an exact match against
+        *exe_path* alone would never release them from a plain exit handler
+        that only knows the exe path (or, for an orphan process, has no
+        game_id at all). Matching either value against any "|"-delimited
+        component of the context — not just the whole string — covers both.
+        """
+        if not self._priority_active:
+            return
+        if not exe_path and not game_id:
+            matched = True
+        else:
+            parts = self._priority_context.split("|") if self._priority_context else []
+            matched = (
+                exe_path == self._priority_context
+                or game_id == self._priority_context
+                or (exe_path and exe_path in parts)
+                or (game_id and game_id in parts)
+            )
+        if matched:
+            logger.debug(f"Releasing priority prompt — subject exited: "
+                        f"exe_path={exe_path!r} game_id={game_id!r}")
             self._priority_active = False
             self._priority_context = ""
             self._flush_deferred_notifs()

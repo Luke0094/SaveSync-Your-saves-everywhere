@@ -15,15 +15,24 @@ logger = logging.getLogger(__name__)
 
 
 def _get_exe() -> str:
-    """Return the path of the running executable (or python main.py fallback).
+    """Return the command to register for startup (path, plus --minimized
+    when that setting is on) — or the python main.py fallback when running
+    from source.
 
     On Windows, quotes both paths so registry Run keys work with spaces.
     """
+    suffix = ""
+    try:
+        from core.config_manager import get_config
+        if get_config().get("start_minimized_on_startup", False):
+            suffix = " --minimized"
+    except Exception:
+        pass
     if getattr(sys, "frozen", False):
         exe = sys.executable
         if platform.system() == "Windows" and " " in exe:
-            return f'"{exe}"'
-        return exe
+            return f'"{exe}"{suffix}'
+        return f'{exe}{suffix}'
     # Running from source: use python + main.py path
     main_py = str(Path(sys.argv[0]).resolve())
     py = sys.executable
@@ -33,7 +42,7 @@ def _get_exe() -> str:
             py = f'"{py}"'
         if " " in main_py:
             main_py = f'"{main_py}"'
-    return f'{py} {main_py}'
+    return f'{py} {main_py}{suffix}'
 
 
 # ── Windows ──────────────────────────────────────────────────────────────────
@@ -62,17 +71,22 @@ def _win_set(enable: bool) -> bool:
 
 
 def _win_get() -> bool:
+    return bool(_win_get_command())
+
+
+def _win_get_command() -> str:
+    """The command currently registered in HKCU Run, or '' if none."""
     try:
         import winreg
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
             try:
-                winreg.QueryValueEx(key, APP_NAME)
-                return True
+                value, _ = winreg.QueryValueEx(key, APP_NAME)
+                return value
             except FileNotFoundError:
-                return False
+                return ""
     except Exception:
-        return False
+        return ""
 
 
 # ── Linux (XDG autostart) ─────────────────────────────────────────────────────
@@ -113,6 +127,20 @@ def _linux_set(enable: bool) -> bool:
 
 def _linux_get() -> bool:
     return _linux_autostart_path().exists()
+
+
+def _linux_get_command() -> str:
+    """The Exec= line currently in the autostart .desktop file, or ''."""
+    path = _linux_autostart_path()
+    if not path.exists():
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Exec="):
+                return line[len("Exec="):].strip()
+    except OSError:
+        pass
+    return ""
 
 
 # ── macOS (LaunchAgent) ───────────────────────────────────────────────────────
@@ -160,6 +188,22 @@ def _macos_get() -> bool:
     return _macos_plist_path().exists()
 
 
+def _macos_get_command() -> str:
+    """The ProgramArguments currently in the LaunchAgent plist, rebuilt into
+    the same space-joined/quoted shape _get_exe() produces, or ''."""
+    path = _macos_plist_path()
+    if not path.exists():
+        return ""
+    try:
+        import plistlib
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+        args = data.get("ProgramArguments") or []
+        return " ".join(f'"{a}"' if " " in a else a for a in args)
+    except Exception:
+        return ""
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def set_launch_on_startup(enable: bool) -> bool:
@@ -188,6 +232,19 @@ def get_launch_on_startup() -> bool:
     return False
 
 
+def _get_registered_command() -> str:
+    """The command currently registered for startup, on whichever platform
+    this is — '' when nothing is registered."""
+    system = platform.system()
+    if system == "Windows":
+        return _win_get_command()
+    elif system == "Linux":
+        return _linux_get_command()
+    elif system == "Darwin":
+        return _macos_get_command()
+    return ""
+
+
 # ── Additional Startup Functions ─────────────────────────────────────────────────────
 
 def ensure_data_directory() -> Path:
@@ -198,19 +255,53 @@ def ensure_data_directory() -> Path:
     return data_dir
 
 
-def sync_launch_on_startup_registration() -> None:
-    """Ensure system boot registration matches the saved config.
+def check_and_repair_registration() -> tuple[bool, str]:
+    """Reconcile the OS autostart registration with what the saved config
+    wants, repairing either direction. Returns ``(repaired, detail)`` —
+    *repaired* is True when something needed fixing (whether or not the fix
+    itself succeeded; *detail* says which).
 
-    On first run or if the executable moved, registers SaveSync in the OS
-    startup mechanism (Windows registry, Linux autostart, macOS LaunchAgent).
+    Windows and Linux builds both bake the version into the shipped
+    executable's own filename/path (see savesync.spec / build_appimage.sh),
+    so the command that needs to be registered changes on every update —
+    checking only "is something registered" (the old behaviour) left a
+    stale path from the previous version sitting there forever after the
+    first update, since it never looked stale from the outside. Comparing
+    the actual registered command against the current one catches that.
+
+    The other direction — config says off, but an entry still exists —
+    covers a version whose own "turn it off" write silently failed, or
+    (before this existed) simply never checked. Shared by the silent
+    at-launch sync below and the reportable diagnostic check in
+    core.self_checks — one repair, told two ways.
     """
     try:
         from core.config_manager import get_config
-        config = get_config()
-        want = bool(config.get("launch_on_startup", True))
-        actual = get_launch_on_startup()
-        if want and not actual:
-            set_launch_on_startup(True)
+        want = bool(get_config().get("launch_on_startup", True))
+        registered = get_launch_on_startup()
+        if want:
+            if registered and _get_registered_command() == _get_exe():
+                return False, ""
+            ok = set_launch_on_startup(True)
+            return True, ("repaired a stale or missing autostart entry" if ok
+                          else "could not repair the autostart entry")
+        if registered:
+            ok = set_launch_on_startup(False)
+            return True, ("removed a stray autostart entry left over after "
+                          "the setting was turned off" if ok
+                          else "could not remove a stray autostart entry")
+        return False, ""
+    except Exception as e:
+        return True, str(e)[:200]
+
+
+def sync_launch_on_startup_registration() -> None:
+    """Silent counterpart of check_and_repair_registration(), run once at
+    every launch (see core.self_checks for the reportable version)."""
+    try:
+        repaired, detail = check_and_repair_registration()
+        if repaired:
+            logger.info(f"Startup registration: {detail}")
     except Exception as e:
         logger.debug(f"Could not sync launch on startup registration: {e}")
 

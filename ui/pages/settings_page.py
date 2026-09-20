@@ -206,6 +206,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._build_section_overlay,
             self._build_section_backup_policy,
             self._build_section_edit_copies,
+            self._build_section_p2p_retention,
             self._build_section_process_monitor,
             self._build_section_excluded_paths,
             self._build_section_detection,
@@ -443,8 +444,22 @@ class SettingsPage(PageScrollMixin, QWidget):
         beh_form = QFormLayout(beh_grp)
         beh_form.setSpacing(14)
 
+        # Shown to whoever's on the other end of a P2P save transfer
+        # ("User X wants to send you save.zip") — otherwise a receiver has
+        # nothing but a machine id to tell one sender from another.
+        self._p2p_username_edit = QLineEdit()
+        self._p2p_username_edit.setPlaceholderText(t("settings.p2p_username_placeholder"))
+        self._p2p_username_edit.setToolTip(t("settings.p2p_username_tooltip"))
+        self._p2p_username_lbl = QLabel(t("settings.p2p_username"))
+        beh_form.addRow(self._p2p_username_lbl, self._p2p_username_edit)
+
         self._startup_cb = WrappedCheckBox(t("settings.launch_on_startup"), t("settings.launch_on_startup_tooltip"))
+        self._startup_cb.toggled.connect(self._on_startup_change)
         beh_form.addRow(self._startup_cb)
+        self._start_minimized_cb = WrappedCheckBox(
+            t("settings.start_minimized_on_startup"),
+            t("settings.start_minimized_on_startup_tooltip"))
+        beh_form.addRow(self._start_minimized_cb)
         self._tray_cb = WrappedCheckBox(t("settings.minimize_to_tray"), t("settings.minimize_to_tray_tooltip"))
         beh_form.addRow(self._tray_cb)
         self._hide_on_game_cb = WrappedCheckBox(t("settings.hide_to_tray_on_game_launch"), t("settings.hide_to_tray_on_game_launch_tooltip"))
@@ -609,6 +624,31 @@ class SettingsPage(PageScrollMixin, QWidget):
         ed_form.addRow(self._edit_copy_days_lbl, self._edit_copy_days_spin)
         self._scroll_layout.addWidget(ed_grp)
         return ed_grp, "settings.section_save_edit_copies"
+
+    def _build_section_p2p_retention(self):
+        # A save someone sends you lands as its own archive (see
+        # ui.dialogs.p2p_receive_dialog), separate from the backup policy
+        # above: that governs YOUR OWN games' regular backups, and applying
+        # the same numbers here would mean one setting silently controlling
+        # two unrelated things — a large "keep 50" meant for your own long
+        # play history is not a limit anyone chose for saves other people
+        # keep sending.
+        p2p_grp = _group(t("settings.section_p2p_retention"))
+        p2p_form = QFormLayout(p2p_grp)
+        p2p_form.setSpacing(14)
+        self._p2p_max_spin = QSpinBox()
+        self._p2p_max_spin.setRange(1, 50)
+        self._p2p_max_spin.setToolTip(t("settings.p2p_max_per_game_tooltip"))
+        self._p2p_max_lbl = QLabel(t("settings.p2p_max_per_game"))
+        p2p_form.addRow(self._p2p_max_lbl, self._p2p_max_spin)
+        self._p2p_retention_spin = QSpinBox()
+        self._p2p_retention_spin.setRange(1, 365)
+        self._p2p_retention_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._p2p_retention_spin.setToolTip(t("settings.p2p_retention_days_tooltip"))
+        self._p2p_retention_lbl = QLabel(t("settings.p2p_retention_days"))
+        p2p_form.addRow(self._p2p_retention_lbl, self._p2p_retention_spin)
+        self._scroll_layout.addWidget(p2p_grp)
+        return p2p_grp, "settings.section_p2p_retention"
 
     def _build_section_process_monitor(self):
         # ── Process monitor ───────────────────────────────────────────────────
@@ -1005,6 +1045,14 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._self_checks_freq_spin.setEnabled(self._self_checks_cb.isChecked())
         self._self_checks_freq_lbl.setEnabled(self._self_checks_cb.isChecked())
         self._mark_dirty()
+
+    def _on_startup_change(self, _checked=False):
+        if self._loading:
+            return
+        # Only meaningful while launch_on_startup is itself on — see
+        # start_minimized_on_startup's own config comment.
+        self._start_minimized_cb.setEnabled(self._startup_cb.isChecked())
+        self._mark_dirty()
     
     def _on_self_checks_freq_changed(self, _value: int):
         if self._loading:
@@ -1084,7 +1132,9 @@ class SettingsPage(PageScrollMixin, QWidget):
                     pass
 
     def _connect_change_signals(self):
+        self._p2p_username_edit.textChanged.connect(self._mark_dirty)
         self._startup_cb.stateChanged.connect(self._mark_dirty)
+        self._start_minimized_cb.stateChanged.connect(self._mark_dirty)
         self._tray_cb.stateChanged.connect(self._mark_dirty)
         self._hide_on_game_cb.stateChanged.connect(self._mark_dirty)
         self._archives_too_cb.stateChanged.connect(self._mark_dirty)
@@ -1100,6 +1150,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._retention_spin.valueChanged.connect(self._mark_dirty)
         self._edit_copies_spin.valueChanged.connect(self._mark_dirty)
         self._edit_copy_days_spin.valueChanged.connect(self._mark_dirty)
+        self._p2p_max_spin.valueChanged.connect(self._mark_dirty)
+        self._p2p_retention_spin.valueChanged.connect(self._mark_dirty)
         self._min_kept_spin.valueChanged.connect(self._mark_dirty)
         self._max_size_spin.valueChanged.connect(self._mark_dirty)
         self._poll_spin.valueChanged.connect(self._mark_dirty)
@@ -1369,7 +1421,9 @@ class SettingsPage(PageScrollMixin, QWidget):
             "self_checks": self._self_checks_cb.isChecked(),
             "self_checks_frequency": self._self_checks_freq_spin.value(),
             "hotkey": self._hotkey_edit.text().strip(),
+            "p2p_username": self._p2p_username_edit.text().strip(),
             "startup": self._startup_cb.isChecked(),
+            "start_minimized": self._start_minimized_cb.isChecked(),
             "tray": self._tray_cb.isChecked(),
             "backup_exit": self._backup_on_exit_cb.isChecked(),
             "auto_sync": self._auto_sync_cb.isChecked(),
@@ -1385,6 +1439,8 @@ class SettingsPage(PageScrollMixin, QWidget):
             "retention": self._retention_spin.value(),
             "edit_copies": self._edit_copies_spin.value(),
             "edit_copy_days": self._edit_copy_days_spin.value(),
+            "p2p_max_per_game": self._p2p_max_spin.value(),
+            "p2p_retention_days": self._p2p_retention_spin.value(),
             "min_kept": self._min_kept_spin.value(),
             "max_size": self._max_size_spin.value(),
             "poll": self._poll_spin.value(),
@@ -1438,7 +1494,10 @@ class SettingsPage(PageScrollMixin, QWidget):
             get_theme_manager().apply(theme, QApplication.instance())
 
         self._hotkey_edit.setText(config.get("overlay_hotkey", "alt+ctrl+s"))
+        self._p2p_username_edit.setText(config.get("p2p_username", ""))
         self._startup_cb.setChecked(get_launch_on_startup())
+        self._start_minimized_cb.setChecked(config.get("start_minimized_on_startup", False))
+        self._start_minimized_cb.setEnabled(self._startup_cb.isChecked())
         self._tray_cb.setChecked(config.get("minimize_to_tray", True))
         self._hide_on_game_cb.setChecked(config.get("hide_to_tray_on_game_launch", True))
         self._archives_too_cb.setChecked(config.get("backup_archives_too", True))
@@ -1455,6 +1514,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._retention_spin.setValue(config.get("backup_retention_days", 30))
         self._edit_copies_spin.setValue(config.get("save_edit_copies", 3))
         self._edit_copy_days_spin.setValue(config.get("save_edit_copy_days", 7))
+        self._p2p_max_spin.setValue(config.get("p2p_max_per_game", 3))
+        self._p2p_retention_spin.setValue(config.get("p2p_retention_days", 7))
         self._min_kept_spin.setValue(config.get("min_kept_backups", 3))
         self._max_size_spin.setValue(config.get("max_backup_size_mb", 512))
         self._poll_spin.setValue(config.get("process_poll_interval", 1))
@@ -1498,6 +1559,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         config = get_config()
         old_hotkey = config.get("overlay_hotkey", "alt+ctrl+s")
         new_hotkey = self._hotkey_edit.text().strip() or "alt+ctrl+s"
+        old_start_minimized = config.get("start_minimized_on_startup", False)
 
         if not self._validate_hotkey(new_hotkey):
             self._saved_lbl.setText(t("settings.invalid_hotkey", hotkey=new_hotkey))
@@ -1568,6 +1630,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("auto_sync_after_backup", self._auto_sync_cb.isChecked())
         config.set("auto_scan_on_exit",      self._auto_scan_cb.isChecked())
         config.set("check_for_updates",      self._updates_cb.isChecked())
+        config.set("p2p_username",           self._p2p_username_edit.text().strip())
         config.set("show_overlay_on_launch", self._overlay_launch_cb.isChecked())
         config.set("show_overlay_on_unknown", self._overlay_unknown_cb.isChecked())
         config.set("show_overlay_on_cloud",  self._overlay_cloud_cb.isChecked())
@@ -1576,6 +1639,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("backup_retention_days",  self._retention_spin.value())
         config.set("save_edit_copies",       self._edit_copies_spin.value())
         config.set("save_edit_copy_days",    self._edit_copy_days_spin.value())
+        config.set("p2p_max_per_game",       self._p2p_max_spin.value())
+        config.set("p2p_retention_days",     self._p2p_retention_spin.value())
         config.set("min_kept_backups",       self._min_kept_spin.value())
         config.set("max_backup_size_mb",     self._max_size_spin.value())
         config.set("process_poll_interval",  self._poll_spin.value())
@@ -1594,11 +1659,18 @@ class SettingsPage(PageScrollMixin, QWidget):
         hints = [h.strip() for h in hints_raw.splitlines() if h.strip()]
         config.set("save_folder_hints", hints)
 
+        config.set("start_minimized_on_startup", self._start_minimized_cb.isChecked())
+
         want_startup = self._startup_cb.isChecked()
         if want_startup != get_launch_on_startup():
             ok = set_launch_on_startup(want_startup)
             if not ok:
                 self._startup_cb.setChecked(get_launch_on_startup())
+        elif want_startup and self._start_minimized_cb.isChecked() != old_start_minimized:
+            # Registration itself is unchanged, but the command it runs just
+            # did (--minimized is baked in by core.startup._get_exe) — rewrite
+            # it now rather than waiting for launch_on_startup to be toggled.
+            set_launch_on_startup(True)
 
         if old_hotkey != new_hotkey:
             self.hotkey_changed.emit(old_hotkey, new_hotkey)
@@ -2072,6 +2144,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             "overlay_hotkey":         "alt+ctrl+s",
             "minimize_to_tray":       True,
             "hide_to_tray_on_game_launch": True,
+            "start_minimized_on_startup": False,
             "backup_on_exit":         True,
             "auto_sync_after_backup": False,
             "auto_scan_on_exit":      True,
@@ -2195,7 +2268,12 @@ class SettingsPage(PageScrollMixin, QWidget):
             if _tid:
                 self._theme_combo.setItemText(_i, theme_display_name(_tid))
         self._hotkey_lbl.setText(t("settings.hotkey"))
+        self._p2p_username_lbl.setText(t("settings.p2p_username"))
+        self._p2p_username_edit.setPlaceholderText(t("settings.p2p_username_placeholder"))
+        self._p2p_username_edit.setToolTip(t("settings.p2p_username_tooltip"))
         self._startup_cb.setText(t("settings.launch_on_startup"))
+        self._start_minimized_cb.setText(t("settings.start_minimized_on_startup"))
+        self._start_minimized_cb.setToolTip(t("settings.start_minimized_on_startup_tooltip"))
         self._tray_cb.setText(t("settings.minimize_to_tray"))
         self._hide_on_game_cb.setText(t("settings.hide_to_tray_on_game_launch"))
         self._hide_on_game_cb.setToolTip(t("settings.hide_to_tray_on_game_launch_tooltip"))
@@ -2235,6 +2313,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._edit_copy_days_lbl.setText(t("settings.save_edit_copy_days"))
         self._edit_copy_days_spin.setToolTip(t("settings.save_edit_copy_days_tooltip"))
         self._edit_copy_days_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._p2p_max_lbl.setText(t("settings.p2p_max_per_game"))
+        self._p2p_max_spin.setToolTip(t("settings.p2p_max_per_game_tooltip"))
+        self._p2p_retention_lbl.setText(t("settings.p2p_retention_days"))
+        self._p2p_retention_spin.setToolTip(t("settings.p2p_retention_days_tooltip"))
+        self._p2p_retention_spin.setSuffix(" " + t("settings.days_suffix"))
         self._min_kept_lbl.setText(t("settings.min_kept_backups"))
         self._min_kept_spin.setToolTip(t("settings.min_kept_backups_tooltip"))
         self._max_size_lbl.setText(t("settings.max_size_mb"))

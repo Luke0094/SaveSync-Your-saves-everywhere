@@ -47,7 +47,7 @@ import sys as _sys
 from pathlib import Path
 
 import PyInstaller.building.splash_templates as _splash_tpl
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
 
 # packaging/ is not on the path when PyInstaller execs a spec.
 _sys.path.insert(0, str(Path(SPECPATH).resolve()))   # noqa: F821
@@ -98,6 +98,7 @@ hiddenimports += [
     'google.auth.transport.requests', 'google_auth_oauthlib.flow',
     'googleapiclient.discovery',
     'cryptography.hazmat.primitives.ciphers.aead',
+    'cryptography.hazmat.primitives.padding',
     'PIL', 'pillow_avif',
     'jaraco.functools', 'jaraco.context', 'jaraco.text',
     'dateutil', 'dateutil.parser',
@@ -111,6 +112,13 @@ hiddenimports += [
     # (never lz4.block — a generic recipe has no out-of-band size to give
     # a block decoder).
     'lz4', 'lz4.block', 'lz4.frame', 'numpy', 'numba',
+    # core.save_editor.steamid_aes_format lazy-imports PyYAML (same reason
+    # as the entries above) to parse a SteamID-keyed save once decrypted.
+    'yaml',
+    # core.p2p.transfer lazy-imports libtorrent for P2P save transfer — its
+    # binary .so dependencies are collected explicitly below (no official
+    # PyInstaller hook exists for it, unlike numpy/numba/lz4 above).
+    'libtorrent',
     # Same fix as the Windows spec, same reason: ui.styles.arrow_icons
     # writes SVG files and lets Qt's image-plugin dispatch decode them via
     # QSS image: url(...) — nothing ever imports QtSvg directly.
@@ -122,10 +130,12 @@ hiddenimports += [
     'PySide6.QtSvg',
 ]
 
+_libtorrent_binaries = collect_dynamic_libs('libtorrent')
+
 a = Analysis(                                    # noqa: F821
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=_libtorrent_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

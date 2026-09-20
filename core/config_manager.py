@@ -34,6 +34,11 @@ _DEFAULTS: dict[str, Any] = {
     # dropped it, so "do not hide while I play" was forgotten at every start
     # and the window went to the tray again regardless.
     "hide_to_tray_on_game_launch": True,
+    # Only meaningful (and only shown) while launch_on_startup is also on —
+    # baked into the registered autostart command itself (see
+    # core.startup._get_exe) as a --minimized flag, so a manual double-click
+    # launch of the exe always shows the window normally regardless of this.
+    "start_minimized_on_startup": False,
     # Whether "back up everything" and "sync everything" reach the archives
     # too, or only the library. On by default: an archive is a save folder
     # the user handed over, and leaving it out of "everything" is how it
@@ -130,6 +135,9 @@ _DEFAULTS: dict[str, Any] = {
     "ignored_processes": [],
     "suppressed_overlay_apps": [],
     "machine_id": None,
+    "p2p_username": "",             # shown to a peer receiving a P2P save transfer
+    "p2p_max_per_game": 3,          # oldest P2P-received archives beyond this are pruned
+    "p2p_retention_days": 7,        # P2P-received archives older than this are pruned
     "sync_timeout": 120,            # timeout in seconds for sync provider operations
     "schema_version": 1,
     "auto_scan_confirmed_games": [],  # Games where auto-scan was confirmed
@@ -232,6 +240,7 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "launch_on_startup": lambda x: isinstance(x, bool),
     "minimize_to_tray": lambda x: isinstance(x, bool),
     "hide_to_tray_on_game_launch": lambda x: isinstance(x, bool),
+    "start_minimized_on_startup": lambda x: isinstance(x, bool),
     "backup_archives_too": lambda x: isinstance(x, bool),
     "auto_scan_excluded_files": lambda x: isinstance(x, dict),
     "show_overlay_on_launch": lambda x: isinstance(x, bool),
@@ -308,6 +317,9 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "sync_provider": lambda x: x is None or isinstance(x, str),
     "sync_credentials": lambda x: isinstance(x, dict),
     "machine_id": lambda x: x is None or isinstance(x, str),
+    "p2p_username": lambda x: isinstance(x, str),
+    "p2p_max_per_game": lambda x: isinstance(x, int) and x >= 1,
+    "p2p_retention_days": lambda x: isinstance(x, int) and x >= 1,
     "schema_version": lambda x: isinstance(x, int) and x >= 1,
 }
 

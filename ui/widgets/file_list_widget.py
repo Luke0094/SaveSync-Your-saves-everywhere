@@ -100,6 +100,22 @@ class FileListWidget(QWidget):
         toggle_row.addWidget(self._count_lbl)
         toggle_row.addStretch()
 
+        # Plain, unconditional select-all/clear-all for THIS path's own
+        # files — independent of "Show files", which only expands/collapses
+        # the list. Hidden until there is something to select (see _toggle
+        # and _sync_select_all_visibility): a section-wide toggle spanning
+        # every save PATH at once (a much bigger, unrelated group) belongs
+        # nowhere in this per-path widget — see GroupToggle for that.
+        self._select_all_btn = QPushButton("☑")
+        self._select_all_btn.setObjectName("file_list_select_all")
+        self._select_all_btn.setFlat(True)
+        self._select_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._select_all_btn.setFixedSize(scaled(20, self), scaled(20, self))
+        self._select_all_btn.setToolTip(t("file_list.select_all"))
+        self._select_all_btn.setVisible(False)
+        self._select_all_btn.clicked.connect(self._select_all_toggle)
+        toggle_row.addWidget(self._select_all_btn)
+
         self._root_layout.addLayout(toggle_row)
 
         # Container for file list (hidden initially)
@@ -218,6 +234,22 @@ class FileListWidget(QWidget):
         self._toggle_btn.setText(
             t("file_list.hide_files") if self._expanded else t("file_list.show_files")
         )
+        self._sync_select_all_visibility()
+
+    def _sync_select_all_visibility(self):
+        self._select_all_btn.setVisible(
+            self._expanded and bool(self._file_checkboxes))
+
+    def _select_all_toggle(self):
+        """Plain, unconditional select-all/clear-all across every file
+        currently listed for this one path. Reuses each checkbox's own
+        toggled handler (already wired to persist exclusions and re-style
+        the row) rather than duplicating that logic here."""
+        if not self._file_checkboxes:
+            return
+        any_unchecked = any(not cb.isChecked() for cb, _ in self._file_checkboxes)
+        for cb, _ in self._file_checkboxes:
+            cb.setChecked(any_unchecked)
 
     def _build_file_list(self):
         """Populate the file list from the directory.
@@ -356,6 +388,7 @@ class FileListWidget(QWidget):
         self._file_rows.pop(rel_path, None)
         self._file_checkboxes = [(c, r) for c, r in self._file_checkboxes
                                  if r != rel_path]
+        self._sync_select_all_visibility()
         try:
             row_w.setParent(None)
             row_w.deleteLater()
@@ -479,6 +512,7 @@ class FileListWidget(QWidget):
         self._deleted_files.clear()
         if getattr(self, "_files_built", False):
             self._build_file_list()
+            self._sync_select_all_visibility()
 
     def get_excluded_files(self) -> set[str]:
         """Return set of relative paths the user has excluded."""

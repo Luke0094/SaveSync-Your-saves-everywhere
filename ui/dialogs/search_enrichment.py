@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from i18n import t
 from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.styles.theme import palette
+from ui.widgets.group_toggle import GroupToggle
 
 logger = logging.getLogger(__name__)
 
@@ -728,6 +729,7 @@ class EnrichmentMergeDialog(QDialog):
         # source key → every chip offered under that source (for header toggle)
         self._source_chips: dict[str, list[QPushButton]] = {}
         self._source_headers: dict[str, QPushButton] = {}
+        self._source_toggle = GroupToggle()
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t('add_game.merge_title'))
         self._apply_window_chrome()
@@ -827,13 +829,19 @@ class EnrichmentMergeDialog(QDialog):
         src_id = meta.get("source_id") or source.split(" · ")[0] or source
         title = (meta.get("name") or "").strip()
         # Toggle target is source · title; the URL is a separate inspect control.
+        # title is a candidate's raw name — a forum-thread title especially can
+        # run 80-100+ characters (see CandidatePreviewDialog's own _snip_title)
+        # — and a QPushButton doesn't wrap, so left unbounded it pushed this
+        # header (and the dialog with it) wider than the screen.
         head = self._src_label(src_id)
         if title:
-            head = f"{head} · {title}"
+            head = f"{head} · {self._short(title, 40)}"
         btn = QPushButton(head)
         btn.setFlat(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setToolTip(t("add_game.merge_toggle_source"))
+        btn.setToolTip(
+            f"{title}\n{t('add_game.merge_toggle_source')}" if title
+            else t("add_game.merge_toggle_source"))
         btn.setStyleSheet(
             f"QPushButton{{color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;"
             f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
@@ -843,6 +851,22 @@ class EnrichmentMergeDialog(QDialog):
         btn.clicked.connect(lambda _=False, s=source: self._toggle_source(s))
         self._source_headers[source] = btn
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # Separate, always-unconditional select-all/clear-all — the header
+        # button above instead remembers and restores a specific (possibly
+        # partial) selection, which isn't what you want when you'd rather
+        # just start from a hard "everything" or "nothing" for this source.
+        all_btn = QPushButton("☑")
+        all_btn.setFlat(True)
+        all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        all_btn.setToolTip(t("add_game.merge_select_all_source"))
+        all_btn.setStyleSheet(
+            f"QPushButton{{color:{palette('text_muted')};font-size:{scaled(11, self)}px;"
+            f"padding:2px 4px;background:transparent;border:none;}}"
+            f"QPushButton:hover{{color:{palette('accent')};}}"
+        )
+        all_btn.clicked.connect(lambda _=False, s=source: self._bulk_set_source(s))
+        lay.addWidget(all_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         inspect = (meta.get("inspect_url") or "").strip()
         if inspect:
@@ -866,13 +890,18 @@ class EnrichmentMergeDialog(QDialog):
         return row
 
     def _toggle_source(self, source: str):
-        chips = self._source_chips.get(source) or []
-        if not chips:
-            return
-        # Any checked → turn all off (exclude source). All off → turn all on.
-        any_on = any(c.isChecked() for c in chips)
-        for c in chips:
-            c.setChecked(not any_on)
+        """Header click: clear this source's picks, remembering exactly what
+        was checked, or restore that same remembered selection — never a
+        blanket "everything". See GroupToggle. The separate always-
+        unconditional select-all/clear-all button (_bulk_set_source) is for
+        when a hard reset is what's actually wanted instead.
+        """
+        self._source_toggle.toggle(source, self._source_chips.get(source) or [])
+        self._refresh_source_header(source)
+
+    def _bulk_set_source(self, source: str):
+        """Separate select-all/clear-all button — see GroupToggle.bulk_set."""
+        self._source_toggle.bulk_set(source, self._source_chips.get(source) or [])
         self._refresh_source_header(source)
 
     def _refresh_source_header(self, source: str):
@@ -1017,11 +1046,17 @@ class EnrichmentMergeDialog(QDialog):
             # self._FIELDS, so this loop never reaches it.
             _default_value = None
             if field in ('name', 'description', 'developer', 'year'):
-                for opt in opts:
-                    _sm = (self._model.get("source_meta") or {}).get(opt['source']) or {}
-                    if _sm.get('source_id') == _prev_label:
-                        _default_value = opt['value']
-                        break
+                # prev_default is set whenever a previous value exists, even
+                # when that same value is already present under an ordinary
+                # (non-previous) option and no tagged chip was added for it
+                # — see _offer_previous_value's dedup skip.
+                _default_value = (self._model.get('prev_default') or {}).get(field)
+                if _default_value is None:
+                    for opt in opts:
+                        _sm = (self._model.get("source_meta") or {}).get(opt['source']) or {}
+                        if _sm.get('source_id') == _prev_label:
+                            _default_value = opt['value']
+                            break
 
             first_taken = False
             if cur_val:
@@ -1035,7 +1070,12 @@ class EnrichmentMergeDialog(QDialog):
                 src_meta = (self._model.get("source_meta") or {}).get(opt['source']) or {}
                 src_id = src_meta.get('source_id') or ''
                 src_label = self._src_label(src_id) if src_id else ''
-                text = self._short(opt['value']) + (f"  ·  {src_label}" if src_label else '')
+                # Elide the WHOLE composed text, not just opt['value'] before
+                # the source-label suffix is appended — eliding only the
+                # value left the suffix free to push the total past the
+                # limit this was supposed to enforce.
+                text = self._short(
+                    opt['value'] + (f"  ·  {src_label}" if src_label else ''))
                 is_default = _default_value is not None and opt['value'] == _default_value
                 chip = self._field_chip(
                     field, text, opt['value'], tooltip=opt['value'],
@@ -1057,20 +1097,32 @@ class EnrichmentMergeDialog(QDialog):
 
         for source, offers in by_source.items():
             col.addWidget(self._source_header_row(source))
+            src_chips: list[QPushButton] = []
+            peer_title = ((self._model.get("source_meta") or {}).get(source) or {}).get("name") or ""
+            # Cover chip(s) get their OWN row, added before the text-field
+            # row below — a cover chip is ~5x the height of a tag/url chip
+            # (_IMG_H vs the fixed 22px chip height), and packing both kinds
+            # into one _FlowLayout let short chips land squeezed beside the
+            # tall cover on its line instead of starting on a fresh line
+            # underneath it.
+            images = offers.get('images', [])
+            if images:
+                img_flow = _FlowLayout(spacing=6)
+                img_host = QWidget()
+                img_host.setLayout(img_flow)
+                for value in images:
+                    chip = self._image_chip(value, checked=True, title=peer_title)
+                    img_flow.addWidget(chip)
+                    src_chips.append(chip)
+                col.addWidget(img_host)
             flow = _FlowLayout(spacing=6)
             host = QWidget()
             host.setLayout(flow)
-            src_chips: list[QPushButton] = []
-            peer_title = ((self._model.get("source_meta") or {}).get(source) or {}).get("name") or ""
-            # Cover chip(s) first — identity at a glance before text fields.
-            # Additive: every offered cover defaults to checked, same as a
-            # tag, since a game can hold more than one (see _image_chip).
-            for value in offers.get('images', []):
-                chip = self._image_chip(value, checked=True, title=peer_title)
-                flow.addWidget(chip)
-                src_chips.append(chip)
             for tag in offers.get('tags', []):
-                chip = _merge_chip(tag)
+                # Same elision as urls/field values below — an unbounded tag
+                # (e.g. a whole scraped phrase mistaken for a genre) could
+                # otherwise widen the chip past the dialog/screen.
+                chip = _merge_chip(self._short(tag), tooltip=tag)
                 chip.setChecked(True)
                 flow.addWidget(chip)
                 self._tag_boxes.append((chip, tag))
@@ -1096,7 +1148,8 @@ class EnrichmentMergeDialog(QDialog):
                 chip.toggled.connect(
                     lambda _on, s=source: self._refresh_source_header(s))
             self._refresh_source_header(source)
-            col.addWidget(host)
+            if offers.get('tags') or offers.get('urls') or offers.get('reviews'):
+                col.addWidget(host)
 
         col.addStretch()
         scroll.setWidget(content)

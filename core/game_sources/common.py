@@ -6,6 +6,7 @@ normalization, description cleaners, the GameInfo dataclass, JSON fetch,
 query expansion/cleaning and the shared noise filters. Every source module
 builds on this; it imports NOTHING from its siblings.
 """
+import difflib
 import html
 import json
 import logging
@@ -1258,15 +1259,31 @@ def _has_review_payload(info: "GameInfo") -> bool:
     return bool(info.rating or (info.review_text or '').strip())
 
 
+def _descriptions_are_near_duplicates(a: str, b: str) -> bool:
+    """True when two descriptions are the same content, just scraped with
+    different ad noise, truncation or formatting — not two genuinely
+    different write-ups that both happen to describe the same game."""
+    if not a or not b:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if shorter in longer:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.9
+
+
 def _is_enrichment_subset(new: "GameInfo", kept: "GameInfo") -> bool:
     """True when *new* would add nothing the merge UI cannot already take from *kept*.
 
     Same title from two APIs is kept when description, tags, links, image or
     a score differ. Dropped only when every non-empty field on *new* is an
     exact match (or a subset, for tags/URLs) of *kept* — a 1:1 duplicate.
+    Two descriptions that only differ by scrape noise (see
+    _descriptions_are_near_duplicates) still count as a match — two forum
+    hits for the same thread should not survive dedup just because one has
+    an extra ad line or got truncated a character earlier.
     """
     nd, kd = _norm_field(new.description), _norm_field(kept.description)
-    if nd and nd != kd:
+    if nd and nd != kd and not (kd and _descriptions_are_near_duplicates(nd, kd)):
         return False
     ndev, kdev = _norm_field(new.developer), _norm_field(kept.developer)
     if ndev and ndev != kdev:

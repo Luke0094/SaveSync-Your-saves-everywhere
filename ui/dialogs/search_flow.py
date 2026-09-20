@@ -944,14 +944,30 @@ class SearchFlowMixin:
     def _apply_result_overwrite(self, result):
         """Case C/D — better tier or significantly different: replace
         fields that exist in the new source, keep existing values for
-        absent fields. Tags are always a union (never cleared)."""
+        absent fields.
+
+        Tags/reviews are additive rather than unconditional here, same as
+        Case B (_apply_result_init) once there's something to protect —
+        this method is only ever called with an existing game, so applying
+        result.genres/review directly would union them in with no way to
+        see or decline any one of them before _run_same_tier_merge's
+        base_result handling (_build_merge_model) ever gets to offer them
+        as checked-by-default chips; see that method's "same gap for tags
+        and reviews" comment.
+        """
+        current_desc = self._desc_edit.toPlainText().strip()
+        current_dev  = self._developer_edit.text().strip()
+        current_year = self._year_edit.text().strip()
+        has_image = bool(self._original_image_path or getattr(self, '_image_path', ''))
+        has_existing = bool(current_desc or has_image or getattr(self, '_tags', None)
+                            or current_dev or current_year)
         if result.name:
             self._name_edit.setText(result.name)
         if result.image_url and result.image_url != self._current_image_url():
             self._download_and_set_image(result.image_url)
         if result.description:
             self._desc_edit.setPlainText(result.description)
-        if result.genres:
+        if result.genres and not has_existing:
             self._apply_web_tags(result.genres)
         if getattr(result, 'developer', ''):
             self._developer_edit.setText(result.developer)
@@ -959,7 +975,8 @@ class SearchFlowMixin:
         if _ry:
             self._year_edit.setText(_ry)
         self._merge_result_urls(result)
-        self._merge_result_review(result)
+        if not has_existing:
+            self._merge_result_review(result)
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
 
@@ -1648,6 +1665,11 @@ class SearchFlowMixin:
             'urls': [],
             'reviews': [],
             'source_meta': {},
+            # field -> the value it held right before base_result was
+            # confirmed, set by _offer_previous_value below even when that
+            # value is already offered as an ordinary (non-previous) option
+            # and no separate chip is added for it — see that function.
+            'prev_default': {},
         }
         seen_tags = set(cur_tags)
         seen_urls: set[str] = set()
@@ -1777,6 +1799,13 @@ class SearchFlowMixin:
             _pv = (pre_confirm_val or '').strip()
             if not _pv or _pv.lower() == cur_val.lower():
                 return
+            # Recorded even when an ordinary option already carries this
+            # same value (the `any(...)` skip right below) — otherwise the
+            # merge dialog has no tagged "previous value" chip to default
+            # to and falls back to "Keep current", silently keeping the
+            # just-applied replacement it was supposed to offer a way back
+            # from.
+            model['prev_default'][field] = _pv
             if any(o['value'].lower() == _pv.lower() for o in model[field]):
                 return
             # Shaped like _peer_section_key's own "source · title · n" so

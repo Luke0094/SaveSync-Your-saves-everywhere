@@ -4812,12 +4812,22 @@ class BackupManager(QObject):
         every backup for that game in one pass, and may also delete any
         that are already overdue — the same as it would on its own normal
         schedule, just not deferred until that game's next backup).
+
+        A P2P archive's game_id is entirely made up of "p2p" entries (see
+        ui.dialogs.p2p_receive_dialog) — routed to enforce_p2p_limits
+        instead, so an archive that predates this stamp, or that a sweep
+        hasn't reached yet, gets judged against p2p_max_per_game /
+        p2p_retention_days rather than the regular backup policy.
         """
         with _index_lock:
-            game_ids = {b.game_id for b in self._index if not b.planned_deletion}
+            unstamped = [b for b in self._index if not b.planned_deletion]
+            p2p_ids = {b.game_id for b in unstamped if b.origin == "p2p"}
+            game_ids = {b.game_id for b in unstamped} - p2p_ids
         for game_id in game_ids:
             self._enforce_limits(game_id)
-        return len(game_ids)
+        for game_id in p2p_ids:
+            self.enforce_p2p_limits(game_id)
+        return len(game_ids) + len(p2p_ids)
 
     def repair_stale_backup_folders(self) -> int:
         """Move each library game's backups that still live under an OLD
@@ -5384,6 +5394,72 @@ class BackupManager(QObject):
                 pass
 
         self._save_game_index(game_id, _folder_hint=folder_hint)
+
+    def enforce_p2p_limits(self, game_id: str) -> None:
+        """Prune old P2P-received archives for *game_id* down to the
+        p2p_max_per_game / p2p_retention_days settings — a separate limit
+        from the backup policy _enforce_limits applies above: that one is
+        about YOUR OWN games' regular backup history, and a save someone
+        else keeps sending you is not the same kind of thing. The bucket
+        is per GAME (see the folder-name-derived game_id in
+        ui.dialogs.p2p_receive_dialog), not per sender — two friends
+        sending the same game share one limit, not one each. The newest
+        is always kept regardless of age, same guarantee _enforce_limits'
+        own min_kept gives its own backups.
+
+        Called reactively after each P2P import (see
+        ui.dialogs.p2p_receive_dialog) for immediate feedback, exactly
+        like _enforce_limits runs right after create_backup — but, same
+        as that method, it also stamps planned_deletion on every survivor
+        so a P2P archive that just sits there (no further sends for that
+        game) still expires on schedule via the periodic retention sweep
+        (ui.main_window._maybe_run_backup_retention_sweep) instead of only
+        when the next send happens to reach it.
+        """
+        config = get_config()
+        max_backups = config.get("p2p_max_per_game", 3)
+        retention_days = config.get("p2p_retention_days", 7)
+
+        zip_paths_to_delete: list[str] = []
+        with _index_lock:
+            game_backups = [b for b in self._index
+                            if b.game_id == game_id and b.origin == "p2p"]
+            to_delete = self.compute_deletions(
+                game_backups, max_backups, retention_days, min_kept=1)
+
+            survivors = [b for b in game_backups if b.backup_id not in to_delete]
+            protected_ids: set[str] = set()
+            by_age = sorted(survivors, key=lambda b: b.created_dt)
+            newest = by_age[-1:] if by_age else []
+            protected_ids = {b.backup_id for b in newest}
+            stamped = False
+            for b in survivors:
+                new_val = ("" if b.backup_id in protected_ids else
+                          (b.created_dt + timedelta(days=retention_days)).isoformat())
+                if b.planned_deletion != new_val:
+                    b.planned_deletion = new_val
+                    stamped = True
+
+            if not to_delete:
+                if stamped:
+                    self._save_game_index(game_id)
+                return
+
+            zip_paths_to_delete = [b.zip_path for b in game_backups
+                                   if b.backup_id in to_delete]
+            self._index = [b for b in self._index if b.backup_id not in to_delete]
+
+        for zp in zip_paths_to_delete:
+            try:
+                p = Path(zp)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        self._record_deleted(game_id, to_delete)
+        for bid in to_delete:
+            self.backup_deleted.emit(bid)
+        self._save_game_index(game_id)
 
 
 _backup_mgr: BackupManager | None = None

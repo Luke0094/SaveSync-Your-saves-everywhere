@@ -109,6 +109,16 @@ class BackupRow(QFrame, ThemedMixin):
 
         row.addLayout(left_col, 1)
 
+        # Send this one backup directly to another SaveSync instance (P2P,
+        # no cloud provider involved) — between Restore and delete, so the
+        # row reads left to right as "look at it locally, get it back,
+        # send it elsewhere, get rid of it".
+        send_btn = QPushButton("➡️")
+        send_btn.setObjectName("icon_btn")
+        send_btn.setFixedSize(scaled(28, self), scaled(28, self))
+        send_btn.setToolTip(t("tooltips.send_backup"))
+        send_btn.clicked.connect(self._on_send_clicked)
+
         # Backup folder button
         backup_folder_btn = QPushButton("📁")
         backup_folder_btn.setObjectName("icon_btn")
@@ -138,6 +148,7 @@ class BackupRow(QFrame, ThemedMixin):
 
         row.addWidget(backup_folder_btn)
         row.addWidget(self._restore_btn)
+        row.addWidget(send_btn)
         row.addWidget(del_btn)
 
     def _on_restore_clicked(self):
@@ -354,6 +365,23 @@ class BackupRow(QFrame, ThemedMixin):
             target = str(BACKUP_DIR)
 
         open_in_file_manager(target)
+
+    def _on_send_clicked(self):
+        """Open the P2P "send this save" dialog for this one backup.
+
+        Cloud-only entries have no local file to seed from yet — sending
+        one means downloading/restoring it locally first, the same
+        prerequisite _download_then_restore already asks for, so this just
+        says so rather than building a second download path only for
+        sending.
+        """
+        zip_path = Path(self._entry.zip_path) if self._entry.zip_path else None
+        if self._cloud_only or zip_path is None or not zip_path.is_file():
+            warning_window_modal(
+                self, t("p2p.send_title"), t("p2p.send_needs_local_copy"))
+            return
+        from ui.dialogs.p2p_send_dialog import P2pSendDialog
+        P2pSendDialog(self._entry, self).exec()
 
 
 from ui.widgets.search_inputs import (GhostClearableLineEdit, _SearchCombo,
@@ -1553,6 +1581,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             "backup_index_zips": "batch.verify_index",
             "backup_index": "batch.verify_index",
             "config_history_restore": "batch.verify_snapshot",
+            "settings_integrity": "batch.verify_settings",
         }
 
         def _on_step(check_id: str, index: int, total_checks: int):
@@ -1601,6 +1630,14 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             else:
                 msg += "\n" + t("backups.verify_snapshots_bad",
                                 detail=result.snapshots_detail)
+            if not result.settings_repaired:
+                msg += "\n" + t("backups.verify_settings_ok")
+            elif "could not" in result.settings_detail:
+                msg += "\n" + t("backups.verify_settings_bad",
+                                detail=result.settings_detail)
+            else:
+                msg += "\n" + t("backups.verify_settings_repaired",
+                                detail=result.settings_detail)
             self._set_verify_status(
                 msg, tone="success" if result.ok else "error")
             self._verify_btn.setToolTip(

@@ -369,7 +369,14 @@ class GameEntry:
         if not path or str(path).casefold() == (self.exe_path or "").casefold():
             return
         self.exe_path_versions = dict(self.exe_path_versions or {})
-        self.exe_path_versions[str(path)] = label or derive_exe_version_label(path)
+        # Reuse a case-variant key already stored here (same match rule as
+        # remove_exe_version below) instead of adding a second dict entry
+        # for what all_exe_paths()/remove_exe_version already treat as the
+        # same path.
+        wanted = str(path).casefold()
+        key = next((p for p in self.exe_path_versions if str(p).casefold() == wanted),
+                  str(path))
+        self.exe_path_versions[key] = label or derive_exe_version_label(path)
 
     def remove_exe_version(self, path: str):
         """Drop *path* from the extra-versions list. Never touches the

@@ -32,6 +32,8 @@ ROOT = Path(SPECPATH)
 _version_src = (ROOT / 'core' / 'constants.py').read_text(encoding='utf-8')
 _version_match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)', _version_src)
 APP_VERSION = _version_match.group(1) if _version_match else '0.0.0'
+_name_match = re.search(r'APP_NAME\s*=\s*["\']([^"\']+)', _version_src)
+APP_NAME = _name_match.group(1) if _name_match else 'SaveSync'
 _WIN_ARCH = _platform.machine() or 'x64'          # e.g. AMD64 — uname -m's Windows counterpart
 EXE_NAME = f'SaveSync-{APP_VERSION}-win-{_WIN_ARCH}'
 print(f"[spec] SaveSync {APP_VERSION} — win-{_WIN_ARCH}")
@@ -122,7 +124,8 @@ _datas = [
     (str(ROOT / 'assets' / 'icon.png'), 'assets'),
 ]
 
-from PyInstaller.utils.hooks import collect_submodules as _collect_submodules
+from PyInstaller.utils.hooks import (collect_submodules as _collect_submodules,
+                                     collect_dynamic_libs as _collect_dynamic_libs)
 
 # Themes are found by scanning ui.styles at runtime (see
 # ui/styles/theme.py::_discover_themes), so nothing imports a new theme
@@ -131,10 +134,17 @@ from PyInstaller.utils.hooks import collect_submodules as _collect_submodules
 # in a frozen build instead of only from source.
 _THEME_MODULES = _collect_submodules('ui.styles')
 
+# libtorrent (core.p2p.transfer) is a compiled C++ extension with no
+# official PyInstaller hook — unlike numpy/numba/lz4 above, nothing here
+# already pulls its binary dependencies in, so they are collected
+# explicitly the same defensive way the hiddenimports list below covers
+# every lazy-imported package this project relies on.
+_LIBTORRENT_BINARIES = _collect_dynamic_libs('libtorrent')
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=_LIBTORRENT_BINARIES,
     datas=_datas,
     hiddenimports=_THEME_MODULES + [
         'core', 'core.config_transfer', 'core.config_manager', 'core.library',
@@ -160,12 +170,18 @@ a = Analysis(
         'core.save_editor.wolf_format', 'core.save_editor.alicesoft_format',
         'core.save_editor.artemis_format', 'core.save_editor.tyrano_format',
         'core.save_editor.tads_rec_format', 'core.save_editor.sqlite_format',
+        'core.save_editor.steamid_aes_format',
         # Decryptors (moved under crypt/)
         'core.save_editor.crypt', 'core.save_editor.crypt.es3',
         'core.save_editor.crypt.game_keys', 'core.save_editor.crypt.unityfs',
         'core.save_editor.crypt.unreal_crypt', 'core.save_editor.crypt.wolf',
         'core.save_editor.crypt.wolf_lz4', 'core.save_editor.wolf_lz4_format',
         'core.save_editor.crypt.recipes', 'core.save_editor.recipe_format',
+        'core.save_editor.crypt.steamid_aes',
+        'core.save_editor.crypt.steamid_aes_recipes',
+        # SteamIdAesFormat's YAML parsing: lazy-imported (see that module),
+        # same reason as the crypto/numba entries elsewhere in this list.
+        'yaml',
         'core.engines', 'core.engines.game_engine',
         'core.engines.alicesoft', 'core.engines.artemis',
         'core.engines.gvas', 'core.engines.kirikiri',
@@ -176,6 +192,13 @@ a = Analysis(
         'core.engines.wolf', 'core.engines.wolf_lz4', 'core.engines.sqlite_db',
         'core.engines.playerprefs', 'core.engines.tads',
         'core.engines.keyvalue', 'core.engines.xml_save',
+        # P2P save transfer: libtorrent itself (native extension, lazy-
+        # imported inside core.p2p.transfer for the same reason as every
+        # other heavy/optional dependency in this list) plus the dialogs
+        # that only ever get imported on demand when the sidebar/backup-row
+        # buttons that open them are actually clicked.
+        'libtorrent', 'core.p2p', 'core.p2p.transfer',
+        'ui.dialogs.p2p_receive_dialog', 'ui.dialogs.p2p_send_dialog',
         'ui.pages.cheats_page',
         'sync.local_provider',
         'sync.google_drive', 'sync.onedrive_provider', 'sync.dropbox_provider',
@@ -208,6 +231,10 @@ a = Analysis(
         'keyring.backends', 'keyring.backends.Windows',
         'google.auth.transport.requests', 'google_auth_oauthlib.flow',
         'googleapiclient.discovery', 'cryptography.hazmat.primitives.ciphers.aead',
+        # core.save_editor.crypt.steamid_aes: PKCS7 padding for SteamID-keyed
+        # saves — a submodule this codebase had not exercised before, same
+        # caution as the aead entry right above it.
+        'cryptography.hazmat.primitives.padding',
         'PIL', 'pillow_avif', 'jaraco.functools', 'jaraco.context', 'jaraco.text',
         # core.engines.wolf_lz4: lz4.block decompresses/recompresses the
         # payload, numpy vectorises its seed search, numba JIT-compiles
@@ -313,11 +340,54 @@ _splash_tpl.build_script = _original_build_script
 # PyInstaller/config.py's own docstring), so this line is what makes
 # `pyinstaller savesync.spec` alone enough, no extra --upx-dir flag needed.
 from PyInstaller.config import CONF as _CONF
-from PyInstaller.configure import _check_upx_availability as _check_upx
 _UPX_DIR = str(ROOT / 'packaging' / 'tools' / 'upx')
 _CONF['upx_dir'] = _UPX_DIR
-_CONF['upx_available'] = _check_upx(_UPX_DIR)
-print(f"[spec] UPX: {'found at ' + _UPX_DIR if _CONF['upx_available'] else 'NOT found — building without it'}")
+try:
+    # Private, underscore-prefixed API — pinned pyinstaller== in
+    # requirements.txt is what keeps this from moving out from under a
+    # future upgrade; if it ever does, fall back to PyInstaller's own
+    # (silent) upx_available detection rather than hard-failing the build.
+    from PyInstaller.configure import _check_upx_availability as _check_upx
+    _CONF['upx_available'] = _check_upx(_UPX_DIR)
+    print(f"[spec] UPX: {'found at ' + _UPX_DIR if _CONF['upx_available'] else 'NOT found — building without it'}")
+except ImportError as e:
+    print(f"[spec] UPX: _check_upx_availability unavailable ({e}) — "
+         f"falling back to PyInstaller's own detection, vendored upx/ may be ignored")
+
+# ── Windows version-info resource ───────────────────────────────────────────
+# Without this, Task Manager, the Startup Apps settings page and the exe's
+# own Properties dialog have nothing but the on-disk FILENAME to show for the
+# process — they only read FileDescription/ProductName from the exe's own
+# resources, falling back to the filename when those are absent. That
+# filename is EXE_NAME, deliberately versioned (see above), so every update
+# changed what those surfaces showed the user instead of a stable "SaveSync".
+# This is independent of EXE_NAME — the file on disk keeps its versioned
+# name, only the resource metadata Windows actually reads for a display name
+# changes.
+from PyInstaller.utils.win32.versioninfo import (
+    VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+    StringStruct, VarFileInfo, VarStruct,
+)
+_ver_tuple = tuple((list(map(int, re.findall(r'\d+', APP_VERSION))) + [0, 0, 0, 0])[:4])
+_version_info = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=_ver_tuple, prodvers=_ver_tuple,
+        mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([StringTable('040904B0', [
+            StringStruct('CompanyName', APP_NAME),
+            StringStruct('FileDescription', APP_NAME),
+            StringStruct('FileVersion', APP_VERSION),
+            StringStruct('InternalName', APP_NAME),
+            StringStruct('OriginalFilename', f'{APP_NAME}.exe'),
+            StringStruct('ProductName', APP_NAME),
+            StringStruct('ProductVersion', APP_VERSION),
+        ])]),
+        VarFileInfo([VarStruct('Translation', [1033, 1200])]),
+    ],
+)
 
 exe = EXE(
     pyz,
@@ -336,6 +406,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=str(ROOT / 'assets' / 'icon.ico'),
+    version=_version_info,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1528,9 +1528,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._paths_layout.setContentsMargins(0, 0, 0, 0)
         self._paths_layout.setSpacing(4)
         # Section: "Your paths" (always above detected)
-        self._manual_section_lbl = QLabel(t('add_game.your_save_folders'))
-        self._manual_section_lbl.setObjectName("form_section_lbl")
-        self._paths_layout.addWidget(self._manual_section_lbl)
+        self._manual_section_lbl, manual_hdr_row = self._build_path_section_header(
+            t('add_game.your_save_folders'), "manual", "form_section_lbl")
+        self._paths_layout.addWidget(manual_hdr_row)
         self._paths_empty_lbl = QLabel(t('add_game.no_paths_added'))
         self._paths_empty_lbl.setObjectName("form_empty_lbl")
         self._paths_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1538,11 +1538,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # Separator and "Detected" section header — hidden until detection runs
         self._detected_sep = QFrame(); self._detected_sep.setFrameShape(QFrame.Shape.HLine)
         self._detected_sep.setVisible(False)
-        self._detected_section_lbl = QLabel(t('add_game.auto_detected'))
-        self._detected_section_lbl.setObjectName("form_section_lbl_faint")
-        self._detected_section_lbl.setVisible(False)
+        self._detected_section_lbl, detected_hdr_row = self._build_path_section_header(
+            t('add_game.auto_detected'), "detected", "form_section_lbl_faint")
+        detected_hdr_row.setVisible(False)
+        self._detected_hdr_row = detected_hdr_row
         self._paths_layout.addWidget(self._detected_sep)
-        self._paths_layout.addWidget(self._detected_section_lbl)
+        self._paths_layout.addWidget(detected_hdr_row)
         self._paths_layout.addStretch()
         self._paths_scroll.setWidget(self._paths_container)
         layout.addWidget(self._paths_scroll, 1)
@@ -3601,6 +3602,27 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
     # ── Path list management ──────────────────────────────────────────────────
 
+    def _build_path_section_header(self, label_text: str, section: str,
+                                    object_name: str) -> tuple:
+        """A plain section label — "Your save folders" / "Auto-detected".
+
+        Selecting/deselecting is per SAVE PATH, not per section: each
+        PathRow's own FileListWidget has its own select-all/clear-all (see
+        FileListWidget._select_all_btn) for the files under THAT path,
+        which is the group size that control actually belongs to. Returns
+        (label, row_widget) — callers show/hide the ROW, kept as a widget
+        for that reason alone; *section* is unused now but kept in the
+        signature so both call sites don't need to change.
+        """
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lbl = QLabel(label_text)
+        lbl.setObjectName(object_name)
+        lay.addWidget(lbl, 1)
+        return lbl, row
+
     def _add_path_with_validation(self, path_str: str):
         """Validate a manually-added path and warn if it looks suspicious."""
         from core.save_detector import validate_save_path
@@ -3645,7 +3667,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 for i in range(self._paths_layout.count())
             )
             self._detected_sep.setVisible(has_manual)
-            self._detected_section_lbl.setVisible(True)
+            self._detected_hdr_row.setVisible(True)
             # Insert before stretch (last item)
             insert_at = self._paths_layout.count() - 1
         else:
@@ -3710,7 +3732,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         )
         # Only show separator when BOTH manual and detected paths exist
         self._detected_sep.setVisible(has_detected and has_manual)
-        self._detected_section_lbl.setVisible(has_detected)
+        self._detected_hdr_row.setVisible(has_detected)
         if not self._save_paths:
             self._paths_empty_lbl.setVisible(True)
 

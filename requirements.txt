@@ -27,12 +27,26 @@ lz4>=4.0.0
 numpy>=1.24.0
 numba>=0.60.0
 
-# ── Test / tools ──────────────────────────────────────────────────────────
-langdetect>=1.0.9
+# core.save_editor.steamid_aes_format (SteamID-keyed saves, e.g. Borderlands
+# 4 — see crypt/steamid_aes_recipes for the full list): the decrypted save is
+# YAML — PyYAML parses/re-serialises it. Lazy-imported in that module, same
+# as everything else in this section, but a real runtime dependency now,
+# not just a test one — see the "Test / tools" note it used to sit under.
 PyYAML>=6.0
 
+# core.p2p.transfer: direct P2P save transfer over BitTorrent's public DHT
+# (see that module's docstring). Lazy-imported, same as everything else in
+# this section. Confirmed installable via prebuilt wheels for Windows and
+# Linux on this project's Python version — no build toolchain needed.
+libtorrent>=2.0.9
+
+# ── Test / tools ──────────────────────────────────────────────────────────
+langdetect>=1.0.9
+
 # ── Build ──────────────────────────────────────────────────────────────────
-# pip install pyinstaller
+# Pinned, not just "pip install pyinstaller": savesync.spec imports PyInstaller's
+# private _check_upx_availability, which only exists on this exact line.
+pyinstaller==6.3.0
 #
 # Build EXE (from project root):
 #   pyinstaller savesync.spec

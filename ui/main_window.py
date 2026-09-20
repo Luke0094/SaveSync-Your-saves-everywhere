@@ -651,17 +651,44 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._nav_buttons.append(self._cheats_nav_btn)
         sl.addWidget(self._cheats_nav_btn)
 
-        # Status dot at bottom of sidebar
+        # Bottom of the sidebar: online/id status on the left, and \u2014 sharing
+        # that same corner \u2014 the P2P "receive a save" entry point on the
+        # right, vertically centered against it, since both are about this
+        # machine's identity to the outside world. Split into its own row
+        # rather than two more stacked full-width labels so the button has
+        # a natural, unobtrusive home instead of competing for space with
+        # a nav button above.
+        status_row = QWidget()
+        status_row_lay = QHBoxLayout(status_row)
+        status_row_lay.setContentsMargins(4, 0, 4, 0)
+        status_row_lay.setSpacing(6)
+
+        status_col = QVBoxLayout()
+        status_col.setSpacing(0)
+        status_col.setContentsMargins(0, 0, 0, 0)
+
         self._sidebar_status = QLabel(t("status.offline"))
         self._sidebar_status.setStyleSheet(
-            f"color: {palette('text_muted')}; font-size: {scaled(10, self)}px; padding: 8px 16px;"
+            f"color: {palette('text_muted')}; font-size: {scaled(10, self)}px; padding: 8px 16px 0 0;"
         )
-        sl.addWidget(self._sidebar_status)
+        status_col.addWidget(self._sidebar_status)
 
         mid = get_machine_id()[:8]
         self._machine_lbl = QLabel(f"ID: {mid}\u2026")
         self._machine_lbl.setObjectName("sidebar_machine")
-        sl.addWidget(self._machine_lbl)
+        status_col.addWidget(self._machine_lbl)
+
+        status_row_lay.addLayout(status_col, 1)
+
+        self._p2p_receive_btn = QPushButton("\ud83d\udce5")
+        self._p2p_receive_btn.setObjectName("toolbar_icon_btn")
+        self._p2p_receive_btn.setFixedSize(scaled(28, self), scaled(28, self))
+        self._p2p_receive_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._p2p_receive_btn.setToolTip(t("p2p.receive_button_tooltip"))
+        self._p2p_receive_btn.clicked.connect(self._open_p2p_receive_dialog)
+        status_row_lay.addWidget(self._p2p_receive_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        sl.addWidget(status_row)
 
         root.addWidget(sidebar)
 
@@ -1751,6 +1778,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.dialogs.credits_dialog import CreditsDialog
         CreditsDialog(self).exec()
 
+    def _open_p2p_receive_dialog(self):
+        from ui.dialogs.p2p_receive_dialog import P2pReceiveDialog
+        P2pReceiveDialog(self).exec()
+
     def _on_sync_batch_progress(self, done: int, total: int, name: str):
         if total <= 0:
             return
@@ -2457,9 +2488,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.pages.cheats_page import CheatsPage
         page = CheatsPage()
         page.set_load_notice(self._cheats_load_notice)
-        # Silent — a toast every time someone opens a save just to look at
-        # it would be noise; see CheatsPage.backup_requested's own docstring.
-        page.backup_requested.connect(lambda gid: self._backup_game(gid, silent=True))
         old = self._stack.widget(5)
         self._stack.removeWidget(old)
         old.deleteLater()
@@ -3913,15 +3941,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._verify_timer.start()
         QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._maybe_run_backup_verify)
         self._verify_thread = None
-        # The save editor's own copies age out on their own schedule. Doing it
-        # here, once, is what makes "delete after N days" true for a save
-        # nobody has opened since — the editor itself only ever sees the files
-        # somebody goes back to.
-        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._prune_save_edit_copies)
-        # Same idea, same clock, for retention pruning — see
-        # _maybe_run_backup_retention_sweep's own docstring for why this
-        # needs to run on its own schedule rather than only when a game
-        # happens to sync.
+        # Backup retention (this game's own history, and P2P archives) AND
+        # the save editor's own kept-copies age-out both ride this same
+        # hourly clock now — see _maybe_run_backup_retention_sweep's own
+        # docstring for why a save/game that nobody revisits still needs
+        # this rather than only pruning when something happens to sync or
+        # get edited again.
         self._verify_timer.timeout.connect(self._maybe_run_backup_retention_sweep)
         QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS,
                           self._maybe_run_backup_retention_sweep)
@@ -4017,6 +4042,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             "backup_index_zips": t("batch.verify_index"),
             "backup_archives": t("batch.verify_label"),
             "archive_rebackup": t("batch.backup_label"),
+            "settings_integrity": t("batch.verify_settings"),
         }
         self._verify_batch_notice.update_progress(
             index, max(total, 1), names.get(check_id, check_id))
@@ -4209,14 +4235,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         finally:
             self._update_dialog_open = False
 
-    @staticmethod
-    def _prune_save_edit_copies():
-        try:
-            from core.save_editor import prune_all
-            prune_all()
-        except Exception as e:              # never let housekeeping stop startup
-            logger.debug(f"Could not clear old save-editor copies: {e}")
-
     def _maybe_run_backup_verify(self):
         """Run the integrity sweep if it is enabled and due.
 
@@ -4274,7 +4292,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _maybe_run_backup_retention_sweep(self):
         """Expire backups whose ``planned_deletion`` has passed, across
         EVERY game with backups — not just whichever one next happens to
-        sync.
+        sync. Also runs the save editor's own kept-copies pruning
+        (``core.save_editor.prune_all`` — count/age policy from
+        ``save_edit_copies``/``save_edit_copy_days``) on this same clock,
+        for the same reason: a save nobody reopens should still age out
+        rather than only when it's next edited.
 
         ``core.backup.BackupManager._enforce_limits`` (max_local_backups /
         backup_retention_days / min_kept_backups) only ever ran as a side
@@ -4326,6 +4348,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from datetime import datetime
 
         def _run():
+            try:
+                from core.save_editor import prune_all
+                prune_all()
+            except Exception as e:      # never let this block backup retention below
+                logger.debug(f"Could not clear old save-editor copies: {e}")
+
             from core.backup import get_backup_manager
             mgr = get_backup_manager()
             all_backups = mgr.get_all_backups()
@@ -5120,7 +5148,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Release any priority prompt tied to this game's exe so a now-closed
         # game can't wedge later notifications.
         if self._overlay and entry.exe_path:
-            self._overlay.clear_priority_for(entry.exe_path)
+            self._overlay.clear_priority_for(entry.exe_path, game_id=entry.id)
 
         # Backup on exit (if enabled and game has save paths).
         # We do NOT force the backup: if nothing changed since the last

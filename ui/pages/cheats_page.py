@@ -24,9 +24,9 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QStackedWidget, QVBoxLayout, QWidget)
 
 from core.library import get_library
-from core.save_editor import (SaveEditorError, describe, explain,
-                              list_backups, open_save, prune_backups,
-                              restore_backup)
+from core.save_editor import (SaveEditorError, delete_backup, describe,
+                              explain, list_backups, open_save,
+                              prune_backups, restore_backup)
 from i18n import t
 from ui.helpers import ElidedLabel, PageScrollMixin, scaled
 from ui.modal_helpers import warning_window_modal
@@ -299,6 +299,16 @@ class _Row(QFrame, ThemedMixin):
         self.layout().addWidget(btn)
         return btn
 
+    def add_icon_button(self, icon: str, tooltip: str, handler) -> QPushButton:
+        btn = QPushButton(icon)
+        btn.setObjectName("icon_btn")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedSize(scaled(30, self), scaled(28, self))
+        btn.setToolTip(tooltip)
+        btn.clicked.connect(handler)
+        self.layout().addWidget(btn)
+        return btn
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
@@ -475,6 +485,28 @@ class _SaveLoadWorker(QThread):
                 self.progress.emit(now - start_mono)
             return not self._is_cancelled
 
+        # A copy of the untouched bytes, taken BEFORE detection ever tries
+        # to decompress/parse them — not after a reader claims success.
+        # Decompression is the risky step this exists to protect against;
+        # gating the safety copy on "this turned out to be readable" would
+        # defeat the point of having one. No copy means no editor either
+        # (see read_source's own docstring for why the bytes are read
+        # here, once, rather than trusted to still match what open_save
+        # reads moments later): a raised SaveEditorError here reaches
+        # _on_save_load_finished exactly like any other open failure, and
+        # nothing is ever opened for editing on top of a failed snapshot.
+        try:
+            from core.save_editor import read_source, backup_original
+            data, p, registry = read_source(self._path)
+            snapshot = backup_original(p, data)
+            if snapshot is None:
+                raise SaveEditorError(
+                    f"could not set aside a safety copy of {p.name} before opening it",
+                    "cheats.err_snapshot_failed", name=p.name)
+        except Exception as exc:
+            self.finished.emit(None, exc)
+            return
+
         try:
             doc = open_save(self._path, game_dir=self._game_dir, progress=_prog_tick,
                             engine=self._engine, full_sweep=self._full_sweep,
@@ -493,21 +525,6 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     """Pick a game, pick a save, edit what is inside it."""
 
     STEP_PICK, STEP_SAVES, STEP_EDIT = 0, 1, 2
-
-    # A real snapshot through the normal backup system, taken the moment a
-    # save successfully loads for editing — BEFORE the person has touched
-    # a single field. Whatever happens next (a bad edit, a write that fails
-    # partway, a value that turns out to corrupt something), this is a
-    # known-good point already sitting in the backup history to fall back
-    # to. Deliberately not tied to save()/write_without_backup's own
-    # backup_original() — that only ever protects the one file being
-    # written, on the editor's own internal copy-aside, not a real backup a
-    # person can see, restore or has synced. Main window wires this to a
-    # SILENT backup (see _backup_game) — a toast every time someone opens a
-    # save just to look at it would be noise, and create_backup's own dedup
-    # already skips the write entirely when nothing has changed since the
-    # last one.
-    backup_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1328,6 +1345,9 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                     row.add_button(
                         t("cheats.restore"),
                         lambda _=False, c=copy, tg=target: self._restore(c, tg))
+                    row.add_icon_button(
+                        "🗑", t("cheats.delete_kept"),
+                        lambda _=False, c=copy, w=when: self._delete_kept(c, w))
                     return self._kept_col, row
                 jobs.append(_kept_row)
 
@@ -1364,6 +1384,24 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._open_game(self._entry)
         else:
             self._show_loose(target)
+
+    def _delete_kept(self, copy: Path, when):
+        from PySide6.QtWidgets import QMessageBox
+        from ui.modal_helpers import question_window_modal
+        reply = question_window_modal(
+            self, t("cheats.title"),
+            t("cheats.delete_kept_question", when=when.strftime("%d/%m/%Y %H:%M")),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            delete_backup(copy)
+        except SaveEditorError as e:
+            warning_window_modal(self, t("cheats.title"), explain(e))
+            return
+        self._subtitle.setText(t("cheats.deleted_kept"))
+        self._render_saves_page()
 
     # ── Step 3: the editor ───────────────────────────────────────────────────
 
@@ -1745,17 +1783,17 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self.show_step(self.STEP_SAVES)
             return
 
+        # The untouched-file safety copy already happened in the worker
+        # thread, BEFORE decompression/detection ever ran (see
+        # _SaveLoadWorker.run) — a failure there raised and reached this
+        # method through the same err-is-not-None branch above, so doc
+        # being non-None here already means a snapshot exists.
         self._doc = doc
         self._loaded_path = path
         try:
             self._loaded_mtime = path.stat().st_mtime_ns
         except OSError:
             self._loaded_mtime = 0
-        # Snapshot NOW, before any field can be touched — see
-        # backup_requested's own docstring for why this is a real backup
-        # and not just the editor's own copy-aside.
-        if self._entry is not None:
-            self.backup_requested.emit(self._entry.id)
         # A manual pick or full sweep that worked is worth remembering: the
         # next save from this game should not need the same detour. Only
         # when it actually says something auto-detection didn't already
@@ -2109,9 +2147,9 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         if was_holding:
             self._hold.stop()
         from ui.widgets.busy_overlay import busy_over
-        for path, value in self._pending.items():
-            self._doc.set_value(path, value)
         try:
+            for path, value in self._pending.items():
+                self._doc.set_value(path, value)
             # Copying the original aside and re-encoding can be a second or
             # two on a large save; cover the window while it happens.
             with busy_over(self, t("common.please_wait")):

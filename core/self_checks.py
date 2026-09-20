@@ -24,6 +24,7 @@ cleaned up after itself):
     backup_index           rebuild manifests/hashes missing on legacy backups
     backup_archives        open every archive and CRC its contents
     config_history_restore config-snapshot restore guard
+    settings_integrity     OS autostart registration vs what config wants
 
 Everything runs on one worker thread; callbacks fire there, so GUI callers
 must marshal to their own thread (a Qt signal).
@@ -50,6 +51,7 @@ CHECK_IDS = (
     "backup_index",
     "backup_archives",
     "config_history_restore",
+    "settings_integrity",
 )
 
 
@@ -67,6 +69,9 @@ class CheckResult:
     # config_history_restore
     snapshots_ok: bool = True
     snapshots_detail: str = ""
+    # settings_integrity
+    settings_repaired: bool = False
+    settings_detail: str = ""
 
     @property
     def ok(self) -> bool:
@@ -264,9 +269,35 @@ def _check_config_history_restore(result, fail, backup_ids, skip_recent_hours,
         fail("config_history_restore", detail or "failed")
 
 
+def _check_settings_integrity(result, fail, backup_ids, skip_recent_hours,
+                              on_backup_result, cancel):
+    """A setting whose real effect lives OUTSIDE config.json — today, only
+    the OS autostart registration — can silently drift from what the saved
+    config says: an old build's path baked into the registry/desktop entry
+    survives an update since nothing ever looks at it again on its own.
+    core.startup.check_and_repair_registration() already does this repair
+    silently at every launch; this just makes the outcome visible here too,
+    on demand and on the schedule, instead of only in the log."""
+    from core.startup import check_and_repair_registration
+    try:
+        repaired, detail = check_and_repair_registration()
+    except Exception as e:
+        fail("settings_integrity", str(e)[:200])
+        return
+    result.settings_repaired = repaired
+    result.settings_detail = detail
+    if not repaired:
+        logger.info("Check ok: settings_integrity")
+    elif "could not" in detail:
+        fail("settings_integrity", detail)
+    else:
+        logger.info("Check ok: settings_integrity — %s", detail)
+
+
 _RUNNERS = {
     "backup_index_zips": _check_backup_index_zips,
     "backup_index": _check_backup_index,
     "backup_archives": _check_backup_archives,
     "config_history_restore": _check_config_history_restore,
+    "settings_integrity": _check_settings_integrity,
 }

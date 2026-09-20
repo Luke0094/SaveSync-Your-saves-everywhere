@@ -10,12 +10,14 @@ readers stay in ``core.engines``.
 from .save_editor import (  # noqa: F401
     SaveEditorError,
     backup_original,
+    delete_backup,
     describe,
     explain,
     list_backups,
     open_save,
     prune_all,
     prune_backups,
+    read_source,
     restore_backup,
 )
 from .save_hold import SaveHold  # noqa: F401
@@ -24,11 +26,13 @@ __all__ = [
     "SaveEditorError",
     "SaveHold",
     "backup_original",
+    "delete_backup",
     "describe",
     "explain",
     "list_backups",
     "open_save",
     "prune_all",
     "prune_backups",
+    "read_source",
     "restore_backup",
 ]

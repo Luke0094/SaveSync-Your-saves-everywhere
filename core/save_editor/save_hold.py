@@ -212,9 +212,9 @@ class SaveHold(QObject):
             self._failures = 0
             return
 
-        for _label, (path, value) in drifted.items():
-            doc.set_value(path, value)
         try:
+            for _label, (path, value) in drifted.items():
+                doc.set_value(path, value)
             doc.write_without_backup()
         except Exception as e:                # OSError, encoding failures…
             self._failures += 1

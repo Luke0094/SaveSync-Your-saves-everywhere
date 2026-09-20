@@ -52,7 +52,7 @@ def _pcgw_extract_store_url(html: str) -> str:
     for row in rows:
         link = re.search(r'<a[^>]*href="(https?://[^"]+)"', row)
         if link:
-            url = link.group(1)
+            url = _decode_entities(link.group(1))
             if 'pcgamingwiki' not in url and 'fandom.com' not in url:
                 return url
     return ""
@@ -78,6 +78,14 @@ def _pcgw_extract_infobox(html: str) -> dict:
     out: dict = {}
     m = re.search(r'<table[^>]*id="infobox-game"[^>]*>(.*?)</table>', html, re.DOTALL)
     if not m:
+        # Not "no infobox on this page" (that's a normal, common case) but
+        # "the id='infobox-game' table this parser looks for isn't there at
+        # all" — exactly the class of markup change that silently broke the
+        # old Cargo API extraction (see module docstring). Surfaced at
+        # warning, not swallowed at debug like search_pcgamingwiki's own
+        # catch-all, so a real regression here doesn't go unnoticed again.
+        logger.warning("PCGamingWiki: no infobox-game table found in page HTML "
+                       "— extraction may need updating for a markup change")
         return out
     current = None
     for row in re.finditer(r'<tr[^>]*>(.*?)</tr>', m.group(1), re.DOTALL):
@@ -229,5 +237,9 @@ def search_pcgamingwiki(game_name: str) -> Optional[GameInfo]:
             return info
 
     except Exception as e:
-        logger.debug(f"PCGamingWiki search failed for {game_name!r}: {e}")
+        # warning, not debug — matches _fetch_json's own convention (common.py)
+        # for a real fetch/parse failure, so a genuine regression here (e.g. an
+        # unexpected response shape) doesn't go as unnoticed as the old
+        # Cargo-API breakage this source was rewritten to stop hiding.
+        logger.warning(f"PCGamingWiki search failed for {game_name!r}: {e}")
     return None
