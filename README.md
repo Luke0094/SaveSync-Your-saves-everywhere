@@ -1,6 +1,6 @@
 # SaveSync
 
-> **Your saves, everywhere.** — Game save manager with cloud sync, versioned backups, and an in-game overlay.
+> **Your saves, everywhere.** — Game save manager with cloud sync, versioned backups, saves editor and an in-game overlay.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Qt](https://img.shields.io/badge/UI-PySide6%20(Qt6)-41cd52)
@@ -12,7 +12,8 @@
 
 SaveSync watches the games you play, finds their save folders on its own, keeps
 versioned local backups, and mirrors everything to the cloud provider of your
-choice — with an always-on-top overlay so you never have to leave the game.
+choice, you can also edit the save the integrates save editor 
+— with an always-on-top overlay so you never have to leave the game.
 Saves can also go straight to a friend, P2P, with no server or cloud provider
 involved at all.
 
