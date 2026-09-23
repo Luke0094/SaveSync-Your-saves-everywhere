@@ -125,7 +125,15 @@ class P2pSendDialog(QDialog):
         machine_id = get_machine_id()
         file_path = self._file_path
         game_name = self._entry.game_name
-        entry_dict = self._entry.to_dict()
+        # publishable_dict, not a raw to_dict(): the receiver is a
+        # different machine's SaveSync, same as a cloud provider — this
+        # entry's LOCAL-only bookkeeping (last_restored above all: it
+        # marks a state as "restored, so don't flag a match as a
+        # regression" — meaningful only to the machine that did the
+        # restoring) must not travel with it and get imported as if it
+        # were a fact about the receiver's own history.
+        from core.backup import get_backup_manager
+        entry_dict = get_backup_manager().publishable_dict(self._entry)
 
         def _work():
             try:

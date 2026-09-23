@@ -1078,7 +1078,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         elif criterion == "playtime":
             result = sorted(games, key=lambda g: g.playtime_seconds, reverse=True)
         elif criterion == "status":
-            order = {"ambiguous": 0, "conflict": 1, "pending": 2, "local_only": 3, "synced": 4, "cloud_only": 5, "no_saves": 6, "provisional": 7}
+            order = {"ambiguous": 0, "review_pending": 1, "conflict": 2, "pending": 3, "local_only": 4, "synced": 5, "cloud_only": 6, "no_saves": 7, "provisional": 8}
             result = sorted(games, key=lambda g: order.get(_display_sync_status(g), 9))
         elif criterion == "last_backup":
             result = sorted(games, key=lambda g: g.last_backed_up or "", reverse=True)

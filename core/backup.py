@@ -1521,7 +1521,10 @@ class BackupManager(QObject):
         orphan: bool = False,
         recorded_save_paths: list[str] | None = None,
         orphan_dest_map: dict | None = None,
-    ) -> "Optional[BackupEntry] | tuple[Optional[BackupEntry], bool]":
+        report_regression: bool = False,
+        check_unbacked: bool = False,
+    ) -> ("Optional[BackupEntry] | tuple[Optional[BackupEntry], bool] "
+          "| tuple[Optional[BackupEntry], bool, Optional[BackupEntry] | str]"):
         """Create a zip backup of all save paths for a game.
         Skips silently if nothing changed since last backup (unless force=True).
 
@@ -1582,13 +1585,45 @@ class BackupManager(QObject):
                 shift every destination one slot to the left and hand the
                 next backup somebody else's chain. Keyed by the source, it
                 cannot drift. Merged with what the archive already knows.
+            report_regression: When True, ``return_status`` is implied and
+                the return becomes a 3-tuple ``(entry, created, flag)`` where
+                *flag* is one of: ``None`` (nothing wrong), a ``BackupEntry``
+                (state exactly matches that OLDER backup — a regression),
+                or the string ``"unbacked"`` (state matches no known backup
+                at all — new, untracked content). A state that exactly
+                matches an OLDER backup instead of the newest is never
+                written as a new backup regardless of this flag — that
+                protection is unconditional, every caller gets it, this only
+                controls whether the caller is TOLD which older backup it
+                matched (for a review panel) or the held-back entry just
+                comes back silently the same shape "already current" always
+                has.
+            check_unbacked: The "unbacked" hold-back (content matches no
+                backup in this game's history at all, not the newest, not
+                any older one) only happens when this is True, separately
+                from report_regression, because unlike a regression this IS
+                what ordinary new play looks like. It's only a risk worth
+                pausing for when nothing tracked that play happening at all
+                (a manual "Backup Now" click, Backup Tutti) — the in-game
+                timer and the exit backup are themselves the thing that
+                would have tracked it, so they always leave this False and
+                write genuinely new content straight through, same as ever.
+                force=True is the deliberate bypass (skips every dedup gate,
+                every one of these included): a reviewer's own "keep it
+                anyway" action re-calls this with force=True.
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # A held-back "unbacked" result is meaningless to a caller that
+        # can't see the 3rd tuple slot — it would look like a plain dedup
+        # skip, with no way to ever learn why nothing got written.
+        report_regression = report_regression or check_unbacked
 
-        def _ret(_entry, _created):
+        def _ret(_entry, _created, _regressed_to=None):
             # created=True only for a genuinely new backup; callers gate sync /
             # notifications / last_backed_up on it instead of guessing from a
             # timestamp window.
+            if report_regression:
+                return (_entry, _created, _regressed_to)
             return (_entry, _created) if return_status else _entry
 
         excluded_set = set(excluded_paths or [])
@@ -1736,6 +1771,56 @@ class BackupManager(QObject):
             if current_hash and current_hash == last_hash:
                 logger.info(f"Backup already current for '{game_name}' — reusing existing")
                 return _ret(recent[0], False)
+            # current_hash differs from the newest backup — genuinely
+            # different content, which is exactly the condition under which
+            # a backup normally gets written below. Before doing that:
+            # playing a game produces content that has never existed
+            # before, so landing exactly on an OLDER backup's state instead
+            # of the newest cannot be the result of play — something put an
+            # earlier state back (a launcher's cloud sync, a manual copy,
+            # an external tool) and writing a new backup here would absorb
+            # that regressed state as if it were normal progress, silently
+            # losing the one signal that anything was ever wrong. Caught
+            # HERE, unconditionally, for every caller (single backup, Backup
+            # Tutti, the in-game timer — they all funnel through this one
+            # function) using the hash already computed above for the dedup
+            # gate, not a second pass over the files. force=True is the
+            # deliberate bypass (recent is then empty, so this never runs):
+            # a reviewer's own "keep it anyway" action re-calls with it set.
+            for _older in recent[1:]:
+                _older_manifest = (_older.cloud_metadata or {}).get("file_manifest") or {}
+                if not self._manifest_is_comparable(_older_manifest):
+                    continue
+                if current_hash != self.state_hash_of(_older_manifest):
+                    continue
+                logger.warning(
+                    f"Backup held back for '{game_name}': current state matches "
+                    f"an older backup ({_older.backup_id}, {_older.created_at}) "
+                    f"instead of the newest — looks like a regression, not new play")
+                return _ret(_older, False, _older)
+            # Content that matches nothing in this game's backup history at
+            # all — not the newest, not any older one either — is exactly
+            # what legitimate new play produces, so writing it through is
+            # the right default... EXCEPT when the caller opts in
+            # (check_unbacked=True — the "outside the game" manual/Backup
+            # Tutti path). There, nothing tracked this content happening:
+            # it's most likely an ordinary offline play session, but it
+            # could just as well be a change SaveSync never saw happen at
+            # all — exactly the gap a launch-time check can't cover for a
+            # game that's never launched through SaveSync. Hold it back and
+            # let the reviewer confirm instead of absorbing it silently.
+            # Unlike the regression gate above this is opt-in, not
+            # unconditional: the in-game timer and exit backup leave
+            # check_unbacked False and always write genuinely new content
+            # straight through — required for normal play to ever get
+            # backed up in the first place. "unbacked" here is a sentinel,
+            # not a BackupEntry — there is no matched entry to point at,
+            # unlike the regression case above.
+            if check_unbacked:
+                logger.warning(
+                    f"Backup held back for '{game_name}': current state matches "
+                    f"no known backup — unrecognized/untracked change")
+                return _ret(recent[0], False, "unbacked")
             # Hard debounce: never more than 1 backup per 30 seconds.
             try:
                 age = (now - recent[0].created_dt).total_seconds()
@@ -1764,21 +1849,41 @@ class BackupManager(QObject):
             )
             return _ret(None, False)
 
-            zip_path_tmp = None
+        zip_path_tmp = None
         try:
             # Write ALL files to .tmp first, then atomic rename.
             # Every backup is a complete snapshot so any single backup can
             # be restored without depending on previous ones.
             game_backup_dir.mkdir(parents=True, exist_ok=True)
             zip_path_tmp = zip_path.with_suffix(".tmp")
+            failed_arc_names: set[str] = set()
             with zipfile.ZipFile(zip_path_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f, rel_root, arc_name in resolved_files:
                     try:
                         zf.write(f, arc_name)
                     except (OSError, ValueError) as e:
                         logger.warning(f"Skipping file {f}: {e}")
+                        failed_arc_names.add(arc_name)
                 for arc_name, data in reg_exports:
                     zf.writestr(arc_name, data)
+
+            if failed_arc_names:
+                # A file that failed to write isn't actually in the zip, so it
+                # can't be left in the manifest with a valid-looking fingerprint —
+                # the fingerprint fast path would then reuse that stale hash and
+                # the file would stay silently missing from every future backup.
+                for _arc in failed_arc_names:
+                    new_manifest.pop(_arc, None)
+                changed_arc_names = [c for c in changed_arc_names if c not in failed_arc_names]
+                # current_hash is the WHOLE-STATE hash _build_manifest computed
+                # before this write even started, so it still reflects the
+                # failed file as present — storing it as this backup's
+                # save_hash would let the dedup gate above match it again next
+                # run (same files, same would-be hash) and skip re-zipping the
+                # file forever. Blanking it means that gate can never fire on
+                # this entry; the per-file fingerprint path (now missing this
+                # arc_name from the manifest) is what actually retries it.
+                current_hash = ""
 
             zip_path_tmp.replace(zip_path)
 
@@ -1895,6 +2000,11 @@ class BackupManager(QObject):
                 self._index.append(entry)
             self._save_game_index(game_id)
             self._enforce_limits(game_id)
+            if not pre_confirmation:
+                # Genuinely new, trusted progress past whatever was last
+                # restored — see clear_last_restored's own docstring for
+                # why the flag doesn't need to survive this.
+                self.clear_last_restored(game_id)
             self.backup_created.emit(entry)
             logger.info(f"Backup created: {backup_id} ({entry.size_human})")
             return _ret(entry, True)
@@ -2348,7 +2458,8 @@ class BackupManager(QObject):
                        only_files: set[str] | None = None,
                        lib_game_id: str = "",
                        target_dir: str = "",
-                       only_roots: set | None = None) -> RestoreResult:
+                       only_roots: set | None = None,
+                       safety_provisional: bool = False) -> RestoreResult:
         """Restore a backup zip to its original save locations or target_dir.
 
         Files whose content matches the backup are skipped.  Files that
@@ -2370,6 +2481,22 @@ class BackupManager(QObject):
                          to the *target_dir* restore, where the user picked
                          the place; a library restore resolves each save
                          path on its own and has nothing to choose between.
+            safety_provisional: The pre-restore safety copy (below) is filed
+                         pre_confirmation instead of straight into real
+                         history. Set True when what's about to be
+                         overwritten is itself unverified — a regression or
+                         unbacked finding the player chose to restore past
+                         (see _restore_after_regression / the regression
+                         review panel) — so the discarded state is neither
+                         lost (still a real zip, still restorable) nor
+                         silently trusted as legitimate history: not
+                         uploaded, not counted as real until someone
+                         explicitly promotes it, same as every other
+                         pre_confirmation backup. False (the default) for an
+                         ordinary restore — going back to an earlier save on
+                         purpose doesn't make the CURRENT progress suspect,
+                         so its safety copy is real backup history
+                         immediately, same as it always was.
 
         Returns:
             RestoreResult with per-file detail.
@@ -2522,6 +2649,7 @@ class BackupManager(QObject):
                         pass
             if valid:
                 _exe = ""
+                _game = None
                 try:
                     from core.library import get_library
                     _game = get_library().get_by_id(entry.game_id)
@@ -2535,9 +2663,22 @@ class BackupManager(QObject):
                     exe_path=_exe,
                     note=i18n.t('backup.pre_restore_safety'), force=True,
                     computed_folder_name=_cfn,
+                    pre_confirmation=safety_provisional,
                 )
                 if not safety:
                     logger.warning(f"Pre-restore safety backup failed for '{entry.game_name}' — proceeding with restore")
+                elif safety_provisional:
+                    # A dedicated marker, not the (locale-baked, so unsafe
+                    # to match on) note string: this is what tells
+                    # discard/promote_pre_confirmation_backups apart from
+                    # the OTHER reason a backup ends up pre_confirmation
+                    # here (create_backup's own notif_gated captures of the
+                    # state being rejected THIS restore). Those two do NOT
+                    # share a lifecycle — a safety copy is a distinct
+                    # vintage from a PAST restore and must survive a LATER,
+                    # unrelated restore's own discard call, exactly the
+                    # data loss this marker exists to prevent.
+                    self.mark_pre_restore_safety(safety.backup_id)
 
         zip_path = _restore_zip
         if not zip_path.exists():
@@ -3038,11 +3179,23 @@ class BackupManager(QObject):
         *discarded_paths* — this method resolves a PATH confirmation
         round, and that is a different question from the identity one,
         answered only at main_window's actual identity-resolution call
-        sites.
+        sites. Same for notif_gated (an unresolved regression/unbacked
+        capture — see mark_notif_gated) and pre_restore_safety (a past
+        restore's own rejected safety copy — see mark_pre_restore_safety):
+        both independent reasons, both answered elsewhere, neither this
+        path confirmation's call to make even if their save_paths happen
+        to overlap with *discarded_paths*.
 
         Returns (promoted_count, discarded_count).
         """
-        discarded_set = set(discarded_paths or [])
+        from core.registry_saves import is_registry_path
+
+        def _norm(p: str) -> str:
+            if is_registry_path(p):
+                return p.lower()
+            return os.path.normcase(os.path.normpath(p))
+
+        discarded_set = {_norm(p) for p in (discarded_paths or [])}
         to_discard: list[str] = []
         promoted = 0
         with _index_lock:
@@ -3050,9 +3203,11 @@ class BackupManager(QObject):
                 if entry.game_id != game_id:
                     continue
                 meta = entry.cloud_metadata or {}
-                if not meta.get("pre_confirmation") or meta.get("identity_pending"):
+                if (not meta.get("pre_confirmation") or meta.get("identity_pending")
+                        or meta.get("notif_gated") or meta.get("pre_restore_safety")):
                     continue
-                if discarded_set and discarded_set.intersection(entry.save_paths or []):
+                entry_paths = {_norm(p) for p in (entry.save_paths or [])}
+                if discarded_set and discarded_set.intersection(entry_paths):
                     to_discard.append(entry.backup_id)
                 elif promote_rest:
                     entry.cloud_metadata.pop("pre_confirmation", None)
@@ -3073,7 +3228,8 @@ class BackupManager(QObject):
 
     def promote_pre_confirmation_backups(self, game_id: str,
                                          note: str = "",
-                                         include_identity_pending: bool = False) -> int:
+                                         include_identity_pending: bool = False,
+                                         include_notif_gated: bool = False) -> int:
         """Turn every temporary (pre-confirmation) backup of *game_id* into a
         definitive one: the user just confirmed the auto-detected save paths,
         so the session backups protecting them are now regular history.
@@ -3088,6 +3244,15 @@ class BackupManager(QObject):
         may not even be the right one. True only at the genuine
         identity-resolution call sites (main_window's _apply_path_add_version
         / _apply_path_overwrite) — landing there IS the answer.
+
+        include_notif_gated: same idea, for the THIRD independent reason a
+        backup can be pre_confirmation — a regression/unbacked warning that
+        was pending when it was written (see mark_notif_gated). A game can
+        have this AND an identity mystery at once; resolving one must never
+        silently promote the other's still-unanswered capture as if the
+        player had confirmed it too. True only at main_window's
+        "backup_now_unbacked" action handler — the one place a click
+        actually says "yes, trust this content."
 
         *note*, when given, replaces the backups' provisional note so the UI
         stops labelling them as pending. Rotation limits are re-enforced
@@ -3104,9 +3269,19 @@ class BackupManager(QObject):
                     continue
                 if meta.get("identity_pending") and not include_identity_pending:
                     continue
+                if meta.get("notif_gated") and not include_notif_gated:
+                    continue
+                if meta.get("pre_restore_safety"):
+                    # A DIFFERENT vintage from whatever this promotion
+                    # round is actually about (see mark_pre_restore_safety)
+                    # — promoting it here would trust a possibly much
+                    # earlier rejected state as current history, which is
+                    # not what confirming THIS session's captures means.
+                    continue
                 entry.cloud_metadata.pop("pre_confirmation", None)
                 entry.cloud_metadata.pop("identity_pending", None)
                 entry.cloud_metadata.pop("identity_alternates", None)
+                entry.cloud_metadata.pop("notif_gated", None)
                 if note:
                     entry.note = note
                 promoted += 1
@@ -3118,7 +3293,8 @@ class BackupManager(QObject):
             )
         return promoted
 
-    def discard_pre_confirmation_backups(self, game_id: str) -> int:
+    def discard_pre_confirmation_backups(self, game_id: str,
+                                         include_notif_gated: bool = False) -> int:
         """Delete every temporary (pre-confirmation) backup of *game_id* —
         the auto-detected paths they covered were rejected or suppressed,
         so per the confirmation contract their session backups go with them.
@@ -3129,13 +3305,33 @@ class BackupManager(QObject):
         unresolved identity mystery, only an eventual one of
         main_window's actual identity-resolution outcomes, and deleting
         real session saves because of it would be a straight data loss
-        with no way back."""
+        with no way back.
+
+        Never touches a pre_restore_safety backup either (see
+        mark_pre_restore_safety) — that one is a DIFFERENT vintage, a
+        rejected state from a possibly much earlier restore, not one of
+        the captures THIS discard round is actually about. Sweeping it up
+        too would be the same "no way back" data loss for a completely
+        unrelated moment in this game's history.
+
+        include_notif_gated: also delete backups held for an unresolved
+        regression/unbacked warning (see mark_notif_gated) — False by
+        default, so an UNRELATED discard round (a rejected auto-detected
+        path, for instance) can't sweep up a game's still-pending
+        regression/unbacked capture just because they share a game_id.
+        True only at main_window's "restore_newest"/"force_restore" action
+        handler — resolving THAT specific warning by restoring past it is
+        the one case where discarding its own captures is the point.
+        """
         with _index_lock:
             temp_ids = [
                 b.backup_id for b in self._index
                 if b.game_id == game_id
                 and (b.cloud_metadata or {}).get("pre_confirmation")
                 and not (b.cloud_metadata or {}).get("identity_pending")
+                and not (b.cloud_metadata or {}).get("pre_restore_safety")
+                and (include_notif_gated
+                     or not (b.cloud_metadata or {}).get("notif_gated"))
             ]
         for bid in temp_ids:
             self.delete_backup(bid)
@@ -3321,6 +3517,172 @@ class BackupManager(QObject):
             reverse=True,
         )
 
+    def mark_last_restored(self, game_id: str, backup_id: str) -> None:
+        """Flag *backup_id* as the state SaveSync itself most recently
+        restored onto this game's save folder — landing on it again is the
+        intended outcome, not a regression (see detect_regression's own
+        expected_backup_id). Stored on the backup entry itself, in the same
+        on-disk index every other backup fact lives in — durable across an
+        app restart, unlike an in-memory dict keyed by game_id, which loses
+        the answer the moment the process ends. At most one entry per game
+        carries the flag; restoring again (to this same backup or another)
+        moves it, never stacks it.
+        """
+        changed = False
+        with _index_lock:
+            for entry in self._index:
+                if entry.game_id != game_id:
+                    continue
+                meta = entry.cloud_metadata or {}
+                is_target = entry.backup_id == backup_id
+                was_flagged = bool(meta.get("last_restored"))
+                if is_target and not was_flagged:
+                    entry.cloud_metadata = dict(meta)
+                    entry.cloud_metadata["last_restored"] = True
+                    changed = True
+                elif not is_target and was_flagged:
+                    entry.cloud_metadata = dict(meta)
+                    entry.cloud_metadata.pop("last_restored", None)
+                    changed = True
+        if changed:
+            self._save_game_index(game_id)
+
+    def clear_last_restored(self, game_id: str) -> None:
+        """Drop *game_id*'s last_restored flag, if any — called by
+        create_backup itself once genuinely NEW, trusted progress is
+        written past the restored point, so the flag doesn't outlive its
+        purpose. Without this it would sit on that one old entry forever;
+        harmless in practice (rotation still reclaims the entry
+        eventually, and expected_backup_id only ever matters again if
+        CURRENT content exactly re-matches that same old backup — a real
+        but remote coincidence), but there's no reason to let a fact stay
+        on record once nothing needs it to answer anything.
+
+        No-op backup_id ("") to mark_last_restored: nothing in this
+        game's history has that id, so its own "is_target" never
+        matches and every currently-flagged entry (there's at most one)
+        falls into the "not target, was flagged" branch and gets cleared
+        — the same loop, used as a clear instead of a move.
+        """
+        self.mark_last_restored(game_id, "")
+
+    def get_last_restored_backup_id(self, game_id: str) -> str:
+        """The backup_id mark_last_restored last flagged for *game_id*, or
+        "" when none is flagged — see detect_regression's expected_backup_id.
+        """
+        with _index_lock:
+            for entry in self._index:
+                if entry.game_id == game_id and (entry.cloud_metadata or {}).get("last_restored"):
+                    return entry.backup_id
+        return ""
+
+    def newest_trusted_backup_id(self, game_id: str) -> str:
+        """The newest backup for *game_id* that ISN'T pre_confirmation, or
+        "" if none exists.
+
+        get_backups_for_game()[0] — "the newest backup" — is the right
+        answer for detect_regression's own hash comparison (the actual,
+        factual newest content, provisional or not), but the WRONG one
+        anywhere a "restore last backup" / "restore newest" action picks
+        its target: a pre_confirmation entry is, by construction,
+        unverified content nobody has confirmed yet (the very state a
+        regression/unbacked warning exists to question, or an earlier
+        restore's own rejected safety copy) — restoring TO it would put
+        exactly that back on disk, undoing the point of restoring at all.
+        This is what every such action site should call instead.
+        """
+        with _index_lock:
+            for entry in sorted(
+                    (b for b in self._index if b.game_id == game_id),
+                    key=lambda b: b.created_dt, reverse=True):
+                if not (entry.cloud_metadata or {}).get("pre_confirmation"):
+                    return entry.backup_id
+        return ""
+
+    def newest_restore_target(self, game_id: str) -> str:
+        """The backup to offer the player as a "restore last backup"
+        target: the newest TRUSTED one (newest_trusted_backup_id) when any
+        exists, else simply the newest backup of any kind. Only "" when
+        this game has no backups on record at all.
+
+        The choice a regression/unbacked warning actually asks the player
+        to make is binary — restore the previous state, or keep this one
+        and make it official — and that only works as a real choice when
+        "restore" always has something concrete to point at. Preferring a
+        provisional entry with nothing else to offer is not the silent
+        default that newest_trusted_backup_id alone would produce (this
+        game's newest CONFIRMED state, mistaken for verified when it
+        isn't) — it's a known trade shown to the player as exactly that
+        (see show_save_reverted's row text), who can just as well pick
+        "back it up now" instead if they don't want it.
+        """
+        trusted = self.newest_trusted_backup_id(game_id)
+        if trusted:
+            return trusted
+        backups = self.get_backups_for_game(game_id)
+        return backups[0].backup_id if backups else ""
+
+    def mark_pre_restore_safety(self, backup_id: str) -> None:
+        """Tag *backup_id* as a pre-restore safety copy filed provisional
+        (see restore_backup's safety_provisional) — a distinct, permanent
+        marker, not the backup's (locale-baked, translated) note text.
+
+        discard_pre_confirmation_backups and promote_pre_confirmation_backups
+        both exclude a backup carrying this tag, the same way they already
+        exclude identity_pending: it is a different VINTAGE from whatever
+        notif_gated capture create_backup's OTHER pre_confirmation reason
+        produces THIS restore, made by a possibly much earlier one, and
+        must not be swept up by a later, unrelated restore's own discard —
+        the exact data loss this whole distinction exists to prevent.
+        """
+        game_id = ""
+        with _index_lock:
+            for entry in self._index:
+                if entry.backup_id != backup_id:
+                    continue
+                meta = dict(entry.cloud_metadata or {})
+                meta["pre_restore_safety"] = True
+                entry.cloud_metadata = meta
+                game_id = entry.game_id
+                break
+        if game_id:
+            self._save_game_index(game_id)
+
+    def mark_notif_gated(self, backup_id: str) -> None:
+        """Tag *backup_id* as filed provisional because a regression/
+        unbacked warning was pending when it was written (see
+        main_window's notif_gated / _launch_notification_pending) — a
+        third, independent reason a backup can be pre_confirmation,
+        alongside identity_pending and pre_restore_safety.
+
+        Without its own tag this reason is indistinguishable from
+        identity_pending in the same index: a game can genuinely have
+        BOTH at once (an exe-path identity mystery racing an unrelated
+        regression/unbacked finding), and promote/discard_pre_confirmation_
+        backups need to act on exactly one reason at a time. Resolving the
+        identity question (_apply_path_add_version / _apply_path_overwrite)
+        must promote only the identity_pending capture, not ALSO silently
+        promote a still-unanswered regression/unbacked one just because it
+        happens to share the same game_id — that would trust unverified
+        content the player never actually confirmed. Idempotent: safe to
+        call again on an already-tagged entry (a dedup-skip landing on the
+        same provisional backup a later tick).
+        """
+        game_id = ""
+        with _index_lock:
+            for entry in self._index:
+                if entry.backup_id != backup_id:
+                    continue
+                meta = entry.cloud_metadata or {}
+                if not meta.get("notif_gated"):
+                    meta = dict(meta)
+                    meta["notif_gated"] = True
+                    entry.cloud_metadata = meta
+                    game_id = entry.game_id
+                break
+        if game_id:
+            self._save_game_index(game_id)
+
     def has_identity_pending_backups(self, game_id: str) -> bool:
         """True when *game_id* still has at least one temporary backup
         held for an unresolved IDENTITY mystery (see create_backup's own
@@ -3333,6 +3695,44 @@ class BackupManager(QObject):
             return any(
                 b.game_id == game_id and (b.cloud_metadata or {}).get("identity_pending")
                 for b in self._index
+            )
+
+    def has_notif_gated_backups(self, game_id: str) -> bool:
+        """True when *game_id* has a notif_gated capture (see
+        mark_notif_gated) that NOTHING has superseded yet — no TRUSTED
+        (non-pre_confirmation) backup created since. Durable across app
+        restarts and independent of whether the live overlay's own
+        in-memory pending state (main_window's _pending_cloud_notification
+        / _pending_regression) still remembers it — a game the player
+        never relaunched to actually see the warning still reads True.
+
+        The "superseded" half matters because "Restore"/"Back it up now"
+        aren't the only ways this ever resolves — "Got it" (ack) and a
+        later launch's own clean re-check both clear the PENDING state
+        (main_window's dicts) without touching the tag on the entry
+        itself, on purpose: an acknowledged-but-not-confirmed capture
+        must stay just as excluded from newest_trusted/future identity-
+        resolution promotions as an unanswered one (see
+        promote_pre_confirmation_backups). But the CARD BADGE isn't
+        making that same promise — it means "there's something here worth
+        looking at", and once real, confirmed play has genuinely moved
+        past that point (the same "moved on" signal clear_last_restored
+        uses), there isn't, even though the old entry sits there exactly
+        as unpromoted as before.
+        """
+        with _index_lock:
+            entries = [b for b in self._index if b.game_id == game_id]
+            notif_times = [
+                b.created_dt for b in entries
+                if (b.cloud_metadata or {}).get("notif_gated")
+            ]
+            if not notif_times:
+                return False
+            newest_notif = max(notif_times)
+            return not any(
+                b.created_dt > newest_notif
+                and not (b.cloud_metadata or {}).get("pre_confirmation")
+                for b in entries
             )
 
     def identity_pending_info(self, game_id: str) -> tuple[str, list]:
@@ -3784,17 +4184,52 @@ class BackupManager(QObject):
             out_c.append(rec.get("content") or "")
         return out_d, out_s, out_c
 
-    def publishable_dict(self, entry: BackupEntry) -> dict:
-        """*entry* as it should appear in a remote index.
+    # Meaningful only to THIS machine's own detect_regression / promote /
+    # discard bookkeeping — never something another machine should read as
+    # a fact about a shared backup. A pre_confirmation entry never reaches
+    # here (filtered out before upload, and cleared by the time promotion
+    # makes one upload-eligible) — EXCEPT last_restored, which lands
+    # directly on an ALREADY-trusted, possibly already-uploaded entry
+    # (mark_last_restored, from restoring to something old). sync/base.py's
+    # own "republish what THIS machine changed about a backup" step
+    # (4b) exists precisely to push an already-uploaded entry's LATER
+    # metadata edits back up — without stripping this first, restoring to
+    # an old backup on one machine would publish "this state is expected"
+    # to every other machine sharing this game, silently excusing a
+    # genuine regression on a machine that never restored anything.
+    _LOCAL_ONLY_METADATA_KEYS = (
+        "last_restored", "notif_gated", "pre_restore_safety",
+        "identity_pending", "identity_alternates", "pre_confirmation",
+    )
 
-        Without the bookkeeping that records publication itself — which is
-        local, and which would otherwise differ from the copy up there the
+    def strip_local_only_metadata(self, meta: dict | None) -> dict:
+        """A copy of *meta* with every key from _LOCAL_ONLY_METADATA_KEYS
+        removed. Used on BOTH sides of a transfer to another machine —
+        publishable_dict strips it going OUT, and sync/base.py's download
+        path (and the P2P receive path) strip it again coming IN — so an
+        entry that somehow got published with one of these anyway (an
+        older build that predates this stripping, or any path that
+        bypassed publishable_dict) doesn't get imported and mistaken for
+        a fact about the machine reading it back. Stripping is symmetric
+        on purpose: the guarantee shouldn't depend on trusting what's
+        already sitting on a remote or in an incoming transfer.
+        """
+        cleaned = dict(meta or {})
+        for key in self._LOCAL_ONLY_METADATA_KEYS:
+            cleaned.pop(key, None)
+        return cleaned
+
+    def publishable_dict(self, entry: BackupEntry) -> dict:
+        """*entry* as it should appear in a remote index — never the
+        bookkeeping that's local to THIS machine (see
+        _LOCAL_ONLY_METADATA_KEYS), including the publish-tracking flag
+        itself, which would otherwise differ from the copy up there the
         moment it is cleared, making every sync republish forever.
         """
         d = entry.to_dict()
-        meta = dict(d.get("cloud_metadata") or {})
-        if meta.pop(self.INDEX_PUBLISH_KEY, None) is not None:
-            d["cloud_metadata"] = meta
+        meta = self.strip_local_only_metadata(d.get("cloud_metadata"))
+        meta.pop(self.INDEX_PUBLISH_KEY, None)
+        d["cloud_metadata"] = meta
         return d
 
     def index_needs_publish(self, entry: BackupEntry) -> bool:
@@ -4040,9 +4475,16 @@ class BackupManager(QObject):
 
     def _archive_is_due(self, game_id: str, interval_minutes: int) -> bool:
         from datetime import datetime, timezone, timedelta
+        # Raw index read, not get_backups_for_game — same reasoning as
+        # archive_auto_backup's own docstring: that one deep-copies every
+        # matching entry, manifest included, and this runs on the same
+        # once-a-minute poll.
+        with _index_lock:
+            metas = [b.cloud_metadata or {} for b in self._index
+                     if b.game_id == game_id]
         last = ""
-        for b in self.get_backups_for_game(game_id):
-            last = max(last, str((b.cloud_metadata or {}).get(self.AUTO_LAST_KEY) or ""))
+        for meta in metas:
+            last = max(last, str(meta.get(self.AUTO_LAST_KEY) or ""))
         if not last:
             return True                       # never checked: due now
         try:
@@ -4055,10 +4497,34 @@ class BackupManager(QObject):
                 >= timedelta(minutes=interval_minutes))
 
     def rebackup_archive(self, game_id: str, sources: list[str] | None = None,
-                         recorded: list[str] | None = None) -> tuple[bool, str]:
+                         recorded: list[str] | None = None,
+                         force: bool = False,
+                         check_unbacked: bool = False,
+                         report_regression: bool = False
+                         ) -> tuple[bool, str] | tuple[bool, str, object]:
         """Back the archive's source folders up again, INTO THE SAME archive.
 
-        ``(created, detail)``. The existing game_id and backup folder are
+        ``(created, detail)`` — or ``(created, detail, regressed_to)`` when
+        *report_regression* is True (create_backup's own return shape,
+        passed straight through; *regressed_to* is None, a BackupEntry, or
+        the string "unbacked", exactly as there).
+
+        force / check_unbacked / report_regression: create_backup's own
+        parameters, threaded straight through — an archive has no game
+        session to be "inside" or "outside" of, so every re-backup of one
+        is the "outside the game" case by default, but only main_window's
+        single/Backup-Tutti archive job actually opts into check_unbacked
+        (reviewable hold-back) and force (a reviewer's own "keep it
+        anyway"). The periodic archive scheduler (_on_archive_tick) and
+        the other, narrower callers (a manual-path re-verify, sync's own
+        "is there anything local to publish" check) leave both False,
+        unchanged from before these parameters existed — there is no
+        modal-safe way for a background timer to ask the question, the
+        same reasoning notif_gated exists for on the library-game side,
+        just with no equivalent machinery built for archives (yet) to
+        hold the answer between now and the next time a person is looking.
+
+        The existing game_id and backup folder are
         reused on purpose: minting a new pair — which is what
         create_orphan_backup does — would leave a separate archive per run,
         so retention would never prune any of them and the Backups page
@@ -4149,12 +4615,16 @@ class BackupManager(QObject):
         # return_status, not "did it hand back an entry": create_backup
         # returns the EXISTING entry when the folder has not changed, so a
         # truthy result says nothing about whether anything was written.
-        entry, created = self.create_backup(
+        # force defaults False same as always ("unchanged folder: no new
+        # zip") — only a reviewer's own "keep it anyway" (main_window's
+        # RegressionReviewDialog._on_keep) ever passes True, to push a
+        # held-back result through on purpose.
+        entry, created, regressed_to = self.create_backup(
             game_id=game_id,
             game_name=newest.game_name,
             save_paths=alive,
             computed_folder_name=self._game_folder_for_entry(newest),
-            force=False,                      # unchanged folder: no new zip
+            force=force,
             orphan=True,
             recorded_save_paths=list(dests) or None,
             content_chains_override=list(content_chains),
@@ -4164,13 +4634,17 @@ class BackupManager(QObject):
                 for src, d, sc, cc in zip(alive, dests, save_chains,
                                           content_chains)
             },
+            check_unbacked=check_unbacked,
+            report_regression=True,
             return_status=True,
         )
         if entry is None:
-            return False, "backup failed"
-        if not created:
-            return False, "unchanged"
-        return True, entry.backup_id
+            result = (False, "backup failed")
+        elif not created:
+            result = (False, "regression" if regressed_to is not None else "unchanged")
+        else:
+            result = (True, entry.backup_id)
+        return (*result, regressed_to) if report_regression else result
 
     def archive_display_name(self, game_id: str) -> str:
         """What to call an archive on screen. Empty when it is not one."""
@@ -4210,15 +4684,35 @@ class BackupManager(QObject):
                 out.append(gid)
         return out
 
+    def _orphan_game_ids(self) -> set[str]:
+        """Distinct game_ids of archive/orphan backups — no deepcopy, no
+        file manifests read, unlike get_orphan_backups() (built for
+        callers that need the full entries, and does copy.deepcopy() per
+        one via get_all_backups()). Just the ids is all a due-for-backup
+        poll running once a minute (see archives_due_for_backup) can
+        afford to ask for.
+        """
+        lib_ids = self.library_game_ids()
+        with _index_lock:
+            return {
+                b.game_id for b in self._index
+                if b.game_id and (self.is_orphan_entry(b) or b.game_id not in lib_ids)
+            }
+
     def archives_due_for_backup(self) -> list[str]:
-        """game_ids of archives whose scheduled re-backup is due."""
+        """game_ids of archives whose scheduled re-backup is due.
+
+        Runs on a 60s timer (main_window's _on_archive_tick, sized to the
+        shortest interval an archive can be given — set_archive_auto_backup
+        clamps to a 1-minute floor, so the poll has to be at least that
+        fine to not overshoot it), which is exactly why this whole method
+        and _archive_is_due read the raw index directly instead of the
+        deep-copying accessors used elsewhere: a poll meant to answer
+        "is anything due" cheaply should not itself be the expensive part,
+        however many archives or however much backup history there is.
+        """
         due: list[str] = []
-        seen: set[str] = set()
-        for b in self.get_orphan_backups():
-            gid = b.game_id
-            if not gid or gid in seen:
-                continue
-            seen.add(gid)
+        for gid in self._orphan_game_ids():
             enabled, interval = self.archive_auto_backup(gid)
             if enabled and self._archive_is_due(gid, interval):
                 due.append(gid)
@@ -4227,7 +4721,7 @@ class BackupManager(QObject):
     def library_game_ids(self) -> set[str]:
         try:
             from core.library import get_library
-            return {g.id for g in get_library().all_games()}
+            return get_library().all_game_ids()
         except Exception:
             return set()
 
@@ -4479,23 +4973,18 @@ class BackupManager(QObject):
 
     # ── Save-state regression ────────────────────────────────────────────────
 
-    # Fallback for changes_explained_since when no tracked process start time
-    # is available. Both callers of this fallback are already close to "now"
-    # by construction, not open-ended sessions: the post-restore regression
-    # check runs synchronously right after the restore's own write, and the
-    # cloud-check race (game exits between its background network call
-    # finishing and the GUI-thread continuation running) is a dispatch delay,
-    # not a multi-second gap. Kept short on purpose — wide enough to absorb
-    # that dispatch delay or a slow disk flushing a large restore, not so
-    # wide that an unrelated external write landing in the same window would
-    # get waved through with nothing to actually tie it to what just happened.
-    _RECENT_LOCAL_WRITE_GRACE_S = 15.0
-    # Safety margin subtracted from an exact process create_time before
-    # comparing: it's cached rounded to 0.1s (see ProcessKey), and mtimes
-    # and process clocks are two different OS readings that are not
-    # guaranteed to agree to the millisecond — a write genuinely made by
-    # the process moments after it started must never lose to rounding.
-    _PROCESS_START_FUDGE_S = 2.0
+    # How far a write can land BEFORE the moment SaveSync started tracking a
+    # process and still count as that process's own — not general "recent
+    # write" amnesty, specifically attribution to a tracked PID. The process
+    # itself is detected by polling (core.monitor), not an OS launch hook, so
+    # "tracking started" can trail the process's real start by a poll cycle
+    # or more (longer still if the monitor was in its backed-off idle
+    # interval before a nudge() woke it); a write the game made in that gap
+    # is exactly as much "the game's own" as one made a second after tracking
+    # began. Widened from a bare clock-rounding margin (was 2.0s, just
+    # covering create_time()'s 0.1s cache rounding) to actually cover that
+    # detection lag.
+    _PID_TRACKING_LAG_S = 15.0
 
     def current_state_hash(self, game_id: str, save_paths: list,
                            changes_explained_since: float = 0) -> str:
@@ -4554,7 +5043,7 @@ class BackupManager(QObject):
                     f"{'…' if len(changed) > 10 else ''}"
                 )
             if changed and prev and changes_explained_since > 0:
-                cutoff = changes_explained_since - self._PROCESS_START_FUDGE_S
+                cutoff = changes_explained_since - self._PID_TRACKING_LAG_S
                 lenient = None
                 explained = []
                 for arc in changed:
@@ -4604,61 +5093,80 @@ class BackupManager(QObject):
 
     def detect_regression(self, game_id: str, save_paths: list,
                           expected_backup_id: str = "",
-                          changes_explained_since: float = 0) -> Optional[BackupEntry]:
-        """Have the saves gone BACK to a state recorded in an older backup?
+                          changes_explained_since: float = 0
+                          ) -> tuple[Optional[BackupEntry], bool]:
+        """Compare the current save state against this game's backup history.
 
-        Returns that older backup, or None.
+        Returns ``(regressed_to, is_unbacked)``:
 
-        The reasoning: playing a game produces save content that has never
-        existed before, so the current state matching an OLD backup exactly
-        cannot be the result of play. Something put an earlier state back —
-        a launcher's cloud sync, a manual copy, an external tool.
+        - *regressed_to*: an OLDER backup the current state exactly
+          matches, or None. Playing a game produces save content that has
+          never existed before, so landing exactly on an OLD backup's
+          state cannot be the result of play — something put an earlier
+          state back (a launcher's cloud sync, a manual copy, an external
+          tool).
+        - *is_unbacked*: True when the current state matches NEITHER the
+          newest backup NOR any older one — content this game's backup
+          history has never seen at all (played without SaveSync running,
+          on another PC, or changed by something outside it entirely).
+          Always False when *regressed_to* is set — the two readings are
+          mutually exclusive outcomes of the same one comparison.
 
-        *expected_backup_id* is the backup SaveSync itself last restored for
-        this game: landing on that state is the intended outcome, not a
-        regression.
+        *expected_backup_id* is the backup SaveSync itself last restored
+        for this game: landing exactly on that state is the intended
+        outcome — neither a regression nor "unbacked" (it is exactly
+        backed, by the restore that just happened).
 
-        *changes_explained_since*: forwarded to current_state_hash — pass the
-        current session's process start time (the caller has that; this
-        method doesn't reach into core.monitor to get it itself) so a write
-        the game made on its own, opening, doesn't read as a regression.
+        *changes_explained_since*: forwarded to current_state_hash as-is,
+        no fallback applied here — pass 0 for a strict, literal comparison
+        (the right choice with no process to attribute a write to: a
+        library-wide sweep, or a restore that ran with the game closed),
+        or a tracked process's start time so a write the game made on its
+        own opening doesn't read as either a regression or unbacked
+        content (see _PID_TRACKING_LAG_S).
 
         Only backups whose manifest is comparable take part; see
         _manifest_is_comparable for why.
         """
-        backups = self.get_backups_for_game(game_id)
-        usable = [b for b in backups
+        usable = [b for b in self.get_backups_for_game(game_id)
                   if self._manifest_is_comparable(
                       (b.cloud_metadata or {}).get("file_manifest") or {})]
-        if len(usable) < 2:
-            return None      # nothing to regress FROM
+        if not usable:
+            return None, False     # nothing to compare against at all
 
-        if not changes_explained_since:
-            import time as _time
-            changes_explained_since = _time.time() - self._RECENT_LOCAL_WRITE_GRACE_S
         current = self.current_state_hash(
             game_id, save_paths,
             changes_explained_since=changes_explained_since)
         if not current:
-            return None
+            return None, False
 
         # get_backups_for_game returns newest first.
         newest = usable[0]
         if current == self.state_hash_of(
                 (newest.cloud_metadata or {}).get("file_manifest") or {}):
-            return None      # up to date with the latest backup
+            return None, False     # up to date with the latest backup
 
         for older in usable[1:]:
-            if older.backup_id == expected_backup_id:
-                continue
-            if current == self.state_hash_of(
+            if not current == self.state_hash_of(
                     (older.cloud_metadata or {}).get("file_manifest") or {}):
-                logger.warning(
-                    f"Save state for {game_id} matches an older backup "
-                    f"({older.backup_id}, {older.created_at}) — something put "
-                    f"an earlier state back")
-                return older
-        return None
+                continue
+            if older.backup_id == expected_backup_id:
+                # Exactly the intended outcome of a restore SaveSync itself
+                # just did — matches something known, so this returns here
+                # rather than falling through to "matches nothing".
+                return None, False
+            logger.warning(
+                f"Save state for {game_id} matches an older backup "
+                f"({older.backup_id}, {older.created_at}) — something put "
+                f"an earlier state back")
+            return older, False
+
+        # Matches neither the newest backup nor any older one: content
+        # this game's history has never seen.
+        logger.info(
+            f"Save state for {game_id} matches no known backup — "
+            f"never backed up, or changed outside SaveSync")
+        return None, True
 
     # ── Integrity ────────────────────────────────────────────────────────────
 
@@ -5292,9 +5800,11 @@ class BackupManager(QObject):
             newest = game_backups[-min_kept:] if len(game_backups) >= min_kept else game_backups
             to_delete -= {b.backup_id for b in newest}
 
-        # Step 2: trim by count
+        # Step 2: trim by count. min_kept protects the newest here too — not
+        # just from age-based deletion in Step 1 — so a low max_backups can't
+        # trim below the number of backups the user asked to always keep.
         remaining = [b for b in game_backups if b.backup_id not in to_delete]
-        while len(remaining) > max_backups:
+        while len(remaining) > max_backups and len(remaining) > min_kept:
             oldest = remaining.pop(0)
             to_delete.add(oldest.backup_id)
 
@@ -5320,7 +5830,7 @@ class BackupManager(QObject):
         min_kept       = config.get("min_kept_backups",     MIN_KEPT_BACKUPS)
 
         # Hold _index_lock for the entire read-modify cycle to prevent races
-        zip_paths_to_delete: list[str] = []
+        entries_to_delete: list[BackupEntry] = []
         folder_hint = ""
         stamped = False
         with _index_lock:
@@ -5359,28 +5869,42 @@ class BackupManager(QObject):
             folder_hint = self._game_folder_for_entry(
                 max(game_backups, key=lambda b: b.created_dt))
 
-            # Collect zip paths before removing from index
+            # Collect the entries before removing from index
             for b in game_backups:
                 if b.backup_id in to_delete:
-                    zip_paths_to_delete.append(b.zip_path)
+                    entries_to_delete.append(b)
 
             # Remove from index while still holding the lock
             self._index = [b for b in self._index if b.backup_id not in to_delete]
 
         # Disk I/O and signals outside the lock
         parents_to_check: set[Path] = set()
-        for zp in zip_paths_to_delete:
+        failed_entries: list[BackupEntry] = []
+        for entry in entries_to_delete:
             try:
-                p = Path(zp)
+                p = Path(entry.zip_path)
                 if p.exists():
                     parents_to_check.add(p.parent)
                     p.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    f"Could not delete backup zip {entry.zip_path}: {e}; "
+                    f"keeping {entry.backup_id} in the index so it isn't orphaned"
+                )
+                failed_entries.append(entry)
+
+        deleted_ids = to_delete - {e.backup_id for e in failed_entries}
+        if failed_entries:
+            # The zip is still on disk — put the entry back so it stays
+            # tracked and this prune is retried next time, instead of
+            # tombstoning a backup whose file was never actually removed.
+            with _index_lock:
+                self._index.extend(failed_entries)
+
         # Tombstone pruned ids so sync never re-downloads what the local
         # retention limits just removed (download→prune→download loop).
-        self._record_deleted(game_id, to_delete)
-        for bid in to_delete:
+        self._record_deleted(game_id, deleted_ids)
+        for bid in deleted_ids:
             self.backup_deleted.emit(bid)
         # Clean up empty game subfolders (keep if index.json remains)
         for parent in parents_to_check:

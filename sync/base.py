@@ -178,6 +178,7 @@ class SyncProvider(ABC):
         # ── 2. Download remote index.json (if exists) ────────────────────
         remote_index_path = f"{remote_base}/index.json"
         tmp_path = None
+        index_seen = False
         try:
             if self.remote_exists(remote_index_path):
                 import tempfile
@@ -188,6 +189,7 @@ class SyncProvider(ABC):
                         with open(tmp_path, encoding="utf-8") as f:
                             remote_entries = _json.load(f)
                         remote_ids = {e["backup_id"] for e in remote_entries}
+                        index_seen = True
                     except Exception as e:
                         _log.warning(f"Could not parse remote index.json: {e}")
         except Exception as e:
@@ -195,6 +197,39 @@ class SyncProvider(ABC):
         finally:
             if tmp_path:
                 tmp_path.unlink(missing_ok=True)
+
+        if not index_seen:
+            # remote_exists()/download() can't tell "no index yet" apart
+            # from "the check itself failed" (expired token, network blip,
+            # rate limit) — every provider swallows that ambiguity to a
+            # plain False/None. If THIS provider has previously published an
+            # index for this game (an entry it uploaded — synced_to — or
+            # downloaded — origin), a shared index must exist right now, so
+            # an empty fetch is far more likely a failed check than a fresh
+            # game — proceeding would upload an index built only from this
+            # machine's entries and erase every other machine's history
+            # from it. A raw foreign machine_id is NOT used for this check:
+            # a P2P-received or hand-added orphan entry also carries a
+            # foreign machine_id despite this provider never having touched
+            # this game, which would make a genuinely first-ever sync here
+            # permanently refuse to create an index at all.
+            try:
+                _has_synced_before = any(
+                    self.PROVIDER_ID in (e.cloud_metadata or {}).get("synced_to", [])
+                    or e.origin == self.PROVIDER_ID
+                    for e in local_entries)
+            except Exception:
+                _has_synced_before = False
+            if _has_synced_before:
+                _log.warning(
+                    f"sync_backups: remote index for {game_folder} came back "
+                    f"empty but local history already knows of other machines — "
+                    f"treating this as a failed fetch rather than risking the "
+                    f"shared index"
+                )
+                result.success = False
+                result.message = t("core.sync_index_unconfirmed")
+                return result
 
         # ── 2b. Cross-machine divergence gate (auto direction only) ───────
         # Both sides progressed independently: this machine has new backups
@@ -352,6 +387,15 @@ class SyncProvider(ABC):
                         # Set origin to this provider's ID
                         rentry_dict["origin"] = self.PROVIDER_ID
                         entry_obj = _BE.from_dict(rentry_dict)
+                        # Strip local-only bookkeeping (last_restored above
+                        # all — see BackupManager.strip_local_only_metadata)
+                        # on the way IN too, not just publishable_dict on
+                        # the way out: a row published before that
+                        # stripping existed, or by an older build, must not
+                        # get read back in here and mistaken for a fact
+                        # about THIS machine's own restore history.
+                        entry_obj.cloud_metadata = backup_manager.strip_local_only_metadata(
+                            entry_obj.cloud_metadata)
                         # Re-stamp with the LOCAL game_id: a cross-PC backup
                         # carries the originating machine's random id, and
                         # get_backups_for_game(local_id) would never find it

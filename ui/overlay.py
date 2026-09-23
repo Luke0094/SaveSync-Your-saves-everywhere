@@ -1770,52 +1770,111 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._show_priority_prompt()
 
     def show_save_reverted(self, game_name: str, game_id: str,
-                           newest_backup_id: str = "", after_restore: bool = False):
-        """The game's saves went back to a state we had already recorded.
+                           newest_backup_id: str = "", after_restore: bool = False,
+                           unbacked: bool = False):
+        """The current save state needs the player's attention: either it
+        went BACK to a state already recorded (a regression), or it is
+        content this game's history has never seen at all (unbacked).
 
-        Playing produces content that never existed before, so landing exactly
-        on an older backup's state is not something play can do — something
-        put an earlier state back. Two wordings, because the two moments call
-        for different advice:
+        Both readings come from one comparison (see
+        core.backup.BackupManager.detect_regression) and share this same
+        prompt shape rather than two separate ones — decision chrome, an
+        icon, title/message/hint, a primary action, an acknowledgement, a
+        mute link — with only the wording and the primary action differing:
 
-        - at launch: state the fact, offer to put the newest state back;
-        - right after a restore: name the likely cause (a launcher's automatic
-          sync racing the restore) and offer to force it with the game frozen,
-          which is the thing that actually wins that race.
+        - regression at launch: state the fact, offer to put the newest
+          state back;
+        - regression right after a restore: name the likely cause (a
+          launcher's automatic sync racing the restore) and offer to force
+          it with the game frozen, which is the thing that actually wins
+          that race;
+        - unbacked: state that nothing on record matches this. The current
+          state is unverified — it could be ordinary offline play, or it
+          could be something else entirely — so the primary action is the
+          cautious one, restoring the previous state (the newest TRUSTED
+          backup when one exists, else simply the newest on record — see
+          core.backup.BackupManager.newest_restore_target), same as a
+          regression. Backing up this unverified state instead (enshrining
+          it as a new backup) is one dropdown click away, not the default.
         """
-        context = f"{game_id}|reverted"
+        context = f"{game_id}|unbacked" if unbacked else f"{game_id}|reverted"
         if self._defer_if_priority(
                 lambda: self.show_save_reverted(game_name, game_id,
-                                                newest_backup_id, after_restore),
+                                                newest_backup_id, after_restore,
+                                                unbacked),
                 context=context, is_priority=True):
             return
         self._set_mode("cloud")          # decision-prompt chrome
+        # Same "game_id|backup_id" shape either way (a bare id when there is
+        # no backup to point at) — every button below, unbacked or
+        # regression, reads it with the same partition("|").
         self._context_exe = f"{game_id}|{newest_backup_id}"
         self._priority_context = context
-        self._icon_label.setText("↩")
-        self._title.setText(t("overlay.save_reverted_title"))
-        msg_key = "overlay.restore_undone_msg" if after_restore else "overlay.save_reverted_msg"
-        hint_key = "overlay.restore_undone_hint" if after_restore else "overlay.save_reverted_hint"
-        self._message.setText(
-            f"{t(msg_key, game=game_name)}<br>"
-            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
-            f"{t(hint_key)}</span>"
-        )
+        if unbacked:
+            self._icon_label.setText("💾")
+            self._title.setText(t("overlay.save_unbacked_title"))
+            self._message.setText(
+                f"{t('overlay.save_unbacked_msg', game=game_name)}<br>"
+                f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
+                f"{t('overlay.save_unbacked_hint')}</span>"
+            )
+        else:
+            self._icon_label.setText("↩")
+            self._title.setText(t("overlay.save_reverted_title"))
+            msg_key = "overlay.restore_undone_msg" if after_restore else "overlay.save_reverted_msg"
+            hint_key = "overlay.restore_undone_hint" if after_restore else "overlay.save_reverted_hint"
+            self._message.setText(
+                f"{t(msg_key, game=game_name)}<br>"
+                f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
+                f"{t(hint_key)}</span>"
+            )
         self._hide_dashboard()
         self._clear_buttons()
         # An alert holds priority and never auto-hides, so it MUST carry a way
         # out: without it nothing behind it would ever be shown again.
-        # "regression_ack" is its own action, not the shared "dismiss":
-        # losing this alert must not mean losing the warning, so it stays
-        # re-summonable by the hotkey until the player actually acknowledges
-        # it — and THAT is what this action says. Worded as an
-        # acknowledgement for the same reason.
+        # "regression_ack"/"unbacked_ack" are their own actions, not the
+        # shared "dismiss": losing this alert must not mean losing the
+        # warning, so it stays re-summonable by the hotkey until the player
+        # actually acknowledges it — and THAT is what this action says.
+        # Worded as an acknowledgement for the same reason.
         #
         # Same shape as the cloud prompts: the repair is the primary button
         # and the acknowledgement sits in its dropdown. With no backup to
         # restore there is no primary to attach a menu to, so the
         # acknowledgement stays a plain button — it is the only way out.
-        if newest_backup_id:
+        if unbacked:
+            if newest_backup_id:
+                # Restore is the primary action: the point is avoiding
+                # unknown changes, so the cautious default is putting the
+                # previous state back, not enshrining this unverified one
+                # as a new backup. newest_backup_id is main_window's
+                # newest_restore_target — the newest TRUSTED backup when
+                # one exists, else simply the newest backup on record, so
+                # this is populated whenever this game has ANY backup at
+                # all, which detect_regression already requires for
+                # unbacked to fire in the first place. "Back it up now"
+                # (for when the player DOES know this state is fine — e.g.
+                # genuine offline play) and the acknowledgement both move
+                # to the dropdown.
+                self._add_split_btn(
+                    self._btn_area,
+                    t("overlay.save_unbacked_restore"),
+                    "restore_newest",
+                    menu_items=[
+                        (t("overlay.save_unbacked_backup"), "backup_now_unbacked"),
+                        (t("overlay.got_it"), "unbacked_ack"),
+                    ],
+                    primary=True)
+            else:
+                # Defense-in-depth only — see above, this game should
+                # always have at least one backup on record here.
+                self._add_split_btn(
+                    self._btn_area,
+                    t("overlay.save_unbacked_backup"),
+                    "backup_now_unbacked",
+                    menu_items=[(t("overlay.got_it"), "unbacked_ack")],
+                    primary=True)
+        elif newest_backup_id:
             self._add_split_btn(
                 self._btn_area,
                 t("overlay.restore_force") if after_restore
@@ -1828,8 +1887,26 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._set_suppress_link(
             "dont_show_ingame",
             lambda _checked=False, gid=game_id:
-                self._suppress_regression_notif(gid))
+                self._suppress_unbacked_notif(gid) if unbacked
+                else self._suppress_regression_notif(gid))
         self._show_priority_prompt()
+
+    def _suppress_unbacked_notif(self, game_id: str) -> None:
+        """Mute the unbacked-save alert for this game — own handler for the
+        same reason _suppress_regression_notif has one: a priority prompt,
+        not something in _notif_queue, so the queue-popping shared handler
+        would leave this alert on screen with nothing to release its lock.
+        """
+        from core.config_manager import get_config
+        config = get_config()
+        suppressed: dict = dict(config.get("suppressed_ingame_notifs", {}))
+        kinds = list(suppressed.get(game_id, []))
+        if "unbacked" not in kinds:
+            kinds.append("unbacked")
+        suppressed[game_id] = kinds
+        config.set("suppressed_ingame_notifs", suppressed)
+        logger.info(f"Muted unbacked-save alerts for game {game_id}")
+        self.hide_animated()
 
     def dismiss_unverified_match(self, proc_name: str, game_id: str) -> None:
         """Withdraw an unanswered unverified-match prompt whose process has

@@ -817,6 +817,16 @@ class LibraryManager(QObject):
         with self._lock:
             return [copy.deepcopy(g) for g in self._games.values()]
 
+    def all_game_ids(self) -> set[str]:
+        """Just the ids — no per-entry deepcopy, unlike all_games(). For a
+        caller that only ever needs "is this id one of mine" (see
+        BackupManager.library_game_ids, read on a 60s timer by the archive
+        scheduler among others), copying every GameEntry to throw the
+        object away and keep one string is pure waste that scales with
+        the size of the library, not the size of the answer."""
+        with self._lock:
+            return set(self._games.keys())
+
     def get_by_id(self, gid: str) -> Optional[GameEntry]:
         with self._lock:
             entry = self._games.get(gid)

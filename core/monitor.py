@@ -1454,7 +1454,15 @@ class ProcessMonitor(QObject):
             except Exception as e:
                 logger.debug(f"Snapshot thread error: {e}")
                 current = {}
-            self._snapshot_ready.emit(current)
+            try:
+                self._snapshot_ready.emit(current)
+            except Exception as e:
+                # If emit itself fails (e.g. the QObject was already torn
+                # down mid-shutdown), _on_snapshot_ready never runs and
+                # _snapshot_in_flight would otherwise never be reset —
+                # every later poll would then silently no-op forever.
+                logger.debug(f"Snapshot emit failed: {e}")
+                self._snapshot_in_flight = False
 
         threading.Thread(target=_bg, daemon=True,
                          name="monitor-snapshot").start()

@@ -39,6 +39,13 @@ _salt_lock = threading.Lock()
 _cached_salt: str | None = None
 
 
+class SaltUnavailableError(Exception):
+    """A previously-wrapped salt exists but couldn't be unwrapped right now
+    (e.g. Windows DPAPI failing after a password reset). Distinct from a
+    genuine decrypt failure so callers don't mistake a transient key-store
+    problem for corrupted credentials and delete them."""
+
+
 def _dpapi_protect(data: bytes) -> bytes:
     """Windows DPAPI (user scope) — ciphertext only decrypts for this login."""
     import ctypes
@@ -159,7 +166,27 @@ def _get_or_create_salt() -> str:
                     _cached_salt = existing
                     return existing
             except Exception as e:
-                logger.warning(f"Could not unwrap protected salt: {e}")
+                # A salt was already wrapped and persisted here — this is
+                # NOT "no salt yet". Falling through to mint a brand-new one
+                # below would silently and permanently invalidate every
+                # credential ever encrypted under the old salt, the moment
+                # DPAPI/keyring has one bad day. Only refuse when there is
+                # actually something on disk that a fresh salt would orphan
+                # — if no credential file exists yet, minting one is exactly
+                # right and refusing would permanently block ever saving a
+                # credential again over a salt file that has nothing to lose.
+                if _FALLBACK_PATH.exists() or _BACKUP_PATH.exists():
+                    logger.error(
+                        f"Could not unwrap the stored encryption salt: {e}. "
+                        "Refusing to create a replacement salt, which would "
+                        "permanently break every existing credential."
+                    )
+                    raise SaltUnavailableError(str(e)) from e
+                logger.warning(
+                    f"Could not unwrap the stored encryption salt: {e}. "
+                    "No credential file exists yet, so creating a fresh "
+                    "salt is safe — nothing to invalidate."
+                )
 
         # 2) Keyring-only salt (no local file yet)
         if not os.environ.get("SAVESYNC_DISABLE_KEYRING"):
@@ -296,22 +323,39 @@ def decrypt_data(encrypted_data: bytes, key: bytes) -> bytes:
 def _try_decrypt_with_multiple_keys(encrypted_data: bytes) -> tuple[bytes, str]:
     """Try primary key first; legacy flexible/weak-backup keys only for migration."""
     keys_to_try = [
-        (_derive_encryption_key(), "primary"),
-        (_derive_flexible_key(), "flexible"),
-        (_create_backup_key(), "legacy_backup"),
+        (_derive_encryption_key, "primary"),
+        (_derive_flexible_key, "flexible"),
+        (_create_backup_key, "legacy_backup"),
     ]
 
     last_error = None
-    for key, key_type in keys_to_try:
+    salt_unavailable = False
+    for derive_key, key_type in keys_to_try:
+        try:
+            key = derive_key()
+        except SaltUnavailableError as e:
+            # Both primary and flexible derive from the same salt, so this
+            # will fail identically every time until the salt is readable
+            # again — keep trying the salt-independent legacy key, but
+            # remember this so the caller can tell "key store unavailable"
+            # apart from "genuinely wrong/corrupt data" below.
+            logger.debug(f"Salt unavailable for {key_type} key: {e}")
+            salt_unavailable = True
+            last_error = e
+            continue
         try:
             decrypted = decrypt_data(encrypted_data, key)
             logger.debug(f"Successfully decrypted with {key_type} key")
             return decrypted, key_type
-        except (ValueError, Exception) as e:
+        except Exception as e:
             logger.debug(f"Decryption with {key_type} key failed: {type(e).__name__}: {e}")
             last_error = e
             continue
 
+    if salt_unavailable:
+        raise SaltUnavailableError(
+            f"Could not derive the credential key — stored salt is "
+            f"unavailable (last error: {last_error})")
     raise ValueError(f"All decryption attempts failed (last error: {last_error})")
 
 
@@ -437,6 +481,18 @@ class CredentialStore:
                             logger.warning(f"Re-encryption failed: {e}")
 
                     return data
+                except SaltUnavailableError as e:
+                    # The file is presumably fine — the key needed to read it
+                    # just isn't derivable right now. Treating that as
+                    # corruption and deleting it would turn a recoverable,
+                    # possibly-transient problem into permanent credential
+                    # loss, so leave the file exactly as it is.
+                    logger.error(
+                        f"{file_type} credential file could not be decrypted "
+                        f"because its encryption salt is unavailable ({e}). "
+                        f"Leaving the file in place rather than treating this "
+                        f"as corruption."
+                    )
                 except Exception as e:
                     logger.warning(f"{file_type} credential file could not be loaded: {type(e).__name__}: {e}")
                     logger.debug(f"Full traceback: {traceback.format_exc()}")

@@ -1666,6 +1666,14 @@ class SettingsPage(PageScrollMixin, QWidget):
             ok = set_launch_on_startup(want_startup)
             if not ok:
                 self._startup_cb.setChecked(get_launch_on_startup())
+            else:
+                # core.startup.check_and_repair_registration() (run at every
+                # launch) decides what the OS registration SHOULD be from
+                # this config key, not by re-reading the registry itself —
+                # so the user's actual choice has to land here too, or the
+                # very next launch treats this checkbox's own change as a
+                # stray/missing entry and silently reverts it.
+                config.set("launch_on_startup", want_startup)
         elif want_startup and self._start_minimized_cb.isChecked() != old_start_minimized:
             # Registration itself is unchanged, but the command it runs just
             # did (--minimized is baked in by core.startup._get_exe) — rewrite

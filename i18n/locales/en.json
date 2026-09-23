@@ -102,6 +102,7 @@
     "status_archives": "Archives (no game)",
     "status_provisional": "Provisional",
     "status_ambiguous": "Identity unconfirmed",
+    "status_review_pending": "Save needs review",
     "status_cloud_only": "Cloud only",
     "status_no_saves": "No saves found",
     "playing": "Playing",
@@ -241,7 +242,12 @@
     "save_reverted_restore": "Restore the newest",
     "restore_undone_msg": "The restore of {game} was undone right after it finished.",
     "restore_undone_hint": "A launcher may have interfered through its automatic sync. Close it first, then try again.",
-    "restore_force": "Force the restore"
+    "restore_force": "Force the restore",
+    "save_unbacked_title": "New save, not backed up",
+    "save_unbacked_msg": "{game}'s save doesn't match any backup on record.",
+    "save_unbacked_hint": "Not sure why? Restoring the last backup is the safe choice. Only back it up if you know it's genuine — played without SaveSync running, or on another PC.",
+    "save_unbacked_restore": "Restore last backup",
+    "save_unbacked_backup": "Back it up now"
   },
   "sync": {
     "title": "Sync Settings",
@@ -720,11 +726,33 @@
     "import_failed": "Failed to import the downloaded backup.",
     "title": "Restore",
     "files_failed": "{count} file(s) could not be restored (in use or write-protected).",
-    "force_restore_question": "Retry restoring only those files now?"
+    "force_restore_question": "Retry restoring only those files now?",
+    "restore_failed": "{game}: the cloud backup could not be restored. Your local save was left unchanged, even though it's marked as synced."
+  },
+  "regression_review": {
+    "title": "Backups held back",
+    "desc_regression": "One or more games' current save state exactly matches an OLDER backup instead of the newest one — something may have restored an earlier state outside SaveSync.",
+    "desc_unbacked": "One or more games' current save state doesn't match any backup on record — played without SaveSync running, or somewhere else entirely.",
+    "row_regression": "{game} — matches a backup from {when}",
+    "row_unbacked": "{game}'s save doesn't match any backup on record.",
+    "keep_regression": "Keep current",
+    "keep_regression_tip": "Back up the current state anyway, even though it matches an older backup.",
+    "keep_unbacked": "Back it up now",
+    "keep_unbacked_tip": "Back up this save to protect it.",
+    "restore_regression": "Restore the newest",
+    "restore_regression_tip": "Put the newest known-good backup back onto disk, discarding the current state.",
+    "restore_unbacked": "Restore the newest",
+    "restore_unbacked_tip": "Put the newest known-good backup back onto disk instead of this save.",
+    "kept": "Backup requested — see the status bar for the result.",
+    "restored": "Restore requested — see the status bar for the result.",
+    "action_failed": "Couldn't start — try again."
   },
   "main": {
     "auto_in_game": "auto (in-game)",
     "auto_pre_confirm": "auto (paths pending confirmation)",
+    "auto_pending_identity": "auto (unconfirmed game)",
+    "auto_pending_review": "auto (pending review)",
+    "auto_confirmed": "auto (confirmed)",
     "backup_before_download_note": "pre-download backup",
     "online": "● Online",
     "offline": "● Offline",
@@ -1094,6 +1122,7 @@
     "launch_failed": "Launch failed",
     "launching": "Launching",
     "sync_complete": "Sync complete",
+    "sync_index_unconfirmed": "Could not confirm the shared backup index — sync skipped to avoid overwriting other machines' history",
     "user_placeholder": "?",
     "launching_via_launcher": "Launching {name} via launcher…"
   },
@@ -1325,6 +1354,7 @@
     "recipes_no_better": "No safer way to read this file was found — it's still read-only.",
     "reload_warning": "{name} is running. It holds its own copy of the save in memory and will write over this file the next time it saves — load the save in the game now for the change to take.",
     "restore": "Restore",
+    "restore_confirm": "Restore {name} from {when}?\nThis overwrites the file's current content, and — unlike the automatic kept copies — this current state is not saved first.",
     "restored": "{name} was put back.",
     "search_placeholder": "Search your library…",
     "subtitle": "Pick a game to edit one of its saves.",

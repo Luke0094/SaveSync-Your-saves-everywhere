@@ -162,6 +162,17 @@ def _candidates(path: Path, data: bytes, game_dir=None, engine: str = "") -> lis
     # is not the first-tried reader's own two harmless-looking "could not
     # read it" warnings before the actually-correct reader was ever reached.
     engine_readers = tuple(registry_module.engine_preferences(eng)) if eng else ()
+    # When the extension already names WHICH of this engine's several
+    # readers applies (RPG Maker MV .rpgsave vs MZ .rmmzsave, sharing one
+    # engine key but never one file), trying the others first is not "most
+    # specific first" — it is a guaranteed-fail attempt on every single
+    # open of that extension, logged every time as a routine-looking but
+    # avoidable rejection. Move the extension-matched reader to the front;
+    # the rest of the engine's preference order still follows unchanged.
+    if ext in _BY_EXTENSION and _BY_EXTENSION[ext] in engine_readers:
+        _preferred = _BY_EXTENSION[ext]
+        engine_readers = (_preferred,) + tuple(
+            c for c in engine_readers if c is not _preferred)
     out.extend(engine_readers)
 
     if ext in _BY_EXTENSION:
@@ -1119,13 +1130,24 @@ def list_backups(path) -> list:
 def restore_backup(backup, target) -> None:
     """Put a kept copy back.
 
-    The file being replaced is NOT kept first: restoring is what someone
-    reaches for precisely because the current state is broken (a bad edit,
-    a corrupted write), so backing it up here would spend a rotation slot
-    — and risk evicting a genuinely good older copy — on the very state
-    the restore exists to get away from. The kept copy being restored FROM
-    stays in the list either way, so restoring the wrong one is still
-    reversible from that same list.
+    The file being replaced is kept first, same call and same list as
+    every other snapshot (backup_original) — restoring an OLDER copy used
+    to discard whatever the CURRENT file held with nothing to undo it: if
+    the player had edited and saved since the copy they're restoring was
+    taken, that later state was never itself captured (a kept copy is
+    taken before the NEXT write, not after this one), so it was simply
+    gone. Now it survives as its own entry in the same list this panel
+    already shows — one restore point, backup or pre-restoration, no
+    second mechanism. backup_original's own dedup means this is a no-op
+    disk-wise on a restore that changes nothing (e.g. restoring the copy
+    already matching what's on disk).
+
+    A failure here (OSError) propagates and the restore does NOT proceed
+    — same "don't spend the write until the copy of what it's about to
+    overwrite actually succeeded" rule save() follows for backup_original,
+    not a softer one just because this call site is new. Losing the
+    ability to protect the current state is not a reason to destroy it
+    anyway.
     """
     b, t = Path(backup), Path(target)
     if not b.is_file():
@@ -1136,6 +1158,7 @@ def restore_backup(backup, target) -> None:
     except OSError as e:
         raise SaveEditorError("that copy could not be read",
                               "cheats.err_copy_gone") from e
+    backup_original(t)
     # write_bytes rather than copy2: the restored file must read as a fresh
     # write. copy2 would carry the copy's old mtime across, making the restore
     # look like nothing changed to everything that keys off mtime — the

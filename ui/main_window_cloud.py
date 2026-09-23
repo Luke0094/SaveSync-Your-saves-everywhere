@@ -96,22 +96,31 @@ class CloudFlowsMixin:
         already known.
 
         Also runs when offline: hand-added orphan archives (same index shape
-        as cloud) are offered through this same notification path.
+        as cloud) are offered through this same notification path. Offline
+        or online, this is also THE place a local divergence gets caught —
+        see core.backup.BackupManager.detect_regression, called here
+        unconditionally rather than from a separate check: whether the
+        current save matches this game's own backup history is a purely
+        local question, answered the same way regardless of what the cloud
+        side finds, and folding it in here means one decision tree produces
+        one notification instead of two systems that could each fire for
+        what is really the same underlying fact.
 
-        *on_resolved*, if given, is called once the (backgrounded) network
-        check has completed — see _on_cloud_check_result(). It fires as
-        soon as the check itself resolves, not once the user has answered
-        any prompt that check may result in: a "no local backup yet, want
-        to download?" question is exactly the situation where the watcher
-        and in-game backup timer (what on_resolved starts, in
+        *on_resolved*, if given, is called once the (backgrounded) check
+        has completed — see _on_cloud_check_result(). It fires as soon as
+        the check itself resolves, not once the user has answered any
+        prompt that check may result in: a "no local backup yet, want to
+        download?" question is exactly the situation where the watcher and
+        in-game backup timer (what on_resolved starts, in
         _start_tracking_after_cloud_check) matter most, so they must not
         wait on how long the player takes to notice/answer an overlay.
 
-        The actual network round-trip (orch.check_cloud_saves) runs in a
-        background thread: it used to run directly on the GUI thread,
-        meaning a slow or unresponsive provider could stall the whole app —
-        including the overlay itself — for as long as the request took,
-        while the player was already in-game.
+        Everything here — the network round-trip AND the local regression
+        check (real file reads/hashing, not free) — runs in a background
+        thread: it used to run directly on the GUI thread, meaning a slow
+        or unresponsive provider could stall the whole app, including the
+        overlay itself, for as long as the request took, while the player
+        was already in-game.
         """
         entry = get_library().get_by_id(game_id)
         if entry is None:
@@ -124,37 +133,62 @@ class CloudFlowsMixin:
                 self._cloud_check_on_resolved[game_id] = on_resolved
 
         orch = get_orchestrator()
-        if not orch.is_online():
-            with self._cloud_check_lock:
-                self._cloud_check_results[game_id] = False
-            from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
-            try:
-                QMetaObject.invokeMethod(
-                    self, "_on_cloud_check_result", _Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, game_id),
-                )
-            except RuntimeError:
-                if on_resolved:
-                    on_resolved()
-            return
+        online = orch.is_online()
 
         import threading
         _game_id = game_id
         _exe_path = entry.exe_path
         _name = entry.name
         _cfn = entry.computed_folder_name
+        _save_paths = list(entry.save_paths or [])
+        from core.monitor import get_monitor
+        _since = get_monitor().tracked_process_start_time(game_id)
+        # The backup id SaveSync itself last restored onto this game's save
+        # folder (see _restore_after_regression / _restore_game_by_id) — if
+        # that write is still what's on disk, detect_regression must read it
+        # as the intended outcome, not a fresh regression. Without this, a
+        # restore's own pre-restore safety copy (of whatever was on disk
+        # right before the restore) becomes the newest backup by timestamp,
+        # and the very next check would find current content matching an
+        # OLDER one instead — the just-completed restore reported as a brand
+        # new regression against itself.
+        #
+        # Read from the persisted flag on the backup entry itself (see
+        # BackupManager.mark_last_restored/get_last_restored_backup_id),
+        # not the in-memory dict alone: a restore followed by quitting and
+        # reopening SaveSync before the next launch would otherwise lose
+        # the answer along with the process, and the same false regression
+        # would fire again with nothing left to explain it.
+        from core.backup import get_backup_manager as _gbm
+        _expected_backup_id = (_gbm().get_last_restored_backup_id(game_id)
+                               or self._last_restored.get(game_id, ""))
 
         def _do_check():
-            try:
-                has_cloud = orch.check_cloud_saves(
-                    _game_id, exe_path=_exe_path, game_name=_name,
-                    computed_folder_name=_cfn,
-                )
-            except Exception as e:
-                logger.debug(f"_check_cloud_on_launch: check_cloud_saves failed: {e}")
-                has_cloud = False
+            has_cloud = False
+            if online:
+                try:
+                    has_cloud = orch.check_cloud_saves(
+                        _game_id, exe_path=_exe_path, game_name=_name,
+                        computed_folder_name=_cfn,
+                    )
+                except Exception as e:
+                    logger.debug(f"_check_cloud_on_launch: check_cloud_saves failed: {e}")
+                    has_cloud = False
+            regressed_to, is_unbacked = None, False
+            if _save_paths:
+                try:
+                    from core.backup import get_backup_manager
+                    regressed_to, is_unbacked = get_backup_manager().detect_regression(
+                        _game_id, _save_paths, changes_explained_since=_since,
+                        expected_backup_id=_expected_backup_id)
+                except Exception as e:
+                    logger.debug(f"_check_cloud_on_launch: detect_regression failed: {e}")
             with self._cloud_check_lock:
-                self._cloud_check_results[_game_id] = has_cloud
+                self._cloud_check_results[_game_id] = {
+                    "has_cloud": has_cloud,
+                    "regressed_to": regressed_to,
+                    "is_unbacked": is_unbacked,
+                }
             from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
             try:
                 QMetaObject.invokeMethod(
@@ -280,12 +314,15 @@ class CloudFlowsMixin:
     @Slot(str)
     def _on_cloud_check_result(self, game_id: str):
         """GUI-thread continuation of _check_cloud_on_launch, run once the
-        (possibly slow) network check has completed in a background thread.
-        Everything below is local/cheap — no I/O — so it's safe to run
-        directly here.
+        (possibly slow) network check AND the local regression check have
+        both completed in the same background pass. Everything below is
+        local/cheap — no I/O — so it's safe to run directly here.
         """
         with self._cloud_check_lock:
-            has_cloud = self._cloud_check_results.pop(game_id, False)
+            _result = self._cloud_check_results.pop(game_id, None) or {}
+            has_cloud = bool(_result.get("has_cloud"))
+            regressed_to = _result.get("regressed_to")
+            is_unbacked = bool(_result.get("is_unbacked"))
             on_resolved = self._cloud_check_on_resolved.pop(game_id, None)
 
         # One-shot suppression: the user already answered the cloud question
@@ -321,8 +358,8 @@ class CloudFlowsMixin:
         # is what caused a visible flicker: two show_animated() calls in the
         # same synchronous pass, each cancelling and restarting the other's
         # fade-in within milliseconds.
-        # "different_machine" | "no_local" | "conflict_diverged"
-        # | "conflict_unreconciled" | "sync_prompt" | None
+        # "regression" | "unbacked" | "different_machine" | "no_local"
+        # | "conflict_diverged" | "conflict_unreconciled" | "sync_prompt" | None
         notification_kind = None
         if entry is not None and self._overlay is not None:
             from core.machine import get_machine_id
@@ -334,11 +371,27 @@ class CloudFlowsMixin:
             has_live_saves = self._entry_has_live_saves_on_disk(entry)
             _muted = entry.id in get_config().get("suppressed_cloud_no_local", [])
             show = get_config().get("show_overlay_on_cloud", True)
+            _notifs_muted = get_config().get("suppressed_ingame_notifs", {}).get(entry.id, [])
+
+            # 0) Regression (an OLDER state came back) is checked first and
+            # unconditionally — but this is a rare safety net closing a
+            # specific gap, not something that meaningfully competes with
+            # the cloud-side findings below in real usage, so giving it top
+            # priority costs nothing in practice.
+            if regressed_to is not None and "regression" not in _notifs_muted:
+                notification_kind = "regression"
 
             # 1) When user has no live saves on disk (deleted save files or empty save folder),
             #    propose restoring/downloading available backups (local, orphan, or cloud)
             #    instead of firing premature live tracking notification.
-            if not has_live_saves and (has_cloud or has_local or has_orphan) and show and not _muted:
+            # Unchanged from before local/unbacked existed: different_machine
+            # and everything below it in this tree are the common, expected
+            # findings and keep their original priority untouched. "unbacked"
+            # is deliberately NOT checked here — see the fallback after this
+            # whole tree, below.
+            if notification_kind is not None:
+                pass
+            elif not has_live_saves and (has_cloud or has_local or has_orphan) and show and not _muted:
                 notification_kind = "no_local"
             elif has_orphan and show and not _muted:
                 notification_kind = "no_local"
@@ -412,6 +465,18 @@ class CloudFlowsMixin:
                         else:
                             notification_kind = "sync_prompt"
 
+            # Fallback, checked LAST: local content matches nothing in this
+            # game's own backup history, but nothing above already found a
+            # more specific/actionable thing to say about it (different
+            # machine, an unresolved conflict, cloud has something to sync).
+            # This is what actually closes the original gap — a save that
+            # regressed or changed entirely outside SaveSync while
+            # sync_status stayed stuck at "synced" (nothing else updates it)
+            # falls through every branch above with nothing to say, which is
+            # exactly when this matters.
+            if notification_kind is None and is_unbacked and "unbacked" not in _notifs_muted:
+                notification_kind = "unbacked"
+
             logger.info(
                 f"Cloud launch check for {entry.name!r}: "
                 f"has_cloud={has_cloud}, has_orphan={has_orphan}, "
@@ -424,7 +489,26 @@ class CloudFlowsMixin:
         if on_resolved:
             on_resolved(show_toast=(notification_kind is None))
 
-        if notification_kind == "different_machine":
+        if notification_kind == "regression":
+            self._pending_cloud_notification[game_id] = "regression"
+            from core.backup import get_backup_manager
+            # Prefer the newest TRUSTED backup — a pre_confirmation entry
+            # (this game's own unresolved-warning capture, or an earlier
+            # restore's rejected safety copy) makes a misleading "restore
+            # back to" default, silently passed off as known-good when
+            # it isn't — but always offer SOMETHING when any backup
+            # exists at all: the choice is restore-or-keep, and that
+            # needs a real target on both sides. See
+            # newest_restore_target's own docstring.
+            _newest_id = get_backup_manager().newest_restore_target(game_id)
+            self._overlay.show_save_reverted(entry.name, game_id, _newest_id, False)
+        elif notification_kind == "unbacked":
+            self._pending_cloud_notification[game_id] = "unbacked"
+            from core.backup import get_backup_manager
+            _newest_id = get_backup_manager().newest_restore_target(game_id)
+            self._overlay.show_save_reverted(
+                entry.name, game_id, _newest_id, unbacked=True)
+        elif notification_kind == "different_machine":
             # Same non-blocking overlay pattern as every other cloud
             # notification — replaces a previous blocking QMessageBox tied
             # to the (often hidden, while in-game) main window, which could
@@ -446,6 +530,26 @@ class CloudFlowsMixin:
             self._overlay.show_cloud_conflict_resolve(
                 entry.name, entry.exe_path,
                 diverged=(notification_kind == "conflict_diverged"))
+        elif game_id in self._pending_cloud_notification or game_id in self._pending_regression:
+            # Nothing to show THIS launch, but a PREVIOUS one left a
+            # regression/unbacked warning the player never answered (the
+            # overlay is non-blocking — closing the game without clicking
+            # anything is the common case). Only the overlay's own action
+            # handlers ever pop these, so an unanswered one would otherwise
+            # sit there forever even once whatever raised it is long gone —
+            # and _launch_notification_pending (which both dicts feed)
+            # would then believe a warning is still pending permanently,
+            # silently disabling this game's in-game timer, reactive
+            # backup, and exit backup for the rest of the process. regressed_to
+            # here is this SAME launch's fresh, unified detect_regression
+            # result (see _check_cloud_on_launch) — the one source of truth
+            # both dicts ultimately describe — so it having come back clean
+            # is exactly the confirmation needed to call the old one stale.
+            self._pending_cloud_notification.pop(game_id, None)
+            self._pending_regression.pop(game_id, None)
+            logger.debug(
+                f"Cleared stale pending regression/unbacked warning for "
+                f"{entry.name if entry else game_id}: this launch's check came back clean")
 
 
     def _stash_local_conflict_time(self, entry) -> None:
@@ -520,7 +624,7 @@ class CloudFlowsMixin:
             since = get_monitor().tracked_process_start_time(entry.id)
             if not since:
                 import time as _time
-                since = _time.time() - bm._RECENT_LOCAL_WRITE_GRACE_S
+                since = _time.time() - bm._PID_TRACKING_LAG_S
             current = bm.current_state_hash(
                 entry.id, entry.save_paths or [],
                 changes_explained_since=since)
@@ -629,11 +733,27 @@ class CloudFlowsMixin:
                 folder = get_install_folder_name(
                     entry.exe_path or "", entry.name, entry.id,
                     entry.computed_folder_name)
-                backups = bm.get_backups_for_folder(folder)
+                lib_ids = bm.library_game_ids()
+                candidates = bm.get_backups_for_folder(folder) or []
+                # Same folder name does not mean same game: reject anything
+                # clearly owned by another live library game (see
+                # _entry_has_local_backups above) so a name collision can't
+                # restore an unrelated game's save over this one's.
+                backups = [
+                    b for b in candidates
+                    if not bm.is_orphan_entry(b)
+                    and not (b.game_id and b.game_id != entry.id and b.game_id in lib_ids)
+                ]
             except Exception as _e:
                 logger.debug(f"_restore_after_cloud_download: folder fallback failed: {_e}")
         if not backups:
             logger.warning(f"_restore_after_cloud_download: no backups found for {entry.name}")
+            from ui.modal_helpers import warning_window_modal
+            warning_window_modal(
+                self._main_window if hasattr(self, '_main_window') else None,
+                t("restore.title"),
+                t("restore.restore_failed", game=entry.name),
+            )
             return
 
         latest = max(backups, key=lambda b: b.created_dt)
@@ -693,6 +813,12 @@ class CloudFlowsMixin:
         elif not result.success:
             logger.warning(
                 f"Cloud backup restore failed for {entry.name}: {result.errors}"
+            )
+            from ui.modal_helpers import warning_window_modal
+            warning_window_modal(
+                self._main_window if hasattr(self, '_main_window') else None,
+                t("restore.title"),
+                t("restore.restore_failed", game=entry.name),
             )
 
 
@@ -895,8 +1021,30 @@ class CloudFlowsMixin:
                 exe_path=entry.exe_path, direction="down", computed_folder_name=entry.computed_folder_name,
                 name_history=list(entry.name_history)
             )
+        elif choice == "cloud":
+            # "Keep Cloud" must actually land on disk — a plain sync_game
+            # only pulls the archive into local backup history and marks
+            # the game synced; without restoring afterward the live save
+            # folder would silently keep holding the rejected local save.
+            def _on_cloud_sync_done(game_id: str, result):
+                if game_id != entry.id:
+                    return
+                try:
+                    orch.sync_finished.disconnect(_on_cloud_sync_done)
+                except RuntimeError:
+                    pass
+                if result.success:
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(300, lambda: self._restore_after_cloud_download(entry.id))
+
+            orch.sync_finished.connect(_on_cloud_sync_done)
+            orch.sync_game(
+                entry.id, entry.name, entry.save_paths,
+                exe_path=entry.exe_path, direction="down", computed_folder_name=entry.computed_folder_name,
+                name_history=list(entry.name_history)
+            )
         else:
-            direction_map = {"local": "up", "cloud": "down"}
+            direction_map = {"local": "up"}
             direction = direction_map.get(choice, "auto")
             orch.sync_game(
                 entry.id, entry.name, entry.save_paths,

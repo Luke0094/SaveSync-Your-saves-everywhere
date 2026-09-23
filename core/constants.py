@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"

@@ -328,6 +328,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._quick_restore_results: deque = deque()  # (success, game_name) from overlay
         self._restore_results: deque = deque()         # ("step1"|"step2", ...) from full restore
         self._backup_results: deque = deque()
+        # Games held back this backup run (single or Backup Tutti) by
+        # create_backup's regression/unbacked gate: game_id -> (game_name,
+        # flag) where flag is a BackupEntry (regression) or "unbacked".
+        # Drained into a RegressionReviewDialog once the run has no more
+        # backups in flight — see _finish_backup_job.
+        self._backup_regression_review: dict[str, tuple[str, object]] = {}
         self._restore_lock = _th.Lock()
         self._backup_lock = _th.Lock()
         # Adaptive backup queue (Backup Tutti + single backups share the cap).
@@ -715,7 +721,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._library_page.add_game_requested.connect(self._show_add_game)
         self._library_page.scan_folder_requested.connect(self._show_scan_folder)
         self._library_page.cheats_requested.connect(self._open_cheats_for)
-        self._library_page.backup_requested.connect(self._backup_game)
+        self._library_page.backup_requested.connect(
+            lambda gid: self._backup_game(gid, check_unbacked=True))
         self._library_page.restore_requested.connect(self._restore_game_latest)
         self._library_page.remove_requested.connect(self._remove_game)
         self._library_page.edit_requested.connect(self._edit_game)
@@ -724,6 +731,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._library_page.review_provisional_requested.connect(self._show_provisional_paths_manager)
 
         # Wire overview page signals
+        # Overview's own backup button is the "active game" one (only ever
+        # visible/wired to the game currently playing — see
+        # OverviewPage._on_backup_active) — always in-game, never held back.
         self._overview_page.backup_requested.connect(self._backup_game)
         self._overview_page.backup_all_requested.connect(self._start_backup_all)
         self._overview_page.open_library.connect(lambda: self._switch_page(1))
@@ -733,7 +743,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overview_page.refresh_all_requested.connect(self._on_refresh_all_pages)
 
         # Wire backups page signals
-        self._backups_page.backup_requested.connect(self._backup_game)
+        self._backups_page.backup_requested.connect(
+            lambda gid: self._backup_game(gid, check_unbacked=True))
         self._backups_page.sync_requested.connect(self._sync_game)
         self._backups_page.backup_then_sync_requested.connect(
             self._backup_then_sync)
@@ -1876,7 +1887,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             for gid in ids:
                 self._enqueue_backup(
                     gid, force_full=bool(bak.get("force")),
-                    silent=True, part_of_batch=True)
+                    silent=True, part_of_batch=True, check_unbacked=True)
             self._pump_backup_queue()
 
         syn = _pbj.get_job(_pbj.KEY_SYNC_ALL)
@@ -2700,6 +2711,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if action in ("restore_newest", "force_restore"):
             game_id, _, backup_id = context.partition("|")
             self._pending_regression.pop(game_id, None)   # acted on
+            self._pending_cloud_notification.pop(game_id, None)
+            # Any temporary backup notif_gated filed while this was pending
+            # (see _run_backup_job) covers exactly the state being rejected
+            # here — gone with it, same as a declined auto-scan detection's
+            # own session backups. Never auto-promoted, only ever explicitly
+            # promoted (below) or discarded (here) by the player's own
+            # choice.
+            try:
+                get_backup_manager().discard_pre_confirmation_backups(
+                    game_id, include_notif_gated=True)
+            except Exception:
+                logger.debug(
+                    f"Could not discard temporary backups for {game_id}", exc_info=True)
             self._restore_after_regression(game_id, backup_id,
                                            freeze=(action == "force_restore"))
             return
@@ -2709,6 +2733,32 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if action == "regression_ack":
             game_id, _, _bk = context.partition("|")
             self._pending_regression.pop(game_id, None)
+            self._pending_cloud_notification.pop(game_id, None)
+            return
+        # Same "game_id|backup_id" shape as the regression actions above —
+        # show_save_reverted's unbacked=True branch now offers "Restore
+        # last backup" (the restore_newest/force_restore branch above) as
+        # its primary action, with these two as dropdown alternatives, so
+        # all of them share one context shape.
+        if action == "backup_now_unbacked":
+            game_id, _, _bk = context.partition("|")
+            self._pending_cloud_notification.pop(game_id, None)
+            # The player has explicitly said this content is fine — the
+            # ONE place any temporary backup notif_gated filed while this
+            # was pending (see _run_backup_job) gets promoted to real
+            # history. Nothing does this automatically; this click is the
+            # only thing that does.
+            try:
+                get_backup_manager().promote_pre_confirmation_backups(
+                    game_id, note=t('main.auto_confirmed'), include_notif_gated=True)
+            except Exception:
+                logger.debug(
+                    f"Could not promote temporary backups for {game_id}", exc_info=True)
+            self._backup_game(game_id)
+            return
+        if action == "unbacked_ack":
+            game_id, _, _bk = context.partition("|")
+            self._pending_cloud_notification.pop(game_id, None)
             return
         # Same shape ("game_id|new_exe_path"), matched before anything that
         # would read the context as a plain executable path on its own.
@@ -3003,8 +3053,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # Remember what WE put there: landing on that exact state is
                 # the intended outcome, and must not read as a regression.
                 # Only here — the game id comes from the backup, not from the
-                # overlay context, which carries just the backup id.
+                # overlay context, which carries just the backup id. Both
+                # the in-memory dict (this session, immediate) and the
+                # persisted flag on the backup entry itself (survives an
+                # app restart — see mark_last_restored) are kept.
                 self._last_restored[bk.game_id] = backup_id
+                mgr.mark_last_restored(bk.game_id, backup_id)
                 entry = get_library().get_by_id(bk.game_id)
                 game_name = entry.name if entry else ""
             # Thread-safe append with lock
@@ -3553,7 +3607,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 entry = get_library().get_by_id(gid)
                 if not entry:
                     continue
-                if notif_type == "no_local":
+                if notif_type == "regression":
+                    from core.backup import get_backup_manager
+                    # Prefers newest TRUSTED, falls back to newest of any
+                    # kind — see newest_restore_target's own docstring.
+                    _newest_id = get_backup_manager().newest_restore_target(gid)
+                    self._overlay.show_save_reverted(entry.name, gid, _newest_id, False)
+                elif notif_type == "unbacked":
+                    from core.backup import get_backup_manager
+                    _newest_id = get_backup_manager().newest_restore_target(gid)
+                    self._overlay.show_save_reverted(
+                        entry.name, gid, _newest_id, unbacked=True)
+                elif notif_type == "no_local":
                     self._overlay.show_cloud_saves_no_local(entry.name, entry.exe_path)
                 elif notif_type == "different_machine":
                     self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path)
@@ -3810,13 +3875,29 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     # ── Save-state regression ────────────────────────────────────────────────
 
+    # Fallback leniency ONLY for the after-restore check when the game is
+    # closed (no tracked process to attribute a write to at all): the
+    # restore's own write, or the disk finishing flushing a large one, can
+    # still be settling a moment after restore_backup() returns. Distinct
+    # from BackupManager._PID_TRACKING_LAG_S, which is about a tracked
+    # process's OWN writes — there is no process here to track.
+    _POST_RESTORE_SETTLE_S = 15.0
+
     def _check_save_regression(self, game_id: str, after_restore: bool = False):
-        """Has something put an older save state back for this game?
+        """Compare the current save state against this game's backup
+        history: has something put an older state back, or is the current
+        state something this game's history has never seen at all?
 
         Runs at game launch and again just after a restore — the two moments
         a launcher's own cloud sync gets a chance to overwrite what is on
         disk. Never on a timer: the check is per-game and event-driven on
-        purpose, so a hundred games in the library cost nothing.
+        purpose, so a hundred games in the library cost nothing. Nothing
+        else runs this proactively (no startup-wide scan, no idle sweep):
+        nothing automatically creates a fresh backup for a game that isn't
+        being played, so a divergence that happens while SaveSync sits idle
+        just waits, undisturbed, for this same check to catch it the moment
+        that game is next launched — discovering it sooner would not have
+        protected anything that was not already safe in the meantime.
 
         Concurrent calls for the same game (e.g. false-positive exit then
         auto re-launch while the first scan is still on disk) coalesce: one
@@ -3845,22 +3926,41 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # or a restore that ran while the game happened to be up) — lets
         # detect_regression tell a write the game itself just made (opening
         # rewrites RPG Maker's settings file, say) apart from one that was
-        # already sitting there before this session existed. 0 when nothing
-        # is tracked (a restore with the game closed) — detect_regression
-        # falls back to its own short grace window in that case.
+        # already sitting there before this session existed. When nothing
+        # is tracked (a restore with the game closed), fall back to a short
+        # settle window here — detect_regression itself applies no fallback,
+        # a strict 0 means a strict, literal comparison.
         _since = get_monitor().tracked_process_start_time(game_id)
+        if not _since and after_restore:
+            import time as _time
+            _since = _time.time() - self._POST_RESTORE_SETTLE_S
 
         def _run():
             try:
                 mgr = get_backup_manager()
-                expected = self._last_restored.get(game_id, "")
-                older = mgr.detect_regression(game_id, list(entry.save_paths),
-                                              expected_backup_id=expected,
-                                              changes_explained_since=_since)
+                expected = (mgr.get_last_restored_backup_id(game_id)
+                           or self._last_restored.get(game_id, ""))
+                older, unbacked = mgr.detect_regression(
+                    game_id, list(entry.save_paths),
+                    expected_backup_id=expected,
+                    changes_explained_since=_since)
                 if older is not None:
-                    backups = mgr.get_backups_for_game(game_id)
-                    newest = backups[0].backup_id if backups else ""
+                    # Prefers newest TRUSTED — a restore's own pre-restore
+                    # safety copy (filed provisional when it's racing
+                    # exactly this check — see restore_backup's
+                    # safety_provisional) makes a misleading "Force the
+                    # restore" default otherwise — but falls back to
+                    # newest of any kind rather than leaving nothing to
+                    # target. See newest_restore_target.
+                    newest = mgr.newest_restore_target(game_id)
                     self.save_regression_found.emit(game_id, newest, after_restore)
+                # unbacked is intentionally ignored here — this call only
+                # ever runs with after_restore=True now (launch-time
+                # detection moved into _on_cloud_check_result, see
+                # _start_tracking_after_cloud_check), and right after a
+                # SaveSync-initiated restore is not the moment to raise
+                # "unbacked" anyway: the whole point of that check was
+                # landing on a KNOWN state.
             except Exception as e:
                 logger.debug(f"Save regression check failed for {game_id}: {e}")
             finally:
@@ -3916,9 +4016,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         def _run():
             try:
-                get_backup_manager().restore_backup(backup_id, freeze_pid=pid,
-                                                    lib_game_id=game_id)
+                mgr = get_backup_manager()
+                # Whatever this overwrites is exactly the state the player
+                # chose to restore past (a regression, or content nothing
+                # ever confirmed) — its own pre-restore safety copy is filed
+                # temporary, not real history, for the same reason nothing
+                # else about it is trusted automatically. Still a real zip,
+                # still restorable, if that turns out to be the wrong call.
+                mgr.restore_backup(backup_id, freeze_pid=pid, lib_game_id=game_id,
+                                   safety_provisional=True)
                 self._last_restored[game_id] = backup_id
+                mgr.mark_last_restored(game_id, backup_id)
             except Exception as e:
                 logger.error(f"Forced restore failed for {game_id}: {e}")
 
@@ -4584,7 +4692,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._backup_provisional_paths(game_id, silent=True)
             return
         if entry.auto_backup_enabled:
-            self._backup_game(game_id, silent=True)  # automatic — no toast spam
+            # notif_gated: while a regression/unbacked warning sits
+            # unanswered, this still writes — as a temporary/pre_confirmation
+            # backup rather than skipped outright — see _run_backup_job.
+            self._backup_game(game_id, silent=True, notif_gated=True)
 
     def _on_game_launched(self, entry: GameEntry, exe_path: str):
         """Known game started.
@@ -4671,8 +4782,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if entry is None:
             return
 
-        # Did anything put an older save state back while we weren't looking?
-        self._check_save_regression(game_id)
+        # Regression/unbacked detection at launch now happens inside
+        # _on_cloud_check_result (see _check_cloud_on_launch) — one decision
+        # tree, not this plus a separate call racing to reach the same
+        # overlay. _check_save_regression still exists and still matters,
+        # but only for its OTHER trigger: right after a SaveSync-initiated
+        # restore, catching a launcher's sync racing that restore — see its
+        # own after_restore=True call site.
 
         # Start watching save paths for this specific game now that it's running.
         # We also watch common save roots for games without configured paths so
@@ -4850,6 +4966,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         Uses the per-game auto_backup_enabled flag and backup_interval_sec.
         The first tick is deferred by the remaining interval since last backup.
+        A tick this timer fires still isn't what writes over an unresolved
+        regression/unbacked warning — _ingame_backup_tick itself skips while
+        one is pending (see _launch_notification_pending); that gate, not
+        the delay before the first tick, is what actually protects this
+        window.
         """
         if not entry:
             return
@@ -4919,6 +5040,30 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             timer.stop()
             timer.deleteLater()
 
+    def _launch_notification_pending(self, game_id: str) -> bool:
+        """True while a regression/unbacked warning for this game is still
+        unresolved — shown and re-summonable, but not yet acted on (see
+        show_save_reverted's action handlers in _on_overlay_action, which
+        pop these dicts on resolution; _restore_after_regression also does
+        for the after-restore path).
+
+        Every automatic backup trigger (the in-game timer, the reactive
+        backup_during_game path, the exit backup) checks this and, while
+        it's true, files a temporary (pre_confirmation) backup instead of
+        a real one — see create_backup's own pre_confirmation/notif_gated
+        docs. Writing a REAL backup over content the player hasn't weighed
+        in on yet would fold it into trusted history as if it were
+        ordinary new progress — the newest backup would then just BE this
+        same unverified state, so the warning's own "restore last backup"
+        action would restore it right back instead of to anything
+        actually known-good. A temporary one protects the data without
+        that risk: nothing promotes or uploads it except the player's own
+        explicit choice.
+        """
+        if game_id in self._pending_regression:
+            return True
+        return self._pending_cloud_notification.get(game_id) in ("regression", "unbacked")
+
     def _ingame_backup_tick(self, game_id: str):
         """Periodic backup tick — runs backup in a background thread to avoid GUI freeze."""
         # If game is no longer tracked as playing, cancel the timer
@@ -4956,24 +5101,50 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         _exe = entry.exe_path
         _cfn = entry.computed_folder_name
         _name_history = list(entry.name_history) if entry.name_history else []
-        _note = t('main.auto_in_game')
         # Still a mystery which entry this really is: file it temporary,
         # same as an unconfirmed auto-add — see _identity_still_ambiguous.
         _identity_alts = self._identity_still_ambiguous(game_id)
+        # An unresolved regression/unbacked warning is the OTHER existing
+        # reason a backup stays temporary (see create_backup's
+        # pre_confirmation) — reusing it here instead of skipping the tick
+        # outright means the session is never left completely unprotected
+        # while the warning sits unanswered, but nothing written during
+        # that window is trusted as real history either: excluded from
+        # cloud upload, never auto-promoted (see the action handlers in
+        # _on_overlay_action, which promote/discard explicitly on the
+        # player's own choice — nothing does either one automatically).
+        # Still subject to the SAME local rotation/retention limits as any
+        # other backup, though — an unresolved one ages out on schedule
+        # rather than piling up forever.
+        _notif_pending = self._launch_notification_pending(_game_id)
+        _pre_confirm = bool(_identity_alts) or _notif_pending
+        # A provisional entry needs its own note — the plain "auto
+        # (in-game)" text a trusted tick's backup gets doesn't say
+        # anything is pending. Identity takes priority when (rarely) both
+        # apply at once: it's the older, more fundamental mystery.
+        _note = (t('main.auto_pending_identity') if _identity_alts
+                else t('main.auto_pending_review') if _notif_pending
+                else t('main.auto_in_game'))
 
         def _do_backup():
             max_mb = get_config().get("max_backup_size_mb", 512)
-            backup, created = get_backup_manager().create_backup(
+            mgr = get_backup_manager()
+            backup, created = mgr.create_backup(
                 _game_id, _name, _paths,
                 exe_path=_exe,
                 note=_note, max_size_mb=max_mb, force=False,
                 computed_folder_name=_cfn,
                 name_history=_name_history,
                 excluded_paths=_excluded,
-                pre_confirmation=bool(_identity_alts),
+                pre_confirmation=_pre_confirm,
                 identity_alternates=_identity_alts,
                 return_status=True,
             )
+            # Its own tag, independent of _identity_alts — see
+            # mark_notif_gated's own docstring for why the two must stay
+            # distinguishable.
+            if backup and _notif_pending:
+                mgr.mark_notif_gated(backup.backup_id)
             if created:
                 from datetime import datetime, timezone as _tz
                 get_library().update_game_fields(
@@ -4981,15 +5152,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     last_backed_up=datetime.now(_tz.utc).isoformat(),
                     machine_id=get_machine_id(),
                 )
-                # Signal the GUI thread to show the in-game backup notification
-                from PySide6.QtCore import QMetaObject, Qt as _Qt
-                try:
-                    QMetaObject.invokeMethod(
-                        self, "_show_ingame_backup_notif",
-                        _Qt.ConnectionType.QueuedConnection,
-                    )
-                except RuntimeError:
-                    pass
+                # Specifically the notif-pending reason stays quiet —
+                # "Backup created" would contradict an overlay in the same
+                # session still warning this content isn't trusted. The
+                # pre-existing identity-ambiguous reason keeps its toast,
+                # unchanged.
+                if not _notif_pending:
+                    # Signal the GUI thread to show the in-game backup notification
+                    from PySide6.QtCore import QMetaObject, Qt as _Qt
+                    try:
+                        QMetaObject.invokeMethod(
+                            self, "_show_ingame_backup_notif",
+                            _Qt.ConnectionType.QueuedConnection,
+                        )
+                    except RuntimeError:
+                        pass
 
         t_backup = threading.Thread(target=_do_backup, daemon=True)
         t_backup.start()
@@ -5155,9 +5332,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # backup the hash check in create_backup will skip it silently,
         # preventing a redundant sync+notification when the game is reopened.
         config = get_config()
+        if self._launch_notification_pending(entry.id):
+            # Still writes (notif_gated=True below) rather than being
+            # skipped outright — this session's progress is never left
+            # completely unprotected — but as a temporary pre_confirmation
+            # backup, same as the reactive in-game path. _on_backup_done
+            # withholds auto_sync_after_backup for a pre_confirmation
+            # result specifically, so nothing goes up to the cloud either
+            # until the warning is answered.
+            logger.info(
+                f"Exit backup for {entry.name}: unresolved regression/"
+                f"unbacked warning, filing temporary instead of skipping")
         if config.get("backup_on_exit", True) and entry.auto_backup_enabled and entry.save_paths:
             logger.info(f"Game exited — checking for exit backup for {entry.name}")
-            self._backup_game(entry.id, force_full=False)
+            self._backup_game(entry.id, force_full=False, notif_gated=True)
         else:
             self._release_idle_documents(force_all=True)
             from ui.helpers import trim_process_memory
@@ -5405,7 +5593,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             get_library().update_game(entry)
             self._carry_rebased_save_data(entry, new_exe_path, moved)
         get_backup_manager().promote_pre_confirmation_backups(
-            entry.id, include_identity_pending=True)
+            entry.id, note=t('main.auto_confirmed'), include_identity_pending=True)
         self._recheck_cloud_after_identity_resolved(entry.id)
 
     def _apply_path_overwrite(self, entry, new_exe_path: str):
@@ -5439,7 +5627,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         which save-path branch runs next.
         """
         get_backup_manager().promote_pre_confirmation_backups(
-            entry.id, include_identity_pending=True)
+            entry.id, note=t('main.auto_confirmed'), include_identity_pending=True)
         self._recheck_cloud_after_identity_resolved(entry.id)
         entry.remove_exe_version(new_exe_path)
         old_exe = entry.exe_path
@@ -6596,7 +6784,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             t("common.cancel"), self._cancel_backup_batch, min_seconds=30)
         for gid in ids:
             self._enqueue_backup(gid, force_full=force_full, silent=True,
-                                part_of_batch=True)
+                                part_of_batch=True, check_unbacked=True)
         self._pump_backup_queue()
 
     def _cancel_backup_batch(self):
@@ -6610,7 +6798,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._backup_batch["pending_ids"] = []
 
     def _enqueue_backup(self, game_id: str, force_full: bool = False,
-                        silent: bool = False, part_of_batch: bool = False):
+                        silent: bool = False, part_of_batch: bool = False,
+                        check_unbacked: bool = False, notif_gated: bool = False):
         if not game_id:
             return
         with self._backup_lock:
@@ -6622,6 +6811,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 "force": bool(force_full),
                 "silent": bool(silent),
                 "batch": bool(part_of_batch),
+                # True only for a user-initiated backup outside an active
+                # session (manual "Backup Now", Backup Tutti) — see
+                # create_backup's check_unbacked. The in-game timer and the
+                # exit backup never set this: they ARE the thing that would
+                # have tracked new content happening, so it's never a risk
+                # there and must never be held back.
+                "check_unbacked": bool(check_unbacked),
+                # True for the reactive backup_during_game path and the exit
+                # backup — the two automatic triggers that, while a launch
+                # regression/unbacked warning sits unanswered, must still
+                # write (never skip outright) but only as a temporary
+                # pre_confirmation backup — see _run_backup_job.
+                "notif_gated": bool(notif_gated),
             })
 
     def _pump_backup_queue(self):
@@ -6695,22 +6897,62 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Read BEFORE the identity banner (_check_auto_scan_for_game, right
         # after this same exit backup) has any chance to resolve it.
         identity_alts = self._identity_still_ambiguous(game_id)
+        # The job's own check_unbacked intent (set only by manual "Backup
+        # Now" / Backup Tutti call sites) still doesn't apply while THIS
+        # game is actually being tracked right now — a manual click mid-
+        # session is not "outside the game" just because the button that
+        # started it also exists when nothing is running.
+        check_unbacked = bool(job.get("check_unbacked")) and not any(
+            g.id == game_id for g in get_monitor().currently_playing())
+        # An unresolved regression/unbacked warning is the OTHER existing
+        # reason a backup stays temporary (create_backup's pre_confirmation)
+        # — only for the two automatic call sites that opt in (notif_gated:
+        # the reactive backup_during_game path, the exit backup). Written
+        # temporary rather than skipped outright: the session is never left
+        # completely unprotected while the warning sits unanswered, but
+        # nothing written during that window is trusted as real history —
+        # excluded from cloud upload, never auto-promoted (see the action
+        # handlers in _on_overlay_action, which promote/discard explicitly
+        # on the player's own choice). Still subject to the same local
+        # rotation/retention limits as any other backup.
+        notif_pending = (bool(job.get("notif_gated"))
+                         and self._launch_notification_pending(game_id))
+        # A provisional entry with no note at all, or the same note a
+        # normal trusted backup gets, is indistinguishable from real
+        # history in every list that shows it (the Backups page, the
+        # restore picker) — both already render whatever note is here, so
+        # giving each pre_confirmation reason its own is the whole fix.
+        # Identity takes priority when (rarely) both apply at once: it's
+        # the older, more fundamental mystery — which game this even is.
+        _note = (t('main.auto_pending_identity') if identity_alts
+                else t('main.auto_pending_review') if notif_pending
+                else "")
 
         def _do_backup():
-            backup, created = get_backup_manager().create_backup(
+            mgr = get_backup_manager()
+            backup, created, regressed_to = mgr.create_backup(
                 game_id, name, save_paths,
                 exe_path=exe_path,
+                note=_note,
                 max_size_mb=max_mb,
                 force=force_full,
                 computed_folder_name=computed,
                 excluded_paths=excluded,
-                pre_confirmation=bool(identity_alts),
+                pre_confirmation=bool(identity_alts) or notif_pending,
                 identity_alternates=identity_alts,
-                return_status=True,
+                report_regression=True,
+                check_unbacked=check_unbacked,
             )
+            # Its own tag, independent of identity_alts — a game can be
+            # BOTH an identity mystery and mid regression/unbacked warning
+            # at once, and promote/discard_pre_confirmation_backups need
+            # to tell the two apart. See mark_notif_gated.
+            if backup and notif_pending:
+                mgr.mark_notif_gated(backup.backup_id)
             with self._backup_lock:
                 self._backup_results.append(
-                    (game_id, backup, silent, created, job.get("batch", False)))
+                    (game_id, backup, silent, created, job.get("batch", False),
+                     regressed_to, check_unbacked))
             from PySide6.QtCore import QMetaObject, Qt
             try:
                 QMetaObject.invokeMethod(
@@ -6743,20 +6985,33 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._backup_batch_notice.update_progress(
                 done, total, self._batch_item_name(game_id))
 
+        # An archive has no game session to be "inside" or "outside" of, so
+        # this job's own check_unbacked/force intent (set only by the
+        # single-archive-backup button and Backup Tutti) applies directly —
+        # no "currently playing" carve-out needed the way a library game's
+        # job gets. See rebackup_archive's own docstring.
+        _force = bool(job.get("force"))
+        _check_unbacked = bool(job.get("check_unbacked"))
+
         def _do_archive():
             created = False
+            regressed_to = None
             try:
-                created, detail = mgr.rebackup_archive(game_id)
+                created, detail, regressed_to = mgr.rebackup_archive(
+                    game_id, force=_force, check_unbacked=_check_unbacked,
+                    report_regression=True)
                 if not created:
                     # "unchanged" and "source unavailable" are both ordinary
-                    # outcomes for an archive, not failures of the batch.
+                    # outcomes for an archive, not failures of the batch —
+                    # so is a regression hold-back, reported separately below
+                    # rather than through this log line.
                     logger.info("Archive %s not rewritten: %s", game_id, detail)
             except Exception:
                 logger.exception("Archive backup failed for %s", game_id)
             with self._backup_lock:
                 self._backup_results.append(
                     (game_id, None, job.get("silent", True), created,
-                     job.get("batch", False)))
+                     job.get("batch", False), regressed_to, _check_unbacked))
             from PySide6.QtCore import QMetaObject, Qt
             try:
                 QMetaObject.invokeMethod(
@@ -6768,12 +7023,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         threading.Thread(target=_do_archive, daemon=True).start()
 
-    def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False):
+    def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False,
+                     check_unbacked: bool = False, notif_gated: bool = False):
         """Enqueue a single-game backup under the adaptive concurrency cap."""
         from core.concurrency import backup_max_inflight
         self._backup_max_inflight = backup_max_inflight()
         self._enqueue_backup(game_id, force_full=force_full, silent=silent,
-                             part_of_batch=False)
+                             part_of_batch=False, check_unbacked=check_unbacked,
+                             notif_gated=notif_gated)
         self._pump_backup_queue()
 
     def _finish_backup_job(self, game_id: str, batch: bool = False,
@@ -6838,6 +7095,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     self._backups_page._refresh_list()
                 except Exception:
                     pass
+                # Deferred a turn (like the sync half below): fires after
+                # this function's own final _pump_backup_queue() call, so a
+                # modal review never stalls other jobs still queued behind
+                # the concurrency cap.
+                QTimer.singleShot(0, self._maybe_show_regression_review)
                 from ui.helpers import trim_process_memory
                 QTimer.singleShot(400, trim_process_memory)
                 # The backups are on disk; now publish them. "Sync after
@@ -6854,11 +7116,33 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if not batch:
             with self._backup_lock:
                 no_more_backups = not self._backup_inflight and not self._backup_job_queue
-            if no_more_backups and not self._is_game_running():
-                self._release_idle_documents(force_all=True)
-                from ui.helpers import trim_process_memory
-                QTimer.singleShot(400, lambda: trim_process_memory(full=True))
+            if no_more_backups:
+                # Deferred a turn: fires after the _pump_backup_queue() call
+                # below, so a modal review never stalls other jobs still
+                # queued behind the concurrency cap.
+                QTimer.singleShot(0, self._maybe_show_regression_review)
+                if not self._is_game_running():
+                    self._release_idle_documents(force_all=True)
+                    from ui.helpers import trim_process_memory
+                    QTimer.singleShot(400, lambda: trim_process_memory(full=True))
         self._pump_backup_queue()
+
+    def _maybe_show_regression_review(self):
+        """End of a backup run (single or Backup Tutti): put up the review
+        panel for anything create_backup held back — same treatment either
+        way, per game_id so a game appearing in both never double-queues.
+        """
+        if not self._backup_regression_review:
+            return
+        items = []
+        for game_id, (game_name, flag) in self._backup_regression_review.items():
+            kind = "unbacked" if flag == "unbacked" else "regression"
+            older = None if kind == "unbacked" else flag
+            items.append((game_id, game_name, kind, older))
+        self._backup_regression_review = {}
+        from ui.dialogs.regression_review_dialog import RegressionReviewDialog
+        dlg = RegressionReviewDialog(items, parent=self)
+        dlg.exec()
 
     def _sync_all_after_backup(self):
         """Second half of "sync everything": the backups are current now."""
@@ -7029,12 +7313,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_backup_done(self):
         """Handle backup completion on the GUI thread."""
         batch = False
+        regressed_to = None
+        check_unbacked = False
         with self._backup_lock:
             if not self._backup_results:
                 return
             try:
                 item = self._backup_results.popleft()
-                if len(item) == 5:
+                if len(item) == 7:
+                    (game_id, backup, silent, created, batch, regressed_to,
+                     check_unbacked) = item
+                elif len(item) == 6:
+                    game_id, backup, silent, created, batch, regressed_to = item
+                elif len(item) == 5:
                     game_id, backup, silent, created, batch = item
                 else:
                     game_id, backup, silent, created = item
@@ -7047,10 +7338,45 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # notice AND the sync that follows a backup — was skipped,
                 # which is why backing one up by hand said nothing and sent
                 # nothing anywhere. Its own ending, same two rules.
+                if regressed_to is not None and check_unbacked:
+                    # Same review panel a library game's held-back backup
+                    # gets (see the branch below) — an archive has no
+                    # card badge or launch-time check to ever catch this
+                    # otherwise, so the outside-game review panel is the
+                    # ONLY place this ever surfaces for one. See
+                    # rebackup_archive's own check_unbacked/report_regression.
+                    name = get_backup_manager().archive_display_name(game_id) or game_id
+                    self._backup_regression_review[game_id] = (name, regressed_to)
                 self._archive_backup_finished(
-                    game_id, created=bool(created), silent=silent, batch=batch)
+                    game_id, created=bool(created), silent=silent, batch=batch,
+                    held_back=(regressed_to is not None))
                 return
-            if backup:
+            if regressed_to is not None:
+                # Held back by create_backup's regression/unbacked gate —
+                # NOT a normal dedup skip (that's backup truthy + created
+                # False + regressed_to None, handled below). Nothing was
+                # written, so there is nothing to announce or sync. The
+                # watcher's own pending-files bookkeeping still needs
+                # clearing, or this same held-back state re-triggers the
+                # backup flow on every tick while it waits.
+                try:
+                    from core.watcher import mark_game_files_backed_up
+                    mark_game_files_backed_up(game_id)
+                except Exception:
+                    pass
+                # Only a user-initiated "outside the game" job (manual
+                # Backup Now, Backup Tutti — check_unbacked was True for it)
+                # ever puts this in front of the player. The exit backup and
+                # the in-game timer can land here too for the regression
+                # half of the gate (that hold-back is unconditional), but
+                # popping a modal over a game that just launched or is still
+                # running elsewhere would be exactly the kind of surprise
+                # the launch-time notifications go through a priority queue
+                # to avoid — this path has no such queue, so it stays silent
+                # for them instead (logged in create_backup already).
+                if check_unbacked:
+                    self._backup_regression_review[game_id] = (entry.name, regressed_to)
+            elif backup:
 
                 # `created` (from create_backup's return_status) says precisely
                 # whether this was a genuinely new backup or a dedup-skip that
@@ -7080,12 +7406,28 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         machine_id=get_machine_id(),
                     )
 
+                    # Any pre_confirmation backup (identity-ambiguous OR
+                    # notif_gated's temporary one — see _run_backup_job):
+                    # "created" but not trusted, so it must not go up to
+                    # the cloud either — sync/base.py already excludes it
+                    # from what a sync uploads, but skipping the sync CALL
+                    # itself here avoids a network round trip for something
+                    # that has nothing new to actually publish.
+                    _bmeta = (backup.cloud_metadata or {}) if backup else {}
+                    _is_provisional = bool(_bmeta.get("pre_confirmation"))
+                    # Narrower, for the toast only: specifically the
+                    # notif_gated reason. The pre-existing identity-
+                    # ambiguous case keeps its normal "created" toast,
+                    # unchanged — only a still-pending regression/unbacked
+                    # warning makes announcing "backed up" a contradiction.
+                    _notif_provisional = _is_provisional and not _bmeta.get("identity_pending")
+
                     config = get_config()
                     # Not per game inside a sweep: twenty-one syncs racing
                     # twenty-one backups freezes the UI the way toast spam
                     # did. The sweep syncs ONCE when it finishes — see
                     # _finish_backup_job — so the setting is still honoured.
-                    if (not batch
+                    if (not batch and not _is_provisional
                             and config.get("auto_sync_after_backup", False)
                             and entry.save_paths):
                         # Not while THIS game is still the one playing: the
@@ -7119,8 +7461,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                                 computed_folder_name=entry.computed_folder_name,
                                 name_history=list(entry.name_history))
 
-                    if silent or batch:
-                        logger.info(f"Auto-backup created silently for {entry.name}")
+                    if silent or batch or _notif_provisional:
+                        # A notif_gated provisional write stays quiet even
+                        # when the caller (e.g. the exit backup) didn't ask
+                        # for silent=True — telling the player "backed up"
+                        # in the same breath the overlay is still warning
+                        # that this content isn't trusted would contradict
+                        # it.
+                        logger.info(
+                            f"{'Temporary' if _notif_provisional else 'Auto'}-backup "
+                            f"created silently for {entry.name}")
                     elif config.get("show_overlay_on_backup", True):
                         self._status_bar.showMessage(
                             t("notifications.backup_created", game=entry.name), 5000)
@@ -7131,12 +7481,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                             f"Backup created for {entry.name} (notifications disabled)")
                 else:
                     # Dedup skip — content unchanged since the previous backup.
+                    # That previous backup can itself be the temporary one
+                    # notif_gated filed (a later tick landing on the same,
+                    # still-unresolved, still-unverified content) — the same
+                    # "don't publish it" rule applies here as in the
+                    # created branch above.
+                    _bmeta = (backup.cloud_metadata or {}) if backup else {}
+                    _is_provisional = bool(_bmeta.get("pre_confirmation"))
+                    # Narrower, for the toast only — see the created branch.
+                    _notif_provisional = _is_provisional and not _bmeta.get("identity_pending")
                     config = get_config()
                     _needs_reconcile = (
                         entry.sync_status == "pending"
                         or getattr(entry, "pending_local_wins", False)
                     )
-                    if (not batch
+                    if (not batch and not _is_provisional
                             and _needs_reconcile
                             and config.get("auto_sync_after_backup", False)
                             and entry.save_paths):
@@ -7150,7 +7509,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                                 exe_path=entry.exe_path,
                                 computed_folder_name=entry.computed_folder_name,
                                 name_history=list(entry.name_history))
-                    if not silent and not batch:
+                    if not silent and not batch and not _notif_provisional:
+                        # Same reasoning as the created branch above: quiet
+                        # for a notif_gated provisional dedup-skip too, not
+                        # just a provisional create — either way it's
+                        # reassurance about content the same session's own
+                        # overlay is still calling unverified. The pre-
+                        # existing identity-ambiguous case keeps its normal
+                        # toast, unchanged.
                         msg = t("notifications.backup_unchanged", game=entry.name)
                         self._status_bar.showMessage(msg, 4000)
                         if self._overlay:
@@ -7165,12 +7531,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._finish_backup_job(game_id, batch=batch, created=bool(created))
 
     def _archive_backup_finished(self, game_id: str, created: bool,
-                                 silent: bool, batch: bool):
+                                 silent: bool, batch: bool,
+                                 held_back: bool = False):
         """The end of a backup of an archive: say so, then send it up.
 
         The same two rules a library game gets — announce unless silenced,
         and sync afterwards when that setting is on — applied to the one
         kind of backup that had neither.
+
+        held_back: create_backup's regression/unbacked gate held this one
+        back rather than nothing genuinely being different (see
+        _on_backup_done's ARCHIVE branch) — "unchanged" would be actively
+        wrong to say here, not just unhelpful: the review panel the caller
+        already queued this into is about to open, saying so right
+        underneath it would flatly contradict it. Same reasoning as
+        _notif_provisional on the library-game side.
         """
         mgr = get_backup_manager()
         name = mgr.archive_display_name(game_id)
@@ -7183,7 +7558,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     t("notifications.backup_created", game=name), 5000)
                 if self._overlay:
                     self._overlay.show_backup_done(name)
-            elif not created:
+            elif not created and not held_back:
                 self._status_bar.showMessage(
                     t("notifications.backup_unchanged", game=name), 4000)
                 if self._overlay:
@@ -7245,9 +7620,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return None
         return by_action.get(chosen)
 
-    def _restore_game_by_id(self, game_id: str, backup_id: str, confirmed: bool = False):
+    def _restore_game_by_id(self, game_id: str, backup_id: str, confirmed: bool = False,
+                            safety_provisional: bool = False):
         """Restore backup_id for game_id.  If confirmed=False, ask the user first.
-        For orphan backups (no game in library), prompts user with custom file picker."""
+        For orphan backups (no game in library), prompts user with custom file picker.
+
+        safety_provisional: forwarded to restore_backup — True only from the
+        regression review panel, where what's being overwritten is itself
+        an unverified/regressed state (see restore_backup's own docstring).
+        False (the default) for every ordinary restore this also serves —
+        the Backups page, RestoreDialog, the quick-restore hotkey."""
         lib_entry = get_library().get_by_id(game_id)
         bk = get_backup_manager().get_backup(backup_id)
         target_dir = ""
@@ -7320,11 +7702,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         import threading
 
         def _do_restore():
-            result = get_backup_manager().restore_backup(
-                backup_id, target_dir=target_dir, only_roots=only_roots)
+            mgr = get_backup_manager()
+            result = mgr.restore_backup(
+                backup_id, target_dir=target_dir, only_roots=only_roots,
+                safety_provisional=safety_provisional)
             # Remember what WE put there: landing on that exact state is
-            # the intended outcome, and must not read as a regression.
+            # the intended outcome, and must not read as a regression. Both
+            # the in-memory dict (this session) and the persisted flag on
+            # the backup entry itself (survives an app restart) are kept.
             self._last_restored[game_id] = backup_id
+            mgr.mark_last_restored(game_id, backup_id)
             with self._restore_lock:
                 self._restore_results.append(("step1", game_id, backup_id, result, target_dir))
             from PySide6.QtCore import QMetaObject, Qt

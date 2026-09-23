@@ -1062,7 +1062,46 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self.on_page_enter()
 
     def on_page_enter(self):
-        """First visit fills the pick list; later visits keep the last step."""
+        """First visit fills the pick list; later visits keep the last step
+        — except a loaded document is re-validated against disk here first.
+
+        The file behind it can change from OUTSIDE this page entirely (the
+        Backups page restoring the whole save folder, cloud sync pulling a
+        different version, the game's own autosave, or this page's OWN hold
+        loop having been quietly re-applying values the whole time — see
+        SaveHold) while this tab was not the active one, and nothing else
+        on this page would ever notice: _open_editor's own staleness check
+        only runs when a file is explicitly clicked again, not when this
+        tab simply regains focus — so returning to a save already open in
+        STEP_EDIT could otherwise go on showing values from before whatever
+        changed it, indefinitely.
+
+        Refreshed IN PLACE (via _open_editor on the same path) rather than
+        dropped back to the save list — a stale view is still wrong, but
+        losing your place every time you glance at another tab is its own
+        kind of broken. _open_editor always clears _held/_hold_armed for
+        what is, from its own point of view, an ordinary re-open; those are
+        restored right after so a lock already armed before you left keeps
+        being shown as held, and _hold_watch resumes checking on its own
+        usual schedule (see _watch_hold_game) instead of silently going
+        quiet until the next manual Apply.
+        """
+        if (self._doc is not None and self._loaded_path is not None
+                and self._stack.currentIndex() == self.STEP_EDIT):
+            try:
+                mtime = self._loaded_path.stat().st_mtime_ns
+            except OSError:
+                mtime = 0
+            if mtime != self._loaded_mtime:
+                path = self._loaded_path
+                held_snapshot = dict(self._held)
+                armed_snapshot = self._hold_armed
+                self._open_editor(path)
+                self._held = held_snapshot
+                self._hold_armed = armed_snapshot
+                if self._held and self._hold_armed:
+                    self._hold_watch.start()
+                return
         if self._entry is not None or self._stack.currentIndex() != self.STEP_PICK:
             return
         QTimer.singleShot(0, self._enter_after_paint)
@@ -1344,7 +1383,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                     row.setToolTip(str(copy))
                     row.add_button(
                         t("cheats.restore"),
-                        lambda _=False, c=copy, tg=target: self._restore(c, tg))
+                        lambda _=False, c=copy, tg=target, w=when: self._restore(c, tg, w))
                     row.add_icon_button(
                         "🗑", t("cheats.delete_kept"),
                         lambda _=False, c=copy, w=when: self._delete_kept(c, w))
@@ -1361,7 +1400,17 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._file_page = index if index >= 0 else 1 << 30
         self._render_saves_page()
 
-    def _restore(self, copy: Path, target: Path):
+    def _restore(self, copy: Path, target: Path, when=None):
+        from PySide6.QtWidgets import QMessageBox
+        from ui.modal_helpers import question_window_modal
+        when_str = when.strftime("%d/%m/%Y %H:%M") if when else copy.name
+        reply = question_window_modal(
+            self, t("cheats.title"),
+            t("cheats.restore_confirm", name=target.name, when=when_str),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         try:
             restore_backup(copy, target)
         except SaveEditorError as e:
@@ -1995,6 +2044,24 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _render_page(self):
         self._clear(self._fields_col)
         self._editors = {}
+        # Cancels any row-insertion job still in flight from a PREVIOUS
+        # render — _begin_async_rows below does this too, but only once
+        # this function actually reaches it. The early return just below
+        # skips that, and without cancelling here first, an old job's
+        # remaining chunks keep landing (via their own queued QTimer ticks)
+        # in the column that was just cleared, resurfacing rows a moment
+        # after a later, real render already drew the current ones —
+        # visible as fields duplicated in the list.
+        self._cancel_row_insert()
+        if self._doc is None:
+            # Reachable mid-reload: _open_editor's own reset clears _doc
+            # before the fresh document is back, but along the way it also
+            # clears widgets (e.g. the field filter) whose signals are
+            # still connected to this same render path — a filter box that
+            # had text in it fires textChanged on .clear(), landing here
+            # with nothing loaded yet. Nothing to show until the load
+            # finishes and calls this again.
+            return
         fields = self._visible_fields()
         self._prefix = self._row_prefix()      # once, not once per row
         pages = max(1, (len(fields) + _PAGE_SIZE - 1) // _PAGE_SIZE)
@@ -2107,13 +2174,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _remember(self, path, value):
         self._pending[path] = value
         self._reset_idle_save_timer()
-        # A held value follows what you type: changing it while it is held
-        # means "hold THIS instead", not "hold the old one and show a lie".
+        # A held field's target tracks what you type, so Apply picks up the
+        # latest value rather than whatever was held before — but this is
+        # bookkeeping only. It is NOT pushed into a currently-running hold:
+        # nothing this page does should reach the file before Apply says so.
         label = next((f.label for f in self._doc.fields if f.path == path), "")
         if label in self._held:
             self._held[label] = value
-            if self._hold is not None:
-                self._hold.set_values(self._held)
 
     def _apply_field_filter(self, _text: str):
         self._page = 0
@@ -2206,12 +2273,16 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._held.pop(field.label, None)
             if btn is not None:
                 btn.setText("🔓")
+            # Unlocking the LAST field stops the loop outright rather than
+            # leaving it running against nothing — that is a safety stop,
+            # not a new enforcement, so it does not wait on Apply. Unlocking
+            # one of SEVERAL held fields is left running unchanged (still
+            # enforcing whatever the last Apply set) until Apply says so —
+            # same rule as a value edit: nothing reaches the file early.
             if not self._held:
                 self._hold_armed = False
                 self._stop_hold()
                 self._hold_watch.stop()
-            elif self._hold is not None and self._hold.is_running():
-                self._hold.set_values(self._held)
         self._sync_hold_label()
 
     def _start_hold(self):

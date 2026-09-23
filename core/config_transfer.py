@@ -879,7 +879,20 @@ _INTERNAL_KEY = "SaveSync_ConfigTransfer_v2"
 
 def _derive_transfer_key() -> bytes:
     """Derive the AES-256 key for config transfer from the internal fixed
-    key (the v1 passphrase-based scheme is gone)."""
+    key (the v1 passphrase-based scheme is gone).
+
+    This key is the same in every install — anyone reading this source can
+    derive it too, so it is honest obfuscation for settings/library content
+    (which embeds filesystem paths, e.g. the Windows username), NOT a
+    confidentiality boundary. It is not a leak for the OAuth credentials a
+    payload may carry, though: those are wrapped a second time, separately,
+    under a per-machine key derived from machine_id + the OS-protected
+    installation salt (see core.credentials.export_credentials /
+    _export_key) — decrypting THIS layer only yields that still-encrypted
+    blob, not usable tokens. Making this outer layer itself un-derivable
+    would need a user-supplied passphrase, which the export format
+    deliberately dropped for cross-machine, no-prompt portability.
+    """
     return hashlib.sha256(
         _INTERNAL_KEY.encode()
     ).digest()

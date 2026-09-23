@@ -102,6 +102,7 @@
     "status_archives": "Archivi (senza gioco)",
     "status_provisional": "Provvisorio",
     "status_ambiguous": "Identità da confermare",
+    "status_review_pending": "Salvataggio da rivedere",
     "status_cloud_only": "Solo cloud",
     "status_no_saves": "Nessun salvataggio trovato",
     "playing": "In esecuzione",
@@ -241,7 +242,12 @@
     "save_reverted_restore": "Ripristina il più recente",
     "restore_undone_msg": "Il ripristino di {game} è stato annullato subito dopo essere terminato.",
     "restore_undone_hint": "Un launcher potrebbe aver interferito tramite la sincronizzazione automatica. Chiudi prima l'applicazione, poi riprova.",
-    "restore_force": "Forza il ripristino"
+    "restore_force": "Forza il ripristino",
+    "save_unbacked_title": "Nuovo salvataggio, non salvato",
+    "save_unbacked_msg": "Il salvataggio di {game} non corrisponde a nessun backup registrato.",
+    "save_unbacked_hint": "Non sai perché? Ripristinare l'ultimo backup è la scelta sicura. Fai il backup solo se sai che è genuino — giocato senza SaveSync avviato, o su un altro PC.",
+    "save_unbacked_restore": "Ripristina l'ultimo backup",
+    "save_unbacked_backup": "Fai backup ora"
   },
   "sync": {
     "title": "Impostazioni Sincronizzazione",
@@ -720,11 +726,33 @@
     "import_failed": "Impossibile importare il backup scaricato.",
     "title": "Ripristino",
     "files_failed": "{count} file non sono stati ripristinati (in uso o protetti da scrittura).",
-    "force_restore_question": "Riprovare ora a ripristinare solo quei file?"
+    "force_restore_question": "Riprovare ora a ripristinare solo quei file?",
+    "restore_failed": "{game}: impossibile ripristinare il backup dal cloud. Il salvataggio locale non è stato modificato, anche se risulta sincronizzato."
+  },
+  "regression_review": {
+    "title": "Backup trattenuti",
+    "desc_regression": "Il salvataggio attuale di uno o più giochi corrisponde esattamente a un backup PIÙ VECCHIO invece che al più recente — qualcosa potrebbe aver ripristinato uno stato precedente al di fuori di SaveSync.",
+    "desc_unbacked": "Il salvataggio attuale di uno o più giochi non corrisponde a nessun backup registrato — giocato senza SaveSync avviato, o su un altro PC.",
+    "row_regression": "{game} — corrisponde a un backup del {when}",
+    "row_unbacked": "Il salvataggio di {game} non corrisponde a nessun backup registrato.",
+    "keep_regression": "Mantieni attuale",
+    "keep_regression_tip": "Esegui comunque il backup dello stato attuale, anche se corrisponde a un backup più vecchio.",
+    "keep_unbacked": "Fai backup ora",
+    "keep_unbacked_tip": "Fai il backup di questo salvataggio per proteggerlo.",
+    "restore_regression": "Ripristina il più recente",
+    "restore_regression_tip": "Riporta su disco il backup più recente conosciuto come valido, scartando lo stato attuale.",
+    "restore_unbacked": "Ripristina il più recente",
+    "restore_unbacked_tip": "Riporta su disco il backup più recente conosciuto come valido invece di questo salvataggio.",
+    "kept": "Backup richiesto — controlla la barra di stato per l'esito.",
+    "restored": "Ripristino richiesto — controlla la barra di stato per l'esito.",
+    "action_failed": "Impossibile avviare — riprova."
   },
   "main": {
     "auto_in_game": "auto (in-game)",
     "auto_pre_confirm": "auto (percorsi da confermare)",
+    "auto_pending_identity": "auto (gioco da confermare)",
+    "auto_pending_review": "auto (in revisione)",
+    "auto_confirmed": "auto (confermato)",
     "backup_before_download_note": "backup pre-download",
     "online": "● Online",
     "offline": "● Offline",
@@ -1094,6 +1122,7 @@
     "launch_failed": "Avvio fallito",
     "launching": "Avvio in corso",
     "sync_complete": "Sincronizzazione completata",
+    "sync_index_unconfirmed": "Impossibile confermare l'indice condiviso dei backup — sincronizzazione saltata per non sovrascrivere la cronologia di altri dispositivi",
     "user_placeholder": "?",
     "launching_via_launcher": "Avvio di {name} tramite launcher…"
   },
@@ -1325,6 +1354,7 @@
     "recipes_no_better": "Non è stato trovato un modo più sicuro di leggere questo file — resta in sola lettura.",
     "reload_warning": "{name} è in esecuzione. Tiene in memoria la propria copia del salvataggio e riscriverà questo file al prossimo salvataggio: ricarica ora il salvataggio nel gioco perché la modifica abbia effetto.",
     "restore": "Ripristina",
+    "restore_confirm": "Ripristinare {name} dalla copia del {when}?\nQuesto sovrascrive il contenuto attuale del file e, a differenza delle copie automatiche mantenute, lo stato attuale non viene salvato prima.",
     "restored": "{name} è stato ripristinato.",
     "search_placeholder": "Cerca nella libreria…",
     "subtitle": "Scegli un gioco per modificarne un salvataggio.",

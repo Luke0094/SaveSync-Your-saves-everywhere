@@ -77,6 +77,20 @@ class P2pError(Exception):
     pass
 
 
+def _safe_filename(name: str, fallback: str = "save.zip") -> str:
+    """Strip any path components from a peer-supplied filename.
+
+    *name* arrives verbatim from the other side's DHT-delivered offer —
+    nothing stops a malicious or buggy peer from sending something like
+    "../../../../secrets.dat". Keeping only the basename means finalize()'s
+    transfer_dir / filename can never resolve outside transfer_dir.
+    """
+    base = Path(str(name or "")).name
+    if not base or base in (".", ".."):
+        return fallback
+    return base
+
+
 def _require_libtorrent():
     try:
         import libtorrent as lt
@@ -197,7 +211,7 @@ class ReceiveSession:
                 data = json.loads(item.decode("utf-8"))
                 self.offer = TransferOffer(
                     magnet=str(data["magnet"]),
-                    filename=str(data.get("filename") or "save.zip"),
+                    filename=_safe_filename(data.get("filename")),
                     size=int(data.get("size") or 0),
                     game_name=str(data.get("game_name") or ""),
                     sender_username=str(data.get("sender_username") or ""),
@@ -241,7 +255,12 @@ class ReceiveSession:
                     backup_entry = manifest["backup_entry"]
             except Exception:
                 logger.debug("P2P receive: manifest did not parse", exc_info=True)
-        return backup_entry, transfer_dir / self.offer.filename
+        save_path = transfer_dir / _safe_filename(self.offer.filename)
+        try:
+            save_path.resolve().relative_to(transfer_dir.resolve())
+        except ValueError:
+            raise P2pError("received filename escaped the transfer directory")
+        return backup_entry, save_path
 
     def progress(self) -> Optional[dict]:
         """None before accept(); a dict of live download stats after."""

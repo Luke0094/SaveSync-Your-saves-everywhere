@@ -48,7 +48,7 @@ def library_card_size(host=None) -> tuple[int, int]:
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".ico", ".avif"}
 
-STATUS_ICONS  = {"synced":"✓","pending":"⟳","conflict":"⚠","local_only":"💾","cloud_only":"☁","no_saves":"—","provisional":"◌","ambiguous":"❔","playing":"▶"}
+STATUS_ICONS  = {"synced":"✓","pending":"⟳","conflict":"⚠","local_only":"💾","cloud_only":"☁","no_saves":"—","provisional":"◌","ambiguous":"❔","review_pending":"🔍","playing":"▶"}
 
 # Each sort criterion's own "natural" direction — what its underlying
 # comparison already produces before any user-chosen reversal. Newest/most
@@ -62,6 +62,12 @@ _STATUS_PALETTE_KEY = {
     # Same family as "provisional" — restorable, held back from cloud
     # upload — but for a different reason (see _display_sync_status).
     "ambiguous": "warning",
+    # Same family too — a regression/unbacked warning was pending when
+    # SOME of this game's recent backups were captured, so they're sitting
+    # there unverified (see BackupManager.has_notif_gated_backups). Same
+    # "warning" color as ambiguous: both need the player to actually look,
+    # not just a quieter "provisional" note.
+    "review_pending": "warning",
     # Not a sync state: it REPLACES one for as long as a game is running.
     # See _display_sync_status.
     "playing": "accent",
@@ -91,6 +97,16 @@ def _display_sync_status(entry, playing: bool = False) -> str:
     BackupManager.has_identity_pending_backups), which matters more than
     whatever sync_status the auto-picked entry happens to carry.
 
+    "review_pending" wins next, for a game WITH confirmed save_paths — a
+    regression/unbacked warning was pending when at least one of its
+    recent backups was captured (see
+    BackupManager.has_notif_gated_backups), so something in its history
+    is still unverified. Read from the backup entries themselves, not the
+    live overlay's own in-memory pending state, so this keeps showing
+    even for a game the player never relaunched to actually see the
+    warning — that in-memory state answers "is a prompt on screen right
+    now", not "is there something here worth looking at."
+
     Otherwise identical to entry.sync_status/"local_only" whenever the
     game has confirmed save_paths. When it doesn't, "no_saves" is
     upgraded to "provisional" if live tracking has already produced at
@@ -103,11 +119,17 @@ def _display_sync_status(entry, playing: bool = False) -> str:
         return "playing"
     try:
         from core.backup import get_backup_manager
-        if get_backup_manager().has_identity_pending_backups(entry.id):
+        bm = get_backup_manager()
+        if bm.has_identity_pending_backups(entry.id):
             return "ambiguous"
     except Exception:
-        pass
+        bm = None
     if entry.save_paths:
+        try:
+            if bm is not None and bm.has_notif_gated_backups(entry.id):
+                return "review_pending"
+        except Exception:
+            pass
         return entry.sync_status or "local_only"
     try:
         from core.backup import get_backup_manager
