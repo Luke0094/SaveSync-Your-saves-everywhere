@@ -91,6 +91,22 @@ _SYSTEM_STEMS: frozenset[str] = _NEVER_A_GAME_PROCESS_STEMS | frozenset({
 _MIN_EXE_BYTES = 64 * 1024    # < 64 KB → almost certainly not a game
 _MIN_RUNTIME_SECONDS = 6    # Process must run at least 6 seconds to be considered a game (avoid borderline 10s cases)
 
+
+def _runtime_check_delay_ms(pid: int) -> int:
+    """How long until *pid* has been up _MIN_RUNTIME_SECONDS.
+
+    The poll is often seconds apart (up to 12 s when nothing is running), so a
+    process is usually already well into its first seconds when it is first
+    seen. Waiting a full threshold from THAT moment made every launch
+    notification late by exactly the lag it had already spent: seen after 9 s,
+    announced after 15+. Waiting only for what is left announces it as soon as
+    it has run long enough."""
+    try:
+        up = time.time() - psutil.Process(pid).create_time()
+    except Exception:
+        up = 0.0
+    return int(max(0.3, _MIN_RUNTIME_SECONDS - up + 0.3) * 1000)
+
 # How long a candidate exe that didn't pan out (see _candidate_last_seen)
 # stays exempt from getting ANOTHER confirmation timer scheduled for it.
 # A few minutes: comfortably longer than the handful of seconds a rapidly
@@ -1216,7 +1232,7 @@ class ProcessMonitor(QObject):
             if fresh is not None:
                 self._prompt_unverified_match(fresh, name, key)
 
-        QTimer.singleShot(_MIN_RUNTIME_SECONDS * 1000, _check)
+        QTimer.singleShot(_runtime_check_delay_ms(key[0]), _check)
 
     def confirm_unverified_match(self, proc_name: str, game_id: str, accept: bool):
         """Record the user's answer to an unverified-match prompt.
@@ -1591,8 +1607,8 @@ class ProcessMonitor(QObject):
                         pass
 
                 # Schedule runtime check
-                QTimer.singleShot(_MIN_RUNTIME_SECONDS * 1000, check_known_game_runtime)
-                logger.info(f"Known game detected, waiting {_MIN_RUNTIME_SECONDS}s: {entry.name} (pid={key[0]})")
+                QTimer.singleShot(_runtime_check_delay_ms(key[0]), check_known_game_runtime)
+                logger.info(f"Known game detected, waiting for {_MIN_RUNTIME_SECONDS}s of runtime: {entry.name} (pid={key[0]})")
             else:
                 # Unknown process - check if it could be a game
                 if self._is_plausible_game(exe):
@@ -1647,7 +1663,7 @@ class ProcessMonitor(QObject):
                     # "is this a game" hasn't changed since the last spawn,
                     # so there is nothing new for another timer to learn.
                     if not self._candidate_on_cooldown(exe):
-                        QTimer.singleShot((_MIN_RUNTIME_SECONDS + 2) * 1000, check_runtime)
+                        QTimer.singleShot(_runtime_check_delay_ms(key[0]), check_runtime)
                 else:
                     # Not a plausible game, track as None but don't show popup
                     with self._data_lock:

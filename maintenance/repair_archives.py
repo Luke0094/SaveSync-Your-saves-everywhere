@@ -23,7 +23,7 @@ What it looks for, in the order the damage happened:
 
 Usage:
     python maintenance/repair_archives.py                  # diagnose everything
-    python maintenance/repair_archives.py --game TomieWGM  # one archive
+    python maintenance/repair_archives.py --game "Example Game"  # one archive
     python maintenance/repair_archives.py --apply --fix injected-source,lost-chain
     python maintenance/repair_archives.py --apply --fix empty-folder
 """

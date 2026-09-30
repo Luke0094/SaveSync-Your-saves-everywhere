@@ -148,6 +148,30 @@ def _steam_user_reviews(appid: str) -> dict:
     }
 
 
+def _supported_languages(app_data: dict) -> list[str]:
+    """The store page's language list. Steam sends it as one HTML string —
+    "English<strong>*</strong>, French, Spanish - Spain<br><strong>*</strong>
+    languages with full audio support" — the footnote after the <br> is not
+    a language."""
+    raw = app_data.get("supported_languages") or ""
+    if not isinstance(raw, str):
+        return []
+    raw = raw.split("<br", 1)[0]
+    return [p for p in re.split(r"\s*,\s*", raw) if p.strip()]
+
+
+def _screenshots(app_data: dict) -> list:
+    """The store page's screenshots, as ``(thumbnail, full size)`` pairs."""
+    out = []
+    for shot in app_data.get("screenshots") or []:
+        if not isinstance(shot, dict):
+            continue
+        full = shot.get("path_full") or ""
+        if full:
+            out.append((shot.get("path_thumbnail") or full, full))
+    return out
+
+
 def _review_fields(app_data: dict, appid: str) -> dict:
     """Prefer Steam user reviews; fall back to Metacritic when present."""
     steam = _steam_user_reviews(str(appid))
@@ -190,6 +214,8 @@ def search_steam(game_name: str, appid: Optional[str] = None,
                 publisher=app_data.get("publishers", [""])[0] if app_data.get("publishers") else "",
                 store_url=f"https://store.steampowered.com/app/{appid}/",
                 source="steam",
+                languages=_supported_languages(app_data),
+                screenshots=_screenshots(app_data),
                 # The title as Steam writes it, kept whenever it is not what
                 # is shown: it holds the game's other name, and that is what
                 # a search written in that name has to match against.

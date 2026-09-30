@@ -28,7 +28,7 @@ from ui.helpers import (ElidedCheckBox, apply_adaptive_dialog_size,
                         open_in_file_manager, restore_dialog_geometry,
                         save_dialog_geometry, scaled, scaled_for_screen,
                         thumbnail_pixmap, viewer_pixmap)
-from ui.modal_helpers import question_window_modal
+from ui.modal_helpers import question_window_modal, warning_window_modal
 from ui.styles.theme import palette
 from core.library import GameEntry, get_library
 from core.machine import get_machine_id
@@ -264,6 +264,7 @@ class _ExeVersionMenuRow(QWidget):
     never trigger each other."""
     apply_requested = Signal()
     delete_requested = Signal()
+    split_requested = Signal()
 
     def __init__(self, version: str, path: str, is_primary: bool, parent=None):
         super().__init__(parent)
@@ -307,6 +308,22 @@ class _ExeVersionMenuRow(QWidget):
             row.addWidget(self._check)
         else:
             from PySide6.QtWidgets import QToolButton
+            # 🔀 before the trash: this version was added by mistake and is
+            # really another game — split it off instead of deleting it.
+            split = QToolButton()
+            split.setText("🔀")
+            split.setAutoRaise(True)
+            split.setCursor(Qt.CursorShape.PointingHandCursor)
+            split.setToolTip(t('add_game.exe_split_version_hint'))
+            # The row itself turns accent while the pointer is on it, so an
+            # accent hover here drew nothing: the chip takes the row's resting
+            # colour instead, which reads against it.
+            split.setStyleSheet(
+                "QToolButton{border:none;background:transparent;border-radius:4px;padding:2px;}"
+                f"QToolButton:hover{{background:{palette('bg_card')};}}"
+            )
+            split.clicked.connect(self._on_split_clicked)
+            row.addWidget(split)
             trash = QToolButton()
             trash.setText("\U0001f5d1")
             trash.setAutoRaise(True)
@@ -380,6 +397,10 @@ class _ExeVersionMenuRow(QWidget):
         self._suppress_apply = True
         self.delete_requested.emit()
 
+    def _on_split_clicked(self):
+        self._suppress_apply = True
+        self.split_requested.emit()
+
     def mouseReleaseEvent(self, event):
         if not self._suppress_apply and self.rect().contains(event.pos()):
             self.apply_requested.emit()
@@ -399,6 +420,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     background_idle = Signal()
     # Sidebar status dot: "running" | "done" | "failed"
     background_status_changed = Signal(str)
+    # generation, url, bytes ("" when the download failed) — one more picture
+    # fetched off the GUI thread, see _start_extra_images
+    _extra_image_ready = Signal(int, str, bytes)
 
     def __init__(self, name: str = "", exe_path: str = "",
                  entry: Optional[GameEntry] = None, parent=None):
@@ -427,14 +451,36 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # (new or existing) on Save, so Cancel discards any additions/removals.
         self._exe_versions: dict[str, str] = dict(
             (entry.exe_path_versions or {}) if entry else {})
+        # Versions marked 🔀 in the version menu: (exe path, label), each made
+        # into a library card of its own on Save — like the dict above, nothing
+        # is done until then.
+        self._exe_splits: list[tuple] = []
+        # Save folders moved on screen by switching version: {original: current},
+        # and the chain each new one belongs to. Save reads them back so the
+        # save data still follows the move (see _carry_saves_after_exe_change).
+        self._ui_moved: dict[str, str] = {}
+        self._ui_chains: dict[str, str] = {}
         self._created_icon_dirs: set[Path] = set()  # Track icon dirs created during this session
+        # The files THIS session wrote into the icon cache (a picture that was
+        # already there writes none). Cancel removes these and only these — the
+        # folder also holds what earlier sessions saved.
+        self._session_new_files: set[str] = set()
+        # More pictures of the game (screenshots), fetched in the background and
+        # only ever ADDED to the carousel. _extra_gen invalidates a batch that
+        # was cancelled or outlived the dialog.
+        self._extra_gen = 0
+        self._extra_pending = 0
+        self._extra_total = 0
+        self._extra_failed = 0
+        self._extra_dest: Optional[Path] = None
+        self._extra_image_ready.connect(self._on_extra_image_ready)
         self._session_initial_image_path: Optional[str] = None  # Image at dialog open (set on first search)
         self._session_image_captured: bool = False               # Guards the one-time capture above
         self._shortcut_name: Optional[str] = None  # Name extracted from shortcut filename
         self._shortcut_dir: Optional[str] = None  # Directory containing the shortcut
         # Pre-search form snapshot; refreshed by _web_search on every search.
-        # Initialized here because _process_search_result (which reads them)
-        # can also run from the candidate picker.
+        # Initialized here because the candidate picker's flow (which reads
+        # them) can run without a fresh _web_search.
         self._original_name: str = ""
         self._original_desc: str = ""
         self._original_image_path: Optional[str] = None
@@ -798,6 +844,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if entry.tags:
             self._tags = self._split_tag_text(entry.tags)
             self._rebuild_tag_chips()
+        self._set_languages(getattr(entry, "languages", None))
         _stored_engine = (getattr(entry, "engine", "") or "").strip()
         if _stored_engine:
             self._set_engine(_stored_engine, from_user=True)
@@ -1062,6 +1109,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         exe_lbl_row.addWidget(self._exe_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         exe_lbl_row.addWidget(self._engine_edit, 0, Qt.AlignmentFlag.AlignVCenter)
         exe_lbl_row.addWidget(self._exe_version_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        # The languages the game is offered in, filled by a web search. Hidden
+        # while there are none; a click lists them with a bin on each, for the
+        # ones a regional store offers and the user's own copy lacks.
+        from ui.widgets.language_badge import LanguageBadge
+        self._language_lbl = LanguageBadge()
+        self._language_lbl.languages_changed.connect(self._on_languages_removed)
+        exe_lbl_row.addWidget(self._language_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         exe_lbl_row.addStretch(1)
         exe_col.addLayout(exe_lbl_row)
         exe_row = QHBoxLayout()
@@ -1461,6 +1515,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         tag_row.addWidget(tag_widget)
         tag_row.addWidget(self._tag_input, 1)
         self._tags: list[str] = []
+        self._languages: list[str] = []
 
         layout.addLayout(tag_row)
 
@@ -2569,9 +2624,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             version = self._exe_version_display_label(path, label)
             row = _ExeVersionMenuRow(version, path, is_primary=is_primary, parent=menu)
             row.setToolTip(path)
+            # Every row applies — the one that is already the primary too: a
+            # game can be on one version while its save folders still name
+            # another (a version registered from the overlay moves them), and
+            # picking the current one is how they are pointed back at it.
+            row.apply_requested.connect(
+                lambda p=path, m=menu: (self._apply_exe_version_from_menu(p), m.close()))
             if not is_primary:
-                row.apply_requested.connect(
-                    lambda p=path, m=menu: (self._apply_exe_version_from_menu(p), m.close()))
+                row.split_requested.connect(
+                    lambda p=path, m=menu: (self._apply_exe_split(p), m.close()))
                 row.delete_requested.connect(
                     lambda p=path, m=menu: (self._apply_exe_removal(p), m.close()))
             action = QWidgetAction(menu)
@@ -2588,12 +2649,122 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         being retyped by hand, and Save's own exe-path-change handling
         (rebasing save_paths, etc.) takes it from there."""
         old_primary = self._exe_edit.text().strip()
+        if old_primary and old_primary.casefold() == path.casefold():
+            # Already the version in use: only its save folders may lag behind.
+            self._align_path_rows_to_primary()
+            return
         from core.library import derive_exe_version_label
         self._exe_versions.pop(path, None)
         if old_primary and old_primary.casefold() != path.casefold():
             self._exe_versions[old_primary] = derive_exe_version_label(old_primary)
         self._exe_edit.setText(path)
         self._refresh_exe_version_controls()
+        self._align_path_rows_to_primary()
+
+    def _align_path_rows_to_primary(self) -> bool:
+        """Point "Your save folders" at the version in use: a save folder that
+        lives in another tracked version's install folder moves onto the
+        primary's — shown now, so the list says where THIS version keeps its
+        saves, the same reading Save applies to a moved exe. A folder elsewhere
+        (a profile folder) stays as it is, and so does one that is only near a
+        version (a shared parent) unless the folder it would become exists.
+        True when a row moved."""
+        from core.library import rebase_path_for_new_exe
+        primary = self._exe_edit.text().strip()
+        if not primary:
+            return False
+        moved = False
+        for p in list(self._save_paths):
+            for version in list(self._exe_versions):
+                if version.casefold() == primary.casefold():
+                    continue
+                hit = rebase_path_for_new_exe(version, primary, p)
+                if hit is None or hit[0] == p:
+                    continue
+                try:
+                    inside = Path(version).resolve().parent in Path(p).resolve().parents \
+                        or Path(version).resolve().parent == Path(p).resolve()
+                except (OSError, ValueError):
+                    inside = False
+                if not inside and not Path(hit[0]).exists():
+                    continue
+                self._replace_path_row(p, hit[0], hit[1])
+                moved = True
+                break
+        return moved
+
+    def _replace_path_row(self, old: str, new: str, chain: str = "") -> None:
+        """Show *new* in the place of the row for *old*, keeping its ticked
+        state. Not _remove_path: that records the path as one the person threw
+        away, which it is not."""
+        row = next((w for i in range(self._paths_layout.count())
+                    if isinstance(w := (self._paths_layout.itemAt(i).widget()
+                                        if self._paths_layout.itemAt(i) else None), PathRow)
+                    and w._path == old), None)
+        if row is None:
+            return
+        checked, detected = row.is_checked(), bool(row.property("detected"))
+        self._paths_layout.removeWidget(row)
+        row.deleteLater()
+        if old in self._save_paths:
+            self._save_paths.remove(old)
+        already = new in self._save_paths
+        if not already:
+            self._add_path(new, detected=detected)
+            added = next((w for i in range(self._paths_layout.count())
+                          if isinstance(w := (self._paths_layout.itemAt(i).widget()
+                                              if self._paths_layout.itemAt(i) else None), PathRow)
+                          and w._path == new), None)
+            if added is not None and not checked:
+                added.set_checked(False)
+        # Where it started, whatever it went through on the way.
+        origin = next((o for o, cur in self._ui_moved.items() if cur == old), old)
+        if new == origin:
+            self._ui_moved.pop(origin, None)
+        else:
+            self._ui_moved[origin] = new
+        if chain:
+            self._ui_chains[new] = chain
+        self._paths_empty_lbl.setVisible(not self._save_paths)
+
+    def _apply_exe_split(self, path: str):
+        """🔀 on a version: it stops being one of this game's versions and is
+        staged to become a library card of its own when the dialog is saved
+        (see _create_split_entries). Nothing happens before Save — cancelling
+        the dialog leaves the version where it was."""
+        label = self._exe_versions.get(path, "")
+        self._exe_versions = {
+            p: lbl for p, lbl in self._exe_versions.items()
+            if p.casefold() != path.casefold()
+        }
+        if not any(p.casefold() == path.casefold() for p, _ in self._exe_splits):
+            self._exe_splits.append((path, label))
+        self._refresh_exe_version_controls()
+        from core.save_detector import display_name_for_added_file
+        self._status_lbl.setText(t('add_game.exe_split_pending',
+                                   name=display_name_for_added_file(path)))
+        self._status_lbl.setStyleSheet(
+            f"color:{palette('accent')};font-size:{scaled(12, self)}px;")
+
+    def _create_split_entries(self, source_entry) -> None:
+        """Save-time half of the split: every staged version becomes its own
+        library entry — the executable, its own save location when it has one,
+        and a name taken fresh from the executable (see build_split_entry)."""
+        if not self._exe_splits:
+            return
+        from core.library import build_split_entry
+        lib = get_library()
+        primary = source_entry.exe_path or ""
+        for path, _label in self._exe_splits:
+            try:
+                new = build_split_entry(path, primary, source_entry.save_paths)
+                new.computed_folder_name = lib.unique_folder_name(
+                    new.computed_folder_name, new.id)
+                lib.add_game(new)
+                logger.info(f"Split '{path}' off '{source_entry.name}' as '{new.name}'")
+            except Exception:
+                logger.exception(f"Could not split {path!r} off '{source_entry.name}'")
+        self._exe_splits = []
 
     def _apply_exe_removal(self, path: str):
         """Drop a tracked version — never reachable for the current
@@ -3232,23 +3403,113 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         return None
 
     def _download_and_set_image(self, url: str):
-        """Download image from URL and set it.
+        """Download an image and make it the one on show (the cover).
 
-        Uses a realistic browser User-Agent and follows redirects.
-        Handles relative protocol-relative URLs (//example.com/img.jpg).
+        The picture is added to the carousel like any other and becomes the
+        current one — see _start_extra_images for the ones that must not.
+        """
+        fetched = self._fetch_image_bytes(url)
+        if fetched is not None:
+            self._store_downloaded_image(fetched[0], fetched[1])
+
+    @staticmethod
+    def _fetch_image_bytes(url: str):
+        """(final url, bytes) for *url*, or None when it is not a picture.
+
+        Only the network: no Qt and no dialog state, so a worker thread may run
+        it. Uses a realistic browser User-Agent and follows redirects; handles
+        protocol-relative URLs (//example.com/img.jpg).
         """
         import logging
         logger = logging.getLogger(__name__)
 
         if not url:
-            return
+            return None
 
         # Normalise protocol-relative URLs
         if url.startswith("//"):
             url = "https:" + url
         if not url.startswith("http"):
-            logger.debug(f"Skipping non-http image URL: {url!r}")
-            return
+            logger.warning(f"Not downloading {url!r}: not an http(s) link")
+            return None
+
+        try:
+            # Headers + /thumb/-to-full rewrite shared with the candidate-
+            # preview thumbnail fetch (search_enrichment.py) — see
+            # core.net.image_fetch_request for why they're needed.
+            from core.net import open_url as _open_url, image_fetch_request
+            req, url = image_fetch_request(url)
+            with _open_url(req, timeout=20) as response:
+                # Verify Content-Type is an image before reading
+                ct = response.headers.get("Content-Type", "")
+                if ct and not ct.startswith("image/") and "octet-stream" not in ct:
+                    logger.warning(f"Not an image: Content-Type {ct!r} for {url!r}")
+                    return None
+                image_data = response.read()
+            logger.info(f"Downloaded {len(image_data)}B, Content-Type: {ct!r}")
+            return url, image_data
+        except Exception as e:
+            logger.error(f"Failed to download image: {e}")
+            return None
+
+    def _icon_dir_path(self) -> Path:
+        """This game's folder in the icon cache — only its path, nothing made.
+
+        Named the way the library names it (get_install_folder_name), so what
+        goes in here is what the carousel finds again on the next open."""
+        exe_path = self._exe_edit.text().strip() if hasattr(self, '_exe_edit') else ""
+        game_name = self._name_edit.text().strip() or "unknown"
+        game_id = self._editing_entry.id if self._editing_entry else ""
+        game_folder = get_install_folder_name(exe_path, game_name, game_id, self._editing_entry.computed_folder_name if self._editing_entry else None)
+        return _ICON_CACHE_DIR / game_folder
+
+    def _icon_dest_dir(self) -> Path:
+        """This game's folder in the icon cache, created and tracked."""
+        _ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        game_icon_dir = self._icon_dir_path()
+        game_icon_dir.mkdir(parents=True, exist_ok=True)
+        self._created_icon_dirs.add(game_icon_dir)
+        return game_icon_dir
+
+    @staticmethod
+    def _cache_stem(url: str) -> str:
+        """The file name (without extension) a picture from *url* is saved under."""
+        original_name = Path(url.split("?")[0]).stem
+        return "".join(c for c in original_name if c.isalnum() or c in "._- ")[:50]
+
+    def _known_image_stems(self) -> set:
+        """The pictures this game already has, as the file names (lower case, no
+        extension) their URLs are saved under — worked out WITHOUT downloading
+        anything. What counts as already there: this session's downloads, the
+        carousel, and whatever an earlier session left in the game's cache
+        folder. A name that was made unique with a suffix counts under both."""
+        import re as _re
+        paths = [str(p) for p in (getattr(self, '_detected_images', None) or [])]
+        try:
+            folder = self._icon_dir_path()
+            if folder.is_dir():
+                paths += [str(f) for f in folder.iterdir() if f.is_file()]
+        except OSError:
+            pass
+        stems = {self._cache_stem(u).lower() for u in self._image_url_cache}
+        for p in paths:
+            stem = Path(p).stem.lower()
+            stems.add(stem)
+            m = _re.match(r'^(.*)_[0-9a-f]{8}$', stem)
+            if m:
+                stems.add(m.group(1))
+        return stems
+
+    def _store_downloaded_image(self, url: str, image_data: bytes, *,
+                                select: bool = True, dest_dir: "Path | None" = None):
+        """Re-encode *image_data* into the icon cache and put it in the carousel.
+
+        *select* True makes it the picture on show (a cover); False only adds
+        it, leaving the cover, the position and the preview as they were.
+        *dest_dir* is the cache folder to write to (default: this game's now).
+        """
+        import logging
+        logger = logging.getLogger(__name__)
 
         # Cleared up front: only the Qt-decode-success branch below sets this
         # again. Without the reset, a download whose format Qt can't decode
@@ -3261,44 +3522,18 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         try:
             import uuid
 
-            # Headers + /thumb/-to-full rewrite shared with the candidate-
-            # preview thumbnail fetch (search_enrichment.py) — see
-            # core.net.image_fetch_request for why they're needed.
-            from core.net import open_url as _open_url, image_fetch_request
-            req, url = image_fetch_request(url)
-            with _open_url(req, timeout=20) as response:
-                # Verify Content-Type is an image before reading
-                ct = response.headers.get("Content-Type", "")
-                if ct and not ct.startswith("image/") and "octet-stream" not in ct:
-                    logger.debug(f"Skipping non-image Content-Type {ct!r} for {url!r}")
-                    return
-                image_data = response.read()
-
             if len(image_data) < 512:
-                logger.debug(f"Downloaded image too small ({len(image_data)} bytes), skipping")
-                return
+                logger.warning(f"Downloaded image too small ({len(image_data)} bytes): {url!r}")
+                return False
 
             magic = image_data[:16].hex().upper()
-            logger.info(f"Downloaded {len(image_data)}B, Content-Type: {ct!r}, magic bytes: {magic}")
 
             # Save directly to cache in a subfolder named after the game
-            _ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            
-            # Get game folder using get_install_folder_name for consistency
-            exe_path = self._exe_edit.text().strip() if hasattr(self, '_exe_edit') else ""
-            game_name = self._name_edit.text().strip() or "unknown"
-            game_id = self._editing_entry.id if self._editing_entry else ""
-            game_folder = get_install_folder_name(exe_path, game_name, game_id, self._editing_entry.computed_folder_name if self._editing_entry else None)
-            game_icon_dir = _ICON_CACHE_DIR / game_folder
+            game_icon_dir = dest_dir or self._icon_dest_dir()
             game_icon_dir.mkdir(parents=True, exist_ok=True)
-            self._created_icon_dirs.add(game_icon_dir)
-            
-            # Get original filename from URL
-            clean_url = url.split("?")[0]
-            original_name = Path(clean_url).stem
 
-            # Sanitize filename
-            safe_name = "".join(c for c in original_name if c.isalnum() or c in "._- ")[:50]
+            # The file name a picture gets comes from its URL (see _cache_stem)
+            safe_name = self._cache_stem(url)
             # Always save as .jpg (compression converts to JPEG)
             filename = f"{safe_name}.jpg"
             cache_path = game_icon_dir / filename
@@ -3318,6 +3553,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 else:
                     filename = f"{safe_name}_{uuid.uuid4().hex[:8]}.jpg"
                     cache_path = game_icon_dir / filename
+
+            _was_there = cache_path.exists()
 
             # AVIF from attachment CDNs: register pillow_avif before Qt so
             # the PIL re-encode path below can open the buffer even when Qt
@@ -3437,14 +3674,133 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 except OSError:
                     pass
                 cache_path = Path(_dup)
+            elif not _was_there:
+                self._session_new_files.add(str(cache_path))
 
-            # Apply the downloaded image to the carousel immediately
-            self._set_web_image(str(cache_path))
+            if select:
+                # Apply the downloaded image to the carousel immediately
+                self._set_web_image(str(cache_path))
+            else:
+                self._attach_extra_image(str(cache_path))
             # Track URL ↔ local path mapping for subsequent unchanged checks
             self._image_url_cache[url] = str(cache_path)
             self._image_path_to_url[str(cache_path)] = url
+            return True
         except Exception as e:
             logger.error(f"Failed to download image: {e}")
+            return False
+
+    # ── More pictures (screenshots) ──────────────────────────────────────────
+
+    def _attach_extra_image(self, path: str):
+        """Add *path* to the carousel WITHOUT selecting it.
+
+        Save writes the picture on show as the game's cover, so anything that
+        moved the selection here would turn the last screenshot into the cover.
+        Only when there is no picture at all does the first one become it —
+        a game needs one."""
+        self._pending_pixmap = None
+        if not self._detected_images and not self._image_path:
+            self._set_web_image(path)
+            return
+        if self._image_path and self._image_path not in self._detected_images:
+            self._detected_images.insert(0, self._image_path)
+            self._current_image_idx = 0
+        if path not in self._detected_images:
+            self._detected_images.append(path)
+        self._update_nav_buttons()
+
+    def _start_extra_images(self, urls) -> None:
+        """Fetch the ticked screenshots off the GUI thread and add each to the
+        carousel as it arrives. A few at a time: a store lists a dozen, each a
+        few hundred KB, and downloading them on the GUI thread would freeze it
+        for as long as that takes."""
+        import queue
+        urls = [u for u in dict.fromkeys(urls or []) if u]
+        if not urls:
+            return
+        # Chosen NOW, like the covers of this same Apply: a name edited while
+        # they download must not scatter them across two folders.
+        self._extra_dest = self._icon_dest_dir()
+        gen = self._extra_gen
+        logger.info(f"Extra pictures: downloading {len(urls)} into {self._extra_dest.name!r}")
+        self._extra_pending += len(urls)
+        self._extra_total += len(urls)
+        self._bg_work_kind = "images"
+        self._emit_bg_status("running")
+        self._show_extra_progress()
+        todo: "queue.SimpleQueue" = queue.SimpleQueue()
+        for u in urls:
+            todo.put(u)
+
+        def _worker():
+            while True:
+                try:
+                    u = todo.get_nowait()
+                except queue.Empty:
+                    return
+                got = self._fetch_image_bytes(u) if gen == self._extra_gen else None
+                try:
+                    self._extra_image_ready.emit(gen, got[0] if got else u,
+                                                 got[1] if got else b"")
+                except RuntimeError:
+                    return          # the dialog is gone
+
+        for _ in range(min(3, len(urls))):
+            threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_extra_progress(self):
+        done = self._extra_total - self._extra_pending
+        self._status_lbl.setText(
+            t('add_game.images_downloading', done=done, total=self._extra_total))
+        self._status_lbl.setStyleSheet(
+            f"color:{palette('accent')};font-size:{scaled(12, self)}px;")
+
+    def _on_extra_image_ready(self, gen: int, url: str, data: bytes):
+        self._extra_pending = max(0, self._extra_pending - 1)
+        if gen != self._extra_gen:
+            # Cancelled, or the dialog was closed: nothing is stored, and
+            # nothing is shown for a batch nobody is waiting on any more.
+            if not self._extra_pending:
+                self._extra_total = 0
+            return
+        stored = False
+        if data:
+            stored = self._store_downloaded_image(
+                url, data, select=False, dest_dir=self._extra_dest) is not False
+        if not stored:
+            self._extra_failed += 1
+            logger.warning(f"Extra picture not added: {url!r}"
+                           f"{'' if data else ' (nothing was downloaded)'}")
+        else:
+            logger.info(f"Extra picture added: {url!r}")
+        if self._extra_pending:
+            self._show_extra_progress()
+            return
+        total, failed = self._extra_total, self._extra_failed
+        self._extra_total = self._extra_failed = 0
+        missing = self._get_missing_fields()
+        if failed:
+            self._status_lbl.setText(
+                t('add_game.images_some_failed', failed=failed, total=total))
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
+        elif missing:
+            self._status_lbl.setText(
+                t('add_game.fields_still_missing', fields=", ".join(missing)))
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
+        else:
+            self._status_lbl.setText(t('add_game.data_saved'))
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('accent')};font-size:{scaled(12, self)}px;")
+        self._emit_bg_status("done")
+        if not self._exe_resolve_active and not self._web_search_active \
+                and not self._detection_in_progress:
+            try:
+                self.background_idle.emit()
+            except RuntimeError:
+                pass
 
     def _set_web_image(self, image_path: str):
         """Set the downloaded web image - adds to existing detected images."""
@@ -3500,6 +3856,24 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     seen.add(tag_merge_key(ct))
                     out.append(ct)
         return out
+
+    def _set_languages(self, languages) -> None:
+        """Stage the game's languages and show them on the read-only badge."""
+        from core.library import normalize_languages
+        self._languages = normalize_languages(languages)
+        self._language_lbl.set_languages(self._languages)
+
+    def _on_languages_removed(self, languages) -> None:
+        """A bin on the language badge dropped some. Staged like every other
+        field here: Save writes it, Cancel leaves the game as it was."""
+        self._languages = list(languages)
+
+    def _apply_web_languages(self, languages) -> None:
+        """Languages picked in the merge dialog join what the game already
+        has — additive, like tags; a web fetch never takes one away."""
+        if not languages:
+            return
+        self._set_languages(list(self._languages) + list(languages))
 
     def _apply_web_tags(self, genres: list[str]):
         """Apply genres as tags from web search."""
@@ -3895,15 +4269,17 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 all_excl[game_id][path_key] = sorted(existing | set(files))
             _cfg.set("auto_scan_excluded_files", all_excl)
 
-    def _prune_stale_icon_dirs(self, keep_dir: "Path"):
+    def _prune_stale_icon_dirs(self, keep_dir: "Path", *also_keep: "Path"):
         """On save, remove session-created icon-cache folders EXCEPT *keep_dir*
-        (the final game's folder) — folders created under earlier names during a
-        web-search rename would otherwise be orphaned. Only touches folders
-        directly under the icon cache root; *keep_dir* is never removed."""
+        (the final game's folder) and *also_keep* — folders created under
+        earlier names during a web-search rename would otherwise be orphaned.
+        Only touches folders directly under the icon cache root; a kept folder
+        is never removed."""
         import shutil
+        keep = {keep_dir, *also_keep}
         for _stale_dir in list(self._created_icon_dirs):
             try:
-                if (_stale_dir != keep_dir
+                if (_stale_dir not in keep
                         and _stale_dir.exists()
                         and _stale_dir.is_dir()
                         and _stale_dir.parent == _ICON_CACHE_DIR):
@@ -3918,8 +4294,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         - New game: the whole tracked folder is temp — remove it (this is what
           deletes the "Unknown" folder created before a name was typed).
-        - Editing: keep only the image that was on disk BEFORE this session's
-          first search ran; session downloads are temp.
+        - Editing: session downloads are temp — the files this session wrote,
+          and nothing that was already in the folder.
         """
         for icon_dir in self._created_icon_dirs:
             if not icon_dir.exists():
@@ -3935,7 +4311,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     continue
                 initial_path = self._session_initial_image_path
                 for f in icon_dir.iterdir():
-                    if f.is_file() and str(f) != initial_path:
+                    # Only what this session wrote: the folder also holds every
+                    # cover and screenshot an earlier session saved.
+                    if (f.is_file() and str(f) != initial_path
+                            and str(f) in self._session_new_files):
                         try:
                             f.unlink()
                         except Exception:
@@ -3949,6 +4328,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Save completed — always close for real, never shelve."""
         self._force_close = True
         self._cancel_event.set()
+        self._extra_gen += 1
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -3958,6 +4338,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Cancel — stop background work and discard the dialog."""
         self._force_close = True
         self._cancel_event.set()
+        self._extra_gen += 1
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -3981,6 +4362,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         thrown away because a search was called off.
         """
         self._cancel_event.set()
+        self._extra_gen += 1
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -4117,7 +4499,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _has_shelvable_work(self) -> bool:
         """Exe resolve, web search, or path detect still in flight — ✕ shelves."""
         return bool(self._exe_resolve_active or self._web_search_active
-                    or self._detection_in_progress)
+                    or self._detection_in_progress or self._extra_pending > 0)
 
     def _shelve(self):
         """Hide while background work continues; sidebar brings this back.
@@ -4176,6 +4558,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             return
         self._force_close = True
         self._cancel_event.set()
+        self._extra_gen += 1
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -4742,6 +5125,143 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             px.fill(QColor(palette(color_key)))
             self._category_combo.addItem(QIcon(px), f"{indent}{name}", path)
 
+    def _ask_carry_saves(self, message_key: str, yes_key: str, no_key: str,
+                         title_key: str = 'add_game.exe_carry_saves_title', **fmt) -> bool:
+        """Yes/No about the save data of an executable change (default Yes)."""
+        reply = question_window_modal(
+            self, t(title_key), t(message_key, **fmt),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            default_button=QMessageBox.StandardButton.Yes,
+            button_texts={
+                QMessageBox.StandardButton.Yes: t(yes_key),
+                QMessageBox.StandardButton.No: t(no_key),
+            },
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _restore_backup_into_new_install(self, entry, old_exe: str, moved: dict) -> None:
+        """The previous version's folder is GONE and the new one has no saves:
+        there is nothing to copy, so offer the latest backup instead.
+
+        Deliberately narrow, because a restore writes to every path the backup
+        covers: only when the old install folder no longer exists (so the
+        backup's install-relative paths resolve onto the NEW exe — with the old
+        one still there they would resolve back onto it), only when every save
+        path the game now has is empty (so nothing on disk can be overwritten),
+        and never with a registry path in the list. Asked, never automatic.
+        """
+        from core.library import path_has_content
+        from core.registry_saves import is_registry_path
+        if not old_exe or Path(old_exe).parent.exists():
+            return
+        paths = [p for p in (entry.save_paths or []) if p not in (entry.excluded_save_paths or [])]
+        if (not paths or any(is_registry_path(p) for p in (entry.save_paths or []))
+                or any(path_has_content(Path(p)) for p in paths)):
+            return
+        if not any(n in paths and not path_has_content(Path(o)) for o, n in moved.items()):
+            return
+        try:
+            from core.backup import get_backup_manager
+            bm = get_backup_manager()
+            bid = bm.newest_trusted_backup_id(entry.id)
+            if not bid or not self._ask_carry_saves(
+                    'add_game.exe_restore_backup_msg',
+                    yes_key='add_game.exe_restore_backup_yes',
+                    no_key='add_game.exe_restore_backup_no'):
+                return
+            result = bm.restore_backup(bid, lib_game_id=entry.id)
+            if not result.success:
+                logger.warning(f"Restore into the new install failed for {entry.name}: "
+                               f"{result.errors}")
+                warning_window_modal(self, t('add_game.exe_carry_saves_title'),
+                                     t('add_game.exe_restore_failed'))
+        except Exception as e:
+            logger.warning(f"Could not restore a backup into the new install of {entry.name}: {e}")
+
+    def _carry_saves_after_exe_change(self, entry, old_exe: str, new_exe: str,
+                                      moved: dict, prev_versions: set) -> None:
+        """Bring the save DATA along after an executable moved or was added.
+
+        Rebasing (see _add_game) only repoints SaveSync's own tracking: the
+        path changes, and a new install whose save folder does not exist yet
+        simply starts empty. Only install-RELATIVE save paths are ever
+        involved — an absolute one (AppData, Documents…) is the same for every
+        version and has nothing to move.
+
+        The primary moved (*moved*: old path → rebased path):
+
+        - the new location holds nothing → the saves are copied across, no
+          question asked (the same "restore" the in-game overlay's transfer
+          does; the originals stay where they are);
+        - it holds the very same files (compared by content hash) → nothing to
+          do;
+        - it holds DIFFERENT saves → only when SWITCHING between tracked
+          versions (the old executable stays as a version), ask whether to
+          overwrite them with the current version's (a mirror: they end up
+          equal, and what was there is copied aside first). A REPLACE has
+          already been asked its own overwrite / keep-both question by
+          _add_game before rebasing, and is never touched here;
+        - the old location has nothing to copy from (the old version may be
+          deleted) → offer the latest backup, see _restore_backup_into_new_install.
+
+        A version added beside the primary (its install folder is new to the
+        entry) gets the current saves copied in the same way when its folder
+        holds nothing; if it already has some they are left alone, and the
+        question is asked when that version is switched to.
+        """
+        from core.library import (copy_save_data, mirror_save_data, path_has_content,
+                                  rebase_path_for_new_exe, save_data_equal)
+        versions = {p.casefold() for p in (entry.exe_path_versions or {})}
+        switched = bool(old_exe) and old_exe.casefold() in versions
+
+        # ── The primary moved ───────────────────────────────────────────
+        differing = {}
+        had_source = False
+        for old_p, new_p in moved.items():
+            old_path, new_path = Path(old_p), Path(new_p)
+            if not path_has_content(old_path):
+                continue
+            had_source = True
+            if not path_has_content(new_path):
+                copy_save_data(old_path, new_path)
+            elif switched and not save_data_equal(old_path, new_path):
+                differing[old_p] = new_p
+        if differing and self._ask_carry_saves(
+                'add_game.exe_switch_conflict_msg',
+                yes_key='add_game.exe_overwrite',
+                no_key='add_game.exe_switch_keep',
+                title_key='add_game.exe_switch_conflict_title'):
+            # A mirror, not a merge: the two must end up equal, or they would
+            # still differ and this question would come back on every switch.
+            # What is replaced is copied aside first (mirror_save_data).
+            for old_p, new_p in differing.items():
+                ok, aside = mirror_save_data(Path(old_p), Path(new_p))
+                if aside is not None:
+                    logger.info(f"Switch: {new_p} copied aside to {aside} before mirroring")
+                if not ok:
+                    logger.warning(f"Switch: could not overwrite {new_p} with {old_p}")
+        if moved and not had_source:
+            # Nothing to copy from: the old version may have been deleted, and
+            # its saves then only exist as backups.
+            self._restore_backup_into_new_install(entry, old_exe, moved)
+
+        # ── A version added beside the primary ──────────────────────────
+        if not new_exe:
+            return
+        excluded = set(entry.excluded_save_paths or [])
+        for ver_exe in (entry.exe_path_versions or {}):
+            key = ver_exe.casefold()
+            if key in prev_versions or (old_exe and key == old_exe.casefold()):
+                continue
+            for p in entry.save_paths or []:
+                if p in excluded:
+                    continue
+                hit = rebase_path_for_new_exe(new_exe, ver_exe, p)
+                if hit is None or hit[0] == p:
+                    continue
+                if path_has_content(Path(p)) and not path_has_content(Path(hit[0])):
+                    copy_save_data(Path(p), Path(hit[0]))
+
     def _add_game(self):
         exe = self._exe_edit.text().strip()
         lib = get_library()
@@ -4814,6 +5334,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # hard-deleted (via _remove_path) can be detected and their
             # provisional backups pruned on save (see the resolve call below).
             _prev_save_paths = set(entry.save_paths or [])
+            _prev_name = entry.name or ""
+            _prev_versions = {p.casefold() for p in (entry.exe_path_versions or {})}
             entry.name       = name
             entry.exe_path   = exe
             if exe and exe != old_exe:
@@ -4832,9 +5354,16 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # declining (or closing the box) leaves every path exactly where
             # it was, same "keep both" default the in-game overlay uses.
             _skip_rebase = False
-            if old_exe and exe and old_exe != exe:
-                from core.library import rebase_targets_have_existing_saves
-                if rebase_targets_have_existing_saves(old_exe, exe, raw_all_paths):
+            # Switching between tracked versions (the old exe stays as one) is
+            # not asked here: whether the two versions' saves are the same is
+            # decided afterwards by content hash — see _carry_saves_after_exe_change.
+            _switching = bool(old_exe) and old_exe.casefold() in {
+                p.casefold() for p in self._exe_versions}
+            if old_exe and exe and old_exe != exe and not _switching:
+                from core.library import (rebase_targets_have_existing_saves,
+                                          rebase_targets_identical)
+                if (rebase_targets_have_existing_saves(old_exe, exe, raw_all_paths)
+                        and not rebase_targets_identical(old_exe, exe, raw_all_paths)):
                     reply = question_window_modal(
                         self, t('add_game.exe_overwrite_conflict_title'),
                         t('add_game.exe_overwrite_conflict_msg'),
@@ -4848,6 +5377,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     _skip_rebase = reply != QMessageBox.StandardButton.Yes
             all_paths = []
             excluded_paths = []
+            # old path -> the path it was rebased onto, for the save data that
+            # has to follow (see _carry_saves_after_exe_change).
+            _moved_paths: dict[str, str] = {}
             for p in raw_all_paths:
                 rebased_p = p
                 is_excl = p in raw_excluded_paths
@@ -4862,10 +5394,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     if hit is not None:
                         rebased_p, chain = hit
                         entry.record_path_chain(rebased_p, chain)
+                        if rebased_p != p:
+                            _moved_paths[p] = rebased_p
                 all_paths.append(rebased_p)
                 if is_excl:
                     excluded_paths.append(rebased_p)
 
+            # A rebase already made on screen (switching version) is still a
+            # move for the save data: the files are where the OLD path was.
+            for _orig, _cur in self._ui_moved.items():
+                if _cur in all_paths and _orig in _prev_save_paths:
+                    _moved_paths.setdefault(_orig, _cur)
+                    if self._ui_chains.get(_cur):
+                        entry.record_path_chain(_cur, self._ui_chains[_cur])
             entry.save_paths = all_paths
             entry.excluded_save_paths = excluded_paths
             entry.save_paths_confirmed = len(all_paths) > 0
@@ -4883,6 +5424,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             entry.description = self._desc_edit.toPlainText().strip()
             entry.category = self._category_combo.currentData() or ""
             entry.tags = list(self._tags)
+            entry.languages = list(self._languages)
             entry.developer  = self._developer_edit.text().strip()
             entry.release_year = self._year_edit.text().strip()
             entry.store_url  = ', '.join(self._store_urls)
@@ -4947,6 +5489,27 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     entry.icon_path = _cand
 
             lib.update_game(entry)
+
+            # Rebasing only repoints SaveSync's own tracking. Without this the
+            # new install starts with no saves of its own and the path merely
+            # changes: the data has to be carried across too.
+            self._carry_saves_after_exe_change(
+                entry, old_exe, exe, _moved_paths, _prev_versions)
+
+            # A rename writes no backup, so nothing else would carry it into
+            # the backup index (folder, title) or tell the provider it is
+            # behind. Done here; the next sync moves the remote folder.
+            if (_prev_name and _prev_name != entry.name) or old_folder_name != new_folder_name:
+                try:
+                    from core.backup import get_backup_manager
+                    if get_backup_manager().apply_game_rename(
+                            entry.id, entry.name, new_folder_name):
+                        if entry.sync_status == "synced":
+                            lib.update_game_fields(entry.id, sync_status="pending")
+                except Exception as e:
+                    logger.warning(
+                        f"Could not carry the rename of {entry.name} into its "
+                        f"backup index: {e}")
 
             # Saving the edit dialog is a genuine confirmation (every path is
             # visible/checkable here), so temporary (pre-confirmation) session
@@ -5020,6 +5583,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 description=self._desc_edit.toPlainText().strip(),
                 category=self._category_combo.currentData() or "",
                 tags=list(self._tags),
+                languages=list(self._languages),
                 appid=appid,
                 developer=self._developer_edit.text().strip(),
                 release_year=self._year_edit.text().strip(),
@@ -5060,6 +5624,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # Save per-file exclusions from file browsers
             self._save_file_exclusions(entry.id)
 
+        # Versions split off with 🔀 become library cards of their own now that
+        # the game they were tracked under is saved.
+        self._create_split_entries(entry)
+
         # At save time, remove icon dirs created under OLD game names during this
         # session (a web-search rename creates a new folder; the original must
         # not linger). Keep only the final game's folder. Runs even when the
@@ -5071,7 +5639,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             _keep_folder = get_install_folder_name(
                 entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
             _keep_dir = _ICON_CACHE_DIR / _keep_folder
-        self._prune_stale_icon_dirs(_keep_dir)
+        # The game's own cache folder stays whichever picture is the cover: a
+        # cover from the install folder must not take the screenshots with it.
+        self._prune_stale_icon_dirs(_keep_dir, _ICON_CACHE_DIR / get_install_folder_name(
+            entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name))
 
         # URL→exe fuzzy search in background (dialog may close immediately).
         # appid already holds the launch URL; only fill exe_path when found.

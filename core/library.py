@@ -29,6 +29,102 @@ def tag_merge_key(tag: str) -> str:
     return re.sub(r"[\s_\-]+", " ", (tag or "").casefold()).strip()
 
 
+# ── Languages ────────────────────────────────────────────────────────────────
+# What a source says a game supports comes in every spelling there is: DLsite's
+# icon codes ("JPN", "CHI_HANS"), VNDB's tags ("ja", "zh-Hans"), Steam's names
+# ("Simplified Chinese", "Spanish - Spain"), and the Japanese names DLsite uses
+# on a page it did not localize. They are stored once, as English names.
+_LANGUAGE_ALIASES: dict[str, str] = {}
+for _name, _aliases in {
+    "English": ("en", "eng", "en-us", "en-gb", "english", "英語", "英語版"),
+    "Japanese": ("ja", "jp", "jpn", "ja-jp", "japanese", "日本語"),
+    "Chinese (Simplified)": ("zh-hans", "zh_hans", "zh-cn", "zh-sg", "chi_hans", "zho-hans",
+                             "simplified chinese", "chinese (simplified)", "chinese simplified",
+                             "簡体中文", "简体中文", "簡体字", "简体"),
+    "Chinese (Traditional)": ("zh-hant", "zh_hant", "zh-tw", "zh-hk", "chi_hant", "zho-hant",
+                              "traditional chinese", "chinese (traditional)", "chinese traditional",
+                              "繁体中文", "繁體中文", "繁体字", "繁體"),
+    "Chinese": ("zh", "chi", "zho", "chinese", "中文", "中国語"),
+    "Korean": ("ko", "ko_kr", "ko-kr", "kor", "korean", "한국어", "韓国語", "韓国語版"),
+    "Spanish": ("es", "spa", "spanish", "español", "スペイン語"),
+    "German": ("de", "ger", "deu", "german", "deutsch", "ドイツ語"),
+    "French": ("fr", "fre", "fra", "french", "français", "フランス語"),
+    "Italian": ("it", "ita", "italian", "italiano", "イタリア語"),
+    "Portuguese": ("pt", "por", "pt-br", "pt-pt", "portuguese", "português", "ポルトガル語"),
+    "Russian": ("ru", "rus", "russian", "русский", "ロシア語"),
+    "Indonesian": ("id", "ind", "indonesian", "インドネシア語"),
+    "Thai": ("th", "tha", "thai", "タイ語"),
+    "Vietnamese": ("vi", "vie", "vietnamese", "ベトナム語"),
+    "Turkish": ("tr", "tur", "turkish", "トルコ語"),
+    "Polish": ("pl", "pol", "polish"),
+    "Ukrainian": ("uk", "ukr", "ukrainian"),
+    "Arabic": ("ar", "ara", "arabic"),
+    "Dutch": ("nl", "nld", "dut", "dutch"),
+    "Swedish": ("sv", "swe", "swedish"),
+    "Czech": ("cs", "cze", "ces", "czech"),
+    "Hungarian": ("hu", "hun", "hungarian"),
+    "Romanian": ("ro", "rum", "ron", "romanian"),
+    "Greek": ("el", "gre", "ell", "greek"),
+    "Hebrew": ("he", "heb", "hebrew"),
+    "Finnish": ("fi", "fin", "finnish"),
+    "Danish": ("da", "dan", "danish"),
+    "Norwegian": ("no", "nb", "nor", "norwegian"),
+    "Hindi": ("hi", "hin", "hindi"),
+    "Bulgarian": ("bg", "bul", "bulgarian"),
+    "Filipino": ("fil", "tl", "filipino"),
+    "Malay": ("ms", "may", "msa", "malay"),
+}.items():
+    for _a in _aliases:
+        _LANGUAGE_ALIASES[_a] = _name
+# "This game has no text to translate" is not a language.
+_LANGUAGE_NONE = frozenset({
+    "", "nm", "nol", "none", "n/a", "no language", "language not required",
+    "language independent", "alingual", "言語不要", "言語なし",
+})
+
+
+def normalize_language(value) -> str:
+    """One language as its English name, whatever spelling it arrived in.
+    "" for something that is not a language ("language not required"). A name
+    this table does not know is kept as written: better shown than lost."""
+    import re
+    raw = re.sub(r"<[^>]+>", "", str(value or "")).replace("*", "").strip()
+    key = raw.casefold()
+    if key in _LANGUAGE_NONE:
+        return ""
+    if key in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[key]
+    # "Spanish - Spain", "Portuguese - Brazil": the language is what precedes
+    # the region. A written-out Chinese script keeps its script, above.
+    head = re.split(r"\s+[-–—]\s+|\s*\(", raw, maxsplit=1)[0].strip()
+    hk = head.casefold()
+    if hk in _LANGUAGE_ALIASES and hk not in ("chinese",):
+        return _LANGUAGE_ALIASES[hk]
+    return raw
+
+
+def language_merge_key(lang: str) -> str:
+    """The key two spellings of one language share (case-insensitive)."""
+    return normalize_language(lang).casefold()
+
+
+def normalize_languages(values) -> list:
+    """Languages as English names, each once, English first when present —
+    the one the badge and the preview lead with. The rest keep the order the
+    source gave them."""
+    out, seen = [], set()
+    for v in (values or []):
+        name = normalize_language(v)
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            out.append(name)
+    if "English" in out:
+        out.remove("English")
+        out.insert(0, "English")
+    return out
+
+
 def derive_exe_version_label(path: str) -> str:
     """A short label for an exe *path* — the install folder's name with
     release noise stripped but the version kept, e.g. "Some Title v1.2.3"
@@ -89,6 +185,120 @@ def rebase_path_for_new_exe(old_exe: str, new_exe: str, path: str):
     return None
 
 
+# ── Name history ─────────────────────────────────────────────────────────────
+_EXE_SUFFIX_RE = None
+
+
+def history_worthy(name: str) -> bool:
+    """Whether *name* belongs in a game's name history: something that names
+    the game. A generic executable name ("game", "Games.exe", "launcher") does
+    not — it is what an exe is called whatever it starts, and a game without a
+    name of its own already falls back to its install folder's."""
+    import re
+    global _EXE_SUFFIX_RE
+    if _EXE_SUFFIX_RE is None:
+        _EXE_SUFFIX_RE = re.compile(r"\.(exe|bat|cmd|lnk|url|sh|appimage|x86_64)$", re.IGNORECASE)
+    n = _EXE_SUFFIX_RE.sub("", (name or "").strip()).strip()
+    if not n:
+        return False
+    try:
+        from core.exe_stems import stem_in
+        from core.save_detector import GENERIC_EXE_STEMS, _CONTAINER_DIR_NAMES
+        # "games" is a folder that holds games, not an executable stem, but as
+        # a name it is just as empty.
+        return not (stem_in(n, GENERIC_EXE_STEMS) or n.casefold() in _CONTAINER_DIR_NAMES)
+    except Exception:
+        return True
+
+
+def merge_name_histories(*lists, current: str = "") -> list:
+    """Name histories joined into one: every name once, in the order first
+    seen (older lists first), without the generic executable names. *current*
+    is always kept, and last — the same shape GameEntry.name_history has."""
+    out: list = []
+    seen: set = set()
+    for names in lists:
+        for n in (names or []):
+            n = (n or "").strip()
+            if n and n != current and n.casefold() not in seen and history_worthy(n):
+                seen.add(n.casefold())
+                out.append(n)
+    if current:
+        out.append(current)
+    return out
+
+
+def reference_history(*lists, current: str = "") -> list:
+    """The name history an index row carries: merge_name_histories, or nothing
+    at all for a game that never changed its name — its one name is already the
+    row's game_name, and a list saying only that would make every row of every
+    game look changed the first time it was written."""
+    merged = merge_name_histories(*lists, current=current)
+    return merged if len(merged) > 1 else []
+
+
+def version_save_paths(version_exe: str, primary_exe: str, save_paths) -> list:
+    """The save locations that belong to ONE exe version of a game — the ones
+    that sit in that version's own install folder, found where the game keeps
+    them ("install/www/save").
+
+    A path already inside the version's folder is its own. A path inside the
+    PRIMARY's folder is read against the version's (rebase_path_for_new_exe)
+    and kept only when that spot exists on disk. Anything else — a profile
+    folder, a location both versions share — is not this version's to claim,
+    and is left out.
+    """
+    import os
+    out: list = []
+    try:
+        vdir = Path(version_exe).resolve().parent
+    except (OSError, ValueError):
+        return out
+    for raw in (save_paths or []):
+        mine = None
+        try:
+            resolved = Path(raw).resolve()
+            if resolved == vdir or vdir in resolved.parents:
+                mine = str(raw)
+        except (OSError, ValueError):
+            pass
+        if mine is None and primary_exe:
+            rebased = rebase_path_for_new_exe(primary_exe, version_exe, raw)
+            if (rebased and os.path.normcase(rebased[0]) != os.path.normcase(str(Path(raw)))
+                    and Path(rebased[0]).exists()):
+                mine = rebased[0]
+        if mine and mine not in out:
+            out.append(mine)
+    return out
+
+
+def build_split_entry(version_exe: str, primary_exe: str, save_paths) -> "GameEntry":
+    """A library entry for one exe version that turned out to be a different
+    game: its executable, its own save location when it has one, and a name
+    taken fresh from the executable — nothing else. Not the tags, cover,
+    description, languages or reviews of the game it was tracked under, and no
+    backups: none of that is known to belong to it."""
+    from core.constants import get_folder_name_for_save
+    from core.machine import get_machine_id
+    from core.save_detector import display_name_for_added_file
+    name = display_name_for_added_file(version_exe)
+    paths = version_save_paths(version_exe, primary_exe, save_paths)
+    entry = GameEntry(
+        name=name,
+        exe_path=version_exe,
+        save_paths=paths,
+        save_paths_confirmed=bool(paths),
+        # Without a location of its own the saves are found by the ordinary
+        # auto-detection after the first session, like any newly added game.
+        requires_confirmation=not paths,
+        machine_id=get_machine_id(),
+        computed_folder_name=get_folder_name_for_save(name, version_exe, ""),
+    )
+    entry.record_name(name)
+    entry.record_exe_hints(version_exe)
+    return entry
+
+
 def path_has_content(target: Path) -> bool:
     """True when *target* already holds something real — a non-empty
     directory, or a file with actual bytes in it. Shared by every "is this
@@ -103,6 +313,145 @@ def path_has_content(target: Path) -> bool:
     except OSError:
         pass
     return False
+
+
+def copy_save_data(old_path: Path, new_path: Path, force: bool = False) -> bool:
+    """Carry the save data at *old_path* over to *new_path*.
+
+    A rebase only ever repoints SaveSync's own tracking and never touches a
+    file; this is the step that makes a move real for the player too. Never
+    overwrites: a *new_path* that already holds something is left alone unless
+    *force* — set only by an explicit "yes, overwrite" answer, never on its own
+    say-so. Shared by every flow that moves a game onto another install (the
+    in-game overlay's transfer and the Add/Edit dialog's replace / switch), so
+    "what counts as carried" is one answer. Returns True when data was copied.
+    """
+    import shutil
+    try:
+        if not old_path.exists():
+            return False
+        if not force and path_has_content(new_path):
+            return False
+        if old_path.is_dir():
+            if not any(old_path.iterdir()):
+                return False
+            shutil.copytree(old_path, new_path, dirs_exist_ok=True)
+            return True
+        if old_path.is_file() and old_path.stat().st_size > 0:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(old_path, new_path)
+            return True
+    except OSError as e:
+        logger.warning(f"Could not carry save data from {old_path} to {new_path}: {e}")
+    return False
+
+
+def mirror_save_data(old_path: Path, new_path: Path) -> "tuple[bool, Optional[Path]]":
+    """Make *new_path* hold exactly what *old_path* holds — files that only
+    *new_path* has are removed too, so the two end up equal by content (see
+    save_data_equal) rather than merged, which would leave the pair differing
+    and the question coming back on every switch.
+
+    What is about to be replaced was never backed up (it is not among the
+    game's tracked paths until now), so it is copied aside first, next to it,
+    as ``<name>.pre-switch-<stamp>``. If that copy cannot be made nothing is
+    touched. A backup is deliberately NOT used for this: a fresh backup of the
+    other version's saves would become the game's newest, and the mirrored
+    state would then read as an older one coming back.
+
+    Returns ``(ok, aside)``: whether the mirror happened and where the previous
+    content went (None when there was none to keep).
+    """
+    import shutil
+    from datetime import datetime as _dt
+    try:
+        if not path_has_content(old_path):
+            return False, None
+        aside = None
+        if path_has_content(new_path):
+            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+            aside = new_path.with_name(f"{new_path.name}.pre-switch-{stamp}")
+            n = 1
+            while aside.exists():
+                aside = new_path.with_name(f"{new_path.name}.pre-switch-{stamp}-{n}")
+                n += 1
+            if new_path.is_dir():
+                shutil.copytree(new_path, aside)
+            else:
+                shutil.copy2(new_path, aside)
+        if old_path.is_file():
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(old_path, new_path)
+            return True, aside
+        if new_path.is_dir():
+            wanted = {p.relative_to(old_path) for p in old_path.rglob("*") if p.is_file()}
+            for p in sorted(new_path.rglob("*"), key=lambda q: len(q.parts), reverse=True):
+                rel = p.relative_to(new_path)
+                if p.is_file():
+                    if rel not in wanted:
+                        p.unlink()
+                elif not any(p.iterdir()):
+                    p.rmdir()
+        shutil.copytree(old_path, new_path, dirs_exist_ok=True)
+        return True, aside
+    except OSError as e:
+        logger.warning(f"Could not mirror save data from {old_path} to {new_path}: {e}")
+        return False, None
+
+
+def save_data_equal(a: Path, b: Path) -> bool:
+    """True when *a* and *b* hold the same files with the same bytes.
+
+    Compared by content hash (sha256), not by dates: a game that rewrites a
+    save unchanged, or a copy made with a fresh mtime, is still the same save.
+    Used to tell "this version already has its own DIFFERENT saves" (worth
+    asking about) from "it has the very same ones" (nothing to ask).
+    """
+    import hashlib
+
+    def _files(root: Path) -> dict:
+        if root.is_file():
+            return {"": root}
+        return {p.relative_to(root).as_posix(): p for p in root.rglob("*") if p.is_file()}
+
+    def _digest(p: Path) -> str:
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    try:
+        fa, fb = _files(a), _files(b)
+        if set(fa) != set(fb):
+            return False
+        for rel, pa in fa.items():
+            pb = fb[rel]
+            if pa.stat().st_size != pb.stat().st_size:
+                return False
+            if _digest(pa) != _digest(pb):
+                return False
+        return True
+    except OSError:
+        return False   # cannot read one side: treat as different, ask
+
+
+def rebase_targets_identical(old_exe: str, new_exe: str, save_paths) -> bool:
+    """True when every rebase target that already holds saves holds the SAME
+    ones as the location it was rebased from (content hash) — so moving onto
+    it loses nothing and there is nothing to ask. False as soon as one differs,
+    or has content while the old location has none to compare with."""
+    if not old_exe or not save_paths:
+        return False
+    seen = False
+    for p in save_paths:
+        hit = rebase_path_for_new_exe(old_exe, new_exe, p)
+        if hit is None or not path_has_content(Path(hit[0])):
+            continue
+        seen = True
+        if not path_has_content(Path(p)) or not save_data_equal(Path(p), Path(hit[0])):
+            return False
+    return seen
 
 
 def rebase_targets_have_existing_saves(old_exe: str, new_exe: str, save_paths) -> bool:
@@ -247,6 +596,9 @@ class GameEntry:
     category: str = ""                      # folder path (e.g. "RPG/JRPG")
     description: str = ""                   # user notes / game description
     tags: list[str] = field(default_factory=list)  # user-defined tags
+    # Languages the game supports, as English names (see normalize_languages).
+    # Filled by a web search; read-only in the add/edit panel.
+    languages: list[str] = field(default_factory=list)
     # Game metadata
     developer: str = ""                     # developer / team name
     release_year: str = ""                  # e.g. "2024" or "2024-03-15"
@@ -490,6 +842,13 @@ class GameEntry:
         """
         if not new_name:
             return
+        # The name it is LEAVING goes on record first. An entry that was never
+        # given a history (a game added straight from the overlay) holds only
+        # its current name, so the first rename used to drop the old one — it
+        # then survived only as a folder, never as a name.
+        if (self.name and self.name != new_name and self.name not in self.name_history
+                and history_worthy(self.name)):
+            self.name_history.append(self.name)
         if new_name not in self.name_history:
             self.name_history.append(new_name)
         self.name = new_name
@@ -504,6 +863,13 @@ class GameEntry:
         if (_old_folder and _old_folder != self.computed_folder_name
                 and _old_folder not in self.folder_history):
             self.folder_history.append(_old_folder)
+        # A new title is a new remote move to make: the record of moves already
+        # done (see SyncWorker._migrate_remote_folders) belonged to the old one,
+        # and would otherwise stop a rename back to an earlier name from ever
+        # migrating.
+        if _old_folder != self.computed_folder_name and self.cloud_metadata:
+            self.cloud_metadata = {k: v for k, v in self.cloud_metadata.items()
+                                   if k != "remote_rehomed"}
 
     def mark_played(self):
         # NOTE: Callers mutate a copy then call update_game() which replaces

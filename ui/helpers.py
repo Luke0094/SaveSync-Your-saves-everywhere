@@ -2408,7 +2408,7 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
     """Decode raw image bytes to a QPixmap, falling back to PIL (+
     pillow_avif) for formats Qt has no plugin for.
 
-    Forum attachment CDNs (f95zone confirmed) serve AVIF under a .png/.jpg
+    Forum attachment CDNs (confirmed on a real one) serve AVIF under a .png/.jpg
     URL — QPixmap.loadFromData alone just fails on it, silently, leaving a
     preview thumbnail blank while the same bytes decode fine through PIL.
     _download_and_set_image (add_game_dialog.py) already has this fallback

@@ -159,6 +159,13 @@ _DEFAULTS: dict[str, Any] = {
     # so before this they behaved as session-only and reappeared every restart
     # — which also left the Settings → suppressed-games reset list empty.
     "suppressed_cloud_no_local": [],   # game_ids: skip "download cloud saves?" at launch
+    # Folders added by hand under a backup folder name that was already taken
+    # and answered "don't ask again": {game_id or "folder:<name>": {folder:
+    # "skip"}}. The only answer that is remembered; it shows in Settings. The
+    # validator also lets "separate" / "keep_both" through — older configs
+    # hold them, are read as no answer, and rejecting them would drop the skips
+    # stored beside them.
+    "archive_choices": {},
     "suppressed_ingame_notifs": {},    # {game_id: [...]}: in-game notification suppression
     "scan_auto_accept_games": {},      # {game_id: ...}: auto-accept the save scan at exit
     "last_cloud_config_hash": None,    # fingerprint of last imported cloud config
@@ -292,6 +299,10 @@ _VALIDATION_RULES: dict[str, Callable] = {
         isinstance(p, str) for p in x),
     "suppressed_overlay_apps": lambda x: isinstance(x, list) and all(
         isinstance(p, str) for p in x),
+    "archive_choices": lambda x: isinstance(x, dict) and all(
+        isinstance(k, str) and isinstance(v, dict)
+        and all(isinstance(a, str) and b in ("separate", "keep_both", "skip") for a, b in v.items())
+        for k, v in x.items()),
     "suppressed_cloud_no_local": lambda x: isinstance(x, list) and all(
         isinstance(p, str) for p in x),
     "auto_scan_confirmed_games": lambda x: isinstance(x, list),

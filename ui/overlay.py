@@ -95,6 +95,14 @@ def _remote_game_folder(orch, provider, entry, game_id: str) -> str:
     return orch.resolve_remote_game_folder(provider, candidates) or candidates[0]
 
 
+def _main_line_first(backups) -> list:
+    """The restore list's order: the real history, then the side branch
+    (provisional / pre-restore copies) — the same split the Backups page
+    makes. Stable, so each group stays newest-first."""
+    from core.backup import BackupManager
+    return sorted(backups, key=BackupManager.is_side_backup)
+
+
 # Recent pins beyond this many scroll instead of growing the menu.
 _PIN_MENU_ROWS = 5
 
@@ -269,6 +277,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._unknown_badge.setToolTip(t("unknown_history.badge_tooltip"))
         self._unknown_badge.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._unknown_badge.clicked.connect(self._on_badge_clicked)
+        from ui import unknown_history
+        unknown_history.signals.changed.connect(self._on_unknown_queue_changed)
         self._unknown_badge.setVisible(False)
         self._refresh_badge_interactivity()
         self._title = QLabel(t("app.name"))
@@ -733,7 +743,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             if not local_backups:
                 lbl = QLabel(f"<span style='color:{palette('text_hint')};font-size:{scaled(10, self)}px;'>{t('overlay.no_backups_available')}</span>")
                 lay.insertWidget(lay.count() - 1, lbl)
-            for bk in local_backups:
+            for bk in _main_line_first(local_backups):
                 lay.insertWidget(lay.count() - 1,
                                  self._make_restore_btn(bk, game_id, cloud_only=False))
             self._resize_restore_scroll(max(1, len(local_backups)))
@@ -805,7 +815,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             if not entries:
                 lbl = QLabel(f"<span style='color:{palette('text_hint')};font-size:{scaled(10, self)}px;'>{t('overlay.no_backups_available')}</span>")
                 lay.insertWidget(lay.count() - 1, lbl)
-            for bk in entries:
+            for bk in _main_line_first(entries):
                 # Already-downloaded backups restore from the local zip
                 # directly; the rest download transparently first.
                 is_cloud_only = bk.backup_id not in local_ids
@@ -900,8 +910,21 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # Temporary (pre-confirmation) backups — created during the first
         # session of a game whose save paths aren't confirmed yet — are
         # exactly what this in-game list exists to restore, so flag them.
-        is_temp = bool((getattr(bk, "cloud_metadata", None) or {}).get("pre_confirmation"))
-        temp_tag = f"  ⏳ {t('overlay.temp_backup_tag')}" if is_temp else ""
+        # A pre-restore copy is the other kind of side-branch entry (see
+        # BackupManager.is_side_backup) and says so, rather than reading as
+        # an ordinary backup among the real ones.
+        from core.backup import BackupManager
+        _meta = getattr(bk, "cloud_metadata", None) or {}
+        # A version added by hand is beside the history too, but it is nothing
+        # to be careful about: no warning colour, and it says what it is.
+        added = bool(_meta.get(BackupManager.MANUAL_VERSION_KEY))
+        is_temp = BackupManager.is_side_backup(bk) and not added
+        if _meta.get("pre_restore_safety"):
+            temp_tag = f"  ↶ {t('backup.pre_restore_safety')}"
+        elif added:
+            temp_tag = f"  ＋ {t('backup.manual_version')}"
+        else:
+            temp_tag = f"  ⏳ {t('overlay.temp_backup_tag')}" if is_temp else ""
         btn = QPushButton(f"  ↩  {date_str}  —  {badge}  —  {bk.size_human}{temp_tag}")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         border_col = palette('warning') if is_temp else palette('border_hover')
@@ -981,12 +1004,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         unknown-process feature is off: the queue is not offered then,
         so a counter for it would only confuse."""
         try:
-            from core.config_manager import get_config
-            if not get_config().get("show_overlay_on_unknown", True):
-                n = 0
-            else:
-                from ui.unknown_history import pending_unknown_count
-                n = pending_unknown_count()
+            from ui.unknown_history import visible_entries
+            n = len(visible_entries())
         except Exception:
             n = 0
         self._unknown_badge.setText(f"🎮 {n}")
@@ -1013,6 +1032,27 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._unknown_badge.setStyleSheet(base)
             self._unknown_badge.setCursor(Qt.CursorShape.ArrowCursor)
             self._unknown_badge.setToolTip(t("unknown_history.badge_pending"))
+
+    def _on_unknown_queue_changed(self):
+        """The shared queue moved (a detection, an add, a "don't show again" —
+        here or on the Overview). The badge follows; the carousel, when it is
+        what is on screen, re-reads the list and stays on the same game if it
+        is still there, or hands over to its neighbour — and closes when the
+        queue has emptied."""
+        self.refresh_unknown_badge()
+        if self._unknown_queue is None or not self.isVisible():
+            return
+        entries = self._pending_unknown_entries()
+        if not entries:
+            self.hide_animated()
+            return
+        stay = self._context_exe
+        exes = [e.get("exe") for e in entries]
+        self._unknown_index = (exes.index(stay) if stay in exes
+                               else min(self._unknown_index, len(entries) - 1))
+        self._unknown_queue = entries
+        self._render_unknown_entry()
+        self._rerender_in_place()
 
     def _on_badge_clicked(self):
         if self._overlay_mode == "unknown":
@@ -1097,25 +1137,17 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     def _on_suppress(self):
         exe = self._context_exe
         in_unknown_queue = self._unknown_queue is not None
-        idx = self._unknown_index
         # Direct connection: by the time emit returns, the main window has
         # already suppressed the app AND pruned it from the pending queue.
         self.dont_show_again.emit(exe)
         if in_unknown_queue:
-            # Stay ON the queue: re-read it (the suppressed entry is gone)
-            # and keep the same position — the next entry slides into this
-            # slot, no jump back to the first one, and the render is
-            # in-place so the auto-hide countdown and the hover-pause
-            # state are NOT reset (with the cursor still on the card the
-            # countdown stays paused exactly as before the click).
-            entries = self._pending_unknown_entries()
-            if entries:
-                self._unknown_queue = entries
-                self._unknown_index = min(idx, len(entries) - 1)
-                self._render_unknown_entry()
-                self._rerender_in_place()
-                self.refresh_unknown_badge()
-                return
+            # Stay ON the queue: the main window has removed the entry from the
+            # shared queue, and _on_unknown_queue_changed has already re-read
+            # it — the next entry slides into this slot (no jump back to the
+            # first one), in-place, so the auto-hide countdown and the
+            # hover-pause state are NOT reset — or the card closed itself
+            # when nothing was left.
+            return
         self.hide_animated()
 
     def _set_suppress_link(self, text_key: str, handler) -> None:
@@ -1276,9 +1308,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._dashboard.setVisible(False)
         self._dashboard.setMaximumHeight(0)
 
-    def _begin_cloud_prompt(self, game_name: str, exe_path: str, hint_key: str) -> None:
+    def _begin_cloud_prompt(self, game_name: str, exe_path: str, hint_key: str,
+                            hint_args: "dict | None" = None) -> None:
         """Shared header for the cloud-save decision prompts: context, cloud
-        icon, game name + overlay.*hint_key* message, clean button areas."""
+        icon, game name + overlay.*hint_key* message (formatted with
+        *hint_args* when the message carries placeholders — escaped by the
+        caller), clean button areas."""
         self._set_mode("cloud")
         self._context_exe = exe_path
         self._priority_context = exe_path
@@ -1286,7 +1321,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._title.setText(t("app.name"))
         self._message.setText(
             f"<b>{game_name}</b><br>"
-            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>{t(f'overlay.{hint_key}')}</span>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
+            f"{t(f'overlay.{hint_key}', **(hint_args or {}))}</span>"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -1336,8 +1372,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         view and falls back to the queue, so no pending toast is lost.
         hide_animated() still clears everything on manual dismiss.
         """
-        from core.config_manager import get_config
-        if not get_config().get("show_overlay_on_unknown", True):
+        from ui.unknown_history import feature_enabled
+        if not feature_enabled():
             self.refresh_unknown_badge()
             return
         if self._defer_if_priority(self.show_unknown_queue):
@@ -1574,6 +1610,25 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             "dont_show_again", lambda: self._on_action("suppress_cloud_no_local"))
         self._show_priority_prompt()
 
+    def show_remote_renamed(self, game_name: str, exe_path: str, new_name: str):
+        """Another machine renamed this game's cloud folder, so this machine's
+        old one is gone. Primary: take the new name here too; dropdown: keep
+        both names (this machine carries on under its own); bottom link: same
+        as keep both, and never ask again for this game."""
+        if self._defer_if_priority(lambda: self.show_remote_renamed(game_name, exe_path, new_name),
+                                   context=exe_path, is_priority=True):
+            return
+        self._begin_cloud_prompt(game_name, exe_path, "cloud_renamed",
+                                 hint_args={"name": html.escape(new_name)})
+        self._add_split_btn(
+            self._btn_area, t("overlay.update_renamed"), "update_renamed_game",
+            menu_items=[(t("sync.keep_both"), "keep_both_renamed_game")],
+            primary=True,
+        )
+        self._set_suppress_link(
+            "dont_show_again", lambda: self._on_action("never_renamed_game"))
+        self._show_priority_prompt()
+
     def show_cloud_saves_different_machine(self, game_name: str, exe_path: str):
         """Cloud saves were last uploaded by a DIFFERENT machine — local saves
         here may be older. Download & replace, or keep local."""
@@ -1779,11 +1834,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         Both readings come from one comparison (see
         core.backup.BackupManager.detect_regression) and share this same
         prompt shape rather than two separate ones — decision chrome, an
-        icon, title/message/hint, a primary action, an acknowledgement, a
-        mute link — with only the wording and the primary action differing:
+        icon, title/message/hint, a primary action, a dropdown alternative,
+        a mute link — with only the wording and the primary action differing:
 
         - regression at launch: state the fact, offer to put the newest
-          state back;
+          state back (or to back the current one up instead);
         - regression right after a restore: name the likely cause (a
           launcher's automatic sync racing the restore) and offer to force
           it with the game frozen, which is the thing that actually wins
@@ -1830,60 +1885,35 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             )
         self._hide_dashboard()
         self._clear_buttons()
-        # An alert holds priority and never auto-hides, so it MUST carry a way
-        # out: without it nothing behind it would ever be shown again.
-        # "regression_ack"/"unbacked_ack" are their own actions, not the
-        # shared "dismiss": losing this alert must not mean losing the
-        # warning, so it stays re-summonable by the hotkey until the player
-        # actually acknowledges it — and THAT is what this action says.
-        # Worded as an acknowledgement for the same reason.
+        # Two answers, the same for a regression and for unbacked content:
+        # put the last backup back (the cautious primary — the point is
+        # avoiding changes nobody vouched for), or make what is on disk the
+        # new backup (the dropdown, for when the player knows it is genuine —
+        # played offline, or on another PC). There is deliberately no third
+        # "dismiss": the ✕ closes the alert and the warning stays pending, so
+        # the game keeps being backed up as temporary copies (see
+        # _launch_notification_pending) that only one of the two answers
+        # above ever settles. The hotkey brings the alert back.
         #
-        # Same shape as the cloud prompts: the repair is the primary button
-        # and the acknowledgement sits in its dropdown. With no backup to
-        # restore there is no primary to attach a menu to, so the
-        # acknowledgement stays a plain button — it is the only way out.
-        if unbacked:
-            if newest_backup_id:
-                # Restore is the primary action: the point is avoiding
-                # unknown changes, so the cautious default is putting the
-                # previous state back, not enshrining this unverified one
-                # as a new backup. newest_backup_id is main_window's
-                # newest_restore_target — the newest TRUSTED backup when
-                # one exists, else simply the newest backup on record, so
-                # this is populated whenever this game has ANY backup at
-                # all, which detect_regression already requires for
-                # unbacked to fire in the first place. "Back it up now"
-                # (for when the player DOES know this state is fine — e.g.
-                # genuine offline play) and the acknowledgement both move
-                # to the dropdown.
-                self._add_split_btn(
-                    self._btn_area,
-                    t("overlay.save_unbacked_restore"),
-                    "restore_newest",
-                    menu_items=[
-                        (t("overlay.save_unbacked_backup"), "backup_now_unbacked"),
-                        (t("overlay.got_it"), "unbacked_ack"),
-                    ],
-                    primary=True)
-            else:
-                # Defense-in-depth only — see above, this game should
-                # always have at least one backup on record here.
-                self._add_split_btn(
-                    self._btn_area,
-                    t("overlay.save_unbacked_backup"),
-                    "backup_now_unbacked",
-                    menu_items=[(t("overlay.got_it"), "unbacked_ack")],
-                    primary=True)
-        elif newest_backup_id:
+        # Not offered right after a restore: keeping the state the player just
+        # restored away from would contradict what they just did — there the
+        # one answer is forcing the restore, a plain button.
+        backup_now = (t("overlay.save_unbacked_backup"), "backup_now_unbacked")
+        if not newest_backup_id:
+            # Defense-in-depth only: detect_regression needs a backup on
+            # record to fire at all, so this game should always have one.
+            self._add_btn(self._btn_area, backup_now[0], backup_now[1], primary=True)
+        elif after_restore:
+            self._add_btn(self._btn_area, t("overlay.restore_force"),
+                          "force_restore", primary=True)
+        else:
             self._add_split_btn(
                 self._btn_area,
-                t("overlay.restore_force") if after_restore
+                t("overlay.save_unbacked_restore") if unbacked
                 else t("overlay.save_reverted_restore"),
-                "force_restore" if after_restore else "restore_newest",
-                menu_items=[(t("overlay.got_it"), "regression_ack")],
+                "restore_newest",
+                menu_items=[backup_now],
                 primary=True)
-        else:
-            self._add_btn(self._btn_area, t("overlay.got_it"), "regression_ack")
         self._set_suppress_link(
             "dont_show_ingame",
             lambda _checked=False, gid=game_id:

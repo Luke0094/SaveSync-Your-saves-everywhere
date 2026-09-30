@@ -3,9 +3,13 @@
 Three steps, one at a time, with a way back from each:
 
 1. pick a game (the library's own search, ghost hint and all);
-2. pick one of that game's save files — with the copies SaveSync has kept
-   of it, newest first, each restorable;
+2. pick one of that game's save files — beside them, the way into the copies
+   SaveSync has kept of them;
 3. edit the values inside it.
+
+The kept copies have a panel of their own, reached from step 2: newest first,
+each tagged with why it was kept (before an edit, or the file as it stood
+just before a restore) and restorable or deletable from there.
 
 Editing is done on files at rest. Nothing attaches to a running game and
 nothing is written into one — see core/save_editor for why that boundary is
@@ -24,7 +28,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QStackedWidget, QVBoxLayout, QWidget)
 
 from core.library import get_library
-from core.save_editor import (SaveEditorError, delete_backup, describe,
+from core.save_editor import (KIND_PRE_RESTORE, SaveEditorError, backup_kind,
+                              backup_taken_at, delete_backup, describe,
                               explain, list_backups, open_save,
                               prune_backups, restore_backup)
 from i18n import t
@@ -466,12 +471,15 @@ class _SaveLoadWorker(QThread):
         self._cancel_token.cancel()
 
     def run(self):
-        # Set from inside run(): setPriority only applies to a RUNNING
-        # thread. From __init__ it did nothing but log "Cannot set
-        # priority, thread is not running", so these scans never
-        # actually ran at idle priority — which is the one thing the
-        # call was there to do while a game has the CPU.
-        self.setPriority(QThread.Priority.IdlePriority)
+        # NOT lowered to idle priority, deliberately. This thread runs Python,
+        # so it takes the GIL — and a thread the OS does not schedule cannot
+        # give it back: with a game on every core an idle-priority load never
+        # finished (measured: no result in two minutes, against ~11 s at
+        # normal priority), and the GUI thread, waiting on the GIL, stalled
+        # for seconds at a time. That is the save editor "unresponsive while a
+        # game runs" — the sheet never left and Minimize barely reacted.
+        # Sharing the CPU fairly costs the game far less than that. Every
+        # other worker in the app follows the same rule.
         from time import monotonic
         start_mono = monotonic()
         last_emit = 0.0
@@ -524,12 +532,18 @@ class _SaveLoadWorker(QThread):
 class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
     """Pick a game, pick a save, edit what is inside it."""
 
-    STEP_PICK, STEP_SAVES, STEP_EDIT = 0, 1, 2
+    STEP_PICK, STEP_SAVES, STEP_EDIT, STEP_RESTORE = 0, 1, 2, 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self._entry = None
+        # The restore panel: every kept copy of the game's saves, newest kept
+        # first, as (kept_at, modified, copy, target, kind).
+        self._restore_items = []
+        self._restore_page = 0
+        self._saves_subtitle = ""   # the saves step's, put back on the way out
+        self._saves_stale = False   # a restore changed files under that list
         self._doc = None
         self._editors = {}          # field path -> widget, for the page shown
         self._pending = {}          # every edit made, whatever page it was on
@@ -566,6 +580,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # of the timer, so it tracks a tier that moved.
         self._idle_save_timer = QTimer(self)
         self._idle_save_timer.timeout.connect(self._on_idle_save_timeout)
+
+        # Watches an open in progress: an empty editor with nothing loading for
+        # it is a page nobody can get out of (see _check_load_alive).
+        self._load_watch = QTimer(self)
+        self._load_watch.setInterval(1000)
+        self._load_watch.timeout.connect(self._check_load_alive)
+        self._stuck_ticks = 0
 
         self._build()
         # Shell only — game rows fill on first on_page_enter (async chunks).
@@ -604,6 +625,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._stack.addWidget(self._build_pick())
         self._stack.addWidget(self._build_saves())
         self._stack.addWidget(self._build_edit())
+        self._stack.addWidget(self._build_restore())
         root.addWidget(self._stack, 1)
 
     def _scroller(self):
@@ -666,12 +688,25 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         col = QVBoxLayout(page)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(8)
+        # The kept copies are not listed here: a game with a few saves and a
+        # few edits each fills a fixed-height strip, and the strip is no place
+        # to read what a copy is or to be sure which one a click restores.
+        # One line says how many there are; the button opens their own panel.
+        kept_row = QHBoxLayout()
+        kept_row.setSpacing(10)
         self._kept_lbl = QLabel(t("cheats.kept_copies"))
         self._kept_lbl.setObjectName("section_header")
-        col.addWidget(self._kept_lbl)
-        self._kept_area, self._kept_col = self._scroller()
-        self._kept_area.setMaximumHeight(scaled(150, self))
-        col.addWidget(self._kept_area)
+        kept_row.addWidget(self._kept_lbl)
+        self._kept_summary = QLabel("")
+        self._kept_summary.setObjectName("form_hint")
+        self._kept_summary.setWordWrap(True)
+        kept_row.addWidget(self._kept_summary, 1)
+        self._restore_open_btn = QPushButton(t("cheats.open_restore"))
+        self._restore_open_btn.setObjectName("cheats_row_btn")
+        self._restore_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._restore_open_btn.clicked.connect(self._open_restore_panel)
+        kept_row.addWidget(self._restore_open_btn)
+        col.addLayout(kept_row)
         head = QHBoxLayout()
         head.setSpacing(8)
         self._files_lbl = QLabel(t("cheats.pick_save"))
@@ -879,6 +914,46 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         col.addLayout(pager)
         return page
 
+    def _build_restore(self) -> QWidget:
+        """The kept copies of a game's saves, on a panel of their own."""
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(8)
+        self._restore_hint = QLabel(t("cheats.restore_panel_hint"))
+        self._restore_hint.setObjectName("form_hint")
+        self._restore_hint.setWordWrap(True)
+        col.addWidget(self._restore_hint)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self._restore_lbl = QLabel(t("cheats.kept_copies"))
+        self._restore_lbl.setObjectName("section_header")
+        head.addWidget(self._restore_lbl)
+        head.addStretch(1)
+        # A game keeps copies of several save files; one file's history is
+        # what anyone opens this for. Same untouched QComboBox as the save
+        # list's folder filter, for the same reason (the theme dresses it).
+        self._restore_file_combo = QComboBox()
+        self._restore_file_combo.setMaximumWidth(scaled(320, self))
+        self._restore_file_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._restore_file_combo.currentIndexChanged.connect(
+            self._apply_restore_filter)
+        head.addWidget(self._restore_file_combo)
+        col.addLayout(head)
+        self._restore_area, self._restore_col = self._scroller()
+        col.addWidget(self._restore_area, 1)
+        (bar, self._restore_first, self._restore_prev, self._restore_page_lbl,
+         self._restore_next, self._restore_last) = self._pager()
+        self._restore_first.clicked.connect(lambda: self._jump_restore(0))
+        self._restore_prev.clicked.connect(lambda: self._step_restore(-1))
+        self._restore_next.clicked.connect(lambda: self._step_restore(1))
+        self._restore_last.clicked.connect(lambda: self._jump_restore(-1))
+        self._restore_page_lbl.editingFinished.connect(
+            lambda: self._jump_from_label(
+                self._restore_page_lbl, self._jump_restore))
+        col.addLayout(bar)
+        return page
+
     # ── Steps ────────────────────────────────────────────────────────────────
 
     def show_step(self, step: int, *, refresh_pick: bool = True):
@@ -918,6 +993,23 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _go_back(self):
         step = self._stack.currentIndex()
+        if step == self.STEP_RESTORE:
+            self._cancel_row_insert()
+            if self._saves_stale:
+                # A restore rewrote files under the list this returns to:
+                # read it again, the order and the times have moved.
+                if self._entry is not None:
+                    self._open_game(self._entry)
+                elif self._loose is not None:
+                    self._show_loose(self._loose)
+                else:
+                    self.show_step(self.STEP_PICK)
+                return
+            self.show_step(self.STEP_SAVES)
+            self._subtitle.setText(self._saves_subtitle)
+            self._refresh_kept_summary()
+            self._render_saves_page()
+            return
         if step == self.STEP_EDIT:
             # A load still actively showing its "please wait" overlay must
             # not be left to land after we've already navigated away — see
@@ -1112,6 +1204,19 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         return bool(self._playing() and self._hold is not None
                     and self._hold.is_running())
 
+    def has_loaded_document(self) -> bool:
+        """A save is open in the editor (asked by the memory sweep — see
+        MainWindow._release_idle_documents)."""
+        return self._doc is not None
+
+    def in_use(self) -> bool:
+        """Someone is working here: a save open, or a load they are waiting
+        on (shelved or not). A page in this state is never wiped from under
+        them just because a game started or exited."""
+        return (self._doc is not None
+                or getattr(self, "_save_load_busy", None) is not None
+                or self._stack.currentIndex() == self.STEP_EDIT)
+
     def _reset_idle_save_timer(self):
         """(Re)start the idle release countdown when a document is loaded and
         no hold is running against a live game."""
@@ -1207,9 +1312,12 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._group_combo.clear()
             self._group_combo.blockSignals(False)
         self._clear(self._games_col)
-        self._clear(self._kept_col)
+        self._clear(self._restore_col)
         self._clear(self._files_col)
         self._clear(self._fields_col)
+        self._restore_items = []
+        self._restore_page = 0
+        self._saves_stale = False
         self._pending_initial_load = True
         self.show_step(self.STEP_PICK, refresh_pick=False)
         if self.isVisible():
@@ -1256,6 +1364,8 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._all_files = list(files)
         self._files = list(files)
         self._file_page = 0
+        self._saves_subtitle = subtitle
+        self._saves_stale = False
         self.show_step(self.STEP_SAVES)
         self._subtitle.setText(subtitle)
         self._fill_folders()
@@ -1265,6 +1375,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # paging back and forth is not a reason to go over the disk again.
         for f in self._files[:page_size(SCOPE_CHEATS_SAVES)]:
             prune_backups(f)
+        self._refresh_kept_summary()
         self._render_saves_page()
 
     def _fill_folders(self):
@@ -1310,17 +1421,12 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._render_saves_page_inner()
 
     def _render_saves_page_inner(self):
-        """One page of the save list, with the copies kept of what is on it.
+        """One page of the save list.
 
-        The copies follow the page rather than the whole list: reading them
-        means a look in the folder per save, and a game with several save
-        paths has a few hundred. What anyone is here to undo is the save they
-        just edited, which — being the newest — is on the first page.
-
-        File/kept rows insert in QTimer chunks (library-style) so switching
-        into this step never freezes on a long page.
+        Rows insert in QTimer chunks (library-style) so switching into this
+        step never freezes on a long page. The kept copies are not listed
+        here — see _open_restore_panel.
         """
-        self._clear(self._kept_col)
         self._clear(self._files_col)
         files = self._files
         per_page = page_size(SCOPE_CHEATS_SAVES)
@@ -1364,32 +1470,6 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                     return self._files_col, row
                 jobs.append(_file_row)
 
-        kept = []
-        for f in shown:
-            for copy, when in list_backups(f):
-                kept.append((when, copy, f))
-        kept.sort(reverse=True, key=lambda t_: t_[0])
-        if not kept:
-            def _empty_kept():
-                lbl = QLabel(t("cheats.no_kept"))
-                lbl.setObjectName("empty_hint")
-                lbl.setWordWrap(True)
-                return self._kept_col, lbl
-            jobs.append(_empty_kept)
-        else:
-            for when, copy, target in kept[:20]:
-                def _kept_row(when=when, copy=copy, target=target):
-                    row = _Row(target.name, when.strftime("%d/%m/%Y %H:%M"))
-                    row.setToolTip(str(copy))
-                    row.add_button(
-                        t("cheats.restore"),
-                        lambda _=False, c=copy, tg=target, w=when: self._restore(c, tg, w))
-                    row.add_icon_button(
-                        "🗑", t("cheats.delete_kept"),
-                        lambda _=False, c=copy, w=when: self._delete_kept(c, w))
-                    return self._kept_col, row
-                jobs.append(_kept_row)
-
         self._begin_async_rows(jobs)
 
     def _step_saves(self, delta: int):
@@ -1400,10 +1480,152 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._file_page = index if index >= 0 else 1 << 30
         self._render_saves_page()
 
+    # ── Step 2b: the kept copies ─────────────────────────────────────────────
+
+    _STAMP_FMT = "%d/%m/%Y %H:%M"
+
+    def _collect_restore_items(self) -> list:
+        """Every copy kept of every save in the list, newest KEPT first.
+
+        Reads the whole list, not just the page on show: the panel is the one
+        place to find a copy, so it cannot be limited to the saves that
+        happen to be on screen. The cost is a look in one folder per save —
+        most of which do not exist (nothing was ever edited) and answer at
+        once.
+        """
+        items = []
+        for f in self._all_files:
+            for copy, modified in list_backups(f):
+                items.append((backup_taken_at(copy), modified, copy, f,
+                              backup_kind(copy)))
+        items.sort(key=lambda it: it[0], reverse=True)
+        self._restore_items = items
+        return items
+
+    def _refresh_kept_summary(self, rescan: bool = True):
+        """The one line on the saves step: how many copies, and the way in.
+
+        *rescan* False when the caller has just read the copies itself.
+        """
+        if rescan:
+            self._collect_restore_items()
+        n = len(self._restore_items)
+        self._kept_summary.setText(
+            t("cheats.kept_summary", count=n) if n else t("cheats.no_kept"))
+        self._restore_open_btn.setVisible(n > 0)
+
+    def _open_restore_panel(self):
+        self._restore_page = 0
+        self._collect_restore_items()
+        self._fill_restore_files()
+        self.show_step(self.STEP_RESTORE)
+        self._subtitle.setText(t("cheats.restore_subtitle"))
+        self._render_restore_page()
+
+    def _fill_restore_files(self, keep: str = ""):
+        """Offer the saves that have copies, when more than one does.
+
+        *keep* is the file that was selected before a refresh, so restoring or
+        deleting a copy does not throw the person back to "all files".
+        """
+        combo = self._restore_file_combo
+        counts = {}
+        for it in self._restore_items:
+            counts[str(it[3])] = counts.get(str(it[3]), 0) + 1
+        combo.blockSignals(True)
+        combo.clear()
+        if len(counts) > 1:
+            combo.addItem(t("cheats.all_files"), "")
+            for where, n in counts.items():
+                name = Path(where).name
+                combo.addItem(f"{name} · {t('cheats.n_copies_of', count=n)}", where)
+                combo.setItemData(combo.count() - 1, where,
+                                  Qt.ItemDataRole.ToolTipRole)
+            idx = combo.findData(keep) if keep else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        combo.setVisible(len(counts) > 1)
+
+    def _apply_restore_filter(self):
+        self._restore_page = 0
+        self._render_restore_page()
+
+    def _render_restore_page(self):
+        with guarded_render(SCOPE_CHEATS_SAVES):
+            self._render_restore_page_inner()
+
+    def _render_restore_page_inner(self):
+        self._clear(self._restore_col)
+        where = self._restore_file_combo.currentData()
+        view = [it for it in self._restore_items
+                if not where or str(it[3]) == where]
+        per_page = page_size(SCOPE_CHEATS_SAVES)
+        pages = max(1, (len(view) + per_page - 1) // per_page)
+        self._restore_page = max(0, min(self._restore_page, pages - 1))
+        start = self._restore_page * per_page
+        shown = view[start:start + per_page]
+
+        self._restore_page_lbl.setText(t("cheats.page_of_copies",
+                                         page=self._restore_page + 1,
+                                         pages=pages, total=len(view)))
+        self._fit_page_label(self._restore_page_lbl)
+        self._restore_first.setEnabled(self._restore_page > 0)
+        self._restore_prev.setEnabled(self._restore_page > 0)
+        self._restore_next.setEnabled(self._restore_page < pages - 1)
+        self._restore_last.setEnabled(self._restore_page < pages - 1)
+
+        if not view:
+            def _empty(note=t("cheats.no_kept")):
+                lbl = QLabel(note)
+                lbl.setObjectName("empty_hint")
+                lbl.setWordWrap(True)
+                return self._restore_col, lbl
+            self._begin_async_rows([_empty])
+            return
+
+        show_folder = len({str(it[3].parent) for it in view}) > 1
+        jobs = []
+        for it in shown:
+            def _copy_row(it=it, show_folder=show_folder):
+                kept_at, modified, copy, target, kind = it
+                tag = t("cheats.tag_pre_restore" if kind == KIND_PRE_RESTORE
+                        else "cheats.tag_before_edit")
+                kept = t("cheats.kept_at", when=kept_at.strftime(self._STAMP_FMT))
+                row = _Row(target.name, modified.strftime(self._STAMP_FMT),
+                           f"{kept} · {target.parent}" if show_folder else kept,
+                           engine=tag)
+                row.setToolTip(f"{copy}\n{t('cheats.copy_state_tip')}")
+                row.add_button(
+                    t("cheats.restore"),
+                    lambda _=False, c=copy, tg=target, w=modified:
+                        self._restore(c, tg, w))
+                row.add_icon_button(
+                    "🗑", t("cheats.delete_kept"),
+                    lambda _=False, c=copy, w=modified: self._delete_kept(c, w))
+                return self._restore_col, row
+            jobs.append(_copy_row)
+        self._begin_async_rows(jobs)
+
+    def _step_restore(self, delta: int):
+        self._restore_page += delta
+        self._render_restore_page()
+
+    def _jump_restore(self, index: int):
+        self._restore_page = index if index >= 0 else 1 << 30
+        self._render_restore_page()
+
+    def _refresh_restore_panel(self):
+        """Read the copies again and redraw, staying on the same file."""
+        keep = self._restore_file_combo.currentData() or ""
+        self._collect_restore_items()
+        self._fill_restore_files(keep)
+        self._render_restore_page()
+        self._refresh_kept_summary(rescan=False)
+
     def _restore(self, copy: Path, target: Path, when=None):
         from PySide6.QtWidgets import QMessageBox
         from ui.modal_helpers import question_window_modal
-        when_str = when.strftime("%d/%m/%Y %H:%M") if when else copy.name
+        when_str = when.strftime(self._STAMP_FMT) if when else copy.name
         reply = question_window_modal(
             self, t("cheats.title"),
             t("cheats.restore_confirm", name=target.name, when=when_str),
@@ -1428,18 +1650,19 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._doc = None
             self._loaded_path = None
             self._loaded_mtime = 0
+        # Stay on the panel: the file as it stood before this restore is now
+        # the first row of the list, tagged, one click from undoing it. The
+        # save list behind it is read again on the way back.
+        self._saves_stale = True
         self._subtitle.setText(t("cheats.restored", name=target.name))
-        if self._entry is not None:
-            self._open_game(self._entry)
-        else:
-            self._show_loose(target)
+        self._refresh_restore_panel()
 
     def _delete_kept(self, copy: Path, when):
         from PySide6.QtWidgets import QMessageBox
         from ui.modal_helpers import question_window_modal
         reply = question_window_modal(
             self, t("cheats.title"),
-            t("cheats.delete_kept_question", when=when.strftime("%d/%m/%Y %H:%M")),
+            t("cheats.delete_kept_question", when=when.strftime(self._STAMP_FMT)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -1450,7 +1673,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             warning_window_modal(self, t("cheats.title"), explain(e))
             return
         self._subtitle.setText(t("cheats.deleted_kept"))
-        self._render_saves_page()
+        self._refresh_restore_panel()
 
     # ── Step 3: the editor ───────────────────────────────────────────────────
 
@@ -1627,6 +1850,8 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._group_combo.clear()
         self._group_combo.blockSignals(False)
         self.show_step(self.STEP_EDIT)
+        self._stuck_ticks = 0
+        self._load_watch.start()
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, lambda p=resolved_path, g=gen:
                           self._open_editor_body(p, g, forced_engine, full_sweep, try_recipes))
@@ -1733,11 +1958,88 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                           full_sweep: bool = False, try_recipes: bool = False):
         if gen != getattr(self, "_save_load_gen", 0):
             return
+        try:
+            self._start_save_load(path, gen, forced_engine, full_sweep, try_recipes)
+        except Exception:
+            # Runs off a timer, where an exception is swallowed — and the
+            # please-wait sheet, already up, would then count seconds for a
+            # load that never started, with buttons wired to nothing.
+            logger.exception(f"Save editor: could not start loading {Path(path).name}")
+            self._abandon_in_flight_save_load(respect_shelved=False)
+            self._close_stray_sheets()
+            self._leave_empty_editor()
+
+    def _close_stray_sheets(self, keep=None):
+        """Take down every please-wait sheet over this page except *keep*. A
+        sheet nobody is tracking has no worker behind it and buttons that act
+        on nothing: whatever it was for is gone."""
+        from ui.widgets.busy_overlay import BusyOverlay
+        for sheet in self.findChildren(BusyOverlay):
+            if sheet is keep:
+                continue
+            try:
+                sheet.close_overlay()
+            except RuntimeError:
+                pass
+
+    def _leave_empty_editor(self):
+        """Back out of an editor that has nothing in it, to the list the person
+        came from."""
+        self._doc = None
+        self._load_watch.stop()
+        self._stuck_ticks = 0
+        self.show_step(self.STEP_SAVES if getattr(self, "_files", None)
+                       else self.STEP_PICK)
+
+    def _check_load_alive(self):
+        """Once a second while an open is in progress: an editor with no save in
+        it and no worker running for it, for three ticks running, is stuck — the
+        person would sit on "please wait" with nothing coming. Whatever went
+        wrong (the worker never started, its result was lost), they are handed
+        back to the list and the log says so."""
+        if self._stack.currentIndex() != self.STEP_EDIT or self._doc is not None:
+            self._load_watch.stop()
+            self._stuck_ticks = 0
+            return
+        worker = getattr(self, "_save_load_worker", None)
+        if worker is not None and worker.isRunning():
+            self._stuck_ticks = 0
+            return
+        self._stuck_ticks += 1
+        if self._stuck_ticks < 3:
+            return           # a result already on its way lands well inside this
+        logger.warning("Save editor: an open is on screen but nothing is loading "
+                       "for it — returning to the list")
+        self._abandon_in_flight_save_load(respect_shelved=False)
+        self._close_stray_sheets()
+        self._leave_empty_editor()
+
+    def _start_save_load(self, path: Path, gen: int, forced_engine: str,
+                         full_sweep: bool, try_recipes: bool):
+        # Only one open is ever legitimate at this point: anything already
+        # over the page is left over from one that no longer is.
+        self._close_stray_sheets()
 
         from ui.widgets.busy_overlay import BusyOverlay
         overlay = BusyOverlay(self, t("common.please_wait"), shelvable=True)
         overlay._reveal_after_s = 0
+        # Registered BEFORE it is shown: reveal() pumps the event loop, and
+        # whatever runs inside that pass (a game launching or exiting wipes
+        # this page via wipe_and_reload) can only close a sheet it can find.
+        # A sheet registered afterwards was invisible to it, and outlived the
+        # wipe that should have taken it down.
+        self._save_load_busy = overlay
         overlay.reveal()
+        if gen != getattr(self, "_save_load_gen", 0):
+            # The page was reset while the sheet was being shown — nothing is
+            # left to load for, and no worker was ever started.
+            if getattr(self, "_save_load_busy", None) is overlay:
+                self._save_load_busy = None
+            try:
+                overlay.close_overlay()
+            except Exception:
+                pass
+            return
         # Most opens land in a second or two even for a format whose unlock
         # can, in the worst case, search (Wolf LZ4's seed formula, a quick
         # Easy Save 3 / Unreal key hit) — the generic "please wait" covers
@@ -1747,7 +2049,6 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # worth saying so explicitly rather than leaving the same one-line
         # message sitting there unchanged. See _on_save_load_progress.
         overlay._decrypt_hint_shown = False
-        self._save_load_busy = overlay
 
         # An explicit "open as..." choice wins over everything else — the
         # user is answering the question auto-detection couldn't. Otherwise
@@ -1762,6 +2063,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         worker = _SaveLoadWorker(path, self._game_dir(), self, engine=known_engine,
                                  full_sweep=full_sweep, try_recipes=try_recipes)
         self._save_load_worker = worker
+        import time as _time
+        worker._t0 = _time.monotonic()
+        logger.info(f"Save editor: loading {Path(path).name} "
+                    f"(engine={known_engine or 'auto'}, gen={gen})")
 
         overlay.on_shelve = lambda: self._shelved_load_start(overlay, worker)
         # Registering on_cancel (rather than wiring the button straight to
@@ -1771,13 +2076,42 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # stays up saying so instead of vanishing early (see
         # BusyOverlay._on_cancel). _on_save_load_finished closes it for
         # real once worker.finished actually arrives, cancelled or not.
-        overlay.on_cancel = worker.cancel
+        overlay.on_cancel = lambda: self._cancel_save_load(worker, overlay, gen)
         worker.progress.connect(lambda el: self._on_save_load_progress(el, overlay))
         worker.finished.connect(
             lambda doc, err, p=path, ov=overlay, wk=worker, g=gen, fe=forced_engine, tr=try_recipes: (
                 self._on_save_load_finished(doc, err, p, ov, wk, g, fe, tr)
             ))
         worker.start()
+
+    # How long a cancelled load may keep the sheet up waiting for its worker
+    # to confirm. Cooperative cancelling is normally quick; this is the bound
+    # for when it is not — a starved or blocked worker must not keep the page
+    # covered for good.
+    _CANCEL_GRACE_MS = 3000
+
+    def _cancel_save_load(self, worker, overlay, gen: int):
+        """Cancel this load, and hand the page back if the worker is slow to
+        confirm. The sheet stays up saying "cancelling" for the grace period
+        (see BusyOverlay._on_cancel), then the load is abandoned outright: the
+        generation moves on, so a late result is ignored, and the saves list
+        comes back."""
+        try:
+            worker.cancel()
+        except Exception:
+            pass
+
+        def _release():
+            if gen != getattr(self, "_save_load_gen", 0):
+                return                      # already finished or replaced
+            if getattr(self, "_save_load_busy", None) is not overlay:
+                return
+            logger.warning("Save load did not confirm its cancel in time — "
+                           "releasing the page")
+            self._abandon_in_flight_save_load(respect_shelved=False)
+            self.show_step(self.STEP_SAVES)
+
+        QTimer.singleShot(self._CANCEL_GRACE_MS, _release)
 
     def _on_save_load_progress(self, elapsed: float, overlay):
         if (overlay is not None and not getattr(overlay, "_decrypt_hint_shown", True)
@@ -1796,10 +2130,22 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                 overlay.close_overlay()
             except Exception:
                 pass
+            # Only the registrations that are THIS load's: a newer load may
+            # already own the fields, and a finished worker / closed sheet
+            # left in them is what the next abandon would trip over.
+            if getattr(self, "_save_load_worker", None) is worker:
+                self._save_load_worker = None
+            if getattr(self, "_save_load_busy", None) is overlay:
+                self._save_load_busy = None
             return
 
         shelved = getattr(overlay, "_shelved", False)
         cancelled = getattr(overlay, "_cancelled", False) or getattr(worker, "_is_cancelled", False)
+        import time as _time
+        logger.info(
+            f"Save editor: {Path(path).name} "
+            f"{'cancelled' if cancelled else 'failed: ' + str(err) if err is not None else 'loaded'}"
+            f" after {_time.monotonic() - getattr(worker, '_t0', _time.monotonic()):.1f}s")
         try:
             overlay.close_overlay()
         except Exception:
@@ -2492,12 +2838,20 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._sync_filter_mode()
         self._save_btn.setText(t("cheats.apply"))
         self._kept_lbl.setText(t("cheats.kept_copies"))
+        self._restore_lbl.setText(t("cheats.kept_copies"))
+        self._restore_hint.setText(t("cheats.restore_panel_hint"))
+        self._restore_open_btn.setText(t("cheats.open_restore"))
         self._files_lbl.setText(t("cheats.pick_save"))
         self._games_size_combo.update_locale()
         self._saves_size_combo.update_locale()
         self._drop.retranslate()
         if self._stack.currentIndex() == self.STEP_SAVES:
+            self._refresh_kept_summary(rescan=False)
             self._render_saves_page()
+        elif self._stack.currentIndex() == self.STEP_RESTORE:
+            self._subtitle.setText(t("cheats.restore_subtitle"))
+            self._fill_restore_files(self._restore_file_combo.currentData() or "")
+            self._render_restore_page()
         if self._doc is not None:
             # The category names are translated too, so they have to be
             # rebuilt rather than left in the language they were made in.

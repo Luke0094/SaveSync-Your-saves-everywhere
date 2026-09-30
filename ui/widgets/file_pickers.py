@@ -338,7 +338,7 @@ class _LnkAwareDialog(QFileDialog):
             # internal selection sync — confirmed directly by tracing every
             # setText() call: only this class's own ever fires, yet the box
             # still ends up holding "Local" instead of the full path
-            # "C:/Users/monel/AppData/Local" moments later. Not something
+            # "C:/Users/<user>/AppData/Local" moments later. Not something
             # any documented signal here can simply run after — the two
             # writes interleave with no reliable ordering to win by being
             # "last". So this reacts instead of racing: the ONE narrow

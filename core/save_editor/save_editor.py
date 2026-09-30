@@ -26,7 +26,7 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field as _field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from core.constants import USER_DATA_DIR
@@ -952,13 +952,61 @@ def _slot_dir(path: Path, create: bool = True) -> Path:
     return d
 
 
-def backup_original(path, contents: bytes = None) -> Path:
+# What a kept copy was taken FOR. It rides in the copy's own file name, ahead of
+# the "__", so it can never disagree with the file it describes and needs no
+# second file to stay in step with it — list_backups already finds copies by
+# that name.
+KIND_EDIT = ""                    # before an edit or a hold — the ordinary copy
+KIND_PRE_RESTORE = "pre_restore"  # the file as it was just before a restore
+_KIND_MARKS = {KIND_PRE_RESTORE: "~pre"}
+
+
+def backup_kind(backup) -> str:
+    """Why *backup* (a path from list_backups) was kept: KIND_PRE_RESTORE for
+    the safety copy a restore takes of what it is about to overwrite,
+    KIND_EDIT for everything else — including copies made before this was
+    recorded, which is exactly what the empty mark on an old name means."""
+    head = Path(backup).name.split("__", 1)[0]
+    for kind, mark in _KIND_MARKS.items():
+        if mark in head:
+            return kind
+    return KIND_EDIT
+
+
+def backup_taken_at(backup) -> datetime:
+    """When *backup* was put aside, read from its own name.
+
+    list_backups reports a copy's modification time, and copy2 carries the
+    ORIGINAL file's time across — so that is when the state it holds was last
+    written, not when the copy was kept. For a pre-restore copy the two can be
+    weeks apart, and sorting by the first buried a restore point taken a
+    minute ago under everything older. Falls back to the modification time
+    for a name that does not carry a stamp.
+    """
+    b = Path(backup)
+    head = b.name.split("__", 1)[0]
+    try:
+        return datetime.strptime(head[:19], "%Y%m%d_%H%M%S_%f")
+    except ValueError:
+        pass
+    try:
+        return datetime.fromtimestamp(b.stat().st_mtime)
+    except OSError:
+        return datetime.min
+
+
+def backup_original(path, contents: bytes = None, kind: str = KIND_EDIT) -> Path:
     """Put a dated copy of *path* aside and return where it went, or None
     when there was nothing to copy.
 
     *contents* is for a save that is not a file — a registry key, whose
     "original" is the export taken when it was opened. Everything else about
     keeping copies, naming them and pruning them is the same either way.
+
+    *kind* says why the copy is being taken (see backup_kind). It is only
+    written into a copy that is actually created: a current state that is
+    byte-identical to one already kept hands that one back unchanged, since
+    two files with the same bytes are not a second restore point.
 
     *path* itself missing, with *contents* not given either, returns None
     rather than raising: the file an editor loaded from can be renamed or
@@ -1001,10 +1049,11 @@ def backup_original(path, contents: bytes = None) -> Path:
     # within the same second, and a second-resolution name would have the
     # undo's copy overwrite the pristine original it exists to protect.
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    dest = d / f"{stamp}__{p.name}"
+    mark = _KIND_MARKS.get(kind, "")
+    dest = d / f"{stamp}{mark}__{p.name}"
     n = 1
     while dest.exists():
-        dest = d / f"{stamp}-{n}__{p.name}"
+        dest = d / f"{stamp}{mark}-{n}__{p.name}"
         n += 1
     if contents is None:
         shutil.copy2(p, dest)
@@ -1038,25 +1087,27 @@ def prune_backups(path) -> int:
     The newest copy is never dropped, whatever its age. Age alone could
     otherwise clear the lot — leaving an edit with nothing to undo it with,
     which is the one thing these copies exist to prevent.
+
+    A copy's age is counted from when it was PUT ASIDE (backup_taken_at), not
+    from its modification time: copy2 gives the copy the original's, so a save
+    the game had last written ten days ago produced a copy that was "ten days
+    old" the moment it existed — a restore, which keeps the current file
+    first, then pruned that very safety copy straight away, and could take the
+    copy being restored with it.
     """
     keep, days = copy_policy()
     p = Path(path)
     try:
-        # By time, not by name: two copies taken in the same millisecond get a
-        # collision suffix, and "...-1__name" sorts BEFORE "...__name", which
-        # would make the newest look like the oldest.
+        # list_backups is already newest-kept first; reversed = oldest first.
         kept = [f for f, _ in reversed(list_backups(p))]
     except OSError:
         return 0
-    cutoff = datetime.now().timestamp() - days * 86400
+    cutoff = datetime.now() - timedelta(days=days)
     gone = 0
     # Oldest first, and never the last one standing.
     for old in kept[:-1]:
         too_many = len(kept) - gone > keep
-        try:
-            too_old = old.stat().st_mtime < cutoff
-        except OSError:
-            continue
+        too_old = backup_taken_at(old) < cutoff
         if not (too_many or too_old):
             continue
         try:
@@ -1109,8 +1160,30 @@ def prune_all() -> int:
     return gone
 
 
+def _kept_order(backup) -> tuple:
+    """Sort key for "which was put aside later": the stamp in the copy's name,
+    then the collision counter two copies taken in the same millisecond get
+    ("...-1__name" is the LATER of the pair, though it sorts before its
+    sibling as text)."""
+    head = Path(backup).name.split("__", 1)[0]
+    n = 0
+    if "-" in head[19:]:
+        try:
+            n = int(head[19:].rsplit("-", 1)[1])
+        except ValueError:
+            n = 0
+    return backup_taken_at(backup), n
+
+
 def list_backups(path) -> list:
-    """Copies kept for *path*, newest first, as (file, modified)."""
+    """Copies kept for *path*, newest KEPT first, as (file, modified).
+
+    *modified* is the copy's modification time — when the state it holds was
+    last written (copy2 carries the original's across), which is what a person
+    reads as "the save from ...". The ORDER is by when the copy was put aside
+    instead (backup_taken_at): a restore point taken a moment ago belongs at
+    the top even when the file it holds was last written weeks earlier.
+    """
     p = Path(path)
     out = []
     d = _slot_dir(p, create=False)
@@ -1124,7 +1197,7 @@ def list_backups(path) -> list:
                 continue
     except OSError:
         return []
-    return sorted(out, key=lambda t: t[1], reverse=True)
+    return sorted(out, key=lambda item: _kept_order(item[0]), reverse=True)
 
 
 def restore_backup(backup, target) -> None:
@@ -1136,9 +1209,10 @@ def restore_backup(backup, target) -> None:
     the player had edited and saved since the copy they're restoring was
     taken, that later state was never itself captured (a kept copy is
     taken before the NEXT write, not after this one), so it was simply
-    gone. Now it survives as its own entry in the same list this panel
-    already shows — one restore point, backup or pre-restoration, no
-    second mechanism. backup_original's own dedup means this is a no-op
+    gone. Now it survives as its own entry in the same list the restore
+    panel already shows, tagged KIND_PRE_RESTORE so it reads as what it
+    is — one restore point, backup or pre-restoration, no second
+    mechanism. backup_original's own dedup means this is a no-op
     disk-wise on a restore that changes nothing (e.g. restoring the copy
     already matching what's on disk).
 
@@ -1158,7 +1232,7 @@ def restore_backup(backup, target) -> None:
     except OSError as e:
         raise SaveEditorError("that copy could not be read",
                               "cheats.err_copy_gone") from e
-    backup_original(t)
+    backup_original(t, kind=KIND_PRE_RESTORE)
     # write_bytes rather than copy2: the restored file must read as a fresh
     # write. copy2 would carry the copy's old mtime across, making the restore
     # look like nothing changed to everything that keys off mtime — the

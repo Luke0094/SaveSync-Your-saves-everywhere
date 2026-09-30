@@ -1334,6 +1334,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
     def _rebuild_dots(self, n: int):
         """Create or reuse exactly min(n, _DOTS_VISIBLE) dot widgets."""
         slots = min(n, self._DOTS_VISIBLE)
+        _d = scaled(6, self, min_px=5)
         if self._dots_layout.count() != slots:
             while self._dots_layout.count():
                 item = self._dots_layout.takeAt(0)
@@ -1341,19 +1342,30 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
                     item.widget().deleteLater()
             for _ in range(slots):
                 dot = QWidget()
-                _d = scaled(6, self, min_px=5)
                 dot.setFixedSize(_d, _d)
                 r = max(2, _d // 2)
                 dot.setStyleSheet(
                     f"background:rgba(255,255,255,0.5);border-radius:{r}px;")
                 self._dots_layout.addWidget(dot)
+                # Shown NOW: a child added to a visible parent is only shown a
+                # turn of the event loop later, and the first hover would draw
+                # the bar without its dots.
+                dot.show()
 
         self._total_images = n          # remember total for window calc
         self._dots_slots  = slots
 
-        # Centre horizontally
-        self._dots_bar.adjustSize()
-        bar_w = self._dots_bar.width()
+        # The bar is absolutely placed (move), not layout-managed, so it is
+        # sized and centred from what it holds — the same way the star rating
+        # is placed at once — rather than asked of the layout. adjustSize()
+        # measured a bar whose new dots were not shown yet (a layout skips a
+        # widget that is not), so the first hover centred a bar with no dots in
+        # it and it looked off until the card was rebuilt.
+        m = self._dots_layout.contentsMargins()
+        bar_w = max(self._dots_bar.minimumWidth(),
+                    m.left() + m.right() + slots * _d
+                    + max(0, slots - 1) * self._dots_layout.spacing())
+        self._dots_bar.setFixedWidth(bar_w)
         cw = getattr(self, "_cw", _CARD_W0)
         x = max(0, (cw - bar_w) // 2)
         dots_y = getattr(self, "_dots_y", scaled(106, self))

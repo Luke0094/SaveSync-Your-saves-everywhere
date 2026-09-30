@@ -114,6 +114,12 @@ def apply_game_info(entry, info, fetch_cover: bool = True) -> list:
             entry.tags = genres[:6]
             changed.append("tags")
 
+    if not getattr(entry, "languages", None):
+        languages = list(getattr(info, "languages", None) or [])
+        if languages:
+            entry.languages = languages
+            changed.append("languages")
+
     # What the source thought of the game — one verdict (Steam/VNDB) or many
     # user reviews (DLsite). Keyed by review_identity so re-running updates
     # each entry instead of stacking duplicates, and the user's own reviews

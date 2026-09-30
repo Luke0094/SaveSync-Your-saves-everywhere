@@ -141,6 +141,11 @@ class CloudFlowsMixin:
         _name = entry.name
         _cfn = entry.computed_folder_name
         _save_paths = list(entry.save_paths or [])
+        # "Never show again" on the rename notification also spares the
+        # network round trip that looks for it.
+        _rename_never = bool((entry.cloud_metadata or {}).get("rename_notice_never"))
+        from core.constants import get_install_folder_name as _gifn
+        _current_folder = _gifn(_exe_path, _name, game_id, _cfn)
         from core.monitor import get_monitor
         _since = get_monitor().tracked_process_start_time(game_id)
         # The backup id SaveSync itself last restored onto this game's save
@@ -174,6 +179,12 @@ class CloudFlowsMixin:
                 except Exception as e:
                     logger.debug(f"_check_cloud_on_launch: check_cloud_saves failed: {e}")
                     has_cloud = False
+            renamed = None
+            if online and not _rename_never:
+                try:
+                    renamed = orch.find_renamed_remote_folder(_game_id, _current_folder)
+                except Exception as e:
+                    logger.debug(f"_check_cloud_on_launch: rename lookup failed: {e}")
             regressed_to, is_unbacked = None, False
             if _save_paths:
                 try:
@@ -188,6 +199,7 @@ class CloudFlowsMixin:
                     "has_cloud": has_cloud,
                     "regressed_to": regressed_to,
                     "is_unbacked": is_unbacked,
+                    "renamed": renamed,
                 }
             from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
             try:
@@ -229,7 +241,7 @@ class CloudFlowsMixin:
     def _apply_orphan_backup_to_game(self, entry) -> bool:
         """Adopt matching orphan index + restore to the chain destination.
 
-        The archive folder (collection copy under e.g. D:\\VN Games\\Save) is
+        The archive folder (collection copy under e.g. D:\\Games\\Saves) is
         only the zip *source*. Live game save_paths must come from the recorded
         chain (AppData/Roaming/…, www/save, …) — never from that origin path.
         """
@@ -323,6 +335,7 @@ class CloudFlowsMixin:
             has_cloud = bool(_result.get("has_cloud"))
             regressed_to = _result.get("regressed_to")
             is_unbacked = bool(_result.get("is_unbacked"))
+            renamed_info = _result.get("renamed")
             on_resolved = self._cloud_check_on_resolved.pop(game_id, None)
 
         # One-shot suppression: the user already answered the cloud question
@@ -358,7 +371,7 @@ class CloudFlowsMixin:
         # is what caused a visible flicker: two show_animated() calls in the
         # same synchronous pass, each cancelling and restarting the other's
         # fade-in within milliseconds.
-        # "regression" | "unbacked" | "different_machine" | "no_local"
+        # "regression" | "unbacked" | "remote_renamed" | "different_machine" | "no_local"
         # | "conflict_diverged" | "conflict_unreconciled" | "sync_prompt" | None
         notification_kind = None
         if entry is not None and self._overlay is not None:
@@ -389,6 +402,16 @@ class CloudFlowsMixin:
             # findings and keep their original priority untouched. "unbacked"
             # is deliberately NOT checked here — see the fallback after this
             # whole tree, below.
+            # 0b) Another machine renamed this game's cloud folder: this
+            # machine's own is gone, so nothing below (which all read "cloud
+            # saves for MY folder") could ever explain why sync now refuses.
+            # Unless this rename was already answered with keep-both.
+            _declined = list((entry.cloud_metadata or {}).get("rename_notice_declined") or [])
+            if (notification_kind is None and renamed_info and show
+                    and renamed_info.get("folder") not in _declined
+                    and not (entry.cloud_metadata or {}).get("rename_notice_never")):
+                notification_kind = "remote_renamed"
+
             if notification_kind is not None:
                 pass
             elif not has_live_saves and (has_cloud or has_local or has_orphan) and show and not _muted:
@@ -508,6 +531,11 @@ class CloudFlowsMixin:
             _newest_id = get_backup_manager().newest_restore_target(game_id)
             self._overlay.show_save_reverted(
                 entry.name, game_id, _newest_id, unbacked=True)
+        elif notification_kind == "remote_renamed":
+            self._pending_cloud_notification[game_id] = "remote_renamed"
+            self._pending_remote_rename[game_id] = dict(renamed_info)
+            self._overlay.show_remote_renamed(
+                entry.name, entry.exe_path, renamed_info.get("name") or renamed_info["folder"])
         elif notification_kind == "different_machine":
             # Same non-blocking overlay pattern as every other cloud
             # notification — replaces a previous blocking QMessageBox tied
@@ -551,6 +579,69 @@ class CloudFlowsMixin:
                 f"Cleared stale pending regression/unbacked warning for "
                 f"{entry.name if entry else game_id}: this launch's check came back clean")
 
+
+    def _apply_remote_rename(self, entry, info: dict) -> None:
+        """"Update name": take the name (and the cloud folder) another machine
+        renamed this game to, then sync — that finds the moved folder and its
+        index, so the ordinary merge takes it from there.
+
+        The folder is set to the ACTUAL remote one rather than recomputed from
+        the name: it may carry a disambiguation suffix a title cannot
+        reproduce. The old one is kept in folder_history, which is what lets
+        the rest of the app still find backups filed under it.
+        """
+        from core.backup import get_backup_manager
+        from core.constants import get_install_folder_name
+        new_folder = info.get("folder") or ""
+        new_name = (info.get("name") or "").strip() or new_folder
+        if not new_folder:
+            return
+        old_folder = get_install_folder_name(
+            entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
+        entry.record_name(new_name)
+        entry.computed_folder_name = new_folder
+        if old_folder and old_folder != new_folder and old_folder not in entry.folder_history:
+            entry.folder_history.append(old_folder)
+        try:
+            from ui.image_cache import migrate_icon_cache
+            entry.icon_path = migrate_icon_cache(old_folder, new_folder, entry.icon_path)
+        except Exception:
+            logger.debug("icon cache migration skipped", exc_info=True)
+        get_library().update_game(entry)
+        get_backup_manager().apply_game_rename(entry.id, entry.name, new_folder)
+        logger.info(f"Renamed {old_folder!r} → {entry.name!r} ({new_folder!r}) "
+                    f"to follow another machine's rename")
+        orch = get_orchestrator()
+        if orch.is_online():
+            orch.sync_game(
+                entry.id, entry.name, entry.save_paths, exe_path=entry.exe_path,
+                computed_folder_name=new_folder, name_history=list(entry.name_history))
+
+    def _keep_both_after_remote_rename(self, entry, info: dict, never: bool = False) -> None:
+        """"Keep both" (and "never show again", which means keep both and stop
+        asking): this machine carries on under its own name, so its cloud
+        folder is started over on the next sync — the refusal that a game with
+        history and no index would otherwise get is switched off for that one
+        folder (see SyncProvider.sync_backups' allow_fresh_index), and this
+        particular rename is remembered as answered."""
+        from core.constants import get_install_folder_name
+        meta = dict(entry.cloud_metadata or {})
+        own_folder = get_install_folder_name(
+            entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
+        reset = list(meta.get("remote_folder_reset") or [])
+        if own_folder and own_folder not in reset:
+            reset.append(own_folder)
+        meta["remote_folder_reset"] = reset
+        declined = list(meta.get("rename_notice_declined") or [])
+        if info.get("folder") and info["folder"] not in declined:
+            declined.append(info["folder"])
+        meta["rename_notice_declined"] = declined
+        if never:
+            meta["rename_notice_never"] = True
+        get_library().update_game_fields(entry.id, cloud_metadata=meta)
+        logger.info(f"{entry.name!r}: keeping this machine's cloud folder "
+                    f"{own_folder!r} alongside the renamed {info.get('folder')!r}"
+                    f"{' (never ask again)' if never else ''}")
 
     def _stash_local_conflict_time(self, entry) -> None:
         """Record the newest local backup date for a launch-time reconcile."""
@@ -851,7 +942,11 @@ class CloudFlowsMixin:
                 continue
             folders = (cloud_meta or {}).get("folders") if cloud_meta else None
             if not folders:
-                self._overlay.show_game_detected(name, exe_path)
+                continue        # nothing in the cloud: the plain notice is already up
+            # The lookup ran while the notice was on screen: the game may have
+            # been added, or muted, in the meantime — nothing left to ask then.
+            if (get_library().get_by_exe(exe_path) is not None
+                    or exe_path in get_config().get("suppressed_overlay_apps", [])):
                 continue
             self._pending_cloud_verify[exe_path] = {"name": name, "folders": folders}
             if len(folders) >= 2:

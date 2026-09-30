@@ -1601,8 +1601,11 @@ class SyncPage(PageScrollMixin, QWidget, ThemedMixin):
         for entry in get_library().all_games():
             if not entry.save_paths:
                 continue
-            # Skip truly unchanged synced games
-            if entry.sync_status == "synced":
+            # Skip truly unchanged synced games — unchanged meaning the saves
+            # AND what the index says about them: a rename or an edited note
+            # leaves every hash identical but the provider is still behind
+            # (same rule as the overview's Sync Tutti).
+            if entry.sync_status == "synced" and not bm.game_needs_publish(entry.id):
                 recents = bm.get_backups_for_game(entry.id)
                 if recents:
                     current_hash = (recents[0].cloud_metadata or {}).get("save_hash", "")

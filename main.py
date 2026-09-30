@@ -958,6 +958,10 @@ def main():
         # Hand the created window to the early second-launch listener.
         _window_ref["w"] = window
 
+        # From here on a frozen window leaves its cause in the log.
+        from core.stall_watchdog import start_stall_watchdog
+        start_stall_watchdog()
+
         sys.exit(app.exec())
     except Exception:
         # aboutToQuit may not fire on exception, so release lock here.

@@ -8,8 +8,12 @@ Wolf unlock, UnityFS, remembered keys). Engine recognition and binary/format
 readers stay in ``core.engines``.
 """
 from .save_editor import (  # noqa: F401
+    KIND_EDIT,
+    KIND_PRE_RESTORE,
     SaveEditorError,
+    backup_kind,
     backup_original,
+    backup_taken_at,
     delete_backup,
     describe,
     explain,
@@ -23,9 +27,13 @@ from .save_editor import (  # noqa: F401
 from .save_hold import SaveHold  # noqa: F401
 
 __all__ = [
+    "KIND_EDIT",
+    "KIND_PRE_RESTORE",
     "SaveEditorError",
     "SaveHold",
+    "backup_kind",
     "backup_original",
+    "backup_taken_at",
     "delete_backup",
     "describe",
     "explain",

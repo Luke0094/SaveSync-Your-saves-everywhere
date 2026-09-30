@@ -1946,39 +1946,13 @@ QPushButton#tag_chip[tagState="2"]:hover {
     background: #7d2e2e;
 }
 
-/* ── Sidebar "filter by" tabs (tags | engine) ─────────────────────── */
-/* Named and keyed on an "active" property for the same reason as the chips
-   above: the two buttons are re-polished on every switch, and a per-button
-   stylesheet would have to be rewritten on a theme change. */
-QPushButton#filter_tab {
-    background: #161619;
-    color: #c8c8d0;
-    border: 1px solid #2a2a38;
-    border-radius: 3px;
-    font-size: 10px;
-    font-weight: 600;
-    padding: 2px 6px;
-    min-width: 0;
-}
-
-QPushButton#filter_tab:hover {
-    color: #e8e8ea;
-    border-color: #3a3a50;
-    background: #1a1a22;
-}
-
-/* Active tab: white on accent. Also pinned for :hover/:focus — the global
-   QPushButton:hover colour was winning and painting light-on-light / green-
-   on-green so the selected label looked blank. */
-QPushButton#filter_tab[active="1"],
-QPushButton#filter_tab[active="1"]:hover,
-QPushButton#filter_tab[active="1"]:pressed,
-QPushButton#filter_tab[active="1"]:focus {
-    background: #76b900;
-    color: #ffffff;
-    border: 1px solid #76b900;
-    padding: 2px 6px;
-    font-weight: 700;
+/* ── Sidebar "filter by" dropdown (tags | engine | languages) ─────── */
+/* The bar itself is painted by _FilterKindCombo (green, bold text in the
+   text-on-accent colour, centred, a chevron); its list is a menu (MenuCombo).
+   This only keeps the global QComboBox min-width from pushing past the
+   sidebar rail. */
+QComboBox#filter_kind_combo {
+    min-width: 0px;
 }
 
 /* The chips' two scroll bodies. These MUST be NAMED rather than carrying

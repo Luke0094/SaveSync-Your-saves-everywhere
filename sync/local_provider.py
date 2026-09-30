@@ -135,7 +135,22 @@ class LocalProvider(SyncProvider):
         except ValueError:
             return False
         try:
-            if p.exists():
+            if p.is_dir():
+                # Only ever an EMPTY folder (rmdir refuses otherwise): a caller
+                # tidying up after moving a game's backups must never take
+                # anything else with it.
+                try:
+                    p.rmdir()
+                except PermissionError:
+                    # A folder OneDrive syncs carries the read-only attribute
+                    # (it means "customised", not "locked"), and Windows then
+                    # refuses to remove it even when it is empty. The
+                    # attribute cleared, the same rmdir — still refusing
+                    # anything that is not empty — goes through.
+                    import stat as _stat
+                    os.chmod(p, _stat.S_IWRITE | _stat.S_IREAD)
+                    p.rmdir()
+            elif p.exists():
                 p.unlink()
             return True
         except Exception:

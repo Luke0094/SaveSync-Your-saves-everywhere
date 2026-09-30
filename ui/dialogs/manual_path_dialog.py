@@ -15,6 +15,7 @@ The name is derived from the folder through the same walk-up that renames a
 generic "game.exe", and stays editable per row.
 """
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -93,12 +94,8 @@ class _CollectionWorker(QThread):
         self._stop = True
 
     def run(self):
-        # Set from inside run(): setPriority only applies to a RUNNING
-        # thread. From __init__ it did nothing but log "Cannot set
-        # priority, thread is not running", so these scans never
-        # actually ran at idle priority — which is the one thing the
-        # call was there to do while a game has the CPU.
-        self.setPriority(QThread.Priority.IdlePriority)
+        # Normal priority on purpose — a lowered one starves under a game and
+        # freezes the GUI with it; see _SaveLoadWorker.run (ui/pages/cheats_page.py).
         try:
             found = scan_save_collection(
                 self._root,
@@ -426,7 +423,14 @@ def _archive_index(bm):
                    for p in (g.save_paths or []) if p}
     orphan_owner: dict = {}
     by_id: dict = {}
+    from core.backup import BackupManager
     for b in bm.get_orphan_backups():
+        if BackupManager.is_manual_version(b):
+            # A version added by hand: one zip of a folder, not a place the
+            # archive is read from. Counted, that folder would read as already
+            # archived, and adding it again would skip the question and make
+            # it a recurring source of the archive.
+            continue
         locations = {p.casefold() for p in (b.save_paths or []) if p}
         origins = {p.casefold() for p in bm.orphan_source_paths(b) if p}
         for p in locations | origins:
@@ -508,12 +512,8 @@ class _StoreWorker(QThread):
         self._stop = True
 
     def run(self):
-        # Set from inside run(): setPriority only applies to a RUNNING
-        # thread. From __init__ it did nothing but log "Cannot set
-        # priority, thread is not running", so these scans never
-        # actually ran at idle priority — which is the one thing the
-        # call was there to do while a game has the CPU.
-        self.setPriority(QThread.Priority.IdlePriority)
+        # Normal priority on purpose — a lowered one starves under a game and
+        # freezes the GUI with it; see _SaveLoadWorker.run (ui/pages/cheats_page.py).
         from core.backup import get_backup_manager
 
         # Where every archive and every library game already lives. Which
@@ -567,6 +567,39 @@ class _StoreWorker(QThread):
                     relocate_to = answer
                     known_paths.add(path_key)
                     orphan_owner[path_key] = answer
+                # A name that is already taken (asked before this thread
+                # started — see _name_collision_answers). Added to a library
+                # game or an archive as another version, or not written at
+                # all: skipped, asked-later (closed with the X: nothing
+                # stored, the question comes back) or already held byte for
+                # byte. Decided BEFORE the known-path shortcut below: a folder
+                # an archive reads from is asked about again when something
+                # else shares the name, and the answer is the user's, not that
+                # shortcut's.
+                named = self._decisions.get(("name", origin))
+                if isinstance(named, tuple) and named[1] == orphan_owner.get(path_key):
+                    named = None        # the archive that already reads this folder: its ordinary refresh, below
+                if isinstance(named, tuple):
+                    _kind, holder_id, save_folder = named
+                    note = t("backups.manual_version_note", folder=Path(item.path).name)
+                    try:
+                        from core.library import get_library
+                        game = get_library().get_by_id(holder_id)
+                        version = (bm.add_version_to_game(game, save_folder, note=note)
+                                   if game is not None
+                                   else bm.add_version_to_archive(holder_id, save_folder, note=note))
+                    except Exception:
+                        logger.exception("Adding a version failed for %s", item.path)
+                        version = None
+                    if version is None:
+                        skipped += 1
+                        continue
+                    updated += 1
+                    entries.append(version)
+                    continue
+                if named in ("skip", "later", "have"):
+                    skipped += 1
+                    continue
                 if answer != "" and path_key in known_paths:
                     # Already archived. Re-adding the same folder is almost
                     # always "here are this folder's newer saves", not "make
@@ -799,6 +832,27 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         picked = pick_folder(self, t("manual_path.pick_folder"))
         if not picked:
             return
+        self.add_single_path(picked)
+
+    def busy(self) -> bool:
+        """A collection is being read or the batch is being stored — the list
+        is not taking new entries right now."""
+        return self._phase in ("scanning", "storing")
+
+    def add_single_path(self, picked: str) -> bool:
+        """Put one save folder into the batch — what "Add single" does once a
+        folder is chosen, and what a folder dropped on the Backups page does.
+        False when it was not added: the dialog is busy, or the folder is
+        already in the batch."""
+        if self.busy():
+            return False
+        key = os.path.normcase(os.path.normpath(picked))
+        for e in self._found_serialized:
+            if e.get("removed"):
+                continue
+            have = (e.get("item") or {}).get("path") or ""
+            if have and os.path.normcase(os.path.normpath(have)) == key:
+                return False
         # Straight into the same master list a collection scan fills, not a
         # loose row beside it. The list on screen is a WINDOW onto that list
         # — rows outside the visible span do not exist — so a row that is not
@@ -821,6 +875,16 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         self._render_list()
         self._status.setText("")
         self._persist_state_soon()
+        return True
+
+    def add_dropped_paths(self, paths) -> int:
+        """Folders dropped on the Backups page: each goes in as one entry, the
+        way "Add one" would have put it. How many were added — and when none
+        was, the window says why instead of staying silent."""
+        added = sum(1 for p in paths if self.add_single_path(p))
+        if not added:
+            self._status.setText(t("manual_path.drop_none_added"))
+        return added
 
     def _add_multiple(self):
         """Read a whole save-collection folder.
@@ -1132,6 +1196,163 @@ class ManualPathDialog(WindowedListMixin, QDialog):
 
     # ── Commit ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _save_folder_of(path: str, chain: str) -> str:
+        """The folder inside *path* the saves are in — the chain's own, when it
+        is there — else *path* itself. A game folder handed over whole holds
+        them under ``game/saves``; a save folder handed over as it is holds
+        them at its root."""
+        from core.backup import _chain_parts
+        parts = _chain_parts(chain or "")
+        if parts:
+            inner = Path(path).joinpath(*parts)
+            if inner.is_dir():
+                return str(inner)
+        return path
+
+    def _collision_rows(self, bm, hit: dict, path: str, chain: str, owner: str = "") -> list:
+        """One row per entry stored under the name: how it reads on screen,
+        whether these saves can be added to it, and what would be stored and
+        compared.
+
+        For a library game that is the saves inside what was handed over,
+        found by the shape of the game's own save folders (a whole game folder
+        has no chain of its own) — only that is compared, so a big game folder
+        is not walked. For an archive: the folder as handed over, as its own
+        zips were made, and the one the chain points to."""
+        from ui.dialogs.archive_choice_dialog import holder_line
+        rows = []
+        for h in hit["holders"]:
+            if h["game"] is not None:
+                found = bm.version_source(h["game"], path)
+                folder, compare = found, (found or path,)
+                can_add, why = bool(found), t("manual_path.name_collision_add_unavailable")
+            else:
+                folder = path
+                compare = tuple(dict.fromkeys((path, self._save_folder_of(path, chain))))
+                can_add, why = True, ""
+            title, detail = holder_line(h)
+            reads = bool(owner) and h["id"] == owner
+            if reads:
+                title += "  ·  " + t("manual_path.name_collision_reads_here")
+            rows.append({"id": h["id"], "kind": h["kind"], "title": title, "detail": detail,
+                         "can_add": can_add, "why": why, "reads": reads,
+                         "folder": folder, "compare": compare})
+        return rows
+
+    def _name_collision_answers(self, pending, bm, known, by_identity, owners=None):
+        """Folders that would be filed under a backup folder name already in
+        use — asked what they are, since only the user can say.
+
+        ``{("name", origin): answer}`` where the answer is:
+
+          * ``"skip"`` — don't ask again about this folder: not added, and the
+            one answer that is remembered (it shows in Settings, where it can
+            be cleared). Add and keep-both are never remembered: the same
+            folder may hold other saves, or another game, the next time;
+          * ``"separate"`` — keep both: its own archive, its name given a tag;
+          * ``"have"`` — not asked: the saves are already in one of those
+            histories, byte for byte, so there is nothing to add;
+          * ``"later"`` — a dialog was closed with the X: nothing stored;
+          * ``("add", game_id, folder)`` — another version of that library
+            game or archive: one zip of *folder* alone (see
+            BackupManager.add_version_to_game / add_version_to_archive).
+
+        More than one entry under the name — a second game kept apart last
+        time — makes add and keep-both an extra step: which one? Listed with
+        their last backups.
+
+        A folder an archive already reads is that archive's: re-adding it is a
+        new version there, and never a new entry with a tag of its own. Not
+        asked at all when that archive is the only thing stored under the
+        name. When a library game or another archive shares the name — sets
+        of saves that may not be the same — the folder may belong to one of
+        them now, so it is asked which; the archive that reads the folder is
+        listed as such and already chosen, and Keep both is not offered, since
+        it would make a second archive of one folder.
+
+        Not asked: a library game's own save path, and a folder the identity
+        question below is about — same saves under the same title — which gets
+        that question alone. *owners* maps a folder to the archive that reads
+        it."""
+        from datetime import datetime
+        from i18n import format_dt
+        from ui.dialogs.archive_choice_dialog import (ADD, CANCEL, SEPARATE, SKIP,
+                                                      NameCollisionDialog,
+                                                      NameTargetDialog)
+        out: dict = {}
+        blanket = None
+        owners = owners or {}
+        walked: dict = {}                # each dropped folder is walked once, however many entries are stored
+        for row in pending:
+            name, item, chain, raw, from_collection = row[:5]
+            if not item.path or not item.exists:
+                continue
+            (title, chain, recorded, path_key, ident, origin) = _store_key(
+                name, item, chain, raw, from_collection)
+            if by_identity.get(ident):
+                continue
+            owner = owners.get(path_key) or owners.get(origin)
+            if (path_key in known or origin in known) and not owner:
+                continue                 # a library game's own save path
+            hit = bm.name_collision(title, hint=item.path)
+            if hit is None:
+                continue
+            if owner and {h["id"] for h in hit["holders"]} <= {owner}:
+                continue                 # its archive's own folder, alone under the name
+            source = recorded or item.path
+            if bm.archive_choice(hit["key"], source) == "skip":
+                out[("name", origin)] = "skip"
+                continue
+            rows = self._collision_rows(bm, hit, item.path, chain, owner or "")
+            # Already in one of them? A name cannot say, and neither can a
+            # version number; the files can.
+            if bm.holding_backup([(c, r["id"]) for r in rows for c in r["compare"]], walked):
+                out[("name", origin)] = "have"
+                continue
+            if blanket == SKIP:
+                answer = SKIP
+            else:
+                stamp = bm.saves_last_changed(
+                    (rows[0]["folder"] if rows else "") or item.path, cache=walked)
+                changed = (t("manual_path.name_collision_changed",
+                             when=format_dt(datetime.fromtimestamp(stamp), "%d %b %Y  %H:%M"))
+                           if stamp else "")
+                dlg = NameCollisionDialog(
+                    hit["folder"], item.path,
+                    {"rows": rows, "changed": changed, "known": bool(owner)}, parent=self)
+                dlg.exec()
+                answer = dlg.choice()
+                if answer == CANCEL:
+                    out[("name", origin)] = "later"
+                    continue
+                # Only "don't ask again" carries over to the rest: add and
+                # keep-both each pick a target, and that is asked every time.
+                if answer == SKIP and dlg.applies_to_all():
+                    blanket = SKIP
+            if answer == SKIP:
+                bm.set_archive_choice(hit["key"], source, "skip")
+                out[("name", origin)] = "skip"
+                continue
+            if len(rows) > 1:
+                step = NameTargetDialog(
+                    hit["folder"], item.path, {"mode": answer, "rows": rows}, parent=self)
+                step.exec()
+                if step.choice() == CANCEL:
+                    out[("name", origin)] = "later"
+                    continue
+                target = step.selected()
+            else:
+                # One entry needs no extra question: add goes to it, keep both
+                # is its own archive.
+                target = rows[0]["id"] if (answer == ADD and rows) else ""
+            if target:
+                chosen = next(r for r in rows if r["id"] == target)
+                out[("name", origin)] = ("add", target, chosen["folder"])
+            else:
+                out[("name", origin)] = "separate"
+        return out
+
     def _collision_decisions(self, pending):
         """Ask about every folder reached from somewhere new.
 
@@ -1159,10 +1380,14 @@ class ManualPathDialog(WindowedListMixin, QDialog):
         for a in archives:
             if a["identity"].strip("|"):
                 by_identity.setdefault(a["identity"], []).append(a)
+        # A name that is already taken comes first, for the folders the
+        # question below is not about: same saves under the same title is put
+        # to the user there, and only there.
+        name_answers = self._name_collision_answers(pending, bm, known, by_identity, _owner)
         if not by_identity:
-            return {}
+            return name_answers
 
-        decisions: dict = {}
+        decisions: dict = dict(name_answers)
         blanket = None
         for row in pending:
             name, item, chain, raw, from_collection = row[:5]

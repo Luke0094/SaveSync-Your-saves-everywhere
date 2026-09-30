@@ -8,7 +8,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QPoint, QRect
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QComboBox, QMessageBox, QApplication,
@@ -32,16 +32,63 @@ from ui.modal_helpers import (
 from ui.styles.theme import palette, ThemedMixin
 
 
+class _CloudZipScan(QThread):
+    """What each folder-backed provider really holds, read off the disk
+    (directory names only — see SyncOrchestrator.local_zip_index) away from
+    the GUI thread. Normal priority: a lowered one starves under a game and
+    freezes the window with it."""
+    done = Signal(object)
+
+    def __init__(self, providers, parent=None):
+        super().__init__(parent)
+        self._providers = list(providers)
+
+    def run(self):
+        out: dict = {}
+        try:
+            from sync import get_orchestrator
+            orch = get_orchestrator()
+            for p in self._providers:
+                found = orch.local_zip_index(p)
+                if found is not None:
+                    out[getattr(p, "PROVIDER_ID", "")] = found
+        except Exception:
+            out = {}
+        self.done.emit(out)
+
+
+class _CloudDelete(QThread):
+    """Delete a cloud-only backup from its provider (provider calls, so off
+    the GUI thread). Normal priority — see _CloudZipScan."""
+    finished_with = Signal(bool, str)
+
+    def __init__(self, provider, folder: str, backup_id: str, parent=None):
+        super().__init__(parent)
+        self._provider, self._folder, self._backup_id = provider, folder, backup_id
+
+    def run(self):
+        try:
+            from sync import get_orchestrator
+            ok, reason = get_orchestrator().delete_cloud_backup(
+                self._provider, self._folder, self._backup_id, get_backup_manager())
+        except Exception:
+            ok, reason = False, "error"
+        self.finished_with.emit(ok, reason)
+
+
 class BackupRow(QFrame, ThemedMixin):
     restore_requested = Signal(str)
     delete_requested  = Signal(str)
 
     def __init__(self, entry: BackupEntry, is_playing: bool = False,
-                 cloud_only: bool = False, parent=None):
+                 cloud_only: bool = False, provider_hint: str = "", parent=None):
         super().__init__(parent)
         self._entry = entry
         self._is_playing = is_playing
         self._cloud_only = cloud_only
+        # The provider the person chose in the page's filter, when they chose
+        # one — "" otherwise. It decides which provider's folder 📁 opens.
+        self._provider_hint = provider_hint
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setObjectName("backup_row")
         self._build()
@@ -239,11 +286,24 @@ class BackupRow(QFrame, ThemedMixin):
         threading.Thread(target=_bg_download, daemon=True).start()
 
     def _confirm_delete(self):
-        reply = question_window_modal(
-            self, t('backups.delete_backup'),
-            t('backups.delete_backup_question', date=(self._entry.created_at or "")[:10]),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
+        if self._cloud_only:
+            # No local copy: this deletes the one on the provider, so it says so
+            # — and there is nothing to bring back afterwards.
+            from ui.backup_labels import ORIGIN_LABELS
+            origin = getattr(self._entry, "origin", "") or ""
+            reply = question_window_modal(
+                self, t('backups.delete_cloud_backup'),
+                t('backups.delete_cloud_backup_question',
+                  date=(self._entry.created_at or "")[:10],
+                  provider=ORIGIN_LABELS.get(origin, origin)),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+        else:
+            reply = question_window_modal(
+                self, t('backups.delete_backup'),
+                t('backups.delete_backup_question', date=(self._entry.created_at or "")[:10]),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
         if reply == QMessageBox.StandardButton.Yes:
             self.delete_requested.emit(self._entry.backup_id)
 
@@ -313,46 +373,54 @@ class BackupRow(QFrame, ThemedMixin):
         finally:
             self._verify_dot.setEnabled(True)
 
-    def _on_open_backup_folder(self):
-        """Open the backup folder for this entry.
+    def _provider_backup_folder(self) -> Optional[str]:
+        """The folder a cloud-only backup sits in, when its provider keeps one on
+        disk (the Local folder provider) — None in every other case.
 
-        For cloud-only / provider-origin entries: opens the provider's local
-        sync folder (e.g. OneDrive\\SaveSync\\backup\\GameName) when available.
-        Falls back to SaveSync's own backup directory.
+        The provider is the one chosen in the page's filter, else the entry's
+        own. With none to go by, the first connected one that has a folder wins.
+        A provider that only speaks to a service (Drive, OneDrive…) has no folder
+        to open, and neither has one that is not connected: those are the cases
+        that open the local backup folder instead."""
+        if not self._cloud_only:
+            return None
+        from sync import get_orchestrator
+        orch = get_orchestrator()
+        connected = list(orch.get_connected_providers())
+        wanted = self._provider_hint or (getattr(self._entry, "origin", "") or "")
+        provider = orch.get_provider(wanted) if wanted else None
+        candidates = [provider] if provider is not None else connected
+        for candidate in candidates:
+            if candidate is None or candidate not in connected:
+                continue
+            root = getattr(candidate, "_root", None)
+            if not root or not Path(root).exists():
+                continue
+            root = Path(root)
+            # Where the zip actually lives: the folder recorded when it was
+            # listed, else the id (a cloud-only entry's id IS the folder name).
+            game_folder = ((self._entry.cloud_metadata or {}).get("remote_folder")
+                           or self._entry.game_id or "")
+            base = root / "SaveSync" / "backup"
+            for folder in ([base / game_folder] if game_folder else []) + [base, root / "SaveSync", root]:
+                if folder.exists():
+                    return str(folder)
+        return None
+
+    def _on_open_backup_folder(self):
+        """Open the folder this backup is kept in.
+
+        A cloud-only backup whose provider keeps a folder on disk opens THAT
+        folder, directly (see _provider_backup_folder). Everything else opens the
+        local one: the folder holding the zip, else SaveSync's own backup folder.
         """
         from core.constants import BACKUP_DIR
 
         target: Optional[str] = None
-        origin = getattr(self._entry, "origin", "local")
-
-        if origin and origin != "local":
-            try:
-                from sync import get_orchestrator
-                provider = get_orchestrator().provider
-                if provider and provider.PROVIDER_ID == origin:
-                    provider_root = getattr(provider, "_root", None)
-                    if provider_root and Path(provider_root).exists():
-                        root = Path(provider_root)
-                        # For cloud-only entries: game_id IS the provider folder name.
-                        # For local entries synced to provider: derive from zip_path.
-                        game_folder: Optional[str] = None
-                        if self._cloud_only or not self._entry.zip_path:
-                            game_folder = self._entry.game_id
-                        else:
-                            zip_p = Path(self._entry.zip_path)
-                            try:
-                                rel = zip_p.relative_to(BACKUP_DIR)
-                                game_folder = rel.parts[0] if rel.parts else None
-                            except ValueError:
-                                pass
-
-                        if game_folder:
-                            candidate = root / "SaveSync" / "backup" / game_folder
-                            target = str(candidate) if candidate.exists() else str(root / "SaveSync")
-                        else:
-                            target = str(root)
-            except Exception as e:
-                logger.debug(f"Could not resolve provider folder for open: {e}")
+        try:
+            target = self._provider_backup_folder()
+        except Exception as e:
+            logger.debug(f"Could not resolve provider folder for open: {e}")
 
         if not target:
             if self._entry.zip_path:
@@ -395,6 +463,9 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
     backup_then_sync_requested = Signal(str)
     backup_all_requested = Signal(object)  # list[str] game ids
     manual_paths_requested = Signal()
+    # Folders dropped onto the page: the same "add save folders" window as the
+    # ➕ button, opened with them already in its list.
+    paths_dropped = Signal(list)
     # Manual "Verifica Backup" sweep — the main window mirrors these into the
     # sidebar notice so the UI never looks frozen while it runs.
     verify_started = Signal(int)               # total
@@ -403,7 +474,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self._selected_game_id: Optional[str] = None
+        # Duplicates view: only titles that appear more than once, side by side.
+        self._dupes_only: bool = False
         self._game_filter_text: str = ""          # current text-filter for game search
         self._game_combo_updating: bool = False   # guard against recursive textChanged
         # Collapsible per-title sections: which titles are expanded, and the
@@ -430,6 +504,14 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # filter-switch stale, and is never recomputed on every keystroke.
         self._provider_only_extra_game_ids: Optional[set] = None
         self._provider_only_phantom_folders: Optional[dict] = None
+        # {provider id: {folder (casefolded): {zip names}}}: what each
+        # folder-backed provider really holds, read off the disk by
+        # _CloudZipScan away from the GUI thread, so an entry is listed only
+        # when a backup is behind it. Empty until the first scan is done —
+        # and nothing is hidden until then.
+        self._cloud_zip_map: dict = {}
+        self._cloud_zip_at: float = 0.0
+        self._cloud_zip_scan = None
         # Debounce timer: fires 120 ms after the last keystroke to avoid
         # rebuilding the combo + list on every character typed.
         self._search_timer = QTimer(self)
@@ -566,6 +648,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._game_combo.setEditable(True)
         self._game_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._game_combo.setLineEdit(GhostClearableLineEdit())
+        # A folder dropped over the search field belongs to the page (see
+        # dropEvent): a line edit would otherwise take it and paste its path.
+        self._game_combo.setAcceptDrops(False)
+        self._game_combo.lineEdit().setAcceptDrops(False)
         # Kill the built-in completer Qt installs on every editable combo:
         # its INLINE completion physically writes the first alphabetical
         # match into the buffer while typing — exactly the "physical text"
@@ -832,6 +918,17 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         'archive_only', 'provider_only', '__sep__', or a provider_id string."""
         return self._origin_combo.currentData() or "all"
 
+    def _chosen_provider_id(self) -> str:
+        """The provider the person picked in the filter (directly, or in the
+        providers sub-list), or "" when they picked none in particular."""
+        filt = self._get_origin_filter()
+        if filt == "provider_only":
+            sub = self._provider_sub_combo.currentData() if hasattr(self, '_provider_sub_combo') else ""
+            return sub if sub and sub != "__all__" else ""
+        if filt in ("all", "local_only", "local_sync", "archive_only", "__sep__"):
+            return ""
+        return filt
+
     def _matches_origin_filter(self, entry) -> bool:
         filt      = self._get_origin_filter()
         origin    = getattr(entry, "origin", "local")
@@ -868,9 +965,59 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # show local backups that were synced to/from that provider
         return origin == filt or filt in synced_to
 
+    def _cloud_zip_names(self, provider, folder: str):
+        """The zips a cloud *folder* holds (names), None when unknown — no scan
+        yet, or a provider that is not a folder on this disk."""
+        found = self._cloud_zip_map.get(getattr(provider, "PROVIDER_ID", ""))
+        return None if found is None else found.get((folder or "").casefold(), set())
+
+    def _ensure_cloud_zip_scan(self):
+        """Start reading what the providers hold, off the GUI thread, unless a
+        recent scan has (or is doing) it."""
+        import time as _time
+        scan = self._cloud_zip_scan
+        if scan is not None and scan.isRunning():
+            return
+        if self._cloud_zip_at and _time.monotonic() - self._cloud_zip_at < 90.0:
+            return
+        try:
+            from sync import get_orchestrator
+            providers = list(get_orchestrator().get_connected_providers())
+        except Exception:
+            return
+        if not providers:
+            return
+        scan = _CloudZipScan(providers, self)
+        scan.done.connect(self._on_cloud_zip_scan)
+        self._cloud_zip_scan = scan
+        scan.start()
+
+    def _on_cloud_zip_scan(self, result):
+        import time as _time
+        self._cloud_zip_at = _time.monotonic()
+        self._cloud_zip_scan = None
+        if result == self._cloud_zip_map:
+            return
+        self._cloud_zip_map = result
+        # Whatever was worked out before the scan took everything at its word.
+        self._provider_only_extra_game_ids = None
+        self._provider_only_phantom_folders = None
+        if not getattr(self, "_pending_initial_load", False):
+            self._load_games()
+
+    def _cloud_backed(self, provider, folder: str, rows) -> int:
+        """How many of a cloud folder's listed *rows* have their zip there;
+        all of them when that cannot be checked."""
+        names = self._cloud_zip_names(provider, folder)
+        rows = list(rows or [])
+        if names is None:
+            return len(rows)
+        return sum(1 for r in rows if f"{(r or {}).get('backup_id', '')}.zip" in names)
+
     def _load_games(self, text_filter: str = ""):
         """Repopulate game combo respecting source-filter and optional text search."""
         self._archive_lib_ids = None  # library may have changed; recompute on demand
+        self._ensure_cloud_zip_scan()
         mgr = get_backup_manager()
         all_backups = mgr.get_all_backups()
         filt = self._get_origin_filter()
@@ -952,6 +1099,12 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                    if version_insensitive_slug(c) in cloud_norm}
                         if hit:
                             matched_folders.update(hit)
+                            # Listed as a cloud title only when a backup is
+                            # really there — an index without its zips is not.
+                            if not any(self._cloud_backed(
+                                    provider, cloud_folders.get(h, h),
+                                    all_cloud.get(cloud_folders.get(h, h), [])) for h in hit):
+                                continue
                             # Mutual exclusivity with local_sync: a game
                             # with ANY local backup (synced or not) never
                             # qualifies for provider_only, no matter how
@@ -966,7 +1119,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                     # folder name itself doubles as the combo's itemData.
                     for folder_lower, folder_original in cloud_folders.items():
                         if folder_lower not in matched_folders:
-                            phantoms[folder_original] = len(all_cloud.get(folder_original, []))
+                            n = self._cloud_backed(provider, folder_original,
+                                                   all_cloud.get(folder_original, []))
+                            if n:
+                                phantoms[folder_original] = n
                 except Exception as e:
                     logger.debug(f"_load_games: provider_only combo pre-check failed: {e}")
                 self._provider_only_extra_game_ids = extra
@@ -1690,6 +1846,37 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         """Register save folders by hand — for saves with no executable."""
         self.manual_paths_requested.emit()
 
+    # ── Drag & drop: a save folder straight onto the page ───────────────────
+
+    @staticmethod
+    def _dropped_folders(mime) -> list:
+        """The folders in a drop, once each. A file stands for the folder it
+        sits in — a save file dropped by itself means its folder."""
+        import os
+        seen, out = set(), []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            p = Path(url.toLocalFile())
+            folder = p if p.is_dir() else p.parent
+            key = os.path.normcase(str(folder))
+            if key in seen or not folder.is_dir():
+                continue
+            seen.add(key)
+            out.append(str(folder))
+        return out
+
+    def dragEnterEvent(self, event):
+        if self._dropped_folders(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        folders = self._dropped_folders(event.mimeData())
+        if not folders:
+            return
+        event.acceptProposedAction()
+        self.paths_dropped.emit(folders)
+
     def _on_page_size_changed(self, _size: int):
         """Back to the first page: the titles have just been redistributed."""
         self._backups_page_num = 1
@@ -1916,6 +2103,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                         bid = rd.get("backup_id", "")
                         if not bid or bid in local_ids or bid in cloud_only_ids:
                             return
+                        if remote_folder:
+                            _names = self._cloud_zip_names(_prov, remote_folder)
+                            if _names is not None and f"{bid}.zip" not in _names:
+                                return    # the index names it, the folder does not hold it
                         rd.setdefault("game_id", fallback_gid)
                         rd.setdefault("game_name", fallback_name)
                         rd.setdefault("created_at", "")
@@ -2072,8 +2263,15 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 pass
 
         backups.sort(key=lambda b: b.created_dt, reverse=True)
+        # A backup keeps the title its game had when it was made; a game that
+        # is in the library is listed under the name it has NOW.
+        _lib_names = {g.id: g.name for g in get_library().all_games() if g.name}
+
+        def _title(b) -> str:
+            return _lib_names.get(getattr(b, "game_id", ""), "") or b.game_name or ""
+
         if not gid:
-            backups.sort(key=lambda b: (b.game_name or "").lower())
+            backups.sort(key=lambda b: _title(b).lower())
 
         if not backups:
             if _safe(self._empty_lbl):
@@ -2107,9 +2305,21 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         for bk in backups:
             key = getattr(bk, "game_id", "") or (bk.game_name or "?")
             if key not in groups:
-                groups[key] = {"name": bk.game_name or key, "entries": []}
+                groups[key] = {"name": _title(bk) or key, "entries": []}
                 order.append(key)
             groups[key]["entries"].append(bk)
+
+        # ── Duplicates: a title that more than one group carries ────────
+        # Two groups are the same title when their names agree once a
+        # disambiguation tag (~4f2a91, or an old _2) and case are set aside —
+        # a library game and an archive of it, two archives of one folder.
+        dupe_keys = self._duplicate_group_keys(groups)
+        if self._dupes_only and not gid:
+            lib_ids = get_library().all_game_ids()
+            order = sorted(
+                (k for k in order if k in dupe_keys),
+                key=lambda k: (self._duplicate_title_key(groups[k]["name"]),
+                               0 if k in lib_ids else 1, k))
 
         # ── Pagination over titles: only the current page is rendered ─────
         from ui.pages.library_page import build_pager
@@ -2131,7 +2341,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # Bottom pager is numbers only — a combo can have one parent.
         self._list_layout.addWidget(
             build_pager(self._backups_page_num, total_pages, _go_page,
-                        size_combo=self._page_size_combo))
+                        size_combo=self._page_size_combo,
+                        lead=self._make_dupes_button(len(dupe_keys), bool(gid))))
+        if self._dupes_only and not gid and not order:
+            none_lbl = QLabel(t("backups.no_duplicates"))
+            none_lbl.setObjectName("backup_empty")
+            none_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._list_layout.addWidget(none_lbl)
 
         single_group = len(order) == 1
         # Queue group widgets; insert in QTimer chunks (library-style).
@@ -2207,6 +2423,41 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 pass
         self._list_layout.addStretch()
         self._stop_list_busy()
+
+    @staticmethod
+    def _duplicate_title_key(name: str) -> str:
+        import re
+        from core.constants import strip_disambiguation_tag
+        return re.sub(r"[\s_]+", " ", strip_disambiguation_tag(name or "")).strip().casefold()
+
+    def _duplicate_group_keys(self, groups: dict) -> set:
+        """The keys of the groups whose title another group has too."""
+        by_title: dict = {}
+        for key, grp in groups.items():
+            by_title.setdefault(self._duplicate_title_key(grp["name"]), []).append(key)
+        return {k for keys in by_title.values() if len(keys) > 1 for k in keys}
+
+    def _make_dupes_button(self, count: int, title_selected: bool):
+        """The far-left button of the pager: the duplicates view on and off.
+        Built anew with every pager (the pager is rebuilt on each refresh)."""
+        from ui.pages.library_page import _style_pager_btn
+        btn = QPushButton("🔁")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(scaled(26, self))
+        btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        btn.setFixedWidth(scaled(34, self))
+        active = self._dupes_only and not title_selected
+        _style_pager_btn(btn, active)
+        btn.setEnabled(not title_selected)
+        btn.setToolTip(t("backups.duplicates_selected") if title_selected
+                       else t("backups.duplicates_tooltip", count=count))
+        btn.clicked.connect(self._toggle_dupes_view)
+        return btn
+
+    def _toggle_dupes_view(self):
+        self._dupes_only = not self._dupes_only
+        self._backups_page_num = 1
+        self._refresh_list()
 
     def _archive_auto_widget(self, entries: list):
         """Per-archive scheduled-backup control, or None when not applicable.
@@ -2426,6 +2677,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         _head.setSpacing(8)
         _head.addWidget(arrow_lbl)
         _head.addWidget(title_lbl, 1)
+        # Every backup of this title lives on the provider only: it is not a
+        # local archive, whatever the index says it once was, and says so.
+        cloud_group = bool(entries) and all(b.backup_id in cloud_only_ids for b in entries)
+        if cloud_group:
+            cloud_lbl = QLabel("☁ " + t("backups.cloud_only_group"))
+            cloud_lbl.setObjectName("backup_group_meta")
+            _head.addWidget(cloud_lbl)
         _head.addWidget(meta_lbl)
         header.setToolTip(t("backups.hide_saves") if expanded else t("backups.show_saves"))
         col.addWidget(header)
@@ -2442,7 +2700,9 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # library gets no scheduled backups from anywhere else, so it carries
         # its own. Inside the body rather than the header — the header is one
         # big toggle button, and a control inside it would fight the click.
-        arch = self._archive_auto_widget(entries)
+        # A title that exists only on the provider has no source folder, no
+        # scheduled backup and no paths to edit: none of that is offered.
+        arch = None if cloud_group else self._archive_auto_widget(entries)
         if arch is not None:
             body_lay.addWidget(arch)
 
@@ -2452,7 +2712,20 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             if built["done"]:
                 return
             built["done"] = True
-            for i, bk in enumerate(entries):
+            # The main history first, then the side branch — provisional and
+            # pre-restore copies — under a heading of its own: they have their
+            # own retention and never leave this machine, so they are not
+            # read as part of the list above them.
+            from core.backup import BackupManager
+            main_rows = [b for b in entries if not BackupManager.is_side_backup(b)]
+            side_rows = [b for b in entries if BackupManager.is_side_backup(b)]
+            ordered = main_rows + side_rows
+            for i, bk in enumerate(ordered):
+                if side_rows and i == len(main_rows):
+                    side_lbl = QLabel(t("backups.side_branch", count=len(side_rows)))
+                    side_lbl.setObjectName("section_header")
+                    side_lbl.setToolTip(t("backups.side_branch_tip"))
+                    body_lay.addWidget(side_lbl)
                 # Apply any check that ran while this title was collapsed, so
                 # a freshly expanded group shows the dots it earned instead of
                 # the state its listing copy was made with.
@@ -2460,11 +2733,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 if _fresh:
                     bk.verify_state, bk.verify_detail, bk.verify_at = _fresh
                 is_cloud = bk.backup_id in cloud_only_ids
-                row = BackupRow(bk, is_playing=is_playing, cloud_only=is_cloud)
+                row = BackupRow(bk, is_playing=is_playing, cloud_only=is_cloud,
+                                provider_hint=self._chosen_provider_id())
                 _target_gid = gid if gid is not None else getattr(bk, "game_id", "")
                 row.restore_requested.connect(
                     lambda bid, g=_target_gid: self._on_restore(g, bid))
-                row.delete_requested.connect(self._on_delete)
+                row.delete_requested.connect(
+                    lambda bid, _bk=bk, _cloud=is_cloud: self._on_delete(bid, _bk if _cloud else None))
                 # Track the live row so refresh_styles() can cascade a theme
                 # switch into it without recreating it (rows own a separate
                 # ThemedMixin registry from the page).
@@ -2609,13 +2884,58 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
     def _on_restore(self, game_id: str, backup_id: str):
         self.restore_requested.emit(game_id, backup_id)
 
-    def _on_delete(self, backup_id: str):
+    def _on_delete(self, backup_id: str, cloud_entry=None):
         # The refresh rides backup_deleted (see _on_backup_deleted): it has
         # to work for the delete paths that never pass through here anyway,
         # so having the button refresh separately only meant two rebuilds
         # for one deletion — and one code path that could be kept correct
         # while the other rotted.
+        #
+        # A local backup is deleted locally and nothing else: its copy on the
+        # cloud stays, and shows as a cloud-only entry until it is deleted
+        # from there in its own right. *cloud_entry* is that second case — a
+        # row with no local copy — and only that row ever reaches the provider.
+        if cloud_entry is not None and get_backup_manager().get_backup(backup_id) is None:
+            self._delete_cloud_entry(cloud_entry)
+            return
         get_backup_manager().delete_backup(backup_id)
+
+    def _delete_cloud_entry(self, entry):
+        """Delete a cloud-only backup from its provider, off the GUI thread."""
+        if getattr(self, "_cloud_delete", None) is not None and self._cloud_delete.isRunning():
+            return
+        from sync import get_orchestrator
+        origin = getattr(entry, "origin", "") or ""
+        folder = (entry.cloud_metadata or {}).get("remote_folder", "")
+        provider = next((p for p in get_orchestrator().get_connected_providers()
+                         if getattr(p, "PROVIDER_ID", "") == origin), None)
+        if provider is None or not folder:
+            from ui.modal_helpers import warning_window_modal
+            warning_window_modal(self, t('backups.delete_cloud_backup'),
+                                 t('backups.delete_cloud_failed', reason=t('backups.delete_cloud_offline')))
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        worker = _CloudDelete(provider, folder, entry.backup_id, self)
+        worker.finished_with.connect(self._on_cloud_delete_done)
+        self._cloud_delete = worker
+        worker.start()
+
+    def _on_cloud_delete_done(self, ok: bool, reason: str):
+        from PySide6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
+        self._cloud_delete = None
+        if not ok:
+            from ui.modal_helpers import warning_window_modal
+            key = {"local": "backups.delete_cloud_local", "zip": "backups.delete_cloud_refused"}.get(
+                reason, "backups.delete_cloud_error")
+            warning_window_modal(self, t('backups.delete_cloud_backup'),
+                                 t('backups.delete_cloud_failed', reason=t(key)))
+        # What the tab worked out about the provider is out of date either way.
+        self._cloud_zip_at = 0.0
+        self._provider_only_extra_game_ids = None
+        self._provider_only_phantom_folders = None
+        self._load_games()
 
     def update_locale(self):
         if _safe(self._header):

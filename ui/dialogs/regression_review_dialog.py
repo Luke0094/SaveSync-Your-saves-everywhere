@@ -19,6 +19,7 @@ the previous state back onto disk instead (the newest TRUSTED backup when
 one exists, else simply the newest on record — see
 core.backup.BackupManager.newest_restore_target).
 """
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QWidget, QFrame
@@ -36,13 +37,29 @@ class RegressionReviewDialog(QDialog):
     all — *older_backup_entry* is ``None``). Either way the "restore" action
     targets newest_restore_target (the newest TRUSTED backup when one
     exists, else the newest of any kind), never that older matched one.
+
+    Every row is answered once, and answering it is final for the run: its
+    buttons give way to the outcome, and the panel closes by itself as soon as
+    the last row is answered — there is nothing left to hold the run up for.
+    Restores are not started here but collected in ``pending_restores`` and
+    run by the caller once this modal has unwound: a restore can raise its own
+    dialogs on the main window (locked files), and ordering those against this
+    dialog's own exec() is not something to rely on.
     """
+
+    # How long the last outcome stays readable before the panel closes itself.
+    _AUTO_CLOSE_MS = 1100
 
     def __init__(self, items: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("regression_review.title"))
         self._items = list(items)
         self._rows: dict[str, QFrame] = {}
+        self._actions: dict[str, list] = {}     # game_id -> the row's buttons
+        self._outcomes: dict[str, QLabel] = {}
+        self._resolved: set[str] = set()
+        # [(game_id, backup_id)] answered "restore" — see the class docstring.
+        self.pending_restores: list[tuple[str, str]] = []
         self._build()
         finalize_adaptive_dialog_size(self, min_w=520, min_h=340)
 
@@ -113,6 +130,13 @@ class RegressionReviewDialog(QDialog):
         label.setWordWrap(True)
         h.addWidget(label, 1)
 
+        # Shown in place of the buttons once the row is answered.
+        outcome = QLabel("")
+        outcome.setWordWrap(True)
+        outcome.setVisible(False)
+        h.addWidget(outcome)
+        self._outcomes[game_id] = outcome
+
         keep_btn = QPushButton(t(f"regression_review.keep_{kind}"))
         keep_btn.setToolTip(t(f"regression_review.keep_{kind}_tip"))
         keep_btn.clicked.connect(
@@ -125,20 +149,30 @@ class RegressionReviewDialog(QDialog):
         restore_btn.clicked.connect(
             lambda _=False, gid=game_id: self._on_restore(gid))
         h.addWidget(restore_btn)
+        self._actions[game_id] = [keep_btn, restore_btn]
 
         return row
 
     def _resolve_row(self, game_id: str, resolved_text: str, ok: bool = True):
+        """Answer a row: its buttons give way to *resolved_text* (context — which
+        game, which date — stays visible). Only on success: a failure keeps the
+        buttons so the person can simply try again instead of the row quietly
+        going dead. Closes the panel once every row has been answered."""
         row = self._rows.get(game_id)
         if row is None:
             return
-        # Leave the row in place (context stays visible — which game, which
-        # date) but replace its actions with a plain outcome label. Only
-        # disabled on success — a failure must stay actionable so the user
-        # can just try again instead of the row quietly going dead.
         row.setToolTip(resolved_text)
-        if ok:
-            row.setEnabled(False)
+        if not ok:
+            return
+        for btn in self._actions.get(game_id, []):
+            btn.setVisible(False)
+        out = self._outcomes.get(game_id)
+        if out is not None:
+            out.setText(f"\u2713 {resolved_text}")
+            out.setVisible(True)
+        self._resolved.add(game_id)
+        if len(self._resolved) >= len(self._rows):
+            QTimer.singleShot(self._AUTO_CLOSE_MS, self.accept)
 
     def _on_keep(self, game_id: str):
         # Routed through MainWindow's own queue (background thread, adaptive
@@ -152,7 +186,11 @@ class RegressionReviewDialog(QDialog):
             self._resolve_row(game_id, t("regression_review.action_failed"), ok=False)
             return
         try:
-            win._backup_game(game_id, force_full=True, silent=True)
+            # Not silent: the row promises "see the status bar", and a silent
+            # job never writes there.
+            win._backup_game(game_id, force_full=True, silent=False)
+            if hasattr(win, "_settle_held_back"):
+                win._settle_held_back(game_id, keep=True)
         except Exception:
             self._resolve_row(game_id, t("regression_review.action_failed"), ok=False)
             return
@@ -161,38 +199,25 @@ class RegressionReviewDialog(QDialog):
         self._resolve_row(game_id, t("regression_review.kept"))
 
     def _on_restore(self, game_id: str):
-        # Routed through MainWindow._restore_game_by_id: background thread,
-        # the app's own locked-file retry flow, AND (the part a direct
-        # restore_backup() call here would miss) records this backup_id in
-        # _last_restored so the NEXT regression check recognizes it as the
-        # intended state instead of flagging this very restore as another
-        # regression.
+        # Recorded, not started: MainWindow._restore_game_by_id (background
+        # thread, the app's own locked-file retry flow, AND — the part a
+        # direct restore_backup() call would miss — the note in _last_restored
+        # so the NEXT regression check recognises this state as intended
+        # instead of flagging the restore itself) runs once this modal has
+        # closed, see MainWindow._maybe_show_regression_review. Until then the
+        # other rows stay answerable; closing the panel used to drop them.
         from core.backup import get_backup_manager
-        win = self.parent()
         # Prefers newest TRUSTED — a pre_confirmation entry (this game's
         # own held-back capture, or an earlier restore's rejected safety
         # copy) makes a misleading default restore target — but falls
         # back to newest of any kind so "Restore" always has something to
         # point at. See newest_restore_target's own docstring.
         backup_id = get_backup_manager().newest_restore_target(game_id)
+        win = self.parent()
         if not backup_id or win is None or not hasattr(win, "_restore_game_by_id"):
             self._resolve_row(game_id, t("regression_review.action_failed"), ok=False)
             return
-        # _restore_game_by_id's own locked-file retry flow can pop a
-        # WindowModal QMessageBox on this same MainWindow once the
-        # background restore finishes — ordering that against THIS dialog's
-        # own application-modal exec() is not something to rely on across
-        # platforms. Close this panel first (any other unresolved rows get
-        # re-surfaced on the next backup run regardless) and defer the
-        # actual call a tick, so it only fires once this dialog's own event
-        # loop has fully unwound and the restore's dialogs have the screen
-        # to themselves.
-        from PySide6.QtCore import QTimer
-        self.accept()
-        # safety_provisional=True: what this overwrites is itself the
-        # unverified state this whole panel exists to review — its own
-        # pre-restore safety copy stays temporary, not real history, same
-        # as everything else about it (see restore_backup's docstring).
-        QTimer.singleShot(
-            0, lambda: win._restore_game_by_id(
-                game_id, backup_id, confirmed=True, safety_provisional=True))
+        self.pending_restores.append((game_id, backup_id))
+        if hasattr(win, "_settle_held_back"):
+            win._settle_held_back(game_id, keep=False)
+        self._resolve_row(game_id, t("regression_review.restored"))

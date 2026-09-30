@@ -20,7 +20,7 @@ from i18n import t
 from ui.helpers import PageScrollMixin, lock_min_size, safe_widget as _safe, scaled
 from ui.styles.theme import palette, ThemedMixin
 
-from ui.widgets.library_folders import FolderTree, _clean_tag_display
+from ui.widgets.library_folders import FolderTree, MenuCombo, _clean_tag_display
 from ui.widgets.game_items import GameCard, GameRow, _display_sync_status, library_card_size
 from ui.widgets.page_size import (
     PageSizeCombo, SCOPE_LIBRARY, guarded_render, page_size)
@@ -81,8 +81,9 @@ def _style_pager_btn(btn, active: bool):
 
 
 def build_pager(current: int, total: int, on_page,
-                size_combo=None) -> QWidget:
-    """Pager row: ‹  [1] … [N]  ›, optional page-size combo on the right.
+                size_combo=None, lead=None) -> QWidget:
+    """Pager row: ‹  [1] … [N]  ›, optional page-size combo on the right and
+    an optional *lead* widget (a filter button, say) at the far left.
 
     - prev hidden on the first page, next hidden on the last;
     - with a single page and no *size_combo*, the caller must not add this;
@@ -100,6 +101,8 @@ def build_pager(current: int, total: int, on_page,
     row = QHBoxLayout(wrap)
     row.setContentsMargins(0, 4, 0, 4)
     row.setSpacing(6)
+    if lead is not None:
+        row.addWidget(lead)
     row.addStretch()
 
     def _btn(text: str, page: int, active: bool = False, tooltip: str = "") -> QPushButton:
@@ -321,7 +324,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         filter_row.setSpacing(8)
 
         # Search mode selector (left of search bar)
-        self._search_mode = QComboBox()
+        self._search_mode = MenuCombo()
         self._search_mode.setObjectName("library_tool_combo")
         self._search_mode.setFixedWidth(scaled(100, self))
         self._search_mode.addItem(t("library.search_by_title"),     "title")
@@ -348,7 +351,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
 
         # Sort combo (criterion) + direction dropdown (asc/desc, resets to
         # a sensible default for the criterion whenever it changes)
-        self._sort_combo = QComboBox()
+        self._sort_combo = MenuCombo()
         self._sort_combo.setFixedWidth(scaled(130, self))
         self._populate_sort_combo()
         saved_sort = get_config().get("library_sort", "date_added")
@@ -398,6 +401,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         self._folder_tree.folder_selected.connect(self._on_folder_selected)
         self._folder_tree.tags_changed.connect(self._on_tags_changed)
         self._folder_tree.engines_changed.connect(self._on_tags_changed)
+        self._folder_tree.languages_changed.connect(self._on_tags_changed)
         body.addWidget(self._folder_tree)
 
         # Scroll area for game cards/rows
@@ -583,6 +587,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
                 unknown_ids.add(g.id)
         self._folder_tree.update_engines(
             list(engine_labels.values()), has_unknown=bool(unknown_ids))
+        self._update_language_sidebar(all_games)
 
         games = self._sort_games(all_games)
 
@@ -627,6 +632,26 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         if excluded_engines:
             games = [g for g in games
                      if _engine_chip_for(g) not in excluded_engines]
+
+        # Language filter, same three states. A game lists several, so it is
+        # the tag rule (include = has all of them, exclude = has any of them);
+        # a game that lists none counts as the Unknown chip.
+        unknown_lang_cf = self._folder_tree.language_unknown_label().casefold()
+        selected_langs = {x.casefold()
+                          for x in self._folder_tree.get_selected_languages()}
+        excluded_langs = {x.casefold()
+                          for x in self._folder_tree.get_excluded_languages()}
+
+        def _language_chips_for(g) -> set:
+            got = {x.casefold() for x in (getattr(g, "languages", None) or [])}
+            return got or {unknown_lang_cf}
+
+        if selected_langs:
+            games = [g for g in games
+                     if selected_langs.issubset(_language_chips_for(g))]
+        if excluded_langs:
+            games = [g for g in games
+                     if not excluded_langs & _language_chips_for(g)]
 
         # Apply text search filter inline so the grid reflows without gaps.
         # Filters/search run on the FULL library — pagination is applied
@@ -917,6 +942,20 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         for g in get_library().all_games():
             all_tags.extend(_clean_tag_display(x) for x in g.tags)
         self._folder_tree.update_tags(all_tags)
+        self._update_language_sidebar(get_library().all_games())
+
+    def _update_language_sidebar(self, games) -> None:
+        """Language chips: what the games list; Unknown when some list none."""
+        languages: set = set()
+        unknown = False
+        for g in games:
+            listed = getattr(g, "languages", None) or []
+            if listed:
+                languages.update(listed)
+            else:
+                unknown = True
+        self._folder_tree.update_languages(
+            sorted(languages, key=str.casefold), has_unknown=unknown)
 
     def _on_game_added(self, entry: GameEntry):
         if entry.id not in self._cards:
@@ -926,10 +965,14 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         card = self._cards.get(entry.id)
         if card is not None and hasattr(card, "_entry"):
             tags_changed = set(entry.tags) != set(card._entry.tags)
+            languages_changed = (list(getattr(entry, "languages", None) or [])
+                                 != list(getattr(card._entry, "languages", None) or []))
             if hasattr(card, "refresh"):
                 card.refresh(entry)
             if tags_changed:
                 self._refresh_tag_sidebar()
+            elif languages_changed:
+                self._update_language_sidebar(get_library().all_games())
         else:
             queue = getattr(self, "_insert_queue", None)
             if queue:

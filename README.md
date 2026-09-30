@@ -12,7 +12,7 @@
 
 SaveSync watches the games you play, finds their save folders on its own, keeps
 versioned local backups, and mirrors everything to the cloud provider of your
-choice, you can also edit the save with the integrated save editor 
+choice, you can also edit the save the integrated save editor 
 — with an always-on-top overlay so you never have to leave the game.
 Saves can also go straight to a friend, P2P, with no server or cloud provider
 involved at all.
@@ -46,7 +46,10 @@ involved at all.
   paths that don't exist yet
 - **Unknown-game queue** — every unrecognized game is remembered; the overlay
   badge counts pending detections and the notification itself is browsable
-  (carousel arrows), no separate window
+  (carousel arrows), no separate window. While nothing is being played the
+  same queue is a carousel on the Overview too — add a game or say "don't show
+  again" without the overlay hotkey. It is one queue with two views: an answer
+  given in either is gone from both
 - **Proton/Wine on Linux** — Windows games save inside their compatibility
   prefix, and SaveSync looks there too
 - **Launcher URL support** — games launched through `steam://`-style URLs are
@@ -58,9 +61,19 @@ involved at all.
   versions from Add/Edit Game, or answer the in-game prompt raised the
   moment a tracked game turns up running from a path it hasn't seen before
   (add it as another version, overwrite the primary, or split it into its
-  own entry). Save paths kept inside the install folder are rebased onto a
+  own entry). A version added by mistake can be split off afterwards with 🔀
+  in the version menu: on Save it becomes its own card with only its exe, its
+  own save location if it has one, and a name taken fresh from the exe. Save
+  paths kept inside the install folder are rebased onto a
   new version automatically; if the destination already has its own saves,
-  SaveSync asks before either gets overwritten
+  SaveSync asks before either gets overwritten. When the new location has no
+  saves yet, replacing the executable brings the saves across (copied, the
+  originals stay put) — or offers the latest backup when the old version's
+  folder is gone. Switching between tracked versions does the same into an
+  empty folder, does nothing when the saves are identical (compared by hash),
+  and asks before overwriting when they differ (a mirror — the replaced set is
+  copied aside first); adding a version beside the current one seeds its empty
+  folder
 
 ### Backups & sync
 - **Versioned local backups** with retention (max count, days, minimum kept,
@@ -71,7 +84,23 @@ involved at all.
 - **Adaptive batch queues** — Backup All / Sync All run with a concurrency
   limit derived from CPU and RAM, with sidebar progress (`N/M — name`) and
   resume after an app restart
-- **Pre-restore safety backups** — automatic backup before any restore
+- **Pre-restore safety backups** — automatic backup before any restore. Like
+  provisional (unconfirmed) backups they form a side branch: their own
+  retention, never counted against the main history, never picked as the
+  newest restore target, never uploaded
+- **Verified on arrival** — every new or downloaded backup is integrity-checked
+  as it lands (green dot from the start); one scheduled sweep covers the rest,
+  skipping archives already verified within its interval
+- **Duplicates view** — the 🔁 button at the far left of the Backups pager
+  narrows the list to titles that appear more than once (a library game and an
+  archive of it, a tagged twin), side by side, so the extra one can be found and
+  deleted. Adding a folder whose backup folder name is already taken compares
+  its files with that history by hash and, if they are not in it, lists what is
+  stored under the name (each with its last backup) and asks: add to it (another
+  version, restorable by hand, kept beside a library game's own history), keep
+  both (its own tagged archive) or don't ask again — with an extra "which one?"
+  step when several are stored. A shared name is never taken as proof of one
+  game; only "don't ask again" is remembered, and it is listed per game in Settings
 - **Integrity checks** — each backup is opened and confirmed readable, on
   demand or on a schedule, so a damaged archive is found before you need it;
   sweeps throttle only on weaker machines, skip archives still marked OK
@@ -89,6 +118,13 @@ involved at all.
   folder), OneDrive (MSAL device flow), Dropbox (OAuth PKCE), WebDAV
   (Nextcloud, ownCloud, Box…), rclone (MEGA, S3, SFTP, B2, pCloud, 40+ remotes),
   local/NAS folder
+- **Renames and edited notes reach the provider** — changing a game's title
+  moves its backup folder (locally and on every connected provider, index and
+  zips together, the old folder removed) on the next sync, and a sync that
+  finds the saves unchanged still republishes an index that changed, so a
+  rename or an edited note no longer waits for a new backup. Another machine
+  that still uses the old name is told when it launches the game: update the
+  name there too, or keep both (its own cloud folder is then started over)
 - **Conflict resolution** with per-machine detection: cross-machine divergence
   always asks (keep local / keep cloud / keep both)
 - **Quick restore from the overlay** — browse local *and* cloud backups without
@@ -99,16 +135,37 @@ involved at all.
 
 ### Library
 - **Card and list views** with search (by title or developer), folder tree with
-  colors, star ratings from reviews, and three-state filters for tags and
-  engines (include / exclude)
+  colors, star ratings from reviews, and three-state filters (include /
+  exclude) for tags, engine and languages, picked from one dropdown that
+  shows how many chips each holds. Languages: include needs all of the ones
+  chosen, exclude drops a game that has any, Unknown covers games listing none
 - **Paged lists** — only the current page of cards/rows is built; on capable
   machines the page is filled in one go, on weaker ones in small chunks so the
   UI stays responsive
 - **Smart tag merging** — case- and separator-insensitive ("2D Game", "2d-game"
   and "2DCG"/"2dcg" converge to one canonical tag, self-healing on startup)
 - **Web metadata search** — name, description, cover, developer, release date,
-  tags and reviews/ratings scraped from store pages, wikis and forum threads
-  (spoiler-wrapped tag lists included), with a merge dialog to pick what to keep
+  tags, languages and reviews/ratings scraped from store pages, wikis and forum
+  threads (spoiler-wrapped tag lists included). Nothing is applied on its own: a
+  chip dialog lists every source (the one you confirmed included). Fields with a
+  value start on "keep current" (an empty one on the fetched value); new tags,
+  languages, covers, reviews and page links start selected, and each source's
+  header clears or restores its whole selection. Only what is selected is written
+- **More pictures** — Steam, VNDB, itch.io, DLsite and forum threads (the
+  pictures posted in the first message) also list screenshots.
+  The chip dialog shows them beside the cover, selected like the rest (untick
+  what you do not want); the ticked ones are downloaded in the background
+  (Save waits for them) and added to the carousel.
+  The cover is never replaced, and Cancel removes only what that session added
+  A source applied before still shows its preview while it has pictures the game
+  lacks (worked out from the cache's file names, nothing is downloaded to know)
+- **Languages** — DLsite, Steam and VNDB say which languages a game is offered
+  in. The candidate card shows up to three (+N more); the chip dialog offers a
+  source's languages as one chip with the count; the add/edit panel shows the
+  result beside the version — English when the game has it, with the full list
+  one per line on hover. Clicking it lists them with a bin on each (shown on
+  hover), for the ones a regional store offers and your copy lacks (kept on
+  Save only)
 - **Per-game context menu** — backup, restore, sync, open save folder, edit,
   web search, remove
 
@@ -118,7 +175,10 @@ involved at all.
   and exclusive-fullscreen protection (never breaks a game's display mode)
 - **Save editor** — open a game's save and change the values in it, with the
   original kept aside first; reachable from the sidebar, the library's context
-  menu, straight to the running game, or by dropping a save file on it
+  menu, straight to the running game, or by dropping a save file on it. Kept
+  copies have a restore panel of their own: each is tagged (before an edit, or
+  the file as it stood just before a restore — a restore keeps the current
+  state first, so it can be undone from the same list)
 - **Pinned notes and images** — keep a text file, a map, or a piece of the
   screen on top of the game, drag it anywhere, edit the text in place; each
   game's pins come back when it starts
@@ -390,6 +450,7 @@ savesync/
 │   ├── credentials.py             # Secure credential store (keyring + AES fallback)
 │   ├── machine.py                 # Machine fingerprint for cross-machine detection
 │   ├── self_checks.py             # Data-integrity checks (one list, two callers)
+│   ├── stall_watchdog.py          # Logs where the GUI thread is stuck when it stops answering
 │   ├── update_check.py            # GitHub Releases check for a newer build
 │   └── startup.py                 # Autostart, directory setup, migrations
 ├── sync/
@@ -496,13 +557,14 @@ per-game *don't show again* silences the launch prompts for that game.
 
 A never-synced game can also answer **"it's a different game"**: the cloud
 folder its title resolves to belongs to a same-titled game from another
-machine, so this one moves to its own folder (`Alpha_2`) with its backups, and
+machine, so this one moves to its own folder (`Alpha~7f31c0`) with its backups, and
 the two stop sharing a destination. Not offered once the two sides have synced
 together — that already settles whose folder it is.
 
 A save that goes *backwards* without SaveSync doing it (a launcher's own cloud
 sync, another tool) is reported separately: it isn't a conflict, so the prompt
-offers to restore the newest backup, with acknowledgement in the dropdown.
+offers to restore the newest backup, or to back up the current state from the dropdown.
+Closing it unanswered leaves the game on temporary backups until you choose.
 
 ---
 
@@ -1370,7 +1432,7 @@ python maintenance/repair_archives.py --apply --fix injected-source,lost-chain
 | `clobbered-dest` | the recorded destination is really one of the sources, written over the real one |
 | `lost-chain` | chains went empty while an older entry still carries them, so a restore has nothing to rebuild the destination from |
 | `doubled-zip` | the zip holds a root that came from the destination: the same saves stored a second time. Not repairable in place — delete the entry and take a fresh backup |
-| `empty-folder` | a backup folder with no zip and no index, debris that pushes the next attempt onto a `_2` name |
+| `empty-folder` | a backup folder with no zip and no index, debris that pushes the next attempt onto a tagged name (`Name~7f31c0`) |
 | `orphan-dup` | two archives with the same identity built from different source folders |
 | `not-published` / `index-drift` | with `--remote-dir`: entries the provider never received, and drift between the local folders and the master index |
 

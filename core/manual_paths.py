@@ -349,7 +349,7 @@ def orphan_index_save_path(
 ) -> str:
     """Path stored on an orphan index entry (destination / zip-root label).
 
-    Never the collection parent (``D:\\VN Games\\Save\\…``): that is only the
+    Never the collection parent (``D:\\Games\\Saves\\…``): that is only the
     zip *source*. Profile chains resolve on this machine; relative collection
     chains keep the game folder *name* so restore can match zip tops.
     Live (non-collection) folders record themselves when they are the real

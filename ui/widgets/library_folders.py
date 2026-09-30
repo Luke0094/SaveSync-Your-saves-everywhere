@@ -7,12 +7,12 @@ FolderRow and FolderTree. Pure move — no behavior change.
 """
 import logging
 
-from PySide6.QtCore import Qt, Signal, QPoint, QEvent
-from PySide6.QtGui import QColor, QPixmap, QIcon
+from PySide6.QtCore import Qt, Signal, QPoint, QPointF, QRectF, QEvent
+from PySide6.QtGui import (QColor, QPixmap, QIcon, QPainter, QPolygonF)
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QMenu, QWidget, QGraphicsOpacityEffect, QScrollArea, QSizePolicy,
-    QSplitter, QStackedWidget, QMessageBox, QApplication,
+    QSplitter, QStackedWidget, QMessageBox, QApplication, QComboBox,
 )
 
 from i18n import t
@@ -820,11 +820,115 @@ class FolderRow(QFrame, ThemedMixin):
         self._apply_style()
 
 
+class MenuCombo(QComboBox):
+    """A combo box whose list is a menu, built as the exe version dropdown is: the
+    row under the pointer in the accent, its text in the theme's text-on-accent
+    colour. (Under the Fusion style the app forces, a combo box's own list draws
+    its hovered row in a dull grey, whatever a stylesheet says.)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._open = False
+
+    def showPopup(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
+            f"border:1px solid {palette('border_hover')};border-radius:10px;padding:6px;}}"
+            f"QMenu::item{{padding:5px 14px;border-radius:6px;font-size:{scaled(11, self)}px;}}"
+            f"QMenu::item:selected{{background:{palette('accent')};color:{palette('accent_text')};}}"
+        )
+        menu.setMinimumWidth(self.width())
+        current = self.currentIndex()
+        for i in range(self.count()):
+            action = menu.addAction(self.itemText(i))
+            action.setData(i)
+            if i == current:
+                font = action.font()
+                font.setBold(True)
+                action.setFont(font)
+        self._open = True
+        self.update()
+        try:
+            chosen = menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+        finally:
+            self._open = False
+            self.update()
+            menu.deleteLater()
+        if chosen is not None:
+            index = chosen.data()
+            if index != current:
+                self.setCurrentIndex(index)
+            self.activated.emit(index)
+
+    def hidePopup(self):
+        pass
+
+
+class _FilterKindCombo(MenuCombo):
+    """The sidebar's "filter by" picker: the green bar the tab buttons used to
+    be, its name centred in the theme's text-on-accent colour (black on the dark
+    theme's green, white on the light one's), with a chevron at the right.
+
+    Painted here rather than styled: a QSS combo box cannot centre its text, and
+    reading the accent at paint time keeps it right through a theme switch with
+    nothing to re-apply."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hover = False
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        fill = QColor(palette('accent'))
+        if self._hover or self._open:
+            fill = fill.lighter(112)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        r = QRectF(self.rect())
+        p.drawRoundedRect(r, 4, 4)
+
+        ink = QColor(palette('accent_text'))   # what every accent fill in the app uses
+        gutter = scaled(20, self)            # room for the chevron, mirrored on the left
+        font = self.font()
+        font.setBold(True)
+        font.setPixelSize(scaled(10, self))
+        p.setFont(font)
+        p.setPen(ink)
+        room = max(0, self.width() - 2 * gutter)
+        text = p.fontMetrics().elidedText(
+            self.currentText(), Qt.TextElideMode.ElideRight, room)
+        p.drawText(QRectF(gutter, 0, room, r.height()),
+                   Qt.AlignmentFlag.AlignCenter, text)
+
+        # chevron ▾
+        cx, cy, half = r.right() - scaled(10, self), r.center().y(), scaled(3.5, self)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink)
+        p.drawPolygon(QPolygonF([QPointF(cx - half, cy - half / 2),
+                                 QPointF(cx + half, cy - half / 2),
+                                 QPointF(cx, cy + half * 0.7)]))
+        p.end()
+
+
 class FolderTree(QFrame, ThemedMixin):
-    """Sidebar showing the folder tree, plus the tag/engine filter tabs."""
+    """Sidebar showing the folder tree, plus the tag/engine/language filters."""
     folder_selected = Signal(str)  # folder_path or "__all__"
     tags_changed = Signal()        # tag selection changed
     engines_changed = Signal()     # engine selection changed
+    languages_changed = Signal()   # language selection changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -863,10 +967,12 @@ class FolderTree(QFrame, ThemedMixin):
         self._folders_pane.setMinimumHeight(scaled(90, self))
         self._splitter.addWidget(self._folders_pane)
 
-        # ── Bottom pane: "filter by" tabs — tags | engine ─────────────────
-        # Two filters of the same shape share the pane. Both stay ACTIVE
-        # while hidden: switching tab changes what is being edited, not what
-        # is being filtered. "Clear all" empties both tabs.
+        # ── Bottom pane: "filter by" dropdown — tags | engine | languages ──
+        # Filters of the same shape share the pane, picked from one dropdown
+        # (three buttons no longer fit the rail). All of them stay ACTIVE
+        # while hidden: picking another changes what is being edited, not
+        # what is being filtered, and each row of the dropdown carries how
+        # many chips its filter holds. "Clear all" empties every one.
         self._filters_pane = QWidget()
         filters_col = QVBoxLayout(self._filters_pane)
         filters_col.setContentsMargins(0, 0, 0, 0)
@@ -876,24 +982,16 @@ class FolderTree(QFrame, ThemedMixin):
         self._filter_by_lbl.setObjectName("folder_filter_by")
         filters_col.addWidget(self._filter_by_lbl)
 
-        tabs_row = QHBoxLayout()
-        tabs_row.setContentsMargins(0, 0, 0, 0)
-        tabs_row.setSpacing(4)
-        self._tab_tags_btn = QPushButton(t("library.tab_tags"))
-        self._tab_engines_btn = QPushButton(t("library.tab_engines"))
-        self._filter_tab_btns = (self._tab_tags_btn, self._tab_engines_btn)
-        self._tab_tags_btn.setToolTip(t("library.filter_tags"))
-        self._tab_engines_btn.setToolTip(t("library.filter_engines"))
-        for i, btn in enumerate(self._filter_tab_btns):
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setFixedHeight(scaled(24, self))
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding,
-                              QSizePolicy.Policy.Fixed)
-            btn.setMinimumWidth(0)
-            btn.clicked.connect(lambda _=False, idx=i: self._show_filter_tab(idx))
-            tabs_row.addWidget(btn, 1)
-        filters_col.addLayout(tabs_row)
+        self._filter_kind = _FilterKindCombo()
+        self._filter_kind.setObjectName("filter_kind_combo")
+        self._filter_kind.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter_kind.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # as the tab buttons were
+        self._filter_kind.setFixedHeight(scaled(25, self))
+        self._filter_kind.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                        QSizePolicy.Policy.Fixed)
+        for _ in range(3):
+            self._filter_kind.addItem("")       # texts: _refresh_filter_kinds
+        filters_col.addWidget(self._filter_kind)
 
         self._filter_stack = QStackedWidget()
         self._tag_panel = TagFilterPanel()
@@ -905,12 +1003,24 @@ class FolderTree(QFrame, ThemedMixin):
             active_key="library.active_engine_filters",
             merge_variants=False)
         self._engine_panel.tags_changed.connect(self.engines_changed)
-        self._tag_panel.cleared.connect(self._clear_sibling_filters)
-        self._engine_panel.cleared.connect(self._clear_sibling_filters)
-        self._filter_stack.addWidget(self._tag_panel)
-        self._filter_stack.addWidget(self._engine_panel)
+        self._language_panel = TagFilterPanel(
+            header_key="library.filter_languages",
+            search_key="library.search_languages",
+            clear_key="library.clear_languages",
+            active_key="library.active_language_filters",
+            merge_variants=False)
+        self._language_panel.tags_changed.connect(self.languages_changed)
+        # Same order as the dropdown's rows.
+        self._filter_panels = (self._tag_panel, self._engine_panel,
+                               self._language_panel)
+        for panel in self._filter_panels:
+            panel.cleared.connect(self._clear_sibling_filters)
+            panel.tags_changed.connect(self._refresh_filter_kinds)
+            self._filter_stack.addWidget(panel)
+        self._filter_kind.currentIndexChanged.connect(self._show_filter_tab)
         filters_col.addWidget(self._filter_stack, 1)
         self._has_unknown_engines = False
+        self._has_unknown_languages = False
 
         # Was a hard setMaximumHeight(215) (no resize possible at all); now
         # just a floor so the header/search/clear row always stays usable
@@ -919,7 +1029,7 @@ class FolderTree(QFrame, ThemedMixin):
         # splitter gives this pane (see TagFilterPanel._build).
         self._filters_pane.setMinimumHeight(scaled(160, self))
         self._splitter.addWidget(self._filters_pane)
-        self._show_filter_tab(0)
+        self._refresh_filter_kinds()
 
         self._splitter.setStretchFactor(0, 1)
         self._splitter.setStretchFactor(1, 0)
@@ -1083,8 +1193,8 @@ class FolderTree(QFrame, ThemedMixin):
                 self._new_folder_btn.setStyleSheet(self._new_folder_btn_style())
             except RuntimeError:
                 pass
-        self._tag_panel.refresh_styles()
-        self._engine_panel.refresh_styles()
+        for panel in self._filter_panels:
+            panel.refresh_styles()
 
     def update_locale(self):
         """Retranslate the sidebar: rebuild covers the folder rows ("All
@@ -1092,19 +1202,19 @@ class FolderTree(QFrame, ThemedMixin):
         never touches, so they retranslate their own header/search/clear."""
         self.rebuild()
         self._filter_by_lbl.setText(t("library.filter_by"))
-        self._tab_tags_btn.setText(t("library.tab_tags"))
-        self._tab_engines_btn.setText(t("library.tab_engines"))
-        self._tab_tags_btn.setToolTip(t("library.filter_tags"))
-        self._tab_engines_btn.setToolTip(t("library.filter_engines"))
-        self._tag_panel.update_locale()
-        self._engine_panel.update_locale()
+        for panel in self._filter_panels:
+            panel.update_locale()
         # Others chip label is translated — rebuild engine chips so the
         # wording tracks the locale while keeping include/exclude state.
         if self._has_unknown_engines:
             old = getattr(self, "_others_label", None)
             engines = [x for x in self._engine_panel._all_tags if x != old]
             self.update_engines(engines, has_unknown=True)
-        self._show_filter_tab(self._filter_stack.currentIndex())
+        if self._has_unknown_languages:
+            old = getattr(self, "_language_unknown_label", None)
+            langs = [x for x in self._language_panel._all_tags if x != old]
+            self.update_languages(langs, has_unknown=True)
+        self._refresh_filter_kinds()
 
     def update_drag_hover(self, global_pos: QPoint):
         """Highlight the folder row under the cursor during drag."""
@@ -1121,44 +1231,31 @@ class FolderTree(QFrame, ThemedMixin):
             row.set_drag_hover(False)
 
     def _clear_sibling_filters(self):
-        """Clear the filter tabs that did not raise the clear signal."""
+        """Clear the filters that did not raise the clear signal."""
         sender = self.sender()
-        for panel in (self._tag_panel, self._engine_panel):
+        for panel in self._filter_panels:
             if panel is not sender:
                 panel.clear_selection(emit=False)
 
     def _show_filter_tab(self, index: int):
-        """Switch which filter is on show; both keep filtering either way."""
+        """Switch which filter is on show; all keep filtering either way."""
         self._filter_stack.setCurrentIndex(index)
-        for i, btn in enumerate(self._filter_tab_btns):
-            active = i == index
-            btn.setObjectName("filter_tab")
-            btn.setProperty("active", "1" if active else "0")
-            # Belt-and-suspenders: Fusion sometimes ignores QSS text colour
-            # on property-keyed buttons, leaving green-on-green (invisible).
-            if active:
-                btn.setStyleSheet(
-                    f"QPushButton#filter_tab{{background:{palette('accent')};"
-                    f"color:{palette('accent_text')};"
-                    f"border:1px solid {palette('accent')};"
-                    f"border-radius:3px;font-size:{scaled(10, self)}px;font-weight:700;"
-                    f"padding:2px 6px;}}")
-            else:
-                btn.setStyleSheet(
-                    f"QPushButton#filter_tab{{background:{palette('bg_elevated')};"
-                    f"color:{palette('text_secondary')};"
-                    f"border:1px solid {palette('border_hover')};"
-                    f"border-radius:3px;font-size:{scaled(10, self)}px;font-weight:600;"
-                    f"padding:2px 6px;}}"
-                    f"QPushButton#filter_tab:hover{{color:{palette('text')};"
-                    f"border-color:{palette('accent')};}}")
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-            btn.update()
+        if self._filter_kind.currentIndex() != index:
+            self._filter_kind.setCurrentIndex(index)
+
+    def _refresh_filter_kinds(self):
+        """The dropdown's rows: each filter's name, and how many chips it
+        holds — a filter that is not on show still narrows the library."""
+        keys = ("library.tab_tags", "library.tab_engines", "library.tab_languages")
+        for i, (key, panel) in enumerate(zip(keys, self._filter_panels)):
+            active = sum(1 for state in panel._states.values() if state)
+            self._filter_kind.setItemText(
+                i, f"{t(key)} ({active})" if active else t(key))
 
     def update_tags(self, all_tags: list[str]):
         """Refresh available tags from game library."""
         self._tag_panel.set_tags(all_tags)
+        self._refresh_filter_kinds()
 
     def update_engines(self, all_engines: list[str], *, has_unknown: bool = False):
         """Refresh available engines from the game library.
@@ -1182,6 +1279,34 @@ class FolderTree(QFrame, ThemedMixin):
         if has_unknown:
             chips.append(self._others_label)
         self._engine_panel.set_tags(chips)
+        self._refresh_filter_kinds()
+
+    def update_languages(self, all_languages: list[str], *, has_unknown: bool = False):
+        """Refresh the language chips from the games' own languages — the same
+        rule as the engines: only what the library has. *has_unknown* adds an
+        Unknown chip for the titles that list none."""
+        self._has_unknown_languages = bool(has_unknown)
+        old = getattr(self, "_language_unknown_label", None)
+        self._language_unknown_label = t("library.language_unknown")
+        if old and old != self._language_unknown_label:
+            st = self._language_panel._states.pop(old, None)
+            if st:
+                self._language_panel._states[self._language_unknown_label] = st
+        chips = [x for x in all_languages
+                 if x and x != old and x != self._language_unknown_label]
+        if has_unknown:
+            chips.append(self._language_unknown_label)
+        # A game update calls this often; an unchanged list rebuilds nothing.
+        sig = tuple(sorted(chips))
+        if sig == getattr(self, "_language_sig", None):
+            return
+        self._language_sig = sig
+        self._language_panel.set_tags(chips)
+        self._refresh_filter_kinds()
+
+    def language_unknown_label(self) -> str:
+        """Current translated label of the Unknown language chip."""
+        return getattr(self, "_language_unknown_label", None) or t("library.language_unknown")
 
     def engine_others_label(self) -> str:
         """Current translated label of the Others engine chip."""
@@ -1199,11 +1324,19 @@ class FolderTree(QFrame, ThemedMixin):
     def get_excluded_engines(self) -> set[str]:
         return self._engine_panel.get_excluded()
 
+    def get_selected_languages(self) -> set[str]:
+        return self._language_panel.get_selected()
+
+    def get_excluded_languages(self) -> set[str]:
+        return self._language_panel.get_excluded()
+
     def has_active_filters(self) -> bool:
         """Whether any chip filter is narrowing the library right now."""
         return bool(self.get_selected_tags() or self.get_excluded_tags()
                     or self.get_selected_engines()
-                    or self.get_excluded_engines())
+                    or self.get_excluded_engines()
+                    or self.get_selected_languages()
+                    or self.get_excluded_languages())
 
     def _on_row_clicked(self, path: str):
         self._selected_path = path

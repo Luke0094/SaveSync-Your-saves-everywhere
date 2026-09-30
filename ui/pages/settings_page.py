@@ -1205,6 +1205,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         even that is gone does the row say so in words.
         """
         from core.library import get_library
+        if game_id.startswith("folder:"):       # an archive answered before it had a game
+            return game_id[len("folder:"):]
         entry = get_library().get_by_id(game_id)
         if entry is not None and entry.name:
             return entry.name
@@ -1218,7 +1220,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         return t("settings.removed_game", id=game_id[:8])
 
     def _suppression_kinds(self, game_id: str, scan_accept: dict,
-                           notif_suppress: dict, cloud_no_local) -> list[str]:
+                           notif_suppress: dict, cloud_no_local,
+                           archive_skips: dict | None = None) -> list[str]:
         """What is actually suppressed for *game_id*, named for the reader.
 
         Empty when nothing is: a game whose entry survives with a falsy value
@@ -1234,6 +1237,9 @@ class SettingsPage(PageScrollMixin, QWidget):
             kinds.append(t(key) if key else str(notif_type))
         if game_id in (cloud_no_local or []):
             kinds.append(t("settings.suppression_cloud_no_local"))
+        for source in (archive_skips or {}).get(game_id, []):
+            kinds.append(t("settings.suppression_archive_skip",
+                           name=os.path.basename(str(source).rstrip("/\\")) or source))
         return kinds
 
     def _load_excluded_paths_list(self):
@@ -1304,14 +1310,17 @@ class SettingsPage(PageScrollMixin, QWidget):
         scan_accept: dict       = config.get("scan_auto_accept_games", {})
         notif_suppress: dict    = config.get("suppressed_ingame_notifs", {})
         cloud_no_local: list    = config.get("suppressed_cloud_no_local", [])
+        from core.backup import BackupManager
+        archive_skips: dict     = BackupManager.skipped_archives()
 
         # Only games that really have something suppressed: an id can outlive
         # its preference (the value emptied, the game deleted), and such rows
         # said "skip path confirmation" while suppressing nothing.
         by_game = {}
-        for game_id in set(scan_accept) | set(notif_suppress) | set(cloud_no_local):
+        for game_id in (set(scan_accept) | set(notif_suppress) | set(cloud_no_local)
+                        | set(archive_skips)):
             kinds = self._suppression_kinds(
-                game_id, scan_accept, notif_suppress, cloud_no_local)
+                game_id, scan_accept, notif_suppress, cloud_no_local, archive_skips)
             if kinds:
                 by_game[game_id] = kinds
         all_game_ids = set(by_game)
@@ -1366,6 +1375,10 @@ class SettingsPage(PageScrollMixin, QWidget):
         if game_id in cloud_no_local:
             cloud_no_local.remove(game_id)
             config.set("suppressed_cloud_no_local", cloud_no_local)
+
+        # An archive that was skipped is asked about again.
+        from core.backup import BackupManager
+        BackupManager.clear_archive_choices(game_id)
 
         self._load_suppression_list()
 

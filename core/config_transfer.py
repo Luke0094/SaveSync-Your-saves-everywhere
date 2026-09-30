@@ -34,9 +34,19 @@ _MACHINE_SPECIFIC_KEYS = frozenset({
     "last_cloud_config_hash",
     "last_cloud_config_import",
     "suppress_cloud_config_prompt",
-    # Per-machine schedule stamps — each install tracks its own last run.
+    # Per-machine schedule stamps — each install tracks its own last run. Every
+    # one of them belongs here: a stamp that can be imported (or restored from
+    # a snapshot, see restore_config_snapshot) resets that machine's schedule
+    # to somebody else's moment, and the sweep it guards runs again.
     "auto_export_config_last",
     "backup_verify_last",
+    "last_self_check",
+    "backup_retention_sweep_last",
+    "update_check_last",
+    "update_check_interval_sec",
+    "update_notified_version",
+    # Answers about archive FOLDERS on this machine's disk.
+    "archive_choices",
     # Note: suppressed_overlay_apps and ignored_processes ARE exported so the
     # blocklist roams with the user.  On a machine where a path doesn't exist
     # it simply never matches — no harm done.
@@ -374,6 +384,13 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
         if not getattr(existing, fill_key, "") and imported_dict.get(fill_key):
             setattr(existing, fill_key, imported_dict[fill_key])
 
+    # Languages: union, like tags — what either machine's search found.
+    imported_languages = imported_dict.get("languages") or []
+    if imported_languages:
+        from core.library import normalize_languages
+        existing.languages = normalize_languages(
+            list(existing.languages or []) + list(imported_languages))
+
     # Reviews: union keyed by source, local side winning. A review is written
     # once and is worth keeping — the same reasoning as playtime — but two
     # machines that both searched Steam hold the same verdict twice, so the
@@ -547,6 +564,14 @@ def restore_config_snapshot(snapshot_path: Path) -> bool:
         # Safety net: snapshot current config before overwriting live files.
         save_config_snapshot("pre_restore")
 
+        # What belongs to THIS machine survives the restore: the snapshot holds
+        # the schedule stamps as they were when it was taken, and restoring it
+        # wholesale sent every integrity/retention/update schedule back to that
+        # moment — everything "due" again at once.
+        from core.config_manager import get_config as _gc
+        _keep = {k: v for k, v in _gc().get_all().items()
+                 if k in _MACHINE_SPECIFIC_KEYS}
+
         # Same-dir tmp + replace: crash mid-write must not leave truncated
         # config/library (important on Unix where there is no AV retry path).
         from core import atomic_replace as _atomic_replace
@@ -568,6 +593,9 @@ def restore_config_snapshot(snapshot_path: Path) -> bool:
         cfg = get_config()
         with cfg._io_lock:
             cfg._load()
+        for _k, _v in _keep.items():
+            cfg.set(_k, _v)
+        cfg.save()
         lib = get_library()
         with lib._lock:
             lib._load()

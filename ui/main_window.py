@@ -4,7 +4,6 @@ NVIDIA App-inspired sidebar with Overview, Library, Sync, Backups, Settings.
 """
 import logging
 import platform
-import shutil
 import sys
 import threading
 import time
@@ -371,6 +370,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # handlers pop it). Closing the prompt does NOT pop it — that is what
         # lets _toggle_overlay() re-summon it via the hotkey until decided.
         self._pending_cloud_notification: dict[str, str] = {}
+        # game_id -> {"folder", "name", "provider"} of the pending "another
+        # machine renamed this game" notification (see CloudFlowsMixin)
+        self._pending_remote_rename: dict[str, dict] = {}
         # library game_id → orphan backup game_id (hand-added archive to adopt
         # when the user accepts the same cloud-saves notification).
         self._pending_orphan_adopt: dict[str, str] = {}
@@ -465,11 +467,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # check samples several times, and a regression that persists would
         # otherwise raise the same prompt at every sample.
         self._regression_warned: set = set()
-        # Shown but not yet acknowledged, per game: game_id -> (backup_id,
+        # Shown but not yet answered, per game: game_id -> (backup_id,
         # after_restore). A warning the player never saw — the overlay was
         # missed, or something else took the screen — must not be lost, so the
-        # hotkey re-summons it for as long as it sits here. Only the
-        # acknowledge button and an actual restore take it out.
+        # hotkey re-summons it for as long as it sits here. Only an actual
+        # restore or "back it up now" (see _settle_held_back) takes it out.
         self._pending_regression: dict[str, tuple[str, bool]] = {}
         # In-flight regression check + rearm (same pattern as watcher.py):
         # a second call for the same game does not start a parallel scan, but
@@ -740,6 +742,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Raised when the Overview has nothing to sync TO — see its _sync_all
         # and the provider label.
         self._overview_page.open_sync.connect(lambda: self._switch_page(2))
+        self._overview_page.unknown_add_requested.connect(self._on_overview_unknown_add)
+        self._overview_page.unknown_dismiss_requested.connect(self._on_suppress_overlay)
         self._overview_page.refresh_all_requested.connect(self._on_refresh_all_pages)
 
         # Wire backups page signals
@@ -751,6 +755,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._backups_page.backup_all_requested.connect(self._start_backup_all)
         self._backups_page.restore_requested.connect(self._restore_game_by_id)
         self._backups_page.manual_paths_requested.connect(self._show_manual_path_dialog)
+        self._backups_page.paths_dropped.connect(
+            lambda paths: self._show_manual_path_dialog(dropped=paths))
         # Manual "Verifica Backup" runs on a worker thread; surface it in the
         # sidebar so the UI keeps working while the sweep runs.
         self._backups_page.verify_started.connect(self._on_verify_batch_started)
@@ -776,6 +782,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Orphanize legacy Aggiungi-percorso stubs once BackupManager exists.
         QTimer.singleShot(200, self._migrate_manual_path_stubs)
+        # Backups that still carry a title the game no longer has (renamed by
+        # an older version) take the current one, so every list shows it.
+        QTimer.singleShot(600, self._retitle_backups_from_library)
         # Resume unfinished Backup/Sync Tutti / Aggiunta multipla after UI is up.
         QTimer.singleShot(400, self._resume_pending_batch_jobs)
         # Re-apply fonts/chrome when the window moves to another monitor
@@ -1490,7 +1499,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if getattr(self, "_cheats_page", None) is not None and self._cheats_page is not current:
             try:
                 has_doc = getattr(self._cheats_page, "has_loaded_document", lambda: False)()
-                if not has_doc or force_all:
+                # Never out from under someone who is in it: a game starting or
+                # exiting is no reason to close the save they have open or drop
+                # the load they are waiting on. Hidden (SaveSync goes to the tray
+                # for the game) the page is fair game, as before.
+                in_use_now = (self._cheats_page.isVisible()
+                              and self._cheats_page.in_use())
+                if (not has_doc or force_all) and not in_use_now:
                     self._cheats_page.wipe_and_reload()
             except Exception:
                 logger.debug("wipe_and_reload failed for CheatsPage",
@@ -1942,14 +1957,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 prior_completed_ids=completed,
             )
 
-    def _show_manual_path_dialog(self, resume_state: dict | None = None):
-        """Open Aggiunta multipla with show() so ✕ can shelve to the sidebar."""
+    def _show_manual_path_dialog(self, resume_state: dict | None = None,
+                                 dropped: list | None = None):
+        """Open Aggiunta multipla with show() so ✕ can shelve to the sidebar.
+
+        *dropped*: folders dropped on the Backups page — added to the window's
+        list as single entries, whether it is new, already open, or put away
+        in the sidebar."""
         from ui.dialogs.manual_path_dialog import ManualPathDialog
         existing = self._manual_path_dlg
         if existing is not None:
             try:
                 existing.unshelve()
-                return
+                if not dropped or existing.isVisible():
+                    if dropped:
+                        existing.add_dropped_paths(dropped)
+                    return
+                # It had finished while put away, and closed itself on
+                # coming back: the drop opens a fresh one.
+                self._manual_path_dlg = None
             except RuntimeError:
                 self._manual_path_dlg = None
         dlg = ManualPathDialog(self)
@@ -1959,6 +1985,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         dlg.finished.connect(lambda _r: self._on_manual_path_finished(dlg))
         if resume_state:
             dlg.restore_persisted_state(resume_state)
+        if dropped:
+            dlg.add_dropped_paths(dropped)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -2710,55 +2738,34 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # that would read the context as an executable path.
         if action in ("restore_newest", "force_restore"):
             game_id, _, backup_id = context.partition("|")
-            self._pending_regression.pop(game_id, None)   # acted on
-            self._pending_cloud_notification.pop(game_id, None)
-            # Any temporary backup notif_gated filed while this was pending
-            # (see _run_backup_job) covers exactly the state being rejected
-            # here — gone with it, same as a declined auto-scan detection's
-            # own session backups. Never auto-promoted, only ever explicitly
-            # promoted (below) or discarded (here) by the player's own
-            # choice.
-            try:
-                get_backup_manager().discard_pre_confirmation_backups(
-                    game_id, include_notif_gated=True)
-            except Exception:
-                logger.debug(
-                    f"Could not discard temporary backups for {game_id}", exc_info=True)
+            # Acted on. Any temporary backup notif_gated filed while this was
+            # pending (see _run_backup_job) covers exactly the state being
+            # rejected here — gone with it, same as a declined auto-scan
+            # detection's own session backups. Never auto-promoted, only ever
+            # explicitly promoted (backup_now_unbacked) or discarded (here) by
+            # the player's own choice. Same settlement the review panel does.
+            self._settle_held_back(game_id, keep=False)
             self._restore_after_regression(game_id, backup_id,
                                            freeze=(action == "force_restore"))
             return
-        # The player says they have seen it: stop re-summoning it. Same
-        # context shape, so it is matched here rather than falling through to
-        # a branch that would read the context as an executable path.
-        if action == "regression_ack":
-            game_id, _, _bk = context.partition("|")
-            self._pending_regression.pop(game_id, None)
-            self._pending_cloud_notification.pop(game_id, None)
-            return
-        # Same "game_id|backup_id" shape as the regression actions above —
-        # show_save_reverted's unbacked=True branch now offers "Restore
-        # last backup" (the restore_newest/force_restore branch above) as
-        # its primary action, with these two as dropdown alternatives, so
-        # all of them share one context shape.
+        # Same "game_id|backup_id" shape as the restore actions above —
+        # show_save_reverted (regression and unbacked alike) offers a restore
+        # as its primary action and this as its one dropdown alternative, so
+        # both share one context shape. Closing the alert with ✕ is not an
+        # answer: the warning stays pending and the game keeps being backed
+        # up as temporary copies until one of these two settles it.
         if action == "backup_now_unbacked":
             game_id, _, _bk = context.partition("|")
-            self._pending_cloud_notification.pop(game_id, None)
             # The player has explicitly said this content is fine — the
             # ONE place any temporary backup notif_gated filed while this
             # was pending (see _run_backup_job) gets promoted to real
             # history. Nothing does this automatically; this click is the
             # only thing that does.
-            try:
-                get_backup_manager().promote_pre_confirmation_backups(
-                    game_id, note=t('main.auto_confirmed'), include_notif_gated=True)
-            except Exception:
-                logger.debug(
-                    f"Could not promote temporary backups for {game_id}", exc_info=True)
-            self._backup_game(game_id)
-            return
-        if action == "unbacked_ack":
-            game_id, _, _bk = context.partition("|")
-            self._pending_cloud_notification.pop(game_id, None)
+            self._settle_held_back(game_id, keep=True)
+            # Forced: the same answer given to a REGRESSION ("keep the current
+            # state") must get through create_backup's regression gate, which
+            # is unconditional and would hold the backup back a second time.
+            self._backup_game(game_id, force_full=True)
             return
         # Same shape ("game_id|new_exe_path"), matched before anything that
         # would read the context as a plain executable path on its own.
@@ -2989,6 +2996,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     name_history=list(entry.name_history),
                 )
                 self._mark_cloud_machine_confirmed(entry.id)
+
+        elif action in ("update_renamed_game", "keep_both_renamed_game", "never_renamed_game"):
+            entry = get_library().get_by_exe(context)
+            if entry:
+                self._pending_cloud_notification.pop(entry.id, None)
+                info = self._pending_remote_rename.pop(entry.id, None)
+                if info:
+                    if action == "update_renamed_game":
+                        self._apply_remote_rename(entry, info)
+                    else:
+                        self._keep_both_after_remote_rename(
+                            entry, info, never=(action == "never_renamed_game"))
+                self._show_tracking_toast_if_playing(entry.id)
 
         elif action == "decline_cloud_different_machine":
             # "Keep Local" — don't re-prompt for this same cloud version again
@@ -3405,8 +3425,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             pass
 
     def _auto_add_game_from_overlay(self, exe_path: str, force_folder_name: str = "",
-                                    force_local_wins: bool = False):
+                                    force_local_wins: bool = False,
+                                    announce: bool = True):
         """Automatically add a game to library from overlay detection.
+
+        *announce*: confirm on the overlay. The Overview's carousel adds the
+        same way and confirms in the page instead (False).
 
         *force_folder_name*, when given, pins the game's sync/backup folder (used
         by the cloud-verify flow: adopt a specific cloud folder on "download", or
@@ -3485,25 +3509,36 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # monitor starts tracking (no window where a sync could fire without it).
         entry.pending_local_wins = force_local_wins
 
-        # The user is playing this game right now — that is the only reason
-        # the overlay is on screen offering to add it. Stamped BEFORE
-        # add_game so the very first write to disk already carries it:
-        # afterwards the answer depended on the monitor late-matching the
-        # running process, and when that did not happen the game sat in the
-        # library reading "never played" while it was on screen.
-        entry.mark_played()
+        # Running right now — the process is still up, so the user is playing
+        # it. A queued detection (an app noticed earlier, offered again from the
+        # badge or the Overview) may be long gone: nothing was played, and
+        # nothing is there to track.
+        running_now = bool(original_url
+                           or (pending_key and pending_key in self._pending_unknown))
+
+        # Stamped BEFORE add_game so the very first write to disk already
+        # carries it: afterwards the answer depended on the monitor
+        # late-matching the running process, and when that did not happen the
+        # game sat in the library reading "never played" while it was on screen.
+        if running_now:
+            entry.mark_played()
 
         # Add to library
         get_library().add_game(entry)
 
-        # Start tracking only when we already know a real process path.
+        # Start tracking only when we already know a real process path — and
+        # there is a process to follow.
         monitor = get_monitor()
-        if exe_path:
+        if exe_path and running_now:
             monitor.start_tracking(entry, exe_path)
 
-        # Remove from pending unknown list
+        # Remove from pending unknown list — and from the shared queue, so
+        # neither the overlay's carousel nor the Overview's banner keeps
+        # offering a game that is in the library now.
         if pending_key:
             self._pending_unknown.pop(pending_key, None)
+            from ui.unknown_history import remove_entry
+            remove_entry(pending_key)
         if original_url:
             self._pending_unknown.pop(original_url, None)
 
@@ -3519,11 +3554,38 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # guarded by the parent/child ancestor check), which runs the cloud-
         # saves check FIRST and only then shows the single tracking toast —
         # chaining a second one from here is what produced the duplicate.
-        if self._overlay:
+        if self._overlay and announce:
             from core.engines.game_engine import engine_display, engine_for_game
             self._overlay.show_game_added(
                 name, exe_path or original_url or "", then_track=False,
                 engine=engine_display(engine_for_game(entry)))
+        return entry
+
+    def _retitle_backups_from_library(self):
+        try:
+            bm = get_backup_manager()
+            n = bm.retitle_rows_from_library()
+            if n:
+                logger.info(f"Backups retitled to the library's current names: {n} game(s)")
+            # The old titles the rows now remember belong on the game's own history too.
+            m = bm.merge_row_names_into_library()
+            if m:
+                logger.info(f"Former names restored to the library history: {m} game(s)")
+            # Numbered folders an earlier version left EMPTY have nothing behind
+            # them; one holding an archive is never touched here.
+            gone = bm.remove_empty_legacy_folders()
+            if gone:
+                logger.info(f"Removed {gone} empty numbered backup folder(s)")
+        except Exception:
+            logger.debug("Retitling backups failed", exc_info=True)
+
+    def _on_overview_unknown_add(self, exe_path: str):
+        """"Add to Library" on the Overview's carousel: the overlay's own add,
+        confirmed in the status bar instead of on the overlay."""
+        entry = self._auto_add_game_from_overlay(exe_path, announce=False)
+        if entry is not None:
+            self._status_bar.showMessage(
+                t("unknown_history.banner_added", name=entry.name), 5000)
 
     def _on_suppress_overlay(self, exe_path: str):
         config = get_config()
@@ -3536,12 +3598,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._session_shown_exes.discard(exe_path)
         # Drop it from the persisted unknown-game queue too: a suppressed
         # app must stop counting on the overlay badge and disappear from
-        # the browsable queue.
-        config.set("unknown_game_history",
-                   [h for h in config.get("unknown_game_history", [])
-                    if not (isinstance(h, dict) and h.get("exe") == exe_path)])
-        if self._overlay:
-            self._overlay.refresh_unknown_badge()
+        # every view of the queue — the overlay's carousel and the Overview's
+        # banner both hear about it from here.
+        from ui.unknown_history import remove_entry
+        remove_entry(exe_path)
 
     # ── Hotkeys ───────────────────────────────────────────────────────────────
 
@@ -3568,9 +3628,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if not self._overlay:
             return
 
-        # Ahead of everything else: an unacknowledged warning that something
+        # Ahead of everything else: an unanswered warning that something
         # is putting older saves back. It stays re-summonable for as long as
-        # the game is running and the player has not acknowledged it — a
+        # the game is running and the player has not answered it — a
         # warning about saves being overwritten right now outranks a question
         # about where to sync from.
         if self._pending_regression:
@@ -3620,6 +3680,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         entry.name, gid, _newest_id, unbacked=True)
                 elif notif_type == "no_local":
                     self._overlay.show_cloud_saves_no_local(entry.name, entry.exe_path)
+                elif notif_type == "remote_renamed":
+                    info = self._pending_remote_rename.get(gid) or {}
+                    if not info:
+                        continue
+                    self._overlay.show_remote_renamed(
+                        entry.name, entry.exe_path, info.get("name") or info.get("folder", ""))
                 elif notif_type == "different_machine":
                     self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path)
                 elif notif_type == "sync_prompt":
@@ -4068,36 +4134,78 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self.self_check_failed.connect(self._on_self_check_failed)
         self.self_check_progress.connect(self._on_self_check_progress)
         self.self_check_done.connect(self._on_self_check_done)
-        QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS, self._run_startup_self_checks)
+        # No timer of its own: there is ONE integrity schedule, driven by the
+        # hourly clock _setup_backup_verify starts (first look a few minutes
+        # after launch) — see _maybe_run_integrity_sweep.
 
-    def _run_startup_self_checks(self):
-        # Only run self-checks if enabled in settings
-        if not get_config().get("self_checks", True):
-            logger.info("Self-checks disabled in settings, skipping")
+    def _integrity_last_run(self) -> float:
+        """Epoch seconds of the last completed integrity sweep, from whichever
+        of the two stamps is newer. There used to be two schedules — the
+        self-checks' (``last_self_check``) and a verify-only one
+        (``backup_verify_last``) — each with its own stamp and each opening
+        every archive; a run of one never counted for the other, so the same
+        work came round twice on different days."""
+        cfg = get_config()
+        last = 0.0
+        try:
+            last = float(cfg.get("last_self_check", 0) or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        iso = cfg.get("backup_verify_last", "") or ""
+        if iso:
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)   # written with utcnow()
+                last = max(last, dt.timestamp())
+            except (ValueError, TypeError, OverflowError):
+                pass       # unreadable stamp — the other one decides
+        return last
+
+    def _maybe_run_integrity_sweep(self):
+        """Run the integrity checks if they are enabled and due — the ONE
+        scheduled sweep (the hourly timer asks; a few minutes after launch is
+        the first look).
+
+        Skipped while a game is running (pure reading, but it competes with
+        the in-game backups for disk, and nothing is lost by waiting an hour)
+        and while another run is in flight.
+
+        Backups already verified "ok" within the schedule's own interval are
+        not opened again. Without that, whatever made a sweep due — the
+        interval elapsing, a restart before a run had been stamped, a stamp
+        that went back — re-read every zip of the library, when most of them
+        had been checked days ago: the same data, checked again for nothing.
+        """
+        cfg = get_config()
+        if not (cfg.get("self_checks", True) or cfg.get("backup_verify_enabled", True)):
+            logger.debug("Integrity checks disabled in settings, skipping")
+            return
+        if get_monitor().currently_playing():
+            logger.debug("Integrity checks postponed — a game is running")
+            return
+        from core.self_checks import run_checks, CHECK_IDS, is_running
+        if is_running():
             return
 
-        # No "is there config history?" gate any more. It was written when
-        # the config snapshots were the only check, and it silently skipped
-        # the backup-integrity ones too — on a fresh install, exactly when
-        # there is nothing to restore from, nothing was being checked. The
-        # snapshot check handles an empty history on its own.
-
-        # Check if enough time has passed since last check based on frequency
-        frequency_days = get_config().get("self_checks_frequency", 7)
-        last_check = get_config().get("last_self_check", 0)
-        current_time = int(time.time())
+        # Same reading the Settings page shows: the larger of the two cadences
+        # it keeps in step.
+        frequency_days = max(int(cfg.get("self_checks_frequency", 7) or 7),
+                             int(cfg.get("backup_verify_interval_days", 7) or 7), 1)
+        current_time = time.time()
         seconds_per_day = 86400
         min_seconds = frequency_days * seconds_per_day
-        
+        last_check = self._integrity_last_run()
         elapsed = current_time - last_check
         if last_check and elapsed < 0:
             # The clock moved back (a timezone fix, an NTP correction, a
             # restored image). A stamp in the future would otherwise hold
             # the checks off until real time caught up with it.
-            logger.info("Last self-check is in the future — running now")
+            logger.info("Last integrity run is in the future — running now")
             elapsed = min_seconds
         if elapsed < min_seconds:
-            remaining = min_seconds - elapsed
+            remaining = int(min_seconds - elapsed)
             # Whole days truncate to "0 days" for anything under 24 hours,
             # which reads as "due now" on a line that is explaining why
             # nothing ran. Report the unit that actually has a number in it.
@@ -4107,14 +4215,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 due_in = f"{remaining // 3600}h"
             else:
                 due_in = f"{max(1, remaining // 60)}m"
-            logger.info("Self-checks not due yet — next run in %s "
-                        "(every %d day(s))", due_in, frequency_days)
+            # The hourly clock asks constantly; say why nothing ran once.
+            if not getattr(self, "_integrity_not_due_logged", False):
+                self._integrity_not_due_logged = True
+                logger.info("Self-checks not due yet — next run in %s "
+                            "(every %d day(s))", due_in, frequency_days)
             return
-            
-        # Run the checks and update last check time. Same list the Backups
-        # page's ⚕️ button runs — see core.self_checks.
-        from core.self_checks import run_checks, CHECK_IDS
+        self._integrity_not_due_logged = False
 
+        # Same list the Backups page's button runs — see core.self_checks.
         # Surface the sweep in the sidebar like Backup/Sync Tutti. The
         # callbacks run on the worker thread — the Qt signals marshal them
         # back to the GUI thread.
@@ -4125,22 +4234,40 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self.self_check_progress.emit(check_id, index, total)
 
         def _fail(check_id: str, detail: str):
+            # A bad archive is reported once, from the result below, with the
+            # counts and the wording the verify sweep always used ("N of M
+            # backups unhealthy") — not also as a bare check id here.
+            if check_id == "backup_archives":
+                return
             self.self_check_failed.emit(check_id, detail)
 
-        def _on_complete(_result):
-            # Update last check time on successful completion
+        def _on_complete(result):
+            # One stamp, both keys, written to disk now: a debounced write that
+            # never lands (the app closed, or was replaced by an upgrade, right
+            # after the run) is exactly a schedule that "forgot" it had run.
             try:
-                get_config().set("last_self_check", int(time.time()))
+                from datetime import datetime
+                cfg_ = get_config()
+                cfg_.set("last_self_check", int(time.time()))
+                cfg_.set("backup_verify_last", datetime.utcnow().isoformat())
+                cfg_.save()
                 logger.info("Self-checks completed, updated last check time")
             except Exception as e:
                 logger.warning(f"Failed to update last self-check time: {e}")
+            if getattr(result, "archives_bad", 0):
+                self.backup_verify_problems.emit(
+                    result.archives_bad, getattr(result, "archives_total", 0))
             self.self_check_done.emit()
 
-        # The scheduled sweep reuses an "ok" verdict newer than 12h instead
-        # of re-opening every archive; the manual button passes 0 because a
-        # user who clicked it is asking for a fresh answer.
-        run_checks(on_failure=_fail, on_done=_on_complete,
-                   on_progress=_progress, skip_recent_hours=12.0)
+        # The scheduled sweep reuses an "ok" verdict newer than its own
+        # interval (never less than 12 h) instead of re-opening every archive;
+        # the manual button passes 0 because a user who clicked it is asking
+        # for a fresh answer.
+        started = run_checks(
+            on_failure=_fail, on_done=_on_complete, on_progress=_progress,
+            skip_recent_hours=max(12.0, frequency_days * 24.0))
+        if not started:
+            self._verify_batch_notice.finish(t("batch.verify_done"), hide_after_ms=500)
 
     @Slot(str, int, int)
     def _on_self_check_progress(self, check_id: str, index: int, total: int):
@@ -4344,58 +4471,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._update_dialog_open = False
 
     def _maybe_run_backup_verify(self):
-        """Run the integrity sweep if it is enabled and due.
-
-        Skipped while a game is running: the check is pure reading, but it
-        competes for disk with the in-game backups, and nothing is lost by
-        waiting an hour.
-        """
-        cfg = get_config()
-        if not cfg.get("backup_verify_enabled", True):
-            return
-        if self._verify_thread is not None and self._verify_thread.is_alive():
-            return
-        if get_monitor().currently_playing():
-            logger.debug("Backup verify postponed — a game is running")
-            return
-
-        days = max(1, int(cfg.get("backup_verify_interval_days", 7)))
-        last = cfg.get("backup_verify_last", "") or ""
-        if last:
-            try:
-                from datetime import datetime, timedelta
-                if datetime.utcnow() - datetime.fromisoformat(last) < timedelta(days=days):
-                    return
-            except (ValueError, TypeError):
-                pass        # unreadable stamp — treat as never run
-
-        import threading
-        from datetime import datetime
-
-        def _run():
-            from core.backup import get_backup_manager
-            mgr = get_backup_manager()
-            ids = [b.backup_id for b in mgr.get_all_backups()]
-            if not ids:
-                return
-            try:
-                # Throttled + batched index writes; skip archives still "ok"
-                # within the last half-day so a weekly schedule does not
-                # re-read every zip on a library of hundreds.
-                results = mgr.verify_backups(ids, deep=False)
-            except Exception as e:
-                logger.debug(f"Scheduled verify failed: {e}")
-                return
-            bad = sum(1 for state, _ in results.values() if state != "ok")
-            get_config().set("backup_verify_last", datetime.utcnow().isoformat())
-            logger.info(
-                f"Scheduled backup verification: {len(results) - bad}/{len(results)} intact"
-            )
-            if bad:
-                self.backup_verify_problems.emit(bad, len(results))
-
-        self._verify_thread = threading.Thread(target=_run, daemon=True)
-        self._verify_thread.start()
+        """Timer slot kept under its old name. The verify-only sweep that used
+        to run here is part of the integrity checks now — one schedule, one
+        stamp (see _maybe_run_integrity_sweep)."""
+        self._maybe_run_integrity_sweep()
 
     def _maybe_run_backup_retention_sweep(self):
         """Expire backups whose ``planned_deletion`` has passed, across
@@ -5531,21 +5610,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         emptiness re-check — set only by the explicit "yes, overwrite"
         answer to the conflict this same method raises when it isn't
         forced (see _carry_rebased_save_data), never on its own say-so."""
-        try:
-            if not old_path.exists():
-                return
-            from core.library import path_has_content
-            if not force and path_has_content(new_path):
-                return
-            if old_path.is_dir():
-                if not any(old_path.iterdir()):
-                    return
-                shutil.copytree(old_path, new_path, dirs_exist_ok=True)
-            elif old_path.is_file() and old_path.stat().st_size > 0:
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(old_path, new_path)
-        except OSError as e:
-            logger.warning(f"Could not carry save data from {old_path} to {new_path}: {e}")
+        from core.library import copy_save_data
+        copy_save_data(old_path, new_path, force=force)
 
     def _carry_rebased_save_data(self, entry, new_exe_path: str, moved: dict):
         """Copy the real save data for every (old_path, new_path) pair in
@@ -5758,20 +5824,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # hotkey must not resurface a queue of silenced detections.
         from ui.unknown_history import record_unknown_game
         record_unknown_game(name, exe_path)
-        if self._overlay and self._overlay.isVisible():
-            self._overlay.refresh_unknown_badge()
         if exe_path in self._session_shown_exes:
             return
         self._session_shown_exes.add(exe_path)
         self._overlay_shown_exes.add(exe_path)
 
-        # If provider is connected, check in background for matching cloud saves
+        # Announced NOW. The cloud lookup below takes as long as the network
+        # does (it used to run first, and the notification waited for it — the
+        # Overview's carousel, fed by the record above, had shown the game
+        # long before). If the lookup does find saves, the prompt is upgraded
+        # when the result arrives (see _process_cloud_found_unknown).
+        if self._overlay:
+            self._overlay.show_game_detected(name, exe_path)
         from sync import get_orchestrator
         if get_orchestrator().is_online():
             self._check_provider_for_unknown_game(name, exe_path)
-        else:
-            if self._overlay:
-                self._overlay.show_game_detected(name, exe_path)
 
 
     def _check_provider_for_unknown_game(self, name: str, exe_path: str):
@@ -6219,8 +6286,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 )
 
         if result.success:
+            # A run that only republished the index (rename, edited note)
+            # moved no zip but did publish something — not "unchanged".
             no_changes = (result.files_uploaded == 0 and result.files_downloaded == 0
-                         and not result.conflicts)
+                         and not result.conflicts
+                         and not getattr(result, "index_published", False))
             if entry:
                 from datetime import timezone as _tz
                 if result.conflicts:
@@ -7143,6 +7213,42 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.dialogs.regression_review_dialog import RegressionReviewDialog
         dlg = RegressionReviewDialog(items, parent=self)
         dlg.exec()
+        # Restores answered in the panel start now that its modal has unwound,
+        # one after another (each can raise dialogs of its own).
+        for i, (gid, backup_id) in enumerate(dlg.pending_restores):
+            # safety_provisional=True: what this overwrites is itself the
+            # unverified state the panel exists to review — its own pre-restore
+            # safety copy stays a side copy, not real history (see
+            # restore_backup's docstring).
+            QTimer.singleShot(
+                200 * i, lambda g=gid, b=backup_id: self._restore_game_by_id(
+                    g, b, confirmed=True, safety_provisional=True))
+
+    def _settle_held_back(self, game_id: str, keep: bool) -> None:
+        """A held-back regression/unbacked backup has been ANSWERED — by the
+        review panel or by the overlay's own buttons: whatever was waiting on
+        the answer stops waiting.
+
+        The pending warning is dropped (it otherwise keeps the game's in-game
+        timer, reactive backup and exit backup switched off, and keeps the
+        hotkey re-summoning a question already answered), and the temporary
+        captures made while it sat unanswered get their verdict: kept states
+        become real history, rejected ones are discarded.
+        """
+        self._pending_regression.pop(game_id, None)
+        if self._pending_cloud_notification.get(game_id) in ("regression", "unbacked"):
+            self._pending_cloud_notification.pop(game_id, None)
+        try:
+            mgr = get_backup_manager()
+            if keep:
+                mgr.promote_pre_confirmation_backups(
+                    game_id, note=t('main.auto_confirmed'), include_notif_gated=True)
+            else:
+                mgr.discard_pre_confirmation_backups(
+                    game_id, include_notif_gated=True)
+        except Exception:
+            logger.debug(f"Could not settle held-back backups for {game_id}",
+                         exc_info=True)
 
     def _sync_all_after_backup(self):
         """Second half of "sync everything": the backups are current now."""
@@ -7491,9 +7597,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     # Narrower, for the toast only — see the created branch.
                     _notif_provisional = _is_provisional and not _bmeta.get("identity_pending")
                     config = get_config()
+                    # Also an index the provider has not been told about (a
+                    # rename, an edited note): the saves are unchanged, which
+                    # is why this branch was reached, and that must not mean
+                    # "nothing to publish".
+                    try:
+                        _index_behind = get_backup_manager().game_needs_publish(game_id)
+                    except Exception:
+                        _index_behind = False
                     _needs_reconcile = (
                         entry.sync_status == "pending"
                         or getattr(entry, "pending_local_wins", False)
+                        or _index_behind
                     )
                     if (not batch and not _is_provisional
                             and _needs_reconcile

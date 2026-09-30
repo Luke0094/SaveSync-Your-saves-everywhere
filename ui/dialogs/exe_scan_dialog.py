@@ -64,12 +64,8 @@ class _ScanWorker(QThread):
         self._stop = True
 
     def run(self):
-        # Set from inside run(): setPriority only applies to a RUNNING
-        # thread. From __init__ it did nothing but log "Cannot set
-        # priority, thread is not running", so these scans never
-        # actually ran at idle priority — which is the one thing the
-        # call was there to do while a game has the CPU.
-        self.setPriority(QThread.Priority.IdlePriority)
+        # Normal priority on purpose — a lowered one starves under a game and
+        # freezes the GUI with it; see _SaveLoadWorker.run (ui/pages/cheats_page.py).
         from core.exe_scan import scan_folder_for_games
         try:
             hits = scan_folder_for_games(
@@ -249,12 +245,8 @@ class _StoreWorker(QThread):
         self._stop = True
 
     def run(self):
-        # Set from inside run(): setPriority only applies to a RUNNING
-        # thread. From __init__ it did nothing but log "Cannot set
-        # priority, thread is not running", so these scans never
-        # actually ran at idle priority — which is the one thing the
-        # call was there to do while a game has the CPU.
-        self.setPriority(QThread.Priority.IdlePriority)
+        # Normal priority on purpose — a lowered one starves under a game and
+        # freezes the GUI with it; see _SaveLoadWorker.run (ui/pages/cheats_page.py).
         from core.library import GameEntry, get_library
         from core.machine import get_machine_id
         from core.constants import get_folder_name_for_save

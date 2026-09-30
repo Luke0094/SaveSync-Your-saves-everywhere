@@ -350,6 +350,56 @@ def _clean_description(text: str) -> str:
     return text
 
 
+# How many pictures one source may offer beyond its cover. A store lists ten
+# to fifty; they are offered as a row of thumbnails, and sixteen of them
+# already show the game.
+MAX_SCREENSHOTS = 16
+
+
+def image_key(url: str) -> str:
+    """What makes two URLs the same picture: the folder and file name, without
+    the query and without the size a host puts on its resized copies
+    (``x_img_main_240x240.jpg`` is ``x_img_main.jpg``, whichever host) and
+    without a forum's ``/thumb/`` folder."""
+    path = urllib.parse.urlsplit(url or "").path
+    # A forum's small copy sits under /thumb/ beside the original.
+    parts = [p for p in path.split("/") if p and p != "thumb"][-2:]
+    if not parts:
+        return ""
+    parts[-1] = re.sub(r'_\d{2,4}x\d{2,4}(?=\.[A-Za-z0-9]+$|$)', '', parts[-1])
+    return "/".join(parts).casefold()
+
+
+def normalize_screenshots(items, cap: int = MAX_SCREENSHOTS) -> list:
+    """Clean ``(thumbnail, full)`` pairs: https, one per picture, at most *cap*.
+
+    A bare URL stands for both halves. A source that has no smaller copy
+    simply repeats the full one."""
+    def _url(value) -> str:
+        value = html.unescape(str(value or "")).strip()
+        return "https:" + value if value.startswith("//") else value
+
+    out: list = []
+    seen: set = set()
+    for item in items or []:
+        try:
+            thumb, full = (item, item) if isinstance(item, str) else (item[0], item[1])
+        except (TypeError, IndexError, KeyError):
+            continue
+        full = _url(full)
+        thumb = _url(thumb) or full
+        if not full.lower().startswith("http"):
+            continue
+        key = image_key(full) or full
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((thumb, full))
+        if len(out) >= cap:
+            break
+    return out
+
+
 @dataclass
 class GameInfo:
     name: str
@@ -395,6 +445,15 @@ class GameInfo:
     # Written VNDB reviews are NOT fetched separately: the Kana API has no
     # review endpoint, and any written vote is already inside votecount.
     vote_count: int = 0
+    # The languages the game is offered in, as English names — English first
+    # when it is one of them (see core.library.normalize_languages). Empty
+    # when the source did not say.
+    languages: Optional[list[str]] = None
+    # More pictures of the game than its cover: ``(thumbnail, full size)``
+    # pairs, at most MAX_SCREENSHOTS. Kept apart from image_url on purpose —
+    # the cover is what the game is known by; these are only ever ADDED to the
+    # carousel, by choice (see normalize_screenshots).
+    screenshots: Optional[list] = None
 
     def __post_init__(self):
         if self.genres is None:
@@ -426,6 +485,9 @@ class GameInfo:
         self.description = _clean_description(self.description)
         self.reviewer = _decode_entities(self.reviewer)
         self.review_text = _clean_description(self.review_text)
+        from core.library import normalize_languages
+        self.languages = normalize_languages(self.languages)
+        self.screenshots = normalize_screenshots(self.screenshots)
         from core.library import quantize_rating
         self.rating = quantize_rating(self.rating)
         cleaned = []
@@ -599,7 +661,7 @@ _FORUM_LABEL_RE = re.compile(
     r'|developer\s*/\s*publisher|developers?|publishers?|artist|author|circle|dev'
     r'|release\s*date|released|thread\s*updated|updated'
     r'|original\s+title|game\s+name|version|status|engine|platform|os'
-    r'|censorship|censored|language|translator|resolution|voiced?'
+    r'|censorship|censored|languages?|translator|resolution|voiced?'
     r'|tags?|genres?|installation|change-?log)\s*:',
     re.IGNORECASE,
 )
@@ -615,7 +677,7 @@ _FORUM_OVERVIEW_KEYS = ('overview', 'description', 'story', 'synopsis', 'plot')
 _FORUM_STRUCT_KEYS = frozenset((
     'developer/publisher', 'developer', 'developers', 'dev', 'publisher',
     'publishers', 'artist', 'author', 'circle', 'version', 'release date',
-    'released', 'thread updated', 'censorship', 'censored', 'language', 'os',
+    'released', 'thread updated', 'censorship', 'censored', 'language', 'languages', 'os',
     'engine', 'platform', 'status', 'tags', 'tag', 'genres', 'genre',
     'installation', 'translator', 'original title', 'game name', 'changelog',
     'change-log', 'resolution', 'voice', 'voiced',
@@ -704,6 +766,52 @@ def _earliest_forum_date(*candidates: str) -> str:
     return best
 
 
+# A forum thread's heading: <h1 class="p-title-value"> holds the prefix labels
+# (engine, status — each an <a class="labelLink"> around a <span>) and then the
+# thread's own title, which by convention carries the version and the
+# developer in trailing [tags].
+_THREAD_H1_RE = re.compile(
+    r'<h1\b[^>]*\bp-title-value\b[^>]*>(.*?)</h1>', re.IGNORECASE | re.DOTALL)
+_THREAD_PREFIX_RE = re.compile(
+    r'<a\b[^>]*\blabelLink\b[^>]*>.*?</a>', re.IGNORECASE | re.DOTALL)
+_THREAD_LABEL_SPAN_RE = re.compile(
+    r'<span\b[^>]*\blabel[\w-]*\b[^>]*>.*?</span>', re.IGNORECASE | re.DOTALL)
+_THREAD_TAG_TAIL_RE = re.compile(r'\s*\[[^\[\]]{1,60}\]\s*$')
+_THREAD_TAG_HEAD_RE = re.compile(r'^\s*\[[^\[\]]{1,60}\]\s*')
+_THREAD_PAREN_VERSION_RE = re.compile(
+    r'\s*\((?:v|ver\.?|version\s*)?\d[\w.\-]*\)\s*$', re.IGNORECASE)
+
+
+def strip_thread_tags(text: str) -> str:
+    """A thread title without its ``[tags]`` — the version, the developer, a
+    status — which come off the ends only, so a bracket inside the name
+    survives. Never empties the title: a heading that is nothing but tags is
+    returned as it is."""
+    original = re.sub(r'\s+', ' ', text or '').strip()
+    cur = original
+    while True:
+        nxt = _THREAD_PAREN_VERSION_RE.sub('', _THREAD_TAG_TAIL_RE.sub('', cur)).strip()
+        nxt = _THREAD_TAG_HEAD_RE.sub('', nxt).strip() if nxt else nxt
+        if nxt == cur or not nxt:
+            break
+        cur = nxt
+    return cur.strip(' -–—|:') or original
+
+
+def forum_thread_title(html: str) -> str:
+    """The game's own title from a forum thread page — without the engine and
+    status prefix labels, the version and the developer that the heading
+    carries (each already has a field of its own, or comes from the exe).
+    "" when the page has no thread heading."""
+    m = _THREAD_H1_RE.search(html or '')
+    if not m:
+        return ''
+    import html as _html
+    inner = _THREAD_LABEL_SPAN_RE.sub(' ', _THREAD_PREFIX_RE.sub(' ', m.group(1)))
+    text = _html.unescape(re.sub(r'<[^>]+>', ' ', inner)).replace('\xa0', ' ')
+    return strip_thread_tags(text)
+
+
 def _parse_forum_description(text: str) -> dict:
     """Split a forum-thread og:description into fields by its inline labels.
 
@@ -726,7 +834,11 @@ def _parse_forum_description(text: str) -> dict:
         return {}
     # Scrub registration-gate placeholders BEFORE locating labels, so they
     # pollute neither the overview nor any field value.
-    text = re.sub(r'\s{2,}', ' ', _FORUM_GATED_RE.sub(' ', text)).strip()
+    # Runs of spaces collapse; LINE ENDS stay (a page that kept them lets a
+    # one-line value end where its line does — see the language field below).
+    text = _FORUM_GATED_RE.sub(' ', text.replace('\r', '\n'))
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    text = re.sub(r' ?\n[ \n]*', '\n', text).strip()
     labels = list(_FORUM_LABEL_RE.finditer(text))
     if not labels:
         return {}
@@ -734,7 +846,7 @@ def _parse_forum_description(text: str) -> dict:
     def _norm_key(raw: str) -> str:
         return re.sub(r'\s*/\s*', '/', re.sub(r'\s+', ' ', raw.lower())).strip()
 
-    preamble = text[:labels[0].start()].strip().strip('.,;·|-–— ')
+    preamble = ' '.join(text[:labels[0].start()].split()).strip('.,;·|-–— ')
     # A single label buried inside ordinary prose is not a forum blob —
     # leave the text untouched. A single LEADING label still parses
     # ("Overview: …" alone must lose its label).
@@ -749,7 +861,14 @@ def _parse_forum_description(text: str) -> dict:
         # First key wins when a label repeats; overview must stay the block
         # that runs until the next field, not a later duplicate.
         if key not in seg:
-            seg[key] = text[start:end].strip().strip('.,;·|-–— ')
+            raw = text[start:end]
+            if key in ('language', 'languages'):
+                # One line and no more. Whatever label follows ("Store:", or
+                # any other) is not a language, and the lines are the only
+                # boundary that needs no list of labels. A value that starts
+                # on the next line ("Language:" then a break) is that line.
+                raw = next((ln for ln in raw.split('\n') if ln.strip()), '')
+            seg[key] = ' '.join(raw.split()).strip('.,;·|-–— ')
 
     has_struct = any(k in seg for k in _FORUM_STRUCT_KEYS)
     overview = next((seg[k] for k in _FORUM_OVERVIEW_KEYS if seg.get(k)), None)
@@ -802,6 +921,21 @@ def _parse_forum_description(text: str) -> dict:
         # not just on first import (re-search kept finding the same
         # never-saved tags and offering them as "new" again).
         out['tags'] = [t for t in _toks if t and len(t) <= 40]
+    # "Language: English" / "Languages: English, Japanese" — the singular and
+    # its trailing-s plural come from the shared combinator, not typed twice.
+    from core.constants import _with_plural_list
+    langstr = next((seg[k] for k in _with_plural_list(('language',)) if seg.get(k)), None)
+    if langstr:
+        # A page that lost its line ends runs the value into the next label
+        # ("English Store: Steam"). A colon is never part of a language list:
+        # cut there, and take the label word off with it.
+        if ':' in langstr:
+            langstr = langstr[:langstr.index(':')]
+            words = langstr.split()
+            if len(words) > 1 and words[-1][:1].isupper():
+                langstr = ' '.join(words[:-1])
+        _lt = (t.strip(' "“”‘’.') for t in re.split(r'[,;/|&]|\band\b', langstr))
+        out['languages'] = [t for t in _lt if t and len(t) <= 30]
     return out
 
 
@@ -853,7 +987,7 @@ _CONTEXTUAL_MARKERS = frozenset({
 _TRAILING_MARKERS = frozenset({
     # Store / publisher labels stuck on the end of a release folder name.
     "kagura", "gog", "dlsite",
-    # Release-edition labels: machine-translated build (f95 convention).
+    # Release-edition labels: machine-translated build (a common forum convention).
     "mtl",
     # Concatenated store label (MangaGamer / mangagamer). The spaced form is
     # handled by _TWO_WORD_TRAILING — "manga" or "gamer" alone must never
@@ -1274,8 +1408,8 @@ def _descriptions_are_near_duplicates(a: str, b: str) -> bool:
 def _is_enrichment_subset(new: "GameInfo", kept: "GameInfo") -> bool:
     """True when *new* would add nothing the merge UI cannot already take from *kept*.
 
-    Same title from two APIs is kept when description, tags, links, image or
-    a score differ. Dropped only when every non-empty field on *new* is an
+    Same title from two APIs is kept when description, tags, links, image,
+    screenshots or a score differ. Dropped only when every non-empty field on *new* is an
     exact match (or a subset, for tags/URLs) of *kept* — a 1:1 duplicate.
     Two descriptions that only differ by scrape noise (see
     _descriptions_are_near_duplicates) still count as a match — two forum
@@ -1298,6 +1432,10 @@ def _is_enrichment_subset(new: "GameInfo", kept: "GameInfo") -> bool:
     if not _info_tag_set(new).issubset(_info_tag_set(kept)):
         return False
     if not _info_url_set(new).issubset(_info_url_set(kept)):
+        return False
+    # Nor is a picture the kept one does not have.
+    kept_shots = {image_key(full) for _, full in (kept.screenshots or [])}
+    if any(image_key(full) not in kept_shots for _, full in (new.screenshots or [])):
         return False
     # A score from another source is never redundant with the first's.
     if _has_review_payload(new):

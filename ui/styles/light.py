@@ -1888,33 +1888,13 @@ QPushButton#tag_chip[tagState="2"]:hover {
     background: #7d2e2e;
 }
 
-/* ── Sidebar "filter by" tabs — mirror of the DARK_THEME block ────── */
-QPushButton#filter_tab {
-    background: #f2f2f7;
-    color: #1a1a2e;
-    border: 1px solid #c8c8d4;
-    border-radius: 3px;
-    font-size: 10px;
-    font-weight: 600;
-    padding: 2px 6px;
-    min-width: 0;
-}
-
-QPushButton#filter_tab:hover {
-    color: #1a1a2e;
-    border-color: #5a9400;
-    background: #e8e8f0;
-}
-
-QPushButton#filter_tab[active="1"],
-QPushButton#filter_tab[active="1"]:hover,
-QPushButton#filter_tab[active="1"]:pressed,
-QPushButton#filter_tab[active="1"]:focus {
-    background: #5a9400;
-    color: #ffffff;
-    border: 1px solid #5a9400;
-    padding: 2px 6px;
-    font-weight: 700;
+/* ── Sidebar "filter by" dropdown (tags | engine | languages) ─────── */
+/* The bar itself is painted by _FilterKindCombo (green, bold text in the
+   text-on-accent colour, centred, a chevron); its list is a menu (MenuCombo).
+   This only keeps the global QComboBox min-width from pushing past the
+   sidebar rail. */
+QComboBox#filter_kind_combo {
+    min-width: 0px;
 }
 
 /* The chips' two scroll bodies. These MUST be NAMED rather than carrying

@@ -47,6 +47,23 @@ def restrict_file_acl(path) -> None:
         logging.getLogger(__name__).debug(f"Could not restrict ACL on {path}: {e}")
 
 
+def has_published_to(provider_id: str, entries) -> bool:
+    """True when any of *entries* (BackupEntry rows) was uploaded to
+    *provider_id* (``synced_to``) or downloaded from it (``origin``) — i.e. a
+    shared index must exist there right now. One definition for everything that
+    asks "has this game's history been through this provider?": the
+    failed-fetch guard in sync_backups, and the launch-time lookup for a folder
+    another machine renamed (SyncOrchestrator.find_renamed_remote_folder).
+    A row that cannot be read counts as "no", never as a reason to fail."""
+    try:
+        return any(
+            provider_id in ((getattr(e, "cloud_metadata", None) or {}).get("synced_to") or [])
+            or getattr(e, "origin", "") == provider_id
+            for e in entries)
+    except Exception:
+        return False
+
+
 @dataclass
 class RemoteFile:
     """Metadata for a file stored on a remote provider."""
@@ -70,6 +87,11 @@ class SyncResult:
     # detected (ISO strings) — shown by the ConflictDialog.
     conflict_local_dt: str = ""
     conflict_remote_dt: str = ""
+    # True when this run wrote the remote index.json — including a run that
+    # moved no zip at all (a rename, a note, a changed row). Callers that
+    # mirror the index elsewhere (the master index) key off this rather than
+    # off the transfer counts, which stay 0 for exactly those runs.
+    index_published: bool = False
 
     def __post_init__(self):
         if self.conflicts is None:
@@ -153,6 +175,7 @@ class SyncProvider(ABC):
         backup_manager,
         direction: str = "auto",
         progress_callback=None,
+        allow_fresh_index: bool = False,
     ) -> SyncResult:
         """Sync versioned backup ZIPs instead of raw save files.
 
@@ -161,6 +184,12 @@ class SyncProvider(ABC):
             SaveSync/backup/{game_folder}/index.json
 
         *direction*: "auto" = bidirectional, "up" = upload only, "down" = download only.
+
+        *allow_fresh_index*: an index missing at *game_folder* is the expected
+        state, not a failed fetch — the person was told that another machine
+        renamed this game's remote folder and chose to keep the old name here,
+        so this folder is being started over on purpose. Without it a game
+        that has synced before refuses to create an index it cannot see.
         """
         import json as _json
         import logging as _logging
@@ -213,14 +242,8 @@ class SyncProvider(ABC):
             # foreign machine_id despite this provider never having touched
             # this game, which would make a genuinely first-ever sync here
             # permanently refuse to create an index at all.
-            try:
-                _has_synced_before = any(
-                    self.PROVIDER_ID in (e.cloud_metadata or {}).get("synced_to", [])
-                    or e.origin == self.PROVIDER_ID
-                    for e in local_entries)
-            except Exception:
-                _has_synced_before = False
-            if _has_synced_before:
+            _has_synced_before = has_published_to(self.PROVIDER_ID, local_entries)
+            if _has_synced_before and not allow_fresh_index:
                 _log.warning(
                     f"sync_backups: remote index for {game_folder} came back "
                     f"empty but local history already knows of other machines — "
@@ -247,7 +270,7 @@ class SyncProvider(ABC):
                 _local_new = [
                     e for e in local_entries
                     if e.backup_id not in remote_ids
-                    and not (e.cloud_metadata or {}).get("pre_confirmation")
+                    and not backup_manager.is_side_backup(e)
                 ]
                 _foreign_new = [
                     e for e in remote_entries
@@ -285,12 +308,15 @@ class SyncProvider(ABC):
         # Pre-confirmation (temporary) backups stay local: they cover
         # auto-detected paths the user hasn't confirmed yet, so uploading
         # them would treat them as definitive. Once confirmed they get
-        # promoted (flag cleared) and picked up by the next sync.
+        # promoted (flag cleared) and picked up by the next sync. A version
+        # the user added by hand is deliberate, and goes up like any backup —
+        # carrying its marker, so every machine keeps it beside the history.
         if direction in ("auto", "up"):
             to_upload = [
                 e for e in local_entries
                 if e.backup_id not in remote_ids
-                and not (e.cloud_metadata or {}).get("pre_confirmation")
+                and (not backup_manager.is_side_backup(e)
+                     or backup_manager.is_manual_version(e))
             ]
             for entry in to_upload:
                 zip_path = Path(entry.zip_path)
@@ -342,7 +368,10 @@ class SyncProvider(ABC):
                                             MIN_KEPT_BACKUPS)
                 from core.backup import BackupEntry as _BE
                 _cfg = _get_cfg()
-                merged: list = list(local_entries)
+                # The side branch stays out of this: it never goes up, so it
+                # must not take places from the entries that do.
+                merged: list = [e for e in local_entries
+                                if not backup_manager.is_side_backup(e)]
                 for rd in remote_entries:
                     bid = rd.get("backup_id")
                     if bid and bid not in local_ids:
@@ -473,6 +502,11 @@ class SyncProvider(ABC):
                     # — nothing would ever come back for it.
                     _log.error("Failed to upload updated remote index.json")
                     result.success = False
+                elif (result.files_uploaded > 0 or result.files_downloaded > 0
+                        or metadata_changed):
+                    # Not for an explicit up/down that re-sent the same index:
+                    # nothing new was published then.
+                    result.index_published = True
                 idx_tmp.unlink(missing_ok=True)
             except Exception as e:
                 _log.error(f"Could not update remote index: {e}")
@@ -541,7 +575,13 @@ class SyncProvider(ABC):
             except Exception:
                 continue
 
-        to_delete = BackupManager.compute_deletions(entry_objs, max_backups, retention_days, min_kept)
+        # Versions added by hand are a line of their own, as they are locally
+        # (BackupManager._enforce_limits): one must not take a place from the
+        # history it sits beside, or be the first thing age removes.
+        history = [e for e in entry_objs if not BackupManager.is_manual_version(e)]
+        added = [e for e in entry_objs if BackupManager.is_manual_version(e)]
+        to_delete = (BackupManager.compute_deletions(history, max_backups, retention_days, min_kept)
+                     | BackupManager.compute_deletions(added, max_backups, retention_days, min_kept))
         if not to_delete:
             return remote_entries
 
@@ -635,8 +675,15 @@ class SyncProvider(ABC):
             pass
         return all_backups
 
-    def update_master_index(self, game_folder: str, entries: list[dict]) -> bool:
+    def update_master_index(self, game_folder: str, entries: list[dict],
+                            remove_folders: "list[str] | None" = None) -> bool:
         """Update the master index with backup info for a specific game.
+
+        *remove_folders* names game folders that no longer exist on the
+        provider (a renamed game's old one) and are dropped from the master
+        index in the same write — see SyncWorker._migrate_remote_folders.
+        *entries* None drops *game_folder* itself (its last backup was
+        deleted) instead of setting it.
 
         Uses a **metadata-check** strategy to handle concurrent updates
         from other machines cheaply (no redundant download):
@@ -700,7 +747,10 @@ class SyncProvider(ABC):
             for gf, ents in base.get("games", {}).items():
                 if gf not in merged_games:
                     merged_games[gf] = ents
-            merged_games[ours_folder] = ours_entries
+            if ours_entries is None:
+                merged_games.pop(ours_folder, None)
+            else:
+                merged_games[ours_folder] = ours_entries
             from datetime import timezone
             return {
                 "games": merged_games,
@@ -716,18 +766,30 @@ class SyncProvider(ABC):
             base = _download_master()
 
             # Step 3: apply our update
-            base.setdefault("games", {})[game_folder] = entries
+            if entries is None:
+                base.setdefault("games", {}).pop(game_folder, None)
+            else:
+                base.setdefault("games", {})[game_folder] = entries
             from datetime import timezone
             base["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+            def _drop_removed(data: dict) -> dict:
+                for gone in (remove_folders or []):
+                    if gone and gone != game_folder:
+                        data.get("games", {}).pop(gone, None)
+                return data
+
+            _drop_removed(base)
 
             # Step 4: check if file changed since our download
             post_meta = _meta_fingerprint(self.get_remote_metadata(master_path))
 
             if pre_meta != post_meta:
-                # Another machine wrote — re-download and merge
+                # Another machine wrote — re-download and merge. Dropped again
+                # afterwards: their copy may still carry the folder we moved.
                 _log.info("Master index changed during update, merging")
                 theirs = _download_master()
-                base = _merge(base, theirs, game_folder, entries)
+                base = _drop_removed(_merge(base, theirs, game_folder, entries))
 
             # Step 5: upload
             ul_tmp = _mktemp(".json")

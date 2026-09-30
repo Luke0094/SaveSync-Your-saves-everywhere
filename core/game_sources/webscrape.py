@@ -21,6 +21,7 @@ from core.game_sources.common import (GameInfo, _clean_description,
                                       _decode_entities, _dedupe_candidates,
                                       _earliest_forum_date,
                                       _fetch_json, _fuzzy_score, _fuzzy_slug,
+                                      forum_thread_title,
                                       _is_dlsite_shop_blurb,
                                       _is_favicon_like,
                                       _is_non_game_media_title,
@@ -274,6 +275,135 @@ _DLSITE_SORRY_TITLE_RE = re.compile(r'^\s*sorry\b', re.IGNORECASE)
 
 def _dlsite_region_locked(html: str) -> bool:
     return bool(html and _DLSITE_REGION_LOCK_RE.search(html))
+
+
+# DLsite lists a work's languages in a row of its own, as icon links inside a
+# div marked ``work_genre notranslate`` — each one
+# ``<span class="icon_JPN" title="Japanese">Japanese</span>``. The class the
+# other icon rows (work type, file format) use has no ``notranslate``.
+_DLSITE_LANG_BLOCK_RE = re.compile(
+    r'<div[^>]*class="(?=[^"]*\bwork_genre\b)(?=[^"]*\bnotranslate\b)[^"]*"[^>]*>'
+    r'([\s\S]*?)</div>', re.IGNORECASE)
+_DLSITE_ICON_SPAN_RE = re.compile(r'<span\b([^>]*)>([^<]*)</span>', re.IGNORECASE)
+
+
+def _dlsite_languages(html: str) -> list[str]:
+    """The languages a DLsite work page lists.
+
+    Each icon is read by its CODE first (``icon_JPN``, ``icon_CHI_HANS``): the
+    code is what identifies it, in every locale the page is served in. Its
+    ``title`` is only the fallback for a code nobody here knows. That order is
+    what keeps ``icon_NM`` — titled "Alingual", a work with no text to
+    translate — from being stored as a language.
+    """
+    from core.library import normalize_language
+    out: list[str] = []
+    for block in _DLSITE_LANG_BLOCK_RE.finditer(html or ""):
+        for span in _DLSITE_ICON_SPAN_RE.finditer(block.group(1)):
+            attrs, text = span.group(1), span.group(2)
+            code = re.search(r'class="icon_([A-Za-z_]+)"', attrs)
+            if not code:
+                continue
+            code = code.group(1)
+            known = normalize_language(code)
+            if known != code:                    # a code we know — or "" for NM
+                if known:
+                    out.append(known)
+                continue
+            title = re.search(r'title="([^"]*)"', attrs)
+            out.append(((title.group(1) if title else "") or text or code).strip())
+    return out
+
+
+def _tag_attr(tag: str, name: str) -> str:
+    """One attribute of an opening tag, entities decoded ("" when absent)."""
+    m = re.search(rf'(?<![\w-]){re.escape(name)}="([^"]*)"', tag or "", re.IGNORECASE)
+    return _decode_entities(m.group(1)).strip() if m else ""
+
+
+_DLSITE_SLIDES_RE = re.compile(
+    r'product-slider-data"[^>]*>((?:\s*<div\b[^>]*></div>)+)', re.IGNORECASE)
+
+
+def _dlsite_screenshots(html: str) -> list:
+    """The work page's slider as ``(thumbnail, full size)`` pairs. Its first
+    slide is the cover itself (``_img_main``), which the page already has."""
+    out = []
+    block = _DLSITE_SLIDES_RE.search(html or "")
+    for tag in re.findall(r'<div\b[^>]*>', block.group(1) if block else ""):
+        full = _tag_attr(tag, "data-src")
+        if full and "_img_main" not in full:
+            out.append((_tag_attr(tag, "data-thumb") or full, full))
+    return out
+
+
+_ITCH_SHOTS_RE = re.compile(r'<div class="screenshot_list">([\s\S]*?)</div>', re.IGNORECASE)
+_ITCH_SHOT_RE = re.compile(
+    r'<a\b[^>]*data-image_lightbox[^>]*\bhref="([^"]+)"[^>]*>\s*<img\b[^>]*\bsrc="([^"]+)"',
+    re.IGNORECASE)
+
+
+def _itch_screenshots(html: str) -> list:
+    """The game page's screenshot strip: the lightbox link is the original,
+    the picture inside it the small copy."""
+    block = _ITCH_SHOTS_RE.search(html or "")
+    return [(m.group(2), m.group(1))
+            for m in _ITCH_SHOT_RE.finditer(block.group(1) if block else "")]
+
+
+_FORUM_IMG_RE = re.compile(r'(<a\b[^>]*>)?\s*(<img\b[^>]*>)', re.IGNORECASE)
+_IMG_FILE_RE = re.compile(r'\.(?:jpe?g|png|webp|gif|avif)(?:$|\?)', re.IGNORECASE)
+
+
+def _forum_screenshots(post_html: str) -> list:
+    """The pictures posted in a forum thread's first message, as ``(thumbnail,
+    full size)`` pairs. XenForo marks a posted picture ``bbImage`` and keeps
+    the original in ``data-url``; without it, the link around the picture (when
+    that link is the picture) or the picture itself is what there is."""
+    _attr = _tag_attr
+    out = []
+    # <noscript> repeats every lazy-loaded picture for browsers without
+    # scripts: the same picture, offered a second time as its small copy.
+    post_html = re.sub(r'<noscript\b[\s\S]*?</noscript>', '', post_html or "", flags=re.IGNORECASE)
+    for m in _FORUM_IMG_RE.finditer(post_html):
+        anchor, img = m.group(1) or "", m.group(2)
+        cls = _attr(img, "class")
+        if "bbimage" not in cls.lower() or "smilie" in cls.lower():
+            continue
+        shown = _attr(img, "src")
+        if shown.startswith("data:"):
+            shown = ""
+        shown = shown or _attr(img, "data-src")
+        linked = _attr(anchor, "href") if anchor else ""
+        full = _attr(img, "data-url") or (linked if _IMG_FILE_RE.search(linked) else "") or shown
+        if full:
+            # The small copy sits under /thumb/; the original, beside it, is
+            # what a linked attachment (or the fetch below) resolves to.
+            out.append((shown or full, full.replace("/thumb/", "/", 1)))
+    return out
+
+
+_GALLERY_BTN_RE = re.compile(
+    r'<button\b[^>]*\bonclick="\s*openGallery\(\s*\d+\s*\)[^"]*"[^>]*>([\s\S]*?)</button>',
+    re.IGNORECASE)
+
+
+def _gallery_screenshots(html: str) -> list:
+    """The pictures of a page's gallery: the buttons that open it
+    (``onclick="openGallery(n)"``), and only those — the rest of the page has
+    pictures of its own (related games, avatars) that are not this game's."""
+    out = []
+    for m in _GALLERY_BTN_RE.finditer(html or ""):
+        img = re.search(r'<img\b[^>]*>', m.group(1), re.IGNORECASE)
+        if not img:
+            continue
+        src = _tag_attr(img.group(0), "src")
+        if src.startswith("data:"):
+            src = ""
+        src = src or _tag_attr(img.group(0), "data-src")
+        if src:
+            out.append((src, src))
+    return out
 
 
 def _dlsite_finish(url: str, html: str) -> Optional[GameInfo]:
@@ -999,6 +1129,12 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         r'|dlsite\.com|gamefaqs\.gamespot\.com|moby ?games?).*$',
         '', title, flags=re.IGNORECASE,
     ).strip()
+    # A forum thread's title carries the engine and status labels, the version
+    # and the developer around the game's name; the heading itself says which
+    # is which, so the name is taken from it alone.
+    _thread_title = forum_thread_title(html)
+    if _thread_title:
+        title = _thread_title
     # DLsite region-lock shells sometimes surface "SORRY..." as og:title —
     # clear it and keep scraping; itemprop="name" / JSON-LD often still
     # carry the real work title. Non-DLsite pages still require a title now.
@@ -1205,6 +1341,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     ld_forum_dates: list[str] = []
     ld_publishers: list[str] = []
     ld_developers: list[str] = []
+    ld_languages: list[str] = []
     # Aggregate score from JSON-LD (itch.io, MobyGames, Product pages…).
     # Kept as (stars_0_to_5, reviewer_label, summary_text) and applied to
     # GameInfo at the end so Steam/VNDB/DLsite-specific paths can still
@@ -1289,6 +1426,16 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                             for g in ([val] if isinstance(val, str) else val):
                                 if str(g) not in genres:
                                     genres.append(str(g))
+                    # The SOFTWARE's languages — only read off a game-typed
+                    # object: on a plain WebPage the same key names the page's
+                    # own language, which says nothing about the game.
+                    for lk in ("inLanguage", "availableLanguage"):
+                        val = ld.get(lk)
+                        for lv in (val if isinstance(val, list) else [val]):
+                            if isinstance(lv, dict):
+                                lv = lv.get("name") or lv.get("alternateName")
+                            if isinstance(lv, str) and lv.strip():
+                                ld_languages.append(lv.strip())
                     if not ld_rating:
                         stars, who, summary, votes = _ld_aggregate_rating(ld)
                         if stars:
@@ -1301,9 +1448,12 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     publisher = "; ".join(dict.fromkeys(ld_publishers)) if ld_publishers else ""
     developer = "; ".join(dict.fromkeys(ld_developers)) if ld_developers else ""
 
+    languages: list[str] = list(ld_languages)
+
     # Site-specific HTML extraction for fields OG/JSON-LD missed
     if "dlsite.com" in url:
         # DLSite: extract release, developer, genre from HTML tables
+        languages = _dlsite_languages(html) or languages
 
         # Developer: Brand (pro) / Circle (maniax), then itemprop.
         # Stay inside the <td> — a loose [\s\S]*?<a> on region-locked shells
@@ -1428,6 +1578,8 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                         release_date = year_m.group(1)
                     else:
                         release_date = value[:80]
+                elif label in ("language", "languages") and not languages:
+                    languages = [x.strip(" .") for x in re.split(r"[,;/]|\band\b", value) if x.strip(" .")]
                 elif label in ("genre", "genres") and not genres:
                     for g in re.split(r'[,;]', value):
                         gs = g.strip().strip('.')
@@ -1500,6 +1652,13 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                     t = a.group(1).strip()
                     if t and t not in genres:
                         genres.append(t)
+            # Languages row — one <a> per language ("Language" when a game has one)
+            lm = re.search(r'<tr>\s*<td>\s*Languages?\s*</td>\s*<td>(.*?)</td>', panel, re.I | re.S)
+            if lm:
+                _lv = re.findall(r'<a[^>]*>([^<]+)</a>', lm.group(1))
+                if not _lv:
+                    _lv = re.split(r'\s*,\s*', re.sub(r'<[^>]+>', ' ', lm.group(1)).strip())
+                languages = [x for x in _lv if x.strip()] or languages
             # Author row as fallback for developer
             if not developer:
                 am = re.search(r'<tr>\s*<td>\s*Author\s*</td>\s*<td>\s*<a[^>]*>\s*([^<]+)\s*</a>', panel, re.I)
@@ -1558,7 +1717,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
             _tm = re.search(
                 r'bbCodeSpoiler-button-title[^>]*>\s*([^<]{1,60}?)\s*</span>',
                 m.group(0), re.IGNORECASE)
-            if _tm:
+            if _tm and _tm.group(1).strip().rstrip(':').lower() not in ('spoiler', 'spoilers'):
                 return f' {_tm.group(1).strip().rstrip(":")}: '
             return ' '
         _ph = re.sub(
@@ -1569,8 +1728,15 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                      lambda m: f' {m.group(1).strip().rstrip(":")}: ',
                      _ph, flags=re.IGNORECASE)
         _pt = re.sub(r'<script[\s\S]*?</script>|<style[\s\S]*?</style>', ' ', _ph)
+        # Line ends survive the flattening: a labelled value that is one line
+        # long ends with it, whatever the NEXT label is called (see
+        # _parse_forum_description) — a line break is the one boundary that
+        # needs no list of labels.
+        _pt = re.sub(r'<br\s*/?>|</(?:p|div|li|tr)>', '\n', _pt, flags=re.IGNORECASE)
         _pt = re.sub(r'<[^>]+>', ' ', _pt)
-        _post_text = re.sub(r'\s+', ' ', _decode_entities(_pt)).strip()
+        _post_text = _decode_entities(_pt)
+        _post_text = re.sub(r'[^\S\n]+', ' ', _post_text)
+        _post_text = re.sub(r' ?\n[ \n]*', '\n', _post_text).strip()
 
     _forum = (_parse_forum_description(_post_text)
               or _parse_forum_description(_raw_description))
@@ -1594,6 +1760,8 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
             release_date = release_date or _picked
         if not genres and _forum.get("tags"):
             genres = _forum["tags"]
+        if not languages and _forum.get("languages"):
+            languages = _forum["languages"]
     elif ld_forum_dates and not release_date:
         release_date = ld_forum_dates[0]
 
@@ -1687,6 +1855,18 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
             _review_text = (f"{_reviewer}: {ld_review_text}"
                             if ld_review_text else f"{_reviewer}: {_rating:g}/5")
 
+    if _source == "dlsite":
+        _shots = _dlsite_screenshots(html)
+    elif _source == "itch":
+        _shots = _itch_screenshots(html)
+    else:
+        _shots = _forum_screenshots(_post_html) if _post_html else []
+        if not _shots:
+            _shots = _gallery_screenshots(html)
+    # Relative and protocol-relative links are resolved against the page.
+    _shots = [(urllib.parse.urljoin(url, th), urllib.parse.urljoin(url, full))
+              for th, full in _shots]
+
     info = GameInfo(
         name=title,
         description=description,
@@ -1695,6 +1875,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         genres=genres,
         developer=developer,
         publisher='',
+        screenshots=_shots,
         store_url=_store_link or url,
         source=_source,
         extra_urls=([url] + _store_extra) if _store_link else [],
@@ -1702,6 +1883,7 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         reviewer=_reviewer,
         review_text=_review_text,
         vote_count=_vote_count if _rating else 0,
+        languages=languages,
     )
     # DLsite user reviews live behind a Vue stub on the work page; every
     # dlsite.com scrape (locale redirect, direct opengraph, pasted link)

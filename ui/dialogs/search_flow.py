@@ -3,10 +3,10 @@ SaveSync - Web-search / enrichment flow for the Add-Edit Game dialog.
 
 SearchFlowMixin hosts the whole search machine extracted verbatim from
 AddGameDialog: tiered web search + result handling, the candidate carousel
-hand-off, the authoritative-candidate apply (init / enrich / soft-promote),
-the same-tier fill-only enrichment offer with its chip merge model, source
-bookkeeping (applied sources + primary reachability), and direct
-fetch-from-URL. AddGameDialog provides the widgets and state the methods
+hand-off, the chip dialog that is the ONLY place a result's values reach the
+form (the confirmed candidate and its same-tier peers as sources, everything
+already stored pre-selected), source bookkeeping (applied sources + primary
+reachability), and direct fetch-from-URL. AddGameDialog provides the widgets and state the methods
 use (self._name_input, self._search_btn, self._last_search_candidates, ...);
 the mixin MUST come first in the MRO.
 """
@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QVBoxLayout)
 
@@ -72,6 +72,10 @@ class SearchFlowMixin:
         # before re-entering; a same-card concurrent start is still blocked.
         if self._has_shelvable_work():
             return
+        if not skip_primary_apis:
+            # A new search, not the next tier of one: it starts without the
+            # memory that an earlier tier found only what the game has already.
+            self._search_saw_nothing_new = False
 
         exe_path = self._exe_edit.text().strip()
 
@@ -340,10 +344,19 @@ class SearchFlowMixin:
                     self._emit_bg_status("failed")
             else:
                 self._web_search_active = False
-                self._emit_bg_status("failed")
-                self._status_lbl.setText(
-                    _rate_limited or t('add_game.search_not_found')
-                )
+                if getattr(self, '_search_saw_nothing_new', False) and not _rate_limited:
+                    # An earlier tier of this search found the game and it was
+                    # already up to date; a later one finding nothing more does
+                    # not turn that into "not found".
+                    self._emit_bg_status("done")
+                    self._status_lbl.setText(t('add_game.candidate_no_changes'))
+                    self._status_lbl.setStyleSheet(
+                        f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
+                else:
+                    self._emit_bg_status("failed")
+                    self._status_lbl.setText(
+                        _rate_limited or t('add_game.search_not_found')
+                    )
             return
 
         # One distinct title or several: always review through the same
@@ -369,12 +382,15 @@ class SearchFlowMixin:
         (CandidatePreviewDialog), so reviewing a result always shows the
         same concrete detail (image, description, developer, year, tags,
         source) whether there's one candidate or many, with ‹ › to browse
-        when there's more than one. The form is only touched once the user
-        confirms — browsing and rejecting are both preview-only.
+        when there's more than one. Browsing, rejecting and confirming are
+        all preview-only — the form is only touched by the chip dialog's
+        Apply.
 
-        After confirm, same-tier peers open the chip merge dialog. Back there
-        restores the form snapshot and reopens this carousel so the user can
-        pick another candidate without being stuck.
+        After confirm, the chip merge dialog opens over the confirmed
+        candidate and its same-tier peers; nothing is written until Apply.
+        Back there reopens this carousel so the user can pick another
+        candidate without being stuck (nothing was written, so nothing needs
+        restoring).
 
         *merge_pool*, when given, is what same-tier peer lookup searches
         instead of *results* — used by the direct-URL fetch, which shows
@@ -413,6 +429,7 @@ class SearchFlowMixin:
                 f"fields={list((_d.get('fields') or {}).keys())} "
                 f"new_tags={_d.get('new_tags')!r} new_urls={_d.get('new_urls')!r} "
                 f"new_reviews_n={len(_d.get('new_reviews') or [])} "
+                f"new_screenshots_n={len(_d.get('new_screenshots') or [])} "
                 f"promote_primary={_d.get('promote_primary')} "
                 # Raw review fields straight off the source, before any
                 # "already saved" filtering — answers "did the API even
@@ -457,7 +474,12 @@ class SearchFlowMixin:
             # like an explicit reject would, instead of just stopping here
             # and leaving a later tier (which might have something this one
             # doesn't, e.g. a review count) never tried.
-            self._candidates_rejected()
+            #
+            # It is also not "no game info found": the game WAS found, and
+            # is already up to date. Said as that, and remembered for the
+            # rest of this search (see _candidates_rejected).
+            self._search_saw_nothing_new = bool(results)
+            self._candidates_rejected(nothing_new=bool(results))
             return
         self._open_candidate_carousel(useful)
 
@@ -486,15 +508,12 @@ class SearchFlowMixin:
                         # next search tier the way an explicit No does.
                         self._candidate_selection_cancelled()
                     return
-                snap = self._capture_search_form()
-                if not self._process_search_result(dlg.selected, offer_enrichment=False):
-                    return
-                if self._run_same_tier_merge(
-                        dlg.selected, pre_confirm_name=snap.get('name', ''),
-                        pre_confirm_description=snap.get('desc', ''),
-                        pre_confirm_developer=snap.get('dev', ''),
-                        pre_confirm_year=snap.get('year', '')):
-                    self._restore_search_form(snap)
+                # Confirming picks the SOURCE; the form is not touched. The
+                # chip dialog that follows is the only place values are chosen.
+                if self._confirm_search_result(dlg.selected):
+                    # Back: nothing was written, so there is nothing to undo —
+                    # reopen the carousel over whatever still has something
+                    # to offer.
                     useful = self._dedupe_except_description([
                         r for r in (self._last_search_candidates or [])
                         if self._compute_candidate_diff(r).get('has_changes')
@@ -504,8 +523,8 @@ class SearchFlowMixin:
                     n = len(useful)
                     continue
                 # Code-hint DLsite URLs survive even when that candidate was
-                # not the one confirmed (and even if its merge URL chip was
-                # left unchecked) — the product code guarantees the work.
+                # not the one confirmed (and even if its link was left
+                # unselected) — the product code guarantees the work.
                 self._retain_hint_coded_dlsite_urls()
                 return
             finally:
@@ -568,24 +587,31 @@ class SearchFlowMixin:
         self._status_lbl.setStyleSheet(
             f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
 
-    def _candidates_rejected(self):
+    def _candidates_rejected(self, nothing_new: bool = False):
         """No confirmed (the No button): proceed straight to the next
         search tier, exactly like declining a single result — no extra "do
         you want to try the next tier?" prompt, the user already said no
-        once by rejecting. Mirrors the decline branch in
-        _process_search_result. Closing the popup's own window instead of
-        clicking No goes to _candidate_selection_cancelled, not here."""
+        once by rejecting. Closing the popup's own window instead of
+        clicking No goes to _candidate_selection_cancelled, not here.
+
+        *nothing_new*: nobody said no — the tier found the game and everything
+        it had is already saved. It cascades the same way, but says so instead
+        of "not found", and where the search ends it ends as done, not failed."""
         # Product-code DLsite links outlive a full reject; keyword-only ones
         # do not (see _retain_hint_coded_dlsite_urls).
         self._retain_hint_coded_dlsite_urls()
         _current_phase = getattr(self, '_current_search_phase', 'api')
         _hint_fwd = getattr(self, '_last_search_folder_hint', '')
-        self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
+        self._status_lbl.setStyleSheet(
+            f"color:{palette('text_secondary' if nothing_new else 'warning')};"
+            f"font-size:{scaled(12, self)}px;")
         self._sync_bg_action_gates()
+        _step_status = t('add_game.search_nothing_new' if nothing_new
+                         else 'add_game.search_not_found')
         if _current_phase == 'api':
             self._status_lbl.setText(
                 t('add_game.enrichment_step_status',
-                  source=t('add_game.enrich_api'), status=t('add_game.search_not_found'))
+                  source=t('add_game.enrich_api'), status=_step_status)
             )
             self._web_search_active = False
             self._web_search(skip_primary_apis=True, enable_targeted_fallback=True,
@@ -593,50 +619,52 @@ class SearchFlowMixin:
         elif _current_phase == 'targeted':
             self._status_lbl.setText(
                 t('add_game.enrichment_step_status',
-                  source=t('add_game.enrich_targeted'), status=t('add_game.search_not_found'))
+                  source=t('add_game.enrich_targeted'), status=_step_status)
             )
             self._web_search_active = False
             self._web_search(skip_primary_apis=True, enable_generic_fallback=True,
                              extra_folder_hint=_hint_fwd)
+        elif nothing_new:
+            # The end of the road, and the game was found: it is up to date.
+            self._web_search_active = False
+            self._status_lbl.setText(t('add_game.candidate_no_changes'))
+            self._emit_bg_status("done")
         else:
             self._web_search_active = False
             self._status_lbl.setText(t('add_game.search_not_found'))
             self._emit_bg_status("failed")
 
-    def _process_search_result(self, result, offer_enrichment: bool = True) -> bool:
-        """Apply ONE confirmed search result — either the only candidate
-        found, or the one the user confirmed in the candidate-preview
-        popup (CandidatePreviewDialog).
+    def _confirm_search_result(self, result) -> bool:
+        """The user picked *result* — either the only candidate found, or the
+        one confirmed in the candidate-preview popup (CandidatePreviewDialog).
 
-        Returns True when the form was updated. When *offer_enrichment* is
-        True (default), same-tier peers open the chip merge dialog; the
-        candidate carousel drives that itself with offer_enrichment=False
-        so Back can restore a snapshot first.
+        Confirming picks the SOURCE; it writes nothing. Values used to be
+        applied on the spot and the chip dialog then offered a way back to
+        "what it was" — which meant a wrong pick was already in the form by the
+        time anyone could look at it, and closing the dialog kept it. Now the
+        chip dialog opens first, over the confirmed candidate and its same-tier
+        peers together, with everything currently stored already selected;
+        only Apply writes, and only what was picked.
+
+        Returns True when the user asked to go Back to the candidate carousel.
         """
-        _raw_source = getattr(result, 'source', '') or ''
-
         diff = self._compute_candidate_diff(result)
 
-        # ── Nothing at all to apply → say so and STOP ─────────────────────
+        # ── Nothing at all to offer → say so and STOP ─────────────────────
         # Confirming a candidate is never a request to keep searching: the
-        # popup's own hint promises "Yes applies this result and stops here"
-        # (No is what tries another source). This used to silently fire a
-        # fresh search — same tier minus this source, or the next tier —
-        # which read as "I pressed Yes and it went looking again, then told
-        # me nothing was found".
+        # popup's own hint promises "Yes picks this result and stops here"
+        # (No is what tries another source).
         #
         # Tested on has_changes rather than the narrower has_enrich /
-        # same_origin_no_diff pair those two branches used: a same-source
-        # candidate can still carry a new cover, tag or store link, and
-        # those were being discarded together with the duplicate text.
+        # same_origin_no_diff pair: a same-source candidate can still carry a
+        # new cover, tag or store link.
         if not diff['has_changes']:
-            fs = scaled(12, self)
-            self._status_lbl.setStyleSheet(f"color:{palette('text_secondary')};font-size:{fs}px;")
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
             self._sync_bg_action_gates()
             self._status_lbl.setText(t('add_game.candidate_no_changes'))
             return False
 
-        # ── Apply — the user already confirmed this exact candidate ───────
         entry = getattr(self, '_entry', None)
         is_from_bulk_auto = bool(
             entry and (
@@ -645,54 +673,76 @@ class SearchFlowMixin:
                 or (getattr(entry, 'cloud_metadata', {}) or {}).get('auto_enriched', False)
             )
         )
-        if not diff['has_existing']:
-            self._apply_result_init(result)
-        elif is_from_bulk_auto:
-            # Game was added/enriched automatically in bulk — replace primary info to fix potential false positives
-            self._apply_result_overwrite(result)
-            if entry:
-                entry.auto_added = False
-                if isinstance(getattr(entry, 'cloud_metadata', None), dict):
-                    entry.cloud_metadata['auto_enriched'] = False
-        else:
-            # User-managed game — non-destructive enrichment (only fill missing fields)
-            self._apply_result_init(result)
-        self._store_result_fingerprint(
-            _raw_source, result, diff['result_year'],
-            as_primary=bool(
-                not diff['has_existing']
-                or is_from_bulk_auto
-                or diff.get('promote_primary')
-                or diff.get('same_origin')
-            ),
-        )
+        peers = self._same_tier_peers(
+            result, getattr(self, '_last_search_candidates', None) or [])
+        model = self._build_merge_model([result] + peers)
+        # Whether the confirmed source becomes the saved primary if any of its
+        # values is taken (see _store_result_fingerprint).
+        model['base_as_primary'] = bool(
+            not diff['has_existing'] or is_from_bulk_auto
+            or diff.get('promote_primary') or diff.get('same_origin'))
+        model['base_year'] = diff['result_year']
+        if not model['has_options']:
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
+            self._sync_bg_action_gates()
+            self._status_lbl.setText(t('add_game.candidate_no_changes'))
+            logger.info(
+                "_confirm_search_result: nothing to choose between "
+                f"(source={getattr(result, 'source', '')!r}, peers="
+                f"{[getattr(p, 'source', '') for p in peers]!r}, "
+                f"current={model.get('current')!r})")
+            return False
 
-        self._status_lbl.setText(t('add_game.data_saved'))
-        fs = scaled(12, self)
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
+        logger.info(
+            f"_confirm_search_result: showing merge dialog — "
+            f"name={len(model.get('name') or [])} "
+            f"description={len(model.get('description') or [])} "
+            f"developer={len(model.get('developer') or [])} "
+            f"year={len(model.get('year') or [])} "
+            f"images={len(model.get('images') or [])} "
+            f"tags={len(model.get('tags') or [])} "
+            f"languages={len(model.get('languages') or [])} "
+            f"links={sum(len(m.get('urls') or []) for m in model['source_meta'].values())} "
+            f"reviews={len(model.get('reviews') or [])}")
+        dlg = EnrichmentMergeDialog(model, self._source_label, self)
+        code = dlg.exec()
+        if code == EnrichmentMergeDialog.RESULT_BACK:
+            return True
+        if code != QDialog.DialogCode.Accepted:
+            # Cancel: nothing was written, and nothing is now.
+            self._candidate_selection_cancelled()
+            return False
+
+        if not self._apply_merge_selection(dlg.selection(), model):
+            self._sync_bg_action_gates()
+            self._status_lbl.setText(t('add_game.merge_nothing_selected'))
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('text_secondary')};font-size:{scaled(12, self)}px;")
+            return False
+
+        # A game added or enriched in bulk is the user's own from the moment
+        # they have confirmed values for it.
+        if is_from_bulk_auto and entry:
+            entry.auto_added = False
+            if isinstance(getattr(entry, 'cloud_metadata', None), dict):
+                entry.cloud_metadata['auto_enriched'] = False
         self._sync_bg_action_gates()
-
-        if offer_enrichment:
-            _peers = [r for r in (getattr(self, '_last_search_candidates', None) or [])
-                      if r is not result]
-            if _peers:
-                self._offer_same_tier_enrichment(result, _peers)
-            self._retain_hint_coded_dlsite_urls()
-
         missing = self._get_missing_fields()
-        if missing:
+        # Pictures still coming in show their progress on this line instead; the
+        # same note is shown when they are done (see _on_extra_image_ready).
+        if missing and not self._extra_pending:
             self._status_lbl.setText(
                 t('add_game.fields_still_missing', fields=", ".join(missing)))
-            fs = scaled(12, self)
-            self._status_lbl.setStyleSheet(f"color:{palette('warning')};font-size:{fs}px;")
-        return True
+            self._status_lbl.setStyleSheet(
+                f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
+        return False
 
     # ── Shared result diff/apply helpers ──────────────────────────────────
-    # Used by _process_search_result (acceptance), the same-tier merge
-    # preview (_offer_same_tier_enrichment/_build_merge_model) AND
-    # CandidatePreviewDialog (live per-candidate preview while browsing) —
-    # single source of truth so the popup never shows something different
-    # from what confirming actually applies.
+    # Used by _confirm_search_result (acceptance), the merge dialog's model
+    # (_build_merge_model) AND CandidatePreviewDialog (live per-candidate
+    # preview while browsing) — single source of truth so the popup never
+    # shows something different from what the chip dialog then offers.
 
     def _extract_result_year(self, result) -> str:
         """4-digit year out of a GameInfo.release_date string, if any."""
@@ -733,6 +783,8 @@ class SearchFlowMixin:
           new_image             — whether a cover would be set (only if none)
           new_reviews           — the source's own verdict, when it isn't
                                   already on the form (one per source)
+          new_languages         — languages the game is offered in that the
+                                  form does not list yet (additive, a union)
         """
         current_name = self._name_edit.text().strip()
         current_desc = self._desc_edit.toPlainText().strip()
@@ -772,14 +824,18 @@ class SearchFlowMixin:
         new_urls = self._new_result_site_urls(result)
         new_image = bool(result.image_url and not has_image)
         new_reviews = self._new_result_reviews(result)
+        new_languages = self._new_result_languages(result)
+        # Pictures are news too: a source applied before, whose screenshots
+        # were left undownloaded, must still be worth showing. Only looked up
+        # (see _new_result_screenshots) — nothing is downloaded to know.
+        new_screenshots = self._new_result_screenshots(result)
 
-        # Name, description, developer and year are ALL applied
-        # unconditionally now (see _apply_result_init) — a candidate that
-        # merely REPLACES an already-saved value for any of them is
-        # material news, the same as a rename always was, not just one
-        # that fills a field that was empty. Image stays fill-only/
-        # additive (new_image, unchanged): a game can hold several covers,
-        # so a differing one is never "the" news on its own.
+        # A candidate that merely DIFFERS from an already-saved name,
+        # description, developer or year is material news — the chip dialog
+        # offers it next to the value stored now — not just one that fills a
+        # field that was empty. Image stays additive (new_image, unchanged):
+        # a game can hold several covers, so a differing one is never "the"
+        # news on its own.
         name_change = bool(result.name and result.name != current_name)
         desc_change = bool(result.description and result.description != current_desc)
         _rdev_ = getattr(result, 'developer', '') or ''
@@ -787,7 +843,8 @@ class SearchFlowMixin:
         year_change = bool(result_year and result_year != current_year)
         has_material = bool(
             new_image or name_change or desc_change or dev_change or year_change
-            or new_tags or new_urls or new_reviews
+            or new_tags or new_urls or new_reviews or new_languages
+            or bool(new_screenshots)
         )
 
         already_applied = bool(
@@ -828,14 +885,10 @@ class SearchFlowMixin:
                 fields['year'] = {'old': current_year or None, 'new': result_year}
         else:
             # User-managed game: name, description, developer and year all
-            # show whenever they DIFFER, filled or not — matching how all
-            # four are actually applied now (see _apply_result_init: all
-            # unconditional, image the only field left that's fill-only).
-            # This dict feeds the candidate-preview meta line AND the merge
-            # dialog's field options — it used to show only what a fill-only
-            # apply could ever change ("nowhere in the preview was shown
-            # the year/developer/name/description" was the original report
-            # that started fixing this, field by field).
+            # show whenever they DIFFER, filled or not. This dict feeds the
+            # candidate-preview meta line and decides whether a candidate has
+            # anything to offer at all (the merge dialog builds its own
+            # options from the sources — see _build_merge_model).
             if name_change:
                 fields['name'] = {'old': current_name or None, 'new': result.name}
             if result_year and result_year != current_year:
@@ -867,6 +920,8 @@ class SearchFlowMixin:
             'new_urls': new_urls,
             'new_image': new_image,
             'new_reviews': new_reviews,
+            'new_languages': new_languages,
+            'new_screenshots': new_screenshots,
             # What's on the form right now, for the preview to tell "this
             # candidate's value already matches what I have" (✓, like an
             # already-saved tag) apart from "this fills a field that was
@@ -890,113 +945,6 @@ class SearchFlowMixin:
         if not path:
             return None
         return (getattr(self, '_image_path_to_url', None) or {}).get(path)
-
-    def _apply_result_init(self, result):
-        """Case B — no existing data: fill all empty fields, tags/reviews
-        unconditional (nothing to protect yet). Name, description,
-        developer AND year are ALL unconditional — each one replaces the
-        field outright, with the previous value recoverable in the merge
-        dialog (see _build_merge_model's pre_confirm_* injection, and
-        EnrichmentMergeDialog's "Previous" default for all four). Image
-        stays fill-only/additive-chip, never auto-swapped — a game can
-        genuinely hold several covers, unlike these four single-value
-        fields where there is exactly one slot and "go back to what it
-        was" is the only safety net that makes sense. Tags and reviews
-        stay unconditional ONLY while the form is still blank (has_existing
-        False below); once there's something to protect, both move to the
-        merge dialog's checked-by-default chips instead — same reasoning
-        as image.
-
-        Tags/reviews for an EXISTING game used to have the SAME bug year/
-        developer/description just got fixed for: applied here
-        unconditionally, so a candidate confirmed with zero same-tier peers
-        had its whole tag/review list silently unioned in with no way to
-        see or decline any one of them before it was already written — and
-        the merge dialog then correctly showed nothing pending, since there
-        was nothing left to offer."""
-        current_name = self._name_edit.text().strip()
-        current_desc = self._desc_edit.toPlainText().strip()
-        current_dev  = self._developer_edit.text().strip()
-        current_year = self._year_edit.text().strip()
-        has_image = bool(self._original_image_path or getattr(self, '_image_path', ''))
-        has_existing = bool(current_desc or has_image or getattr(self, '_tags', None)
-                            or current_dev or current_year)
-        if result.name and result.name != current_name:
-            self._name_edit.setText(result.name)
-        if result.image_url and not has_image:
-            self._download_and_set_image(result.image_url)
-        if result.description and result.description != current_desc:
-            self._desc_edit.setPlainText(result.description)
-        if result.genres and not has_existing:
-            self._apply_web_tags(result.genres)
-        _rdev = getattr(result, 'developer', '') or ''
-        if _rdev and _rdev != current_dev:
-            self._developer_edit.setText(_rdev)
-        _ry = self._extract_result_year(result)
-        if _ry and _ry != current_year:
-            self._year_edit.setText(_ry)
-        self._merge_result_urls(result)
-        if not has_existing:
-            self._merge_result_review(result)
-        if hasattr(self, '_rebuild_tag_chips'):
-            self._rebuild_tag_chips()
-
-    def _apply_result_overwrite(self, result):
-        """Case C/D — better tier or significantly different: replace
-        fields that exist in the new source, keep existing values for
-        absent fields.
-
-        Tags/reviews are additive rather than unconditional here, same as
-        Case B (_apply_result_init) once there's something to protect —
-        this method is only ever called with an existing game, so applying
-        result.genres/review directly would union them in with no way to
-        see or decline any one of them before _run_same_tier_merge's
-        base_result handling (_build_merge_model) ever gets to offer them
-        as checked-by-default chips; see that method's "same gap for tags
-        and reviews" comment.
-        """
-        current_desc = self._desc_edit.toPlainText().strip()
-        current_dev  = self._developer_edit.text().strip()
-        current_year = self._year_edit.text().strip()
-        has_image = bool(self._original_image_path or getattr(self, '_image_path', ''))
-        has_existing = bool(current_desc or has_image or getattr(self, '_tags', None)
-                            or current_dev or current_year)
-        if result.name:
-            self._name_edit.setText(result.name)
-        if result.image_url and result.image_url != self._current_image_url():
-            self._download_and_set_image(result.image_url)
-        if result.description:
-            self._desc_edit.setPlainText(result.description)
-        if result.genres and not has_existing:
-            self._apply_web_tags(result.genres)
-        if getattr(result, 'developer', ''):
-            self._developer_edit.setText(result.developer)
-        _ry = self._extract_result_year(result)
-        if _ry:
-            self._year_edit.setText(_ry)
-        self._merge_result_urls(result)
-        if not has_existing:
-            self._merge_result_review(result)
-        if hasattr(self, '_rebuild_tag_chips'):
-            self._rebuild_tag_chips()
-
-    def _merge_result_review(self, result):
-        """Keep the source's verdict(s) as reviews of their own.
-
-        Every tier does this — a rating is not something one tier owns and
-        another ignores — and the source travels with each review, so where a
-        score came from is answerable long after the search. A site that
-        ships many user reviews (DLsite) contributes the whole list.
-        """
-        if hasattr(result, "as_reviews"):
-            reviews = result.as_reviews()
-        elif hasattr(result, "as_review"):
-            one = result.as_review()
-            reviews = [one] if one else []
-        else:
-            reviews = []
-        if reviews:
-            self._merge_reviews(reviews)
 
     def _merge_reviews(self, reviews: list):
         """Fold *reviews* into the form, keyed by review_identity.
@@ -1060,39 +1008,6 @@ class SearchFlowMixin:
                 continue
             fresh.append(review)
         return fresh
-
-    def _apply_result_enrich(self, result, new_tags: list):
-        """Case E — same/lower tier: only fill EMPTY fields; tags always
-        union (additive, never replaces or clears existing tags).
-
-        The title is the exception: the candidate preview already showed the
-        rename with a strikethrough, and accepting that candidate means the
-        rename — leaving the old name in place after the user confirmed the
-        new one is what made "already saved" games keep the wrong title.
-        """
-        current_name = self._name_edit.text().strip()
-        current_desc = self._desc_edit.toPlainText().strip()
-        current_dev  = self._developer_edit.text().strip()
-        current_year = self._year_edit.text().strip()
-        if result.name and result.name != current_name:
-            self._name_edit.setText(result.name)
-        if result.description and not current_desc:
-            self._desc_edit.setPlainText(result.description)
-        if result.image_url and not (
-                self._original_image_path or getattr(self, '_image_path', '')
-        ):
-            self._download_and_set_image(result.image_url)
-        if getattr(result, 'developer', '') and not current_dev:
-            self._developer_edit.setText(result.developer)
-        _ry = self._extract_result_year(result)
-        if _ry and not current_year:
-            self._year_edit.setText(_ry)
-        if new_tags:
-            self._apply_web_tags(new_tags)
-        self._merge_result_urls(result)
-        self._merge_result_review(result)
-        if hasattr(self, '_rebuild_tag_chips'):
-            self._rebuild_tag_chips()
 
     def _store_result_fingerprint(self, src: str, result, result_year: str,
                                   *, as_primary: bool = True):
@@ -1466,156 +1381,27 @@ class SearchFlowMixin:
             bits.append(short)
         return " · ".join(bits)
 
-    def _run_same_tier_merge(self, base_result, pre_confirm_name: str = '',
-                             pre_confirm_description: str = '',
-                             pre_confirm_developer: str = '',
-                             pre_confirm_year: str = '') -> bool:
-        """Offer peer enrichment chips. Returns True when the user asked to
-        go back to the candidate carousel (form snapshot must be restored).
+    def _build_merge_model(self, sources: list) -> dict:
+        """Everything the chip dialog offers, per field and per source.
 
-        *pre_confirm_name*, *pre_confirm_description*, *pre_confirm_developer*
-        and *pre_confirm_year* are what those four fields held right before
-        this candidate was confirmed (the carousel's form snapshot) — all
-        four are applied unconditionally on confirm (never fill-only), so
-        by the time this runs the ORIGINAL values are already gone from
-        the form; this is the only way to still offer "go back to what it
-        was" as a choice for any of them."""
-        _pool = getattr(self, '_last_search_candidates', None) or []
-        logger.info(
-            f"_run_same_tier_merge: base={getattr(base_result, 'source', '')!r}/"
-            f"{getattr(base_result, 'name', '')!r} pool_size={len(_pool)}")
-        peers = self._same_tier_peers(base_result, _pool)
-        if not peers:
-            logger.info(
-                "_run_same_tier_merge: no same-tier peers — still checking "
-                "the confirmed candidate's own year/name against what's saved")
-        # base_result is passed even with zero peers: it may still offer its
-        # OWN image/tags/reviews as options (see _build_merge_model) when it
-        # came from a different tier than whatever is currently saved.
-        model = self._build_merge_model(
-            peers, base_result=base_result, pre_confirm_name=pre_confirm_name,
-            pre_confirm_description=pre_confirm_description,
-            pre_confirm_developer=pre_confirm_developer,
-            pre_confirm_year=pre_confirm_year)
-        if not model.get('has_options'):
-            logger.info(
-                "_run_same_tier_merge: peers found "
-                f"({[getattr(p, 'source', '') for p in peers]!r}) but "
-                f"_build_merge_model produced no options (current="
-                f"{model.get('current')!r}) — no dialog")
-            return False
-        logger.info(
-            f"_run_same_tier_merge: showing merge dialog — "
-            f"name={len(model.get('name') or [])} "
-            f"description={len(model.get('description') or [])} "
-            f"developer={len(model.get('developer') or [])} "
-            f"year={len(model.get('year') or [])} "
-            f"images={len(model.get('images') or [])} "
-            f"tags={len(model.get('tags') or [])} "
-            f"urls={len(model.get('urls') or [])} "
-            f"reviews={len(model.get('reviews') or [])}")
-        dlg = EnrichmentMergeDialog(model, self._source_label, self)
-        code = dlg.exec()
-        if code == EnrichmentMergeDialog.RESULT_BACK:
-            return True
-        if code == QDialog.DialogCode.Accepted:
-            self._apply_merge_selection(dlg.selection())
-            missing = self._get_missing_fields()
-            if missing:
-                self._status_lbl.setText(
-                    t('add_game.fields_still_missing', fields=", ".join(missing)))
-                self._status_lbl.setStyleSheet(
-                    f"color:{palette('warning')};font-size:{scaled(12, self)}px;")
-        return False
+        *sources* is the confirmed candidate FIRST, then its same-tier peers.
+        The confirmed candidate is a source like any other here: nothing of it
+        has been applied, so its own values are chips too, not only its peers'.
 
-    def _offer_same_tier_enrichment(self, base_result, others: list):
-        """Legacy entry: merge without a Back path (no form snapshot)."""
-        peers = self._same_tier_peers(base_result, others)
-        if not peers:
-            return
-        model = self._build_merge_model(peers)
-        if not model.get('has_options'):
-            return
-        dlg = EnrichmentMergeDialog(model, self._source_label, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._apply_merge_selection(dlg.selection())
+        - name / description / developer / year: the values that DIFFER from
+          what the form holds now, one entry per distinct value (``sources``
+          lists every source that offers it). A value equal to the current one
+          is not repeated — the dialog's "Keep current" chip already is that
+          value — and two sources agreeing on a value share one chip.
+        - images / tags / languages / reviews: additive, per source; what the
+          game already has is left out. Languages are one chip per source. Reviews are one chip per source (same API source
+          identity still collapses on apply).
+        - ``source_meta[key]["urls"]``: the source's page links not stored yet.
+          They are not chips: they ride on the source's header (selecting the
+          header adds them).
 
-    def _capture_search_form(self) -> dict:
-        """Snapshot fields a search apply may change, for merge-dialog Back."""
-        return {
-            'name': self._name_edit.text(),
-            'desc': self._desc_edit.toPlainText(),
-            'dev': self._developer_edit.text(),
-            'year': self._year_edit.text(),
-            'tags': list(getattr(self, '_tags', []) or []),
-            'urls': list(getattr(self, '_store_urls', []) or []),
-            'reviews': [dict(r) for r in (getattr(self, '_reviews', None) or [])],
-            'image_path': getattr(self, '_image_path', None),
-            'original_image_path': getattr(self, '_original_image_path', None),
-            'detected_images': list(getattr(self, '_detected_images', []) or []),
-            'current_image_idx': getattr(self, '_current_image_idx', 0),
-            'fingerprint': dict(
-                getattr(self, '_enrichment_source_fingerprint', None) or {}),
-        }
-
-    def _restore_search_form(self, snap: dict):
-        """Undo a provisional candidate apply so the carousel can reopen."""
-        self._name_edit.setText(snap.get('name', ''))
-        self._desc_edit.setPlainText(snap.get('desc', ''))
-        self._developer_edit.setText(snap.get('dev', ''))
-        self._year_edit.setText(snap.get('year', ''))
-        self._tags = list(snap.get('tags') or [])
-        self._store_urls = list(snap.get('urls') or [])
-        self._reviews = [dict(r) for r in (snap.get('reviews') or [])]
-        self._image_path = snap.get('image_path')
-        self._original_image_path = snap.get('original_image_path')
-        self._detected_images = list(snap.get('detected_images') or [])
-        self._current_image_idx = snap.get('current_image_idx') or 0
-        self._enrichment_source_fingerprint = dict(snap.get('fingerprint') or {})
-        if hasattr(self, '_rebuild_tag_chips'):
-            self._rebuild_tag_chips()
-        if hasattr(self, '_rebuild_url_chips'):
-            self._rebuild_url_chips()
-        if hasattr(self, '_update_reviews_btn'):
-            self._update_reviews_btn()
-        if hasattr(self, '_update_image_preview'):
-            self._update_image_preview(self._image_path or '')
-        self._status_lbl.setText(
-            t('add_game.candidates_found',
-              n=len(getattr(self, '_last_search_candidates', []) or []))
-            if len(getattr(self, '_last_search_candidates', []) or []) > 1
-            else t('add_game.candidate_found_single')
-        )
-        fs = scaled(12, self)
-        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
-
-    def _build_merge_model(self, collected: list, *, base_result=None,
-                           pre_confirm_name: str = '',
-                           pre_confirm_description: str = '',
-                           pre_confirm_developer: str = '',
-                           pre_confirm_year: str = '') -> dict:
-        """Per-field option lists for the merge preview.
-
-        Name, description, developer AND year are ALL applied
-        unconditionally on confirm now (see _apply_result_init) and all
-        four get a "Previous" option here so the value they replaced is
-        still reachable — never fill-only, never silently gone with
-        nothing to revert to. Image is the one exception left (additive
-        chip, never auto-swapped — a game can hold several covers). Each
-        peer title is its own section (``vndb::Title::0``), so two VNDB
-        hits stay distinguishable. Tags/URLs expand additively; reviews
-        are one chip per peer (same API source identity still collapses
-        on apply).
-
-        *base_result*, when given, is the just-confirmed candidate itself —
-        its own tags/reviews/cover still need offering here (see below),
-        since those stay additive rather than unconditional; it is never
-        added as a tag/url/review source a SECOND time for anything that
-        already came in through the normal apply.
-
-        *pre_confirm_name*, *pre_confirm_description*, *pre_confirm_developer*
-        and *pre_confirm_year*, when given, are what those four fields held
-        right before *base_result* was confirmed — see below.
+        Each source is its own section (``vndb · Title · url``), so two VNDB
+        hits stay distinguishable.
         """
         cur_name = self._name_edit.text().strip()
         cur_desc = self._desc_edit.toPlainText().strip()
@@ -1626,84 +1412,100 @@ class SearchFlowMixin:
         has_img  = bool(self._original_image_path or getattr(self, '_image_path', ''))
         cur_image_url = self._current_image_url() or ''
 
-        peer_keys: list[str] = []
-        for i, info in enumerate(collected):
-            peer_keys.append(self._peer_section_key(info, i))
+        keys = [self._peer_section_key(info, i) for i, info in enumerate(sources)]
 
-        def _opts(getter, exclude: str = ''):
-            opts, seen = [], set()
-            _excl = (exclude or '').strip().lower()
-            for info, pkey in zip(collected, peer_keys):
+        def _offer(getter, current: str) -> list:
+            """One option per distinct value that differs from *current*."""
+            found: dict = {}
+            for info, pkey in zip(sources, keys):
                 v = (getter(info) or '').strip()
-                if not v or v.lower() in seen or v.lower() == _excl:
+                if not v or v.lower() == (current or '').lower():
                     continue
-                seen.add(v.lower())
-                opts.append({'source': pkey, 'value': v})
-            return opts
+                slot = found.get(v.lower())
+                if slot is None:
+                    found[v.lower()] = {'source': pkey, 'sources': [pkey], 'value': v}
+                else:
+                    slot['sources'].append(pkey)
+            return list(found.values())
 
         model = {
             'current': {
                 'name': cur_name, 'description': cur_desc, 'developer': cur_dev,
                 'year': cur_year, 'has_image': has_img,
             },
-            # Name/description/developer/year are all offered even though a
-            # value is already set — only a DIFFERING peer value shows, and
-            # it's never auto-selected (EnrichmentMergeDialog adds an
-            # explicit chip alongside it — "Keep current", or "Previous"
-            # when one exists, since all four are applied unconditionally;
-            # see that file's _build()). Images are NEITHER exclusive nor
-            # unconditional — a game can hold many covers (the carousel in
-            # the add/edit dialog), so a peer's differing image is
-            # additive, exactly like tags/urls below: checked by default,
-            # never replacing the current cover, just offered alongside it.
-            'name':        _opts(lambda i: getattr(i, 'name', ''), exclude=cur_name),
-            'description': _opts(lambda i: i.description, exclude=cur_desc),
-            'developer':   _opts(lambda i: getattr(i, 'developer', ''), exclude=cur_dev),
-            'year':        _opts(lambda i: self._extract_result_year(i), exclude=cur_year),
+            'name':        _offer(lambda i: getattr(i, 'name', ''), cur_name),
+            'description': _offer(lambda i: getattr(i, 'description', ''), cur_desc),
+            'developer':   _offer(lambda i: getattr(i, 'developer', ''), cur_dev),
+            'year':        _offer(lambda i: self._extract_result_year(i), cur_year),
             'images': [],
             'tags': [],
-            'urls': [],
+            'languages': [],
             'reviews': [],
             'source_meta': {},
-            # field -> the value it held right before base_result was
-            # confirmed, set by _offer_previous_value below even when that
-            # value is already offered as an ordinary (non-previous) option
-            # and no separate chip is added for it — see that function.
-            'prev_default': {},
+            'base_key': keys[0] if keys else '',
+            'base_result': sources[0] if sources else None,
         }
         seen_tags = set(cur_tags)
+        from core.library import language_merge_key
+        seen_langs: set[str] = set()
         seen_urls: set[str] = set()
         seen_images = {cur_image_url} if cur_image_url else set()
+        # Screenshots are told apart by the picture, not the URL (a store serves
+        # one at several sizes): what the carousel already holds, and every
+        # candidate's cover, is not offered again as one.
+        from core.game_sources.common import image_key
+        seen_shots = {image_key(u) for u in
+                      (set(seen_images) | set(getattr(self, '_image_url_cache', None) or {}))}
+        known_stems = self._known_image_stems()
         # Review slot is per API source id (steam/vndb…): two VNDB titles
-        # share one stored identity, so only the first peer offers reviews.
+        # share one stored identity, so only the first offers reviews.
         seen_review_api: set[str] = set()
-        for info, pkey in zip(collected, peer_keys):
+        for info, pkey in zip(sources, keys):
             src_id = (info.source or 'web').split('+')[0] or 'web'
             title = (getattr(info, 'name', '') or '').strip()
             inspect = _inspect_url(info)
             cover = (getattr(info, 'image_url', '') or '').strip()
+            links = []
+            for u in self._new_result_site_urls(info):
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    links.append(u)
             model['source_meta'][pkey] = {
                 'inspect_url': inspect,
                 'image_url': cover,
                 'name': title,
                 'source_id': src_id,
+                'urls': links,
                 'label': self._peer_section_label(
                     self._source_label(src_id), title, inspect),
             }
             if cover and cover not in seen_images:
                 seen_images.add(cover)
                 model['images'].append({'source': pkey, 'value': cover})
+            if cover:
+                seen_shots.add(image_key(cover))
+            # More pictures of the game, listed after its cover. Not selected
+            # until the user picks them (see EnrichmentMergeDialog._image_chip).
+            for thumb, full in (getattr(info, 'screenshots', None) or []):
+                key = image_key(full) or full
+                if key in seen_shots or self._cache_stem(full).lower() in known_stems:
+                    continue
+                seen_shots.add(key)
+                model['images'].append({'source': pkey, 'value': full,
+                                        'thumb': thumb, 'extra': True})
             for g in (info.genres or []):
                 _gk = tag_merge_key(g)
                 if _gk in seen_tags:
                     continue
                 seen_tags.add(_gk)
                 model['tags'].append({'source': pkey, 'value': g})
-            for u in self._new_result_site_urls(info):
-                if u in seen_urls:
-                    continue
-                seen_urls.add(u)
-                model['urls'].append({'source': pkey, 'value': u})
+            # One entry per source, like reviews: the languages nobody above
+            # has offered yet and the game does not list.
+            _langs = [x for x in self._new_result_languages(info)
+                      if language_merge_key(x) not in seen_langs]
+            if _langs:
+                seen_langs.update(language_merge_key(x) for x in _langs)
+                model['languages'].append({'source': pkey, 'value': _langs})
             if src_id in seen_review_api:
                 continue
             _revs = self._new_result_reviews(info)
@@ -1711,137 +1513,30 @@ class SearchFlowMixin:
                 seen_review_api.add(src_id)
                 model['reviews'].append({'source': pkey, 'value': _revs})
 
-        # The just-confirmed candidate's OWN cover/tags/reviews, offered
-        # even with ZERO same-tier peers. All three stay additive rather
-        # than unconditional (see _apply_result_init), so a candidate found
-        # in a LATER tier than what's already saved — e.g. a forum result
-        # confirmed after Steam — would otherwise have them with nothing
-        # around to ever offer them as a choice: same-tier peers can only
-        # ever come from the SAME search batch as the confirmed candidate,
-        # never from an earlier, separate tier's search (and the per-peer
-        # loop above only looks at `collected`, i.e. peers).
-        if base_result is not None:
-            _bkey = self._peer_section_key(base_result, -1)
-
-            def _ensure_base_source_meta():
-                if _bkey in model['source_meta']:
-                    return
-                _bsrc = (getattr(base_result, 'source', '') or 'web').split('+')[0] or 'web'
-                _btitle = (getattr(base_result, 'name', '') or '').strip()
-                _binspect = _inspect_url(base_result)
-                model['source_meta'][_bkey] = {
-                    'inspect_url': _binspect,
-                    'image_url': (getattr(base_result, 'image_url', '') or '').strip(),
-                    'name': _btitle,
-                    'source_id': _bsrc,
-                    'label': self._peer_section_label(
-                        self._source_label(_bsrc), _btitle, _binspect),
-                }
-
-            # Name/description/developer/year no longer need a "base result's
-            # own differing value" injection here (there used to be a
-            # _base_offer helper doing exactly that for year/developer/
-            # description) — all four are unconditionally applied by
-            # _apply_result_init now, so the candidate's own value is
-            # already sitting in model['current'] by the time this runs.
-            # What's still missing without help is the PREVIOUS value each
-            # one just replaced — see _offer_previous_value below, which
-            # covers all four uniformly.
-
-            # Same zero-peer gap for the cover — additive like the per-peer
-            # loop above (seen_images/model['images']), not exclusive like
-            # the fields above: a confirmed candidate's own image never had
-            # any path to reach model['images'] at all when there were no
-            # same-tier peers to bring it in through that loop.
-            _base_cover = (getattr(base_result, 'image_url', '') or '').strip()
-            if _base_cover and _base_cover not in seen_images:
-                seen_images.add(_base_cover)
-                _ensure_base_source_meta()
-                model['images'].append({'source': _bkey, 'value': _base_cover})
-
-            # Same gap for tags and reviews — _apply_result_init no longer
-            # unions the confirmed candidate's OWN genres/review into the
-            # form unconditionally for an existing game (see that method):
-            # they used to be written before this dialog ever ran, so the
-            # per-peer loop above — which only ever looked at `collected`,
-            # i.e. OTHER candidates — had nothing left to offer for the one
-            # candidate that was actually just confirmed. Same additive,
-            # checked-by-default treatment as a peer's tags/review.
-            _base_src_id = (getattr(base_result, 'source', '') or 'web').split('+')[0] or 'web'
-            for g in (getattr(base_result, 'genres', None) or []):
-                _gk = tag_merge_key(g)
-                if _gk in seen_tags:
-                    continue
-                seen_tags.add(_gk)
-                _ensure_base_source_meta()
-                model['tags'].append({'source': _bkey, 'value': g})
-            if _base_src_id not in seen_review_api:
-                _base_revs = self._new_result_reviews(base_result)
-                if _base_revs:
-                    seen_review_api.add(_base_src_id)
-                    _ensure_base_source_meta()
-                    model['reviews'].append({'source': _bkey, 'value': _base_revs})
-
-        # The value held right before this candidate was confirmed, offered
-        # as a "go back" option — for name, description, developer AND
-        # year, all four applied UNCONDITIONALLY on confirm
-        # (_apply_result_init never gates any of them on "currently empty"
-        # the way image still is), so unlike image the original value is
-        # already gone from the form by the time this runs;
-        # pre_confirm_name/pre_confirm_description/pre_confirm_developer/
-        # pre_confirm_year are the only trace of it left. Without this,
-        # confirming a messy-titled candidate (e.g. a forum thread's raw
-        # post title, or its own rewritten blurb/developer/year) left no
-        # way back to a cleaner value a better source had already set —
-        # not even a chip, since a candidate reached via a different tier
-        # has no same-tier peer to offer one either.
-        def _offer_previous_value(field: str, cur_val: str, pre_confirm_val: str):
-            _pv = (pre_confirm_val or '').strip()
-            if not _pv or _pv.lower() == cur_val.lower():
-                return
-            # Recorded even when an ordinary option already carries this
-            # same value (the `any(...)` skip right below) — otherwise the
-            # merge dialog has no tagged "previous value" chip to default
-            # to and falls back to "Keep current", silently keeping the
-            # just-applied replacement it was supposed to offer a way back
-            # from.
-            model['prev_default'][field] = _pv
-            if any(o['value'].lower() == _pv.lower() for o in model[field]):
-                return
-            # Shaped like _peer_section_key's own "source · title · n" so
-            # _source_header_row's src_id fallback (source.split(" · ")[0])
-            # resolves to the localized label below instead of this raw key.
-            _prev_label = t('add_game.merge_previous_value')
-            _pkey = f"{_prev_label} · {_pv} · {field}"
-            if _pkey not in model['source_meta']:
-                model['source_meta'][_pkey] = {
-                    'inspect_url': '',
-                    'image_url': '',
-                    'name': _pv,
-                    'source_id': _prev_label,
-                    'label': _prev_label,
-                }
-            model[field].append({'source': _pkey, 'value': _pv})
-
-        _offer_previous_value('name', cur_name, pre_confirm_name)
-        _offer_previous_value('description', cur_desc, pre_confirm_description)
-        _offer_previous_value('developer', cur_dev, pre_confirm_developer)
-        _offer_previous_value('year', cur_year, pre_confirm_year)
-
-        # Description/developer/year now count toward has_options too, same
-        # reasoning as name: all four are unconditionally applied on
-        # confirm, so a differing value is no longer a soft "fill if you
-        # like" — it already replaced whatever was there, and the ONLY way
-        # back to the previous value is this dialog actually opening.
         model['has_options'] = any([
             model['name'], model['description'], model['developer'],
-            model['year'], model['images'], model['tags'], model['urls'],
-            model['reviews'],
+            model['year'], model['images'], model['tags'], model['reviews'],
+            model['languages'],
+            any(m.get('urls') for m in model['source_meta'].values()),
         ])
         return model
 
-    def _apply_merge_selection(self, sel: dict):
-        """Write ONLY the pieces the user picked in the merge preview."""
+    def _apply_merge_selection(self, sel: dict, model: dict | None = None) -> bool:
+        """Write ONLY the pieces the user picked in the merge preview.
+
+        Returns False when nothing was picked (the form is left exactly as it
+        was). With *model*, also records which sources contributed — the
+        confirmed candidate as the saved primary when it is one, the others as
+        merely applied — so a later search knows what has already been used.
+        """
+        _urls = [u for u in (sel.get('urls') or []) if u not in (self._store_urls or [])]
+        anything = bool(
+            sel.get('name') or sel.get('description') or sel.get('developer')
+            or sel.get('year') or sel.get('images') or sel.get('tags')
+            or sel.get('languages') or sel.get('reviews') or sel.get('extra_images')
+            or _urls)
+        if not anything:
+            return False
         if sel.get('name'):
             self._name_edit.setText(sel['name'])
         if sel.get('description'):
@@ -1857,22 +1552,51 @@ class SearchFlowMixin:
             self._download_and_set_image(_img_url)
         if sel.get('tags'):
             self._apply_web_tags(sel['tags'])
+        if sel.get('languages'):
+            self._apply_web_languages(sel['languages'])
         if sel.get('reviews'):
             self._merge_reviews(sel['reviews'])
             for r in sel['reviews']:
                 if isinstance(r, dict):
                     self._mark_source_applied(r.get('source') or '')
-        _new_urls = [u for u in sel.get('urls', []) if u not in self._store_urls]
-        if _new_urls:
-            self._store_urls.extend(_new_urls)
+        if _urls:
+            self._store_urls = list(self._store_urls or []) + _urls
             self._rebuild_url_chips()
-            for u in _new_urls:
+            for u in _urls:
                 self._mark_source_applied(self._source_from_url(u))
         if hasattr(self, '_rebuild_tag_chips'):
             self._rebuild_tag_chips()
+
+        if model:
+            metas = model.get('source_meta') or {}
+            base_key = model.get('base_key')
+            for pkey in (sel.get('sources') or ()):
+                if pkey == base_key and model.get('base_result') is not None:
+                    base = model['base_result']
+                    self._store_result_fingerprint(
+                        getattr(base, 'source', '') or '', base,
+                        model.get('base_year') or '',
+                        as_primary=bool(model.get('base_as_primary', True)))
+                else:
+                    self._mark_source_applied((metas.get(pkey) or {}).get('source_id') or '')
+
         self._status_lbl.setText(t('add_game.data_saved'))
         fs = scaled(12, self)
         self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{fs}px;")
+        # After the line above, so the progress it starts is what stays on show.
+        logger.info(f"_apply_merge_selection: images={len(sel.get('images') or [])} "
+                    f"extra_images={len(sel.get('extra_images') or [])}")
+        if sel.get('extra_images'):
+            try:
+                self._start_extra_images(sel['extra_images'])
+            except Exception:
+                # A slot's exception only reaches the console: say so in the log,
+                # and on screen, rather than losing the pictures without a word.
+                logger.exception("Extra pictures could not be started")
+                self._status_lbl.setText(t('add_game.images_some_failed',
+                                           failed=len(sel['extra_images']),
+                                           total=len(sel['extra_images'])))
+        return True
 
     def _result_site_urls(self, result) -> list[str]:
         """All site URLs carried by a search result: the store page plus any
@@ -1887,20 +1611,29 @@ class SearchFlowMixin:
                 urls.append(eu)
         return urls
 
+    def _new_result_languages(self, result) -> list[str]:
+        """The result's languages the form does not list yet, English first."""
+        from core.library import language_merge_key, normalize_languages
+        have = {language_merge_key(x) for x in (getattr(self, '_languages', None) or [])}
+        return [x for x in normalize_languages(getattr(result, 'languages', None))
+                if language_merge_key(x) not in have]
+
+    def _new_result_screenshots(self, result) -> list:
+        """The result's screenshots the game does not have yet, as
+        ``(thumbnail, full size)`` pairs — decided without downloading them: by
+        the name each would be saved under, against what is already in the
+        game's icon cache (see _known_image_stems)."""
+        pairs = getattr(result, 'screenshots', None) or []
+        if not pairs:
+            return []
+        known = self._known_image_stems()
+        return [(th, full) for th, full in pairs
+                if self._cache_stem(full).lower() not in known]
+
     def _new_result_site_urls(self, result) -> list[str]:
         """The result's site URLs not yet present among the URL chips."""
         return [u for u in self._result_site_urls(result)
                 if u not in (self._store_urls or [])]
-
-    def _merge_result_urls(self, result) -> bool:
-        """Append the result's new site URLs to the URL chips (union, never
-        removes). Returns True when at least one URL was added."""
-        new = self._new_result_site_urls(result)
-        if not new:
-            return False
-        self._store_urls = list(self._store_urls or []) + new
-        self._rebuild_url_chips()
-        return True
 
     def _fetch_from_url_input(self):
         """Chain-icon entry point: open a small modal asking for the game
@@ -1917,6 +1650,7 @@ class SearchFlowMixin:
         # — this entry point (paste-a-link) is exactly the one that used to
         # skip the capture entirely, since it never calls _web_search().
         self._capture_session_initial_image()
+        self._search_saw_nothing_new = False          # a new fetch, a clean slate
         prefill = (self._url_input.text().strip()
                    or (self._store_urls[0] if self._store_urls else ""))
         dlg = _UrlFetchDialog(self, prefill)

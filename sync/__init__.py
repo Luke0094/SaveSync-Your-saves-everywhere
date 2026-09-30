@@ -3,12 +3,14 @@ SaveSync - Sync Registry & Orchestrator
 Manages provider selection, conflict detection, and sync execution.
 """
 import logging
+import os
 import threading
+from pathlib import Path
 from typing import Optional, Type
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from sync.base import SyncProvider, SyncResult
+from sync.base import SyncProvider, SyncResult, has_published_to
 from core.config_manager import get_config
 import i18n
 
@@ -89,108 +91,366 @@ class SyncWorker(QThread):
         self._excluded_paths = excluded_paths or []
         self._orphan = bool(orphan)
 
-    def _migrate_remote_folders(self, providers: list, current_folder: str) -> None:
-        """Move remote backup files from old-name folders into *current_folder*.
+    def _old_folder_candidates(self, current_folder: str) -> list[str]:
+        """Folder names this game has lived under, other than *current_folder*.
 
-        For each past name, if a remote folder exists under the old name it
-        means the game was renamed.  We copy each relevant zip to the new
-        remote folder (using the local copy we already have) then delete the
-        old remote file.  Finally the old remote folder's index.json is removed.
+        Reconstructed from the display-name history PLUS the actual past
+        folder names (folder_history), which keep any disambiguation suffix a
+        display name cannot reproduce. Read from the library as well as from
+        what the caller passed: several callers never hand a name_history over.
+        Folders another live game still owns are left out — a disambiguated
+        game ("Foo~ab12") keeps the plain base ("Foo") in its name history, and
+        "Foo" may be somebody else's home.
         """
         from core.constants import get_folder_name_for_save
-        from core.backup import BACKUP_DIR
         game_id = self._game_id
-
-        # Candidate old folders: reconstructed from display-name history PLUS
-        # actual past folder names (folder_history), which preserve any
-        # disambiguation suffix a display name can't reproduce.
-        candidate_folders = [get_folder_name_for_save(n, self._exe_path, game_id)
-                             for n in self._name_history]
+        names = list(self._name_history)
+        folders: list[str] = []
         try:
             from core.library import get_library as _gl
             _entry = _gl().get_by_id(game_id)
             if _entry is not None:
-                candidate_folders += list(_entry.folder_history or [])
+                names += list(_entry.name_history or [])
+                folders += list(_entry.folder_history or [])
         except Exception:
             pass
-
-        seen_old: set[str] = set()
-        for old_folder in candidate_folders:
-            if not old_folder or old_folder == current_folder or old_folder in seen_old:
+        candidates = [get_folder_name_for_save(n, self._exe_path, game_id)
+                      for n in names] + folders
+        out: list[str] = []
+        for old_folder in candidates:
+            if not old_folder or old_folder == current_folder or old_folder in out:
                 continue
-            seen_old.add(old_folder)
-            # Never migrate OUT of a folder still owned by a different live game.
-            # A disambiguated game (folder "Foo_2") keeps the un-suffixed base
-            # ("Foo") in its name_history, but "Foo" may be another game's active
-            # folder — touching it would delete that game's remote index.json or
-            # steal its files. Only migrate from folders that are truly ex-mine.
             try:
                 from core.library import get_library
                 if get_library().folder_name_in_use_by_other(old_folder, game_id):
                     continue
             except Exception:
                 pass
-            old_remote_base = f"SaveSync/{old_folder}"
-            new_remote_base = f"SaveSync/{current_folder}"
+            out.append(old_folder)
+        return out
 
-            for provider in providers:
+    def _recorded_moves(self) -> dict:
+        """``{provider_id: ["old→new", ...]}`` of remote moves already made for
+        this game (GameEntry.cloud_metadata["remote_rehomed"])."""
+        try:
+            from core.library import get_library
+            e = get_library().get_by_id(self._game_id)
+            return dict((e.cloud_metadata or {}).get("remote_rehomed") or {}) if e else {}
+        except Exception:
+            return {}
+
+    def _record_move(self, provider_id: str, pair: str) -> None:
+        try:
+            from core.library import get_library
+            lib = get_library()
+            e = lib.get_by_id(self._game_id)
+            if e is None:
+                return
+            meta = dict(e.cloud_metadata or {})
+            moves = {k: list(v) for k, v in (meta.get("remote_rehomed") or {}).items()}
+            if pair not in moves.setdefault(provider_id, []):
+                moves[provider_id].append(pair)
+            meta["remote_rehomed"] = moves
+            lib.update_game_fields(self._game_id, cloud_metadata=meta)
+        except Exception:
+            logger.debug("could not record the remote move", exc_info=True)
+
+    def _migrate_remote_folders(self, providers: list, current_folder: str, bm) -> dict:
+        """Re-home this game's remote backups from old-name folders into
+        *current_folder*, on every provider that still has the old folder.
+
+        Remote backups live under ``SaveSync/backup/<folder>`` (see
+        SyncProvider.sync_backups); this used to look one level up, at the
+        legacy ``SaveSync/<folder>``, so a renamed game never found its old
+        folder and the sync that followed met an empty folder under the new
+        name. Returns ``{provider_id: {"gone": [...], "trimmed": {...}}}`` —
+        old folders that were emptied and removed, and old folders that still
+        hold somebody else's backups, with the entries left in their index —
+        so the master index can follow.
+        """
+        candidates = self._old_folder_candidates(current_folder)
+        report: dict = {}
+        if not candidates:
+            return report
+        # One move per (provider, old → new) pair, ever. The name history never
+        # shrinks, so without this every later sync would look at the old
+        # folder again — and if another machine has since started it over on
+        # purpose ("keep both"), take that away too.
+        done = self._recorded_moves()
+        for provider in providers:
+            for old_folder in candidates:
+                pair = f"{old_folder}→{current_folder}"
+                if pair in done.get(provider.PROVIDER_ID, []):
+                    # Moved before. What it can still have left behind is an
+                    # empty folder (a delete that did not go through then).
+                    self._tidy_empty_old_folder(provider, old_folder)
+                    continue
                 try:
-                    if not provider.remote_exists(old_remote_base):
-                        continue
-                    # List backup zips for this game in the old remote folder
-                    try:
-                        remote_files = provider.list_files(old_remote_base)
-                    except Exception:
-                        continue
-
-                    for rf in remote_files:
-                        fname = rf.path.split("/")[-1]
-                        if game_id not in fname:
-                            continue
-                        # Find the local copy to re-upload to new folder
-                        local_zip = BACKUP_DIR / current_folder / fname
-                        if not local_zip.exists():
-                            local_zip = BACKUP_DIR / old_folder / fname
-                        if not local_zip.exists():
-                            logger.debug(f"Skipping {fname}: no local copy found")
-                            continue
-                        new_remote = f"{new_remote_base}/{fname}"
-                        old_remote = f"{old_remote_base}/{fname}"
-                        try:
-                            if provider.upload(local_zip, new_remote):
-                                provider.delete_remote(old_remote)
-                                logger.info(
-                                    f"[{provider.PROVIDER_ID}] Migrated {fname}: "
-                                    f"{old_folder} → {current_folder}"
-                                )
-                        except Exception as e:
-                            logger.warning(f"[{provider.PROVIDER_ID}] Migration failed for {fname}: {e}")
-
-                    # Clean up old remote index.json once the folder is empty.
-                    # "Empty" has to mean empty of EVERYTHING, not just of our
-                    # own zips: a folder named after a shared title can be a
-                    # homonym's home on another machine, and deleting the index
-                    # that describes ITS backups would cost that game its
-                    # history — for a folder this game never even uploaded to.
-                    try:
-                        remaining = provider.list_files(old_remote_base)
-                        others = [f for f in remaining
-                                  if f.path.split("/")[-1] != "index.json"]
-                        if not others:
-                            old_idx = f"{old_remote_base}/index.json"
-                            if provider.remote_exists(old_idx):
-                                provider.delete_remote(old_idx)
-                    except Exception:
-                        pass
+                    res = self._rehome_remote_folder(
+                        provider, old_folder, current_folder, bm)
                 except Exception as e:
-                    logger.debug(f"[{provider.PROVIDER_ID}] Remote migration check failed: {e}")
+                    logger.warning(
+                        f"[{provider.PROVIDER_ID}] Remote folder move "
+                        f"{old_folder} → {current_folder} failed: {e}")
+                    continue
+                if res is None:
+                    continue   # nothing moved (or could not be): try again next time
+                self._record_move(provider.PROVIDER_ID, pair)
+                rep = report.setdefault(
+                    provider.PROVIDER_ID, {"gone": [], "trimmed": {}})
+                if res["old_left"] is None:
+                    rep["gone"].append(old_folder)
+                else:
+                    rep["trimmed"][old_folder] = res["old_left"]
+        return report
 
-    def _sync_one_provider(self, provider: SyncProvider, bm, game_folder) -> SyncResult:
-        """Run sync_backups against a single provider."""
+    def _tidy_empty_old_folder(self, provider, old_folder: str) -> None:
+        """Remove *old_folder* on the provider when — and only when — nothing is
+        in it. The folders offered here are this game's own past homes (see
+        _old_folder_candidates), and an empty one is a leftover of its rename."""
+        base = f"SaveSync/backup/{old_folder}"
+        try:
+            if not provider.remote_exists(base):
+                return
+            if provider.list_files(base) or getattr(provider, "last_list_error", None):
+                return
+            if provider.delete_remote(base):
+                logger.info(f"[{provider.PROVIDER_ID}] Removed the empty old folder {old_folder}")
+        except Exception:
+            logger.debug(f"[{provider.PROVIDER_ID}] Could not tidy {old_folder}", exc_info=True)
+
+    def _rehome_remote_folder(self, provider, old_folder: str,
+                              current_folder: str, bm) -> Optional[dict]:
+        """Move this game's zips — and the index that describes them — from
+        one remote folder to another. None when there was nothing of this
+        game to move or the old folder could not be read.
+
+        Order matters and is what makes a half-finished move recoverable:
+        every zip goes up to the new folder first, THEN the new index, and
+        only then does anything come off the old folder. A run that stops
+        after the zips leaves the old folder whole; one that stops after the
+        index leaves the new folder whole. Never a folder with zips and no
+        index, which the next sync would have to read as a failed fetch.
+
+        Only backups this game owns move (its own rows in the local index).
+        Whatever else sits in the old folder is another game's and stays,
+        with its index trimmed instead of deleted.
+        """
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from core.backup import BACKUP_DIR
+
+        old_base = f"SaveSync/backup/{old_folder}"
+        new_base = f"SaveSync/backup/{current_folder}"
+        if not provider.remote_exists(old_base):
+            return None
+        old_files = provider.list_files(old_base)
+        if not old_files and getattr(provider, "last_list_error", None):
+            return None   # could not verify what is there — touch nothing
+
+        own = {e.backup_id: e for e in bm.get_backups_for_game(self._game_id)}
+        game_id = self._game_id
+
+        def _name(rf) -> str:
+            return rf.path.replace("\\", "/").split("/")[-1]
+
+        # (backup_id, file name, local zip — None when only the provider has it)
+        to_move: list[tuple[str, str, Optional[Path]]] = []
+        for rf in old_files:
+            fname = _name(rf)
+            if not fname.lower().endswith(".zip"):
+                continue
+            stem = fname[:-4]
+            if stem not in own and game_id not in fname:
+                continue
+            candidates = []
+            if stem in own and own[stem].zip_path:
+                candidates.append(Path(own[stem].zip_path))
+            candidates += [BACKUP_DIR / current_folder / fname,
+                           BACKUP_DIR / old_folder / fname]
+            # No local copy is not a reason to leave it behind: local retention
+            # prunes zips that stay listed remotely, and one left in the old
+            # folder would keep that folder (and a trimmed index) alive for
+            # good. It is relayed through a temp file instead.
+            to_move.append((stem, fname, next((p for p in candidates if p.exists()), None)))
+        old_names = {_name(rf) for rf in old_files}
+
+        # The old folder's index, read now: it can be all that is left there. An
+        # earlier version moved the zips and left the index behind — the new
+        # folder then had zips and no index, which a sync must refuse to build
+        # from one machine's rows — and this game's entries in that index still
+        # have to travel, for zips that are ALREADY under the new name.
+        old_idx_entries = provider.list_cloud_backups(old_folder)
+        mine_in_index = [d for d in old_idx_entries
+                         if d.get("backup_id")
+                         and (d["backup_id"] in own or game_id in d["backup_id"])]
+        if not to_move and not mine_in_index:
+            return None
+
+        new_files = provider.list_files(new_base)
+        if not new_files and getattr(provider, "last_list_error", None):
+            return None
+        new_names = {_name(rf) for rf in new_files}
+
+        # 1. Zips into the new folder.
+        moved: list[tuple[str, str]] = []
+        for stem, fname, local in to_move:
+            if fname in new_names:
+                moved.append((stem, fname))
+                continue
+            relay = None
+            try:
+                if local is None:
+                    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
+                        relay = Path(tf.name)
+                    if not provider.download(f"{old_base}/{fname}", relay):
+                        logger.warning(
+                            f"[{provider.PROVIDER_ID}] Could not fetch {fname} from {old_folder}")
+                        continue
+                    local = relay
+                if provider.upload(local, f"{new_base}/{fname}"):
+                    moved.append((stem, fname))
+                else:
+                    logger.warning(
+                        f"[{provider.PROVIDER_ID}] Could not copy {fname} to {current_folder}")
+            finally:
+                if relay is not None:
+                    relay.unlink(missing_ok=True)
+        # Entries whose zip is already where it belongs: nothing to copy, but
+        # their rows go into the new index all the same.
+        already = {d["backup_id"] for d in mine_in_index
+                   if f'{d["backup_id"]}.zip' in new_names}
+        if not moved and not already:
+            return None
+        moved_ids = {stem for stem, _ in moved} | already
+
+        # 2. The index, before anything leaves the old folder.
+        entries = [d for d in old_idx_entries if d.get("backup_id") in moved_ids]
+        listed = {d.get("backup_id") for d in entries}
+        for stem in moved_ids - listed:
+            row = own.get(stem)
+            if row is not None:
+                entries.append(bm.publishable_dict(row))
+        # Every row that moves carries the game's CURRENT title: the old index
+        # still names it as it was, and the move would otherwise keep the old
+        # title alive under the new folder. The old one stays on the row as a
+        # reference (name_history), so the game is still recognisable by it.
+        if self._game_name:
+            from core.library import get_library, reference_history
+            try:
+                _e = get_library().get_by_id(game_id)
+                lib_history = list(_e.name_history or []) if _e is not None else []
+            except Exception:
+                lib_history = []
+            entries = [dict(d, game_name=self._game_name,
+                            name_history=reference_history(
+                                d.get("name_history"), [d.get("game_name")],
+                                lib_history, current=self._game_name))
+                       for d in entries]
+        # A row this machine made says where its zip is read from; that is now
+        # the new folder, and the old path would name a folder that is gone.
+        # Another machine's rows are left as it wrote them (the same rule
+        # sync_backups follows when it republishes an index).
+        from core.machine import get_machine_id
+        me = get_machine_id()
+        entries = [dict(d, zip_path=own[d["backup_id"]].zip_path)
+                   if (d.get("backup_id") in own
+                       and getattr(own[d["backup_id"]], "machine_id", None) == me
+                       and getattr(own[d["backup_id"]], "zip_path", ""))
+                   else d
+                   for d in entries]
+        merged = list(provider.list_cloud_backups(current_folder))
+        seen = {d.get("backup_id") for d in merged}
+        merged += [d for d in entries if d.get("backup_id") not in seen]
+        idx_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
+                                             encoding="utf-8") as f:
+                _json.dump(merged, f, indent=2)
+                idx_tmp = Path(f.name)
+            if not provider.upload(idx_tmp, f"{new_base}/index.json"):
+                logger.warning(
+                    f"[{provider.PROVIDER_ID}] Could not write the index of "
+                    f"{current_folder}; old folder {old_folder} left as it was")
+                return None
+        finally:
+            if idx_tmp is not None:
+                idx_tmp.unlink(missing_ok=True)
+
+        # 3. Off the old folder — the zips that were there; the ones already under
+        # the new name were never in it.
+        for _stem, fname in moved:
+            if fname not in old_names:
+                continue
+            try:
+                provider.delete_remote(f"{old_base}/{fname}")
+            except Exception as e:
+                logger.debug(f"[{provider.PROVIDER_ID}] Could not delete old {fname}: {e}")
+            logger.info(f"[{provider.PROVIDER_ID}] Migrated {fname}: "
+                        f"{old_folder} → {current_folder}")
+
+        # 4. What is left of the old folder. "Empty" means empty of everything
+        # but the index: a folder named after a shared title can be a
+        # homonym's home, and deleting the index that describes ITS backups
+        # would cost that game its history.
+        left = [d for d in old_idx_entries if d.get("backup_id") not in moved_ids]
+        old_idx = f"{old_base}/index.json"
+        remaining = [f for f in provider.list_files(old_base)
+                     if _name(f) != "index.json"]
+        if not remaining:
+            try:
+                provider.delete_remote(old_idx)
+                # The folder itself — but only if a fresh listing says nothing
+                # is in it any more. A cloud provider's folder delete is
+                # normally recursive, so it is never issued on the strength of
+                # a listing taken before the index came off.
+                if not provider.list_files(old_base) and not getattr(
+                        provider, "last_list_error", None):
+                    provider.delete_remote(old_base)
+            except Exception as e:
+                logger.debug(f"[{provider.PROVIDER_ID}] Could not clear {old_folder}: {e}")
+            return {"moved": len(moved), "old_left": None}
+        if old_idx_entries and len(left) != len(old_idx_entries):
+            trim_tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
+                                                 encoding="utf-8") as f:
+                    _json.dump(left, f, indent=2)
+                    trim_tmp = Path(f.name)
+                provider.upload(trim_tmp, old_idx)
+            finally:
+                if trim_tmp is not None:
+                    trim_tmp.unlink(missing_ok=True)
+        return {"moved": len(moved), "old_left": left}
+
+    def _sync_one_provider(self, provider: SyncProvider, bm, game_folder,
+                           rehomed: Optional[dict] = None) -> SyncResult:
+        """Run sync_backups against a single provider.
+
+        *rehomed* is this provider's entry of _migrate_remote_folders' report
+        (old folders emptied / trimmed by a rename), so the master index can
+        follow the move.
+        """
+        rehomed = rehomed or {}
+
         def _on_progress(up, down, bytes_total):
             self.progress.emit(
                 f"⟳ {self._game_name} [{provider.PROVIDER_ID}]: ↑{up} ↓{down} ({bytes_total // 1024}KB)"
             )
+
+        # "Keep both" on the rename notification (see
+        # SyncOrchestrator.find_renamed_remote_folder): this game's old remote
+        # folder is gone on purpose, so a missing index there is expected.
+        allow_fresh = False
+        try:
+            from core.library import get_library as _gl
+            _e = _gl().get_by_id(self._game_id)
+            allow_fresh = bool(
+                _e is not None
+                and game_folder in ((_e.cloud_metadata or {}).get("remote_folder_reset") or []))
+        except Exception:
+            pass
 
         result = provider.sync_backups(
             self._game_id,
@@ -198,6 +458,7 @@ class SyncWorker(QThread):
             bm,
             direction=self._direction,
             progress_callback=_on_progress,
+            allow_fresh_index=allow_fresh,
         )
 
         # Refresh the master index whenever anything actually transferred —
@@ -216,7 +477,16 @@ class SyncWorker(QThread):
         # to refresh it, and every sync until then treated already-uploaded
         # backups as still needing to be checked from scratch.
         # Limit enforcement only applies when new backups were uploaded.
-        if result.files_uploaded > 0 or result.files_downloaded > 0:
+        #
+        # A run that only republished the index (a rename, a note, a changed
+        # row) or that re-homed a renamed game's folder transfers nothing, so
+        # the counts alone left the master index describing the old folder.
+        # Those two triggers additionally require an index that could be read
+        # back: an empty list there means the fetch failed, and writing it
+        # over the game's master entry would erase it.
+        transferred = result.files_uploaded > 0 or result.files_downloaded > 0
+        republished = result.index_published or bool(rehomed)
+        if transferred or republished:
             try:
                 from core.config_manager import get_config
                 from core.constants import MAX_LOCAL_BACKUPS, BACKUP_RETENTION_DAYS, MIN_KEPT_BACKUPS
@@ -233,9 +503,15 @@ class SyncWorker(QThread):
                     )
 
                 # Always update master index after any change (serialized locally)
-                if remote_entries is not None:
+                if remote_entries is not None and (transferred or remote_entries):
                     with SyncWorker._master_index_lock:
-                        provider.update_master_index(game_folder, remote_entries)
+                        provider.update_master_index(
+                            game_folder, remote_entries,
+                            remove_folders=list(rehomed.get("gone") or []))
+                        # Old folders that still hold another game's backups
+                        # keep their master row, minus what moved out.
+                        for old_folder, left in (rehomed.get("trimmed") or {}).items():
+                            provider.update_master_index(old_folder, left)
             except Exception as e:
                 logger.warning(f"Post-sync index update failed for {provider.PROVIDER_ID}: {e}")
 
@@ -312,9 +588,30 @@ class SyncWorker(QThread):
                             skip_mtime_preflight=True,
                         )
 
-            # Migrate remote folders for old names before sync
-            if self._name_history:
-                self._migrate_remote_folders(active, game_folder)
+            # A rename that never produced a backup left the zips in the old
+            # local folder — create_backup is what moves them, and a sync that
+            # finds the saves unchanged never gets that far. Same for the
+            # remote side below, which only a sync can do.
+            rehomed: dict = {}
+            if not self._orphan and self._direction in ("auto", "up"):
+                try:
+                    bm.consolidate_game_folder(self._game_id, game_folder)
+                except Exception:
+                    logger.debug("Sync: local folder consolidation failed", exc_info=True)
+                # The index is published from these rows: they carry the
+                # game's current title, whatever it was called when each was made.
+                try:
+                    bm.retitle_rows(self._game_id, self._game_name)
+                except Exception:
+                    logger.debug("Sync: retitling the backup rows failed", exc_info=True)
+
+                # Move the remote folder of any old name into the current one
+                # BEFORE syncing, so the index under the new name exists
+                # (see SyncProvider.sync_backups' failed-fetch guard).
+                try:
+                    rehomed = self._migrate_remote_folders(active, game_folder, bm)
+                except Exception:
+                    logger.warning("Sync: remote folder migration failed", exc_info=True)
 
             if self.isInterruptionRequested():
                 self.finished.emit(SyncResult(success=False, message="Sync cancelled"))
@@ -329,10 +626,17 @@ class SyncWorker(QThread):
                     combined.message = "Sync cancelled"
                     break
                 try:
-                    result = self._sync_one_provider(provider, bm, game_folder)
+                    result = self._sync_one_provider(
+                        provider, bm, game_folder,
+                        rehomed=rehomed.get(provider.PROVIDER_ID))
                     combined.files_uploaded += result.files_uploaded
                     combined.files_downloaded += result.files_downloaded
                     combined.bytes_transferred += result.bytes_transferred
+                    # A folder move re-published the index too, even when the
+                    # sync itself then found nothing further to send.
+                    combined.index_published = (
+                        combined.index_published or result.index_published
+                        or bool(rehomed.get(provider.PROVIDER_ID)))
                     if result.conflicts:
                         # Cross-machine divergence: stop the whole run and
                         # let the user's ConflictDialog choice re-launch the
@@ -925,6 +1229,19 @@ class SyncOrchestrator(QObject):
                     _gl().update_game_fields(game_id, pending_local_wins=False)
             except Exception:
                 pass
+        # The fresh start "keep both" allowed has happened once the folder has
+        # an index of its own again: the escape is spent, and must not stay
+        # open for a later, genuinely failed fetch.
+        if result.success and (result.files_uploaded > 0 or result.index_published):
+            try:
+                from core.library import get_library as _gl
+                _er = _gl().get_by_id(game_id)
+                if _er is not None and (_er.cloud_metadata or {}).get("remote_folder_reset"):
+                    _meta = dict(_er.cloud_metadata)
+                    _meta.pop("remote_folder_reset", None)
+                    _gl().update_game_fields(game_id, cloud_metadata=_meta)
+            except Exception:
+                pass
         # Stamp the machine_id on cloud_metadata so other machines can detect cross-machine syncs
         if result.files_uploaded > 0 or result.files_downloaded > 0:
             try:
@@ -1099,6 +1416,75 @@ class SyncOrchestrator(QObject):
                 continue
         return False
 
+    def find_renamed_remote_folder(self, game_id: str, current_folder: str) -> Optional[dict]:
+        """Where this game's backups went, when ITS remote folder is gone.
+
+        Another machine that renamed the game moves the remote folder to the
+        new name (see SyncWorker._migrate_remote_folders), so here the old
+        folder is simply missing and every sync would meet an empty one. The
+        link between the two is the backups themselves: a backup id is the
+        same on every machine, so the folder whose index holds ids this game
+        already has locally IS the game, under its new name.
+
+        Conservative on purpose — None (nothing to say) unless the game's own
+        folder is confirmed empty, the provider could be read, and some other
+        folder holds backups this game already has (the one sharing the most
+        wins). Returns ``{"folder", "name", "provider"}``: the folder to follow
+        and the title its newest entry from another machine carries. Meant for
+        a background thread (network).
+        """
+        if not game_id or not current_folder:
+            return None
+        from core.backup import get_backup_manager
+        rows = list(get_backup_manager().get_backups_for_game(game_id))
+        local_ids = {b.backup_id for b in rows}
+        if not local_ids:
+            return None
+        try:
+            from core.machine import get_machine_id
+            mine = get_machine_id()
+        except Exception:
+            mine = ""
+        for p in self.get_connected_providers():
+            # A game that never published to this provider has no folder there
+            # to have lost — same test sync_backups uses for "history exists".
+            # Without it every launch of such a game would download the master
+            # index (or scan every folder's) for nothing.
+            if not has_published_to(p.PROVIDER_ID, rows):
+                continue
+            try:
+                # Its own folder still holds backups (or cannot be checked —
+                # this fails open): nothing was renamed as far as we can tell.
+                if self._remote_folder_has_backup_zip(p, current_folder):
+                    continue
+                found = p.list_all_cloud_backups()
+            except Exception:
+                continue
+            best = None
+            for folder, entries in (found or {}).items():
+                if folder == current_folder or not isinstance(entries, list):
+                    continue
+                ids = {e.get("backup_id") for e in entries if isinstance(e, dict)}
+                overlap = len(ids & local_ids)
+                if overlap and (best is None or overlap > best[0]):
+                    best = (overlap, folder, entries)
+            if best is None:
+                continue
+            _n, folder, entries = best
+            try:
+                from core.library import get_library
+                if get_library().folder_name_in_use_by_other(folder, game_id):
+                    continue   # another game here already lives there
+            except Exception:
+                pass
+            named = sorted((e for e in entries if isinstance(e, dict) and e.get("game_name")),
+                           key=lambda e: e.get("created_at") or "", reverse=True)
+            others = [e for e in named if e.get("machine_id") != mine]
+            pick = (others or named or [None])[0]
+            return {"folder": folder, "name": (pick or {}).get("game_name") or folder,
+                    "provider": p.PROVIDER_ID}
+        return None
+
     def cloud_name_folders(self, base_folder: str) -> list[str]:
         """Remote backup folders whose base name — with any ``_N`` disambiguation
         suffix stripped — matches *base_folder*, and that actually contain a
@@ -1182,6 +1568,97 @@ class SyncOrchestrator(QObject):
             except Exception:
                 continue
         return False
+
+    def delete_cloud_backup(self, provider, folder: str, backup_id: str, bm) -> tuple:
+        """Delete a backup that exists ONLY on *provider*: its zip, its row in
+        the folder's index and in the master index, and the folder itself when
+        that leaves it empty. ``(True, "")``, or ``(False, reason)`` with the
+        reason "local" (a local copy exists), "zip" (the provider would not
+        delete it) or "error".
+
+        The two sides are separate things and are never deleted together: a
+        backup that still has a local copy is refused here — deleting locally
+        never touched the cloud, and deleting from the cloud never touches
+        the local one. Blocking (provider calls): run it off the GUI thread.
+
+        The zip goes first, so a provider that refuses leaves everything as
+        it was; only then is the index rewritten. Another machine that still
+        holds the backup locally will publish it again at its next sync — a
+        delete here is a delete on THIS provider, not a tombstone."""
+        import json as _json
+        import tempfile
+        if bm.get_backup(backup_id) is not None:
+            return False, "local"
+        base = f"SaveSync/backup/{folder}"
+        try:
+            rows = list(provider.list_cloud_backups(folder))
+            zip_path = f"{base}/{backup_id}.zip"
+            if provider.remote_exists(zip_path) and not provider.delete_remote(zip_path):
+                return False, "zip"
+            left = [r for r in rows if r.get("backup_id") != backup_id]
+            if left:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
+                                                 encoding="utf-8") as f:
+                    _json.dump(left, f, indent=2)
+                    tmp = Path(f.name)
+                try:
+                    if not provider.upload(tmp, f"{base}/index.json"):
+                        return False, "error"
+                finally:
+                    tmp.unlink(missing_ok=True)
+                provider.update_master_index(folder, left)
+            else:
+                index_path = f"{base}/index.json"
+                if provider.remote_exists(index_path):
+                    provider.delete_remote(index_path)
+                # The folder goes only when nothing at all is left in it.
+                if (not provider.list_files(base)
+                        and not getattr(provider, "last_list_error", None)):
+                    provider.delete_remote(base)
+                provider.update_master_index(folder, None)
+        except Exception:
+            logger.warning(f"[{getattr(provider, 'PROVIDER_ID', '?')}] Could not delete "
+                           f"{backup_id} from {folder}", exc_info=True)
+            return False, "error"
+        logger.info(f"[{provider.PROVIDER_ID}] Deleted cloud backup {backup_id} from {folder}")
+        return True, ""
+
+    @staticmethod
+    def _local_root_of(provider):
+        """The folder on THIS disk a provider works out of — None for an API
+        provider. A synced OneDrive / Dropbox / Drive folder and a plain one
+        both are: the delegate holds the folder."""
+        for candidate in (provider, getattr(provider, "_local_delegate", None)):
+            root = getattr(candidate, "_root", None)
+            if root is not None:
+                return Path(root)
+        return None
+
+    def local_zip_index(self, provider):
+        """``{folder (casefolded): {zip names}}`` for a provider's whole backup
+        tree, or None when that cannot be said cheaply.
+
+        Read off the disk — directory names only, never file contents:
+        list_files hashes every file it lists, which for a tree of zips is
+        every byte of it (and, in a synced folder, can pull placeholders
+        down). What lets the Backups tab list a cloud entry only when there
+        is a backup behind it. None for an API provider or a tree that
+        cannot be read, and then nothing is hidden. Read-only: nothing here
+        deletes or writes anything, on either side."""
+        root = self._local_root_of(provider)
+        if root is None:
+            return None
+        out: dict = {}
+        try:
+            with os.scandir(root / "SaveSync" / "backup") as entries:
+                folders = [e for e in entries if e.is_dir()]
+            for e in folders:
+                with os.scandir(e.path) as files:
+                    out[e.name.casefold()] = {f.name for f in files
+                                              if f.name.lower().endswith(".zip")}
+        except OSError:
+            return None       # one folder unreadable: no claim about any
+        return out
 
 
 _orchestrator: Optional[SyncOrchestrator] = None

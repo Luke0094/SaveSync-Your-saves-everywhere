@@ -20,6 +20,7 @@ _VNDB_FIELDS = (
     "id, title, alttitle, "
     "titles{lang,title,latin,official,main}, "
     "image{url,thumbnail,sexual,violence}, "
+    "screenshots{url,thumbnail}, "
     "description, "
     "tags{id,name,rating,spoiler}, "
     "developers{name}, "
@@ -224,6 +225,12 @@ def _parse_vndb_entry(entry: dict) -> GameInfo:
         release_date=release_date,
         store_url=store_url,
         source="vndb",
+        languages=[l for l in (entry.get("languages") or []) if isinstance(l, str)],
+        # The same policy as the cover above: nothing is filtered by rating —
+        # they are offered, and only added when picked.
+        screenshots=[(s.get("thumbnail") or s["url"], s["url"])
+                     for s in (entry.get("screenshots") or [])
+                     if isinstance(s, dict) and s.get("url")],
         extra_urls=extra_urls,
         alt_names=alt_names,
         rating=stars,

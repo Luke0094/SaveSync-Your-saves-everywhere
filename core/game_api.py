@@ -40,6 +40,7 @@ from core.game_sources.webscrape import (   # noqa: F401
     _search_targeted_sites, _web_search_urls, _web_search_urls_single,
     _find_itch_url_via_search, _find_dlsite_url_via_search,
     _scrape_itch_title, engines_blocked_status, _engine_new_search_phase,
+    _scrape_dlsite_en,
 )
 
 
@@ -108,6 +109,18 @@ def fetch_info_from_url(url: str) -> Optional[GameInfo]:
         if info:
             return info
         logger.info(f"Steam API gave nothing for {u!r} — reading the page directly")
+    if "dlsite.com" in urllib.parse.urlsplit(u).netloc.lower():
+        # A DLsite link is read in the English locale, whatever it was pasted
+        # as: without it the page answers in Japanese and so do its tags. The
+        # search path does the same (and follows the canonical page when the
+        # section it was pasted under only serves the Japanese one).
+        base = u.split("?")[0]
+        info = _scrape_dlsite_en(base)
+        if info and info.name:
+            info.source = "dlsite"
+            info.store_url = info.store_url or (base + "?locale=en_US")
+            return info
+        u = base + "?locale=en_US"
     status, html = _fetch_html_ex(u)
     if status == 0:
         raise UrlFetchError('network')

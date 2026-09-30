@@ -661,6 +661,12 @@ def _is_foreign_user_path(path_str: str, current_user: str) -> bool:
     return False
 
 
+def _names_for_row(given, library_history, current: str) -> list:
+    """The name_history a new row is written with (see BackupEntry.name_history)."""
+    from core.library import reference_history
+    return reference_history(given, library_history, current=current)
+
+
 @dataclass
 class BackupEntry:
     game_id: str
@@ -707,6 +713,13 @@ class BackupEntry:
     # destination is known to the library and to nobody else, so a restore
     # can only put the files back where they were copied from.
     content_chains: list[str] = field(default_factory=list)
+    # The game's own name_history (core.library.GameEntry.name_history) as the
+    # index carries it — a REFERENCE, never the name shown. game_name is always
+    # the current title; this is what still ties the row to the same game for
+    # anything that only knows it by an earlier name (another machine's
+    # library, a fresh install about to pull the saves down). Absent from
+    # older index files.
+    name_history: list[str] = field(default_factory=list)
     # Integrity check state. Absent from older index files, which is exactly
     # what "" means: never checked. from_dict drops unknown keys, so adding
     # these does not invalidate an existing index.
@@ -753,6 +766,9 @@ class BackupEntry:
 
     @classmethod
     def from_dict(cls, d: dict) -> "BackupEntry":
+        d = dict(d)
+        if "former_names" in d:          # an early spelling of name_history
+            d.setdefault("name_history", d["former_names"])
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
     @property
@@ -1098,10 +1114,26 @@ class BackupManager(QObject):
             return True
         if had_tombstone:
             self._save_deleted_ids()
+        # What just came off a provider is checked before it is trusted: the
+        # state recorded above says "unchecked" on purpose (a verdict from the
+        # machine that made it describes a different file), and it would stay
+        # that way until the next sweep.
+        self._verify_on_arrival(imported.backup_id)
         self._save_game_index(imported.game_id)
         self.backup_created.emit(imported)
         logger.info(f"Imported cloud backup: {imported.backup_id} ({imported.size_human})")
         return True
+
+    def _verify_on_arrival(self, backup_id: str) -> None:
+        """Integrity-check one backup the moment it enters the index (created
+        here, or downloaded). In memory only — the caller's own index write
+        carries the result. Never raises: a failed check is a state on the
+        entry ("corrupt", "missing"), and the backup itself must still land."""
+        try:
+            self.verify_backup(backup_id, deep=False, persist=False,
+                               repair_legacy=False)
+        except Exception:
+            logger.debug(f"Arrival check failed for {backup_id}", exc_info=True)
 
     def _save_game_index(self, game_id: str, _folder_hint: str = "",
                          mark_unpublished: bool = True):
@@ -1147,7 +1179,12 @@ class BackupManager(QObject):
                         if not meta.get(self.INDEX_PUBLISH_KEY):
                             meta[self.INDEX_PUBLISH_KEY] = True
                             b.cloud_metadata = meta
-            # Everything that belongs in this folder's index — any game_id.
+        self._write_folder_index(folder, game_id)
+
+    def _write_folder_index(self, folder: str, game_id: str = ""):
+        """Write (or, when nothing is left in it, remove) one backup folder's
+        index.json: every entry whose zip lives there, whatever its game_id."""
+        with _index_lock:
             folder_entries = [
                 b for b in self._index
                 if self._game_folder_for_entry(b) == folder
@@ -1174,16 +1211,32 @@ class BackupManager(QObject):
                 json.dump(data, f, indent=2)
             _atomic_replace(tmp_path, idx_path)
         except Exception as e:
-            logger.error(f"Game index save error for {game_id}: {e}")
+            logger.error(f"Game index save error for {game_id or folder}: {e}")
 
-    def _save_index(self):
-        """Save all per-game index files. Used after bulk operations."""
+    def _save_folder_indexes(self, folders):
+        """Write index.json for just these backup folders, and not flag them.
+
+        A relocation touches the folder a game's zips came from and the one they
+        went to — never the rest of the library. _save_index() rewrites every
+        game's index, one file each with a scan of every row in between, which
+        is what froze the window for seconds when a rename was saved from the
+        edit panel of a large library."""
+        for folder in dict.fromkeys(f for f in folders if f):
+            self._write_folder_index(folder)
+
+    def _save_index(self, mark_unpublished: bool = True):
+        """Save all per-game index files. Used after bulk operations.
+
+        *mark_unpublished* is passed straight to _save_game_index; a caller
+        that only relocated files (nothing the provider needs to be told)
+        passes False so the whole library is not flagged for republishing.
+        """
         game_ids: set[str] = set()
         with _index_lock:
             for b in self._index:
                 game_ids.add(b.game_id)
         for gid in game_ids:
-            self._save_game_index(gid)
+            self._save_game_index(gid, mark_unpublished=mark_unpublished)
 
     @staticmethod
     def _file_fingerprint(path: Path, prev_fp: str = "") -> str:
@@ -1523,6 +1576,7 @@ class BackupManager(QObject):
         orphan_dest_map: dict | None = None,
         report_regression: bool = False,
         check_unbacked: bool = False,
+        extra_metadata: dict | None = None,
     ) -> ("Optional[BackupEntry] | tuple[Optional[BackupEntry], bool] "
           "| tuple[Optional[BackupEntry], bool, Optional[BackupEntry] | str]"):
         """Create a zip backup of all save paths for a game.
@@ -1598,6 +1652,11 @@ class BackupManager(QObject):
                 matched (for a review panel) or the held-back entry just
                 comes back silently the same shape "already current" always
                 has.
+            extra_metadata: Merged into the entry's cloud_metadata BEFORE it is
+                indexed — so a marker that decides which line of history the
+                row belongs to (see MANUAL_VERSION_KEY) is already there when
+                the limits are enforced, and cannot push a real backup out
+                to make room for a row that is not part of that line.
             check_unbacked: The "unbacked" hold-back (content matches no
                 backup in this game's history at all, not the newest, not
                 any older one) only happens when this is True, separately
@@ -1712,7 +1771,14 @@ class BackupManager(QObject):
         # When every save mtime is still ≤ the newest mtime recorded on the
         # previous backup and the entry count matches, skip without walking
         # into hashing. Newer mtimes fall through to the content path.
-        recent = self.get_backups_for_game(game_id) if not force else []
+        # The game's own history first, newest first — then any versions added
+        # by hand. Those are dated when they were ADDED, so by date one of them
+        # is the "newest", and the mtime preflight, the manifest and the hash
+        # below would all be the live saves measured against saves that may be
+        # older than they are, with the same number of files: "already
+        # current". They stay in the list — a state the saves may match — but
+        # never at its head.
+        recent = self._history_for_comparison(game_id) if not force else []
         prev_manifest: dict = {}
         if recent and not selective:
             prev_meta = recent[0].cloud_metadata or {}
@@ -1771,6 +1837,34 @@ class BackupManager(QObject):
             if current_hash and current_hash == last_hash:
                 logger.info(f"Backup already current for '{game_name}' — reusing existing")
                 return _ret(recent[0], False)
+            # A state SaveSync itself put there is an intended one, not a
+            # regression. The gate below reads "matches an OLDER backup" as
+            # "something put an earlier state back", and a restore does exactly
+            # that on purpose — so the next Backup Now / Backup Tutti held the
+            # game back against the restore the person had just asked for, and
+            # asking again ("Restore the newest") only moved which backup it
+            # matched. detect_regression has always honoured the marker a
+            # restore leaves (get_last_restored_backup_id); this gate did not.
+            #
+            # Likewise the newest row of the MAIN history stands for "now" even
+            # when a side copy (see is_side_backup) is newer by timestamp: a
+            # pre-restore copy is the newest row right after a restore, and the
+            # current state matching the real newest is the opposite of a
+            # regression.
+            _intended = []
+            _restored_id = self.get_last_restored_backup_id(game_id)
+            if _restored_id:
+                _intended += [b for b in recent if b.backup_id == _restored_id]
+            _main_line = [b for b in recent if not self.is_side_backup(b)]
+            if _main_line and _main_line[0] is not recent[0]:
+                _intended.append(_main_line[0])
+            for _cand in _intended:
+                _cm = (_cand.cloud_metadata or {}).get("file_manifest") or {}
+                if self._manifest_is_comparable(_cm) and current_hash == self.state_hash_of(_cm):
+                    logger.info(
+                        f"Backup already current for '{game_name}' — the state is "
+                        f"backup {_cand.backup_id} (restored / newest of the main history)")
+                    return _ret(_cand, False)
             # current_hash differs from the newest backup — genuinely
             # different content, which is exactly the condition under which
             # a backup normally gets written below. Before doing that:
@@ -1821,13 +1915,18 @@ class BackupManager(QObject):
                     f"Backup held back for '{game_name}': current state matches "
                     f"no known backup — unrecognized/untracked change")
                 return _ret(recent[0], False, "unbacked")
-            # Hard debounce: never more than 1 backup per 30 seconds.
+            # Hard debounce: never more than 1 backup per 30 seconds. Against
+            # the main history's newest for an ordinary backup: a pre-restore
+            # copy taken moments ago is a side copy, and must not hold a real
+            # backup of new play off for half a minute.
+            _deb = (_main_line[0] if (_main_line and not pre_confirmation)
+                    else recent[0])
             try:
-                age = (now - recent[0].created_dt).total_seconds()
+                age = (now - _deb.created_dt).total_seconds()
             except (ValueError, TypeError):
                 age = 999  # malformed timestamp, allow backup
             if age < 30:
-                return _ret(recent[0], False)
+                return _ret(_deb, False)
 
         if not changed_arc_names:
             logger.info(f"Backup skipped for '{game_name}' — all {len(new_manifest)} files unchanged (per-file check)")
@@ -1905,6 +2004,8 @@ class BackupManager(QObject):
             }
             if pre_confirmation:
                 metadata["pre_confirmation"] = True
+            if extra_metadata:
+                metadata.update(extra_metadata)
             if identity_alternates:
                 metadata["identity_pending"] = True
                 metadata["identity_alternates"] = [
@@ -1995,15 +2096,24 @@ class BackupManager(QObject):
                 exe_path=exe_path,
                 save_chains=_save_chains,
                 content_chains=_content,
+                name_history=_names_for_row(
+                    name_history, self._library_name_history(game_id), game_name),
             )
             with _index_lock:
                 self._index.append(entry)
+            # A backup nobody has looked at is not yet one anyone can rely on:
+            # the dot stayed grey until a sweep happened to come round (up to a
+            # schedule's worth of days later) — and a sweep that had already
+            # listed its archives never saw this one at all. Checked here, on
+            # the zip just written, and saved with the same index write.
+            self._verify_on_arrival(backup_id)
             self._save_game_index(game_id)
             self._enforce_limits(game_id)
-            if not pre_confirmation:
+            if not pre_confirmation and not (extra_metadata or {}).get(self.MANUAL_VERSION_KEY):
                 # Genuinely new, trusted progress past whatever was last
                 # restored — see clear_last_restored's own docstring for
-                # why the flag doesn't need to survive this.
+                # why the flag doesn't need to survive this. A version added
+                # by hand is not progress: the game has not moved.
                 self.clear_last_restored(game_id)
             self.backup_created.emit(entry)
             logger.info(f"Backup created: {backup_id} ({entry.size_human})")
@@ -2542,7 +2652,7 @@ class BackupManager(QObject):
 
         # An archive's zip is rooted on the name of the folder it was READ
         # from — the user's own shelf name, version and release tags and all
-        # ("TomieWGM v0.760"). save_paths above carries the DESTINATION,
+        # ("Example Game v0.760"). save_paths above carries the DESTINATION,
         # whose last component is a different word entirely, so keying the
         # redirect on it alone meant no archive member ever matched one: the
         # extraction fell through to the "single directory" remap and
@@ -2667,16 +2777,21 @@ class BackupManager(QObject):
                 )
                 if not safety:
                     logger.warning(f"Pre-restore safety backup failed for '{entry.game_name}' — proceeding with restore")
-                elif safety_provisional:
+                else:
                     # A dedicated marker, not the (locale-baked, so unsafe
-                    # to match on) note string: this is what tells
-                    # discard/promote_pre_confirmation_backups apart from
-                    # the OTHER reason a backup ends up pre_confirmation
-                    # here (create_backup's own notif_gated captures of the
-                    # state being rejected THIS restore). Those two do NOT
-                    # share a lifecycle — a safety copy is a distinct
-                    # vintage from a PAST restore and must survive a LATER,
-                    # unrelated restore's own discard call, exactly the
+                    # to match on) note string. Always — not only when the
+                    # copy is also provisional: an ordinary restore's safety
+                    # copy used to join the main history as a plain backup, so
+                    # it counted against the limits, could be picked as "the
+                    # newest" and was uploaded as if it were real progress.
+                    # Marked, it is the branch's (see is_side_backup) — and it
+                    # is what tells discard/promote_pre_confirmation_backups
+                    # apart from the OTHER reason a backup ends up
+                    # pre_confirmation here (create_backup's own notif_gated
+                    # captures of the state being rejected THIS restore).
+                    # Those two do NOT share a lifecycle — a safety copy is a
+                    # distinct vintage from a PAST restore and must survive a
+                    # LATER, unrelated restore's own discard call, exactly the
                     # data loss this marker exists to prevent.
                     self.mark_pre_restore_safety(safety.backup_id)
 
@@ -3025,6 +3140,7 @@ class BackupManager(QObject):
                 stale_folders.add(folder)
 
         moved = 0
+        emptied: list[str] = []
         for old_folder in sorted(stale_folders):
             # Never steal a folder that is still another live game's home.
             try:
@@ -3032,10 +3148,26 @@ class BackupManager(QObject):
                     continue
             except Exception:
                 pass
-            moved += self._move_game_zips(game_id, old_folder, current_folder)
+            n = self._move_game_zips(game_id, old_folder, current_folder)
+            if n:
+                emptied.append(old_folder)
+            moved += n
         if moved:
-            self._save_index()
+            # A relocation is not news for the provider: writing every index
+            # back as "unpublished" made one moved game flag the whole library.
+            # Nor is it news for any other game's index, so only the folders
+            # the zips left and reached are written.
+            self._save_folder_indexes([current_folder, *emptied])
         return moved
+
+    def consolidate_game_folder(self, game_id: str, current_folder: str) -> int:
+        """Public face of the index-driven folder move, for callers that must
+        not depend on a backup being written to get it (a sync that finds
+        the saves unchanged never reaches create_backup). Returns how many
+        zips were relocated."""
+        if not game_id or not current_folder:
+            return 0
+        return self._migrate_stale_backup_folders(game_id, current_folder)
 
     def _move_game_zips(self, game_id: str, old_folder: str,
                         current_folder: str) -> int:
@@ -3112,6 +3244,125 @@ class BackupManager(QObject):
             self._save_game_index(game_id)
             self._save_index()
         return moved
+
+    def apply_game_rename(self, game_id: str, game_name: str,
+                          current_folder: str) -> bool:
+        """A game's title — and with it its backup folder — has changed.
+
+        Nothing else notices. A rename writes no backup, and a backup is the
+        only thing that used to carry a folder move, a new title or a fresh
+        "publish me" flag into the index, so the provider kept the old folder
+        and the old name for as long as the saves stayed untouched, and a
+        sync that finally ran met an empty folder under the new name.
+
+        Done here, right when it happens: the zips move into the new folder,
+        every row of this game takes the new title, and the index is marked as
+        not yet published — which is what lets a sweep, an exit-time sync or
+        the sync page have a reason to go for a game whose SAVES have not
+        moved. Returns True when there was anything of this game to update.
+        """
+        if not game_id or not current_folder:
+            return False
+        # Index-driven, not name_history-driven: it moves exactly the zips this
+        # game's rows point at, and — unlike _migrate_old_backup_folders — does
+        # not re-save (and so re-flag) every other game's index on the way.
+        self._migrate_stale_backup_folders(game_id, current_folder)
+        touched = False
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                touched = True
+        if touched:
+            # retitle_rows writes the index when a title or history moved; a
+            # folder move alone still has to be written and flagged.
+            if not self.retitle_rows(game_id, game_name):
+                # Marks the rows unpublished as a side effect of every index write.
+                self._save_game_index(game_id)
+        return touched
+
+    @staticmethod
+    def _library_name_history(game_id: str) -> list:
+        """The game's own name_history, or [] when it is not in the library."""
+        try:
+            from core.library import get_library
+            g = get_library().get_by_id(game_id)
+            return list(g.name_history or []) if g is not None else []
+        except Exception:
+            return []
+
+    def retitle_rows(self, game_id: str, game_name: str) -> bool:
+        """Give every row of *game_id* the game's current title and its name
+        history — and write the index (so it is published) only when a row
+        actually changed.
+
+        The rows carry the title the game had when each backup was taken, and
+        nothing rewrote them when the game was renamed by an older version, or
+        when an index that still named it as it was came back in a sync. The
+        Backups page titles a group by its rows, so the old name kept showing.
+        The title a row replaces is not lost: it joins the row's name_history,
+        the same list the game itself keeps.
+        """
+        from core.library import reference_history
+        if not game_id or not game_name:
+            return False
+        lib_history = self._library_name_history(game_id)
+        changed = False
+        with _index_lock:
+            for b in self._index:
+                if b.game_id != game_id:
+                    continue
+                history = reference_history(
+                    b.name_history, [b.game_name], lib_history, current=game_name)
+                if b.game_name != game_name or list(b.name_history or []) != history:
+                    b.name_history = history
+                    b.game_name = game_name
+                    changed = True
+        if changed:
+            self._save_game_index(game_id)
+        return changed
+
+    def retitle_rows_from_library(self) -> int:
+        """retitle_rows for every library game whose backups still carry
+        another title. Returns how many games were corrected."""
+        try:
+            from core.library import get_library
+            names = {g.id: g.name for g in get_library().all_games() if g.name}
+        except Exception:
+            return 0
+        with _index_lock:
+            stale = {b.game_id for b in self._index if b.game_id in names}
+        return sum(1 for gid in stale if self.retitle_rows(gid, names[gid]))
+
+    def merge_row_names_into_library(self) -> int:
+        """Put the names the backups remember for a game onto the game's own
+        name_history, where they are missing. One list, seen from two sides —
+        the library entry on this machine, the rows in the index — and a side
+        that lost a name (an entry renamed before it had a history, an index
+        that arrived from another machine) is repaired from the other. The
+        older names go first, the current one stays last. Returns how many
+        games gained a name."""
+        from core.library import merge_name_histories
+        try:
+            from core.library import get_library
+            lib = get_library()
+            games = {g.id: g for g in lib.all_games()}
+        except Exception:
+            return 0
+        found: dict = {}
+        with _index_lock:
+            for b in self._index:
+                if b.game_id in games:
+                    found.setdefault(b.game_id, []).extend(
+                        list(b.name_history or []) + [b.game_name])
+        changed = 0
+        for gid, names in found.items():
+            g = games[gid]
+            merged = merge_name_histories(names, g.name_history, current=g.name)
+            if merged != list(g.name_history or []):
+                lib.update_game_fields(gid, name_history=merged)
+                changed += 1
+        return changed
 
     def delete_backup(self, backup_id: str) -> bool:
         entry = self.get_backup(backup_id)
@@ -3577,7 +3828,8 @@ class BackupManager(QObject):
         return ""
 
     def newest_trusted_backup_id(self, game_id: str) -> str:
-        """The newest backup for *game_id* that ISN'T pre_confirmation, or
+        """The newest backup for *game_id* on the main line (not a side-branch
+        copy — see is_side_backup) and not known to be corrupt or missing, or
         "" if none exists.
 
         get_backups_for_game()[0] — "the newest backup" — is the right
@@ -3595,7 +3847,14 @@ class BackupManager(QObject):
             for entry in sorted(
                     (b for b in self._index if b.game_id == game_id),
                     key=lambda b: b.created_dt, reverse=True):
-                if not (entry.cloud_metadata or {}).get("pre_confirmation"):
+                # Neither provisional NOR a pre-restore safety copy: the latter
+                # is the state a restore just moved AWAY from, so "restore the
+                # newest" landing on it would undo the restore it followed. And
+                # not an archive the integrity checks found broken or gone —
+                # "restore the newest" pointing at one that cannot be restored
+                # is no answer (it falls through to the next one).
+                if (not self.is_side_backup(entry)
+                        and (entry.verify_state or "") not in ("corrupt", "missing")):
                     return entry.backup_id
         return ""
 
@@ -3623,9 +3882,10 @@ class BackupManager(QObject):
         return backups[0].backup_id if backups else ""
 
     def mark_pre_restore_safety(self, backup_id: str) -> None:
-        """Tag *backup_id* as a pre-restore safety copy filed provisional
-        (see restore_backup's safety_provisional) — a distinct, permanent
-        marker, not the backup's (locale-baked, translated) note text.
+        """Tag *backup_id* as a pre-restore safety copy — filed provisional
+        too when the restore asked for that (safety_provisional); either way a
+        side-branch copy (see is_side_backup). A distinct, permanent marker,
+        not the backup's (locale-baked, translated) note text.
 
         discard_pre_confirmation_backups and promote_pre_confirmation_backups
         both exclude a backup carrying this tag, the same way they already
@@ -3667,6 +3927,12 @@ class BackupManager(QObject):
         content the player never actually confirmed. Idempotent: safe to
         call again on an already-tagged entry (a dedup-skip landing on the
         same provisional backup a later tick).
+
+        Only ever tags an entry that IS temporary. create_backup hands back
+        the existing backup when it writes nothing (state unchanged, held
+        back as a regression), and the callers tag whatever came back: that
+        would mark a real backup as "held for review", raising a review
+        badge over history nobody is questioning.
         """
         game_id = ""
         with _index_lock:
@@ -3674,6 +3940,8 @@ class BackupManager(QObject):
                 if entry.backup_id != backup_id:
                     continue
                 meta = entry.cloud_metadata or {}
+                if not meta.get("pre_confirmation"):
+                    break
                 if not meta.get("notif_gated"):
                     meta = dict(meta)
                     meta["notif_gated"] = True
@@ -3700,19 +3968,19 @@ class BackupManager(QObject):
     def has_notif_gated_backups(self, game_id: str) -> bool:
         """True when *game_id* has a notif_gated capture (see
         mark_notif_gated) that NOTHING has superseded yet — no TRUSTED
-        (non-pre_confirmation) backup created since. Durable across app
+        (main-line, see is_side_backup) backup created since. Durable across app
         restarts and independent of whether the live overlay's own
         in-memory pending state (main_window's _pending_cloud_notification
         / _pending_regression) still remembers it — a game the player
         never relaunched to actually see the warning still reads True.
 
         The "superseded" half matters because "Restore"/"Back it up now"
-        aren't the only ways this ever resolves — "Got it" (ack) and a
-        later launch's own clean re-check both clear the PENDING state
-        (main_window's dicts) without touching the tag on the entry
-        itself, on purpose: an acknowledged-but-not-confirmed capture
-        must stay just as excluded from newest_trusted/future identity-
-        resolution promotions as an unanswered one (see
+        aren't the only ways this ever resolves — a later launch's own
+        clean re-check also clears the PENDING state (main_window's
+        dicts) without touching the tag on the entry itself, on purpose:
+        a capture nobody confirmed must stay just as excluded from
+        newest_trusted/future identity-resolution promotions as one
+        still awaiting an answer (see
         promote_pre_confirmation_backups). But the CARD BADGE isn't
         making that same promise — it means "there's something here worth
         looking at", and once real, confirmed play has genuinely moved
@@ -3731,7 +3999,7 @@ class BackupManager(QObject):
             newest_notif = max(notif_times)
             return not any(
                 b.created_dt > newest_notif
-                and not (b.cloud_metadata or {}).get("pre_confirmation")
+                and not self.is_side_backup(b)
                 for b in entries
             )
 
@@ -4016,6 +4284,8 @@ class BackupManager(QObject):
         for b in rows or []:
             if self.ORPHAN_SOURCES_KEY not in (b.cloud_metadata or {}):
                 continue
+            if self.is_manual_version(b):
+                continue        # a version added by hand: its own folder, not the archive's
             if best is None or b.created_dt > best.created_dt:
                 best = b
         return best
@@ -4028,7 +4298,8 @@ class BackupManager(QObject):
         """
         with _index_lock:
             rows = [(b.created_dt, b.cloud_metadata or {})
-                    for b in self._index if b.game_id == game_id]
+                    for b in self._index
+                    if b.game_id == game_id and not self.is_manual_version(b)]
 
         def _lst(meta, key):
             raw = meta.get(key)
@@ -4276,8 +4547,8 @@ class BackupManager(QObject):
         touched = False
         with _index_lock:
             for b in self._index:
-                if b.game_id != game_id:
-                    continue
+                if b.game_id != game_id or self.is_manual_version(b):
+                    continue        # a version added by hand carries its own, not the archive's
                 meta = dict(b.cloud_metadata or {})
                 if clean:
                     if meta.get(key) == clean:
@@ -4318,7 +4589,7 @@ class BackupManager(QObject):
         touched = False
         with _index_lock:
             for b in self._index:
-                if b.game_id != game_id:
+                if b.game_id != game_id or self.is_manual_version(b):
                     continue
                 meta = dict(b.cloud_metadata or {})
                 current = meta.get(self.ORPHAN_DEST_KEY)
@@ -4355,7 +4626,7 @@ class BackupManager(QObject):
             return self._write_orphan_dest_map(game_id, dest_map or {})
         with _index_lock:
             existing = next((self.orphan_source_paths(b) for b in self._index
-                             if b.game_id == game_id), [])
+                             if b.game_id == game_id and not self.is_manual_version(b)), [])
         merged = list(existing)
         seen = {p.casefold() for p in merged}
         for p in clean:
@@ -4377,7 +4648,7 @@ class BackupManager(QObject):
             return False
         wrote = False
         for b in list(self._index):
-            if b.game_id != game_id:
+            if b.game_id != game_id or self.is_manual_version(b):
                 continue
             wrote = self._write_orphan_meta(
                 game_id, self.ORPHAN_SOURCES_KEY,
@@ -4397,7 +4668,7 @@ class BackupManager(QObject):
         if not target:
             return False
         for b in self._index:
-            if b.game_id != game_id:
+            if b.game_id != game_id or self.is_manual_version(b):
                 continue
             current = self.orphan_sources_skipped(b)
             rest = [p for p in current if p.casefold() != target]
@@ -4744,6 +5015,398 @@ class BackupManager(QObject):
             counts[folder] = counts.get(folder, 0) + 1
         return counts
 
+    # ── Archives that share a library game's name ───────────────────────────
+
+    _LEGACY_FOLDER_RE = None
+
+    def name_collision(self, title: str, hint: str = "") -> Optional[dict]:
+        """What an archive titled *title* would land on: the backup folder it
+        would be filed under is already in use. None when that name is free.
+
+        ``{"folder", "holders", "key"}`` — the folder name, everything stored
+        under that name (see name_holders — there can be several: a library
+        game and the archive kept separate from it last time) and what an
+        answer about it is stored under. Decided by the function that files
+        the archive (_unique_backup_folder), so it is asked exactly when the
+        archive would otherwise be given a tag — never on a name that merely
+        resembles one, such as a game's earlier name. Whether the two are one
+        game is not something a shared name can say."""
+        from core.constants import get_folder_name_for_save
+        base = get_folder_name_for_save(title or "", "", "")
+        if not base or self._unique_backup_folder(base, hint=hint) == base:
+            return None
+        holders = self.name_holders(base)
+        game = next((h["game"] for h in holders if h["game"] is not None), None)
+        return {"folder": base, "holders": holders,
+                "key": game.id if game else f"folder:{base}"}
+
+    def name_holders(self, base: str) -> list:
+        """Every entry stored under the backup folder name *base*: the library
+        games and the archives whose folder is *base* or a tagged form of it
+        (``base~4f2a91``, or an old ``base_2``).
+
+        One dict each — ``id`` (the game_id), ``kind`` ("game" / "archive"),
+        ``name``, ``folder``, ``where`` (its save folder, or the folder an
+        archive reads), ``last`` (when its last backup of its own history was
+        made, "" when there is none), ``count`` and ``game`` (the library
+        entry, None for an archive). *last* is what tells two games of one
+        name apart, so it is the last time the game was played and backed up:
+        a version added by hand is dated when it was added, and a safety copy
+        when a restore ran, and neither is that."""
+        from core.constants import get_install_folder_name, strip_disambiguation_tag
+        want = (base or "").casefold()
+        with _index_lock:
+            by_gid: dict = {}
+            for b in self._index:
+                by_gid.setdefault(b.game_id, []).append(
+                    (b.created_dt, b.created_at, self.is_side_backup(b),
+                     self._game_folder_for_entry(b), b.game_name or "",
+                     self.is_orphan_entry(b)))
+
+        def _last(rows) -> str:
+            own = [r for r in rows if not r[2]] or rows
+            return max(own, key=lambda r: r[0])[1] if own else ""
+
+        out: list = []
+        lib_ids: set = set()
+        try:
+            from core.library import get_library
+            games = get_library().all_games()
+        except Exception:
+            games = []
+        for g in games:
+            folder = get_install_folder_name(
+                g.exe_path or "", g.name, g.id, g.computed_folder_name)
+            if not folder or strip_disambiguation_tag(folder).casefold() != want:
+                continue
+            lib_ids.add(g.id)
+            rows = by_gid.get(g.id, [])
+            out.append({"id": g.id, "kind": "game", "name": g.name, "folder": folder,
+                        "where": next((p for p in (g.save_paths or []) if p), ""),
+                        "last": _last(rows), "count": len(rows), "game": g})
+        for gid, rows in by_gid.items():
+            if gid in lib_ids or not any(r[5] for r in rows):
+                continue
+            folder = max(rows, key=lambda r: r[0])[3]
+            if strip_disambiguation_tag(folder).casefold() != want:
+                continue
+            newest = max(rows, key=lambda r: r[0])
+            entries = self.get_backups_for_game(gid)
+            row = self.newest_archive_row(entries) or (entries[0] if entries else None)
+            where = ""
+            if row is not None:
+                where = next((p for p in self.orphan_source_paths(row) if p), "") \
+                    or next((p for p in (row.save_paths or []) if p), "")
+            out.append({"id": gid, "kind": "archive", "name": newest[4] or folder,
+                        "folder": folder, "where": where,
+                        "last": _last(rows), "count": len(rows), "game": None})
+        games_first = [h for h in out if h["kind"] == "game"]
+        archives = sorted((h for h in out if h["kind"] != "game"),
+                          key=lambda h: h["last"], reverse=True)
+        return games_first + archives
+
+    def _files_of(self, folder: str, game_id: str, cache: dict | None):
+        """The files a backup of *folder* would hold under *game_id*'s rules —
+        walked once per folder and rule set when a *cache* is passed. The same
+        dropped folder comes up for every entry stored under a name, and once
+        more for when it was last written; a game install walked five times on
+        the GUI thread is a window that stops answering."""
+        chain_dirs = _declared_chain_dirs(game_id)
+        excluded = self._excluded_files_for(game_id)
+        key = (str(folder), chain_dirs, repr(sorted((k, sorted(v)) for k, v in excluded.items())))
+        if cache is not None and key in cache:
+            return cache[key]
+        files = self._collect_save_files([Path(folder)], chain_dirs, None, excluded)
+        if cache is not None:
+            cache[key] = files
+        return files
+
+    def holding_backup(self, pairs, cache: dict | None = None) -> Optional[BackupEntry]:
+        """The backup, in any of the histories asked about, whose files are,
+        byte for byte, the ones in a folder — None when there is none.
+
+        *pairs* is ``[(folder, game_id), …]``: each folder is compared with
+        that game's or archive's backups. Compared by CONTENT HASH, as a
+        backup's own dedup is: a name says nothing about whether two folders
+        hold the same saves, and neither does a version number. The files are
+        the ones a backup of the folder would hold (same collection rules, same
+        unticked files), and only their contents are compared, not the names
+        they sit under — the zip's root is the folder's own name, which differs
+        between one drop and the next, so a state hash that includes it would
+        never match.
+
+        Sizes first: they cost a stat each, and only a history holding the
+        same sizes is worth reading the files for. A folder that comes up
+        against several histories is read once — the hashes of the first pass
+        are the next one's starting point."""
+        built: dict = {}                 # folder -> the manifest built for it
+        for folder, game_id in pairs:
+            p = Path(folder or "")
+            if not folder or not p.is_dir():
+                continue
+            held = [(b, (b.cloud_metadata or {}).get("file_manifest") or {})
+                    for b in self.get_backups_for_game(game_id)]
+            held = [(b, m) for b, m in held if m and self._manifest_is_comparable(m)]
+            if not held:
+                continue
+            all_files = self._files_of(folder, game_id, cache)
+            if not all_files:
+                continue
+
+            def _size(fp: str) -> int:
+                try:
+                    return int(str(fp).split("|", 1)[0])
+                except ValueError:
+                    return -1
+
+            sizes = []
+            for f, _root in all_files:
+                try:
+                    sizes.append(f.stat().st_size)
+                except OSError:
+                    sizes = None            # unreadable now: no claim either way
+                    break
+            if sizes is None:
+                continue
+            sizes.sort()
+            candidates = [(b, m) for b, m in held
+                          if sorted(_size(v) for v in m.values()) == sizes]
+            if not candidates:
+                continue
+            manifest = self._build_manifest(all_files, [], built.get(folder, {}))[0]
+            built[folder] = manifest
+            want = sorted(self._fp_content(v) for v in manifest.values())
+            for b, m in candidates:
+                if sorted(self._fp_content(v) for v in m.values()) == want:
+                    return b
+        return None
+
+    def backup_holding_folder(self, folder: str, game_id: str) -> Optional[BackupEntry]:
+        """holding_backup for one folder and one history."""
+        return self.holding_backup([(folder, game_id)])
+
+    def saves_last_changed(self, folder: str, game_id: str = "", cache: dict | None = None) -> float:
+        """When the newest file a backup of *folder* would hold was last
+        written (a timestamp), 0.0 when there is none — the other half of "is
+        this the game I played last week": the last backup of each entry
+        stored under the name, and when these saves last changed."""
+        p = Path(folder or "")
+        if not folder or not p.is_dir():
+            return 0.0
+        newest = 0.0
+        for f, _root in self._files_of(folder, game_id, cache):
+            try:
+                newest = max(newest, f.stat().st_mtime)
+            except OSError:
+                pass
+        return newest
+
+    @staticmethod
+    def matching_save_path(game, folder: str) -> str:
+        """The save folder of library game *game* that *folder* is another copy
+        of — the one with the same NAME, since a backup's zip is rooted on the
+        folder's name and restore finds its destination by it. "" when none
+        has that name: such a folder cannot be laid out like the game's own
+        backups, and is not offered as one of its versions."""
+        from core.registry_saves import is_registry_path
+        want = Path(folder or "").name.casefold()
+        if not want:
+            return ""
+        for sp in (game.save_paths or []):
+            if sp and not is_registry_path(sp) and Path(sp).name.casefold() == want:
+                return sp
+        return ""
+
+    @staticmethod
+    def version_source(game, path: str) -> str:
+        """Where, inside *path*, the saves are that go with library game
+        *game* — "" when nowhere is laid out like one of the game's own save
+        folders.
+
+        *path* is what was handed over: the save folder itself, or a whole
+        game folder (another version of the game, say) with the saves inside.
+        Looked for by the shape of the game's own save folders, not by
+        anything read from the handed-over folder's name or from a chain
+        detected on it — a whole game folder has none:
+
+          * the folder itself, when it is named like one of them;
+          * the same tail — ``game/saves``, ``www/save`` — inside it;
+          * a folder of that name, when exactly one sits within a few levels
+            (two of them would be a guess).
+        """
+        from core.registry_saves import is_registry_path
+        root = Path(path or "")
+        if not path or not root.is_dir():
+            return ""
+        targets = [Path(sp) for sp in (game.save_paths or [])
+                   if sp and not is_registry_path(sp)]
+        for sp in targets:
+            if sp.name and root.name.casefold() == sp.name.casefold():
+                return str(root)
+        for sp in targets:
+            tail = list(sp.parts[1:]) if sp.anchor else list(sp.parts)
+            for n in (3, 2):
+                if len(tail) >= n:
+                    inner = root.joinpath(*tail[-n:])
+                    if inner.is_dir():
+                        return str(inner)
+        for sp in targets:
+            if not sp.name:
+                continue
+            found = set()
+            for depth in range(1, 4):
+                pattern = "/".join(["*"] * (depth - 1) + [sp.name])
+                try:
+                    found.update(str(p) for p in root.glob(pattern) if p.is_dir())
+                except OSError:
+                    pass
+            if len(found) == 1:
+                return found.pop()
+        return ""
+
+    def add_version_to_archive(self, archive_id: str, folder: str, note: str = "") -> Optional[BackupEntry]:
+        """Store *folder* as another version of archive *archive_id*: ONE zip of
+        that folder alone, filed under the archive and kept beside its history.
+
+        Not "another folder the archive reads from" — that is what re-adding a
+        moved folder does, and from then on every scheduled backup of the
+        archive would zip both folders into one snapshot. This is a single
+        copy of what was handed over: it names its own folder, describes
+        nothing about the archive (newest_archive_row and the source lists
+        pass it over), and is restored to where the archive's own saves go —
+        the destination and chains are the archive's, inherited the way a
+        moved folder inherits them."""
+        rows = self.get_backups_for_game(archive_id)
+        newest = self.newest_archive_row(rows) or (rows[0] if rows else None)
+        if newest is None or not folder or not Path(folder).is_dir():
+            return None
+        known = self.orphan_source_paths(newest)
+        dests, save_chains, content_chains = self._orphan_targets(
+            newest, known[:1] or [str(folder)])
+        dest, sc, cc = dests[0], save_chains[0], content_chains[0]
+        entry, created = self.create_backup(
+            game_id=archive_id,
+            game_name=newest.game_name,
+            save_paths=[str(folder)],
+            note=note,
+            computed_folder_name=self._game_folder_for_entry(newest),
+            force=True,
+            skip_mtime_preflight=True,
+            orphan=True,
+            recorded_save_paths=[dest],
+            content_chains_override=[cc],
+            save_chains_override=[sc],
+            orphan_dest_map={str(folder): {"path": dest, "chain": sc, "content": cc}},
+            return_status=True,
+            extra_metadata={self.MANUAL_VERSION_KEY: True},
+        )
+        return entry if created else None
+
+    def add_version_to_game(self, game, folder: str, note: str = "") -> Optional[BackupEntry]:
+        """Store *folder* as another version of library game *game*.
+
+        Written as an ordinary backup of the game — its destination is the
+        game's own save folder, its chains come from the game — so restoring
+        it by hand puts the files where the game's own backups do. It is
+        filed in the side branch (MANUAL_VERSION_KEY), not the main line: it
+        may be older than the game's newest, and must not become what the
+        game's live saves are compared against or what "restore the newest"
+        picks. None when there is no save folder of that name to lay it out
+        by, or nothing could be written.
+
+        Never skipped as "already current": a folder of older saves has older
+        mtimes, and with the same number of files a preflight would say so."""
+        target = self.matching_save_path(game, folder)
+        if not target:
+            return None
+        entry, created = self.create_backup(
+            game_id=game.id,
+            game_name=game.name,
+            save_paths=[str(folder)],
+            exe_path=game.exe_path or "",
+            note=note,
+            computed_folder_name=game.computed_folder_name or None,
+            force=True,
+            skip_mtime_preflight=True,
+            recorded_save_paths=[target],
+            return_status=True,
+            extra_metadata={self.MANUAL_VERSION_KEY: True},
+        )
+        return entry if created else None
+
+    def remove_empty_legacy_folders(self) -> int:
+        """Delete the numbered folders ("Foo_2", from before names were tagged)
+        that hold nothing at all — debris from the run that numbered them, with
+        no backup, index or remote copy behind it. Only an EMPTY folder, and
+        only one whose plain twin ("Foo") exists; anything with an archive in
+        it is left exactly as it is."""
+        import re
+        if BackupManager._LEGACY_FOLDER_RE is None:
+            BackupManager._LEGACY_FOLDER_RE = re.compile(r"^(?P<base>.+)_\d+$")
+        removed = 0
+        try:
+            dirs = [p for p in BACKUP_DIR.iterdir() if p.is_dir()]
+        except OSError:
+            return 0
+        for d in dirs:
+            m = BackupManager._LEGACY_FOLDER_RE.match(d.name)
+            if not m or not (BACKUP_DIR / m.group("base")).is_dir():
+                continue
+            try:
+                if any(d.iterdir()):
+                    continue
+                d.rmdir()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    # ── Answers about them ──
+
+    @staticmethod
+    def archive_choice(key: str, source: str) -> str:
+        """What was decided about folder *source* under *key* — "skip" (don't
+        ask again), or "" when nothing was. Nothing else is remembered: an
+        answer to add it to something, or to keep it apart, is about THESE
+        saves, and the same folder may hold other ones — or another game —
+        the next time. (Older configs may carry "separate" / "keep_both"; they
+        are read as no answer.) Paths compare without regard to case."""
+        per = ((get_config().get("archive_choices", {}) or {}).get(key, {}) or {})
+        want = (source or "").casefold()
+        for path, choice in per.items():
+            if path.casefold() == want and choice == "skip":
+                return "skip"
+        return ""
+
+    @staticmethod
+    def set_archive_choice(key: str, source: str, choice: str) -> None:
+        cfg = get_config()
+        choices = {k: dict(v) for k, v in (cfg.get("archive_choices", {}) or {}).items()}
+        per = choices.setdefault(key, {})
+        for path in [p for p in per if p.casefold() == (source or "").casefold()]:
+            del per[path]
+        per[source] = choice
+        cfg.set("archive_choices", choices)
+
+    @staticmethod
+    def clear_archive_choices(key: str) -> None:
+        """Forget every answer under *key*: the question comes back."""
+        cfg = get_config()
+        choices = {k: dict(v) for k, v in (cfg.get("archive_choices", {}) or {}).items()}
+        if choices.pop(key, None) is not None:
+            cfg.set("archive_choices", choices)
+
+    @staticmethod
+    def skipped_archives() -> dict:
+        """{key: [source, ...]} of what was answered "skip" — the part of the
+        answers Settings shows (a "keep both" leaves an archive to see)."""
+        out: dict = {}
+        for key, per in (get_config().get("archive_choices", {}) or {}).items():
+            sk = [s for s, c in per.items() if c == "skip"]
+            if sk:
+                out[key] = sk
+        return out
+
     def find_orphan_backups_for_game(self, game) -> list[BackupEntry]:
         """Orphan index entries whose name/folder matches *game*."""
         if game is None:
@@ -5025,7 +5688,8 @@ class BackupManager(QObject):
                          if is_registry_path(p) and registry_key_exists(p)]
             if not fs_paths and not valid_reg:
                 return ""
-            backups = self.get_backups_for_game(game_id)
+            backups = [b for b in self.get_backups_for_game(game_id)
+                       if not self.is_manual_version(b)]
             prev = ((backups[0].cloud_metadata or {}).get("file_manifest", {})
                     if backups else {})
             files = self._collect_save_files(fs_paths, _declared_chain_dirs(game_id))
@@ -5140,13 +5804,18 @@ class BackupManager(QObject):
         if not current:
             return None, False
 
-        # get_backups_for_game returns newest first.
-        newest = usable[0]
+        # get_backups_for_game returns newest first — by date, which for a
+        # version added by hand is when it was added. The live saves are
+        # measured against the head of the game's own history instead; the
+        # added versions still count as states the saves may match.
+        newest = next((b for b in usable if not self.is_manual_version(b)), usable[0])
         if current == self.state_hash_of(
                 (newest.cloud_metadata or {}).get("file_manifest") or {}):
             return None, False     # up to date with the latest backup
 
-        for older in usable[1:]:
+        for older in usable:
+            if older is newest:
+                continue
             if not current == self.state_hash_of(
                     (older.cloud_metadata or {}).get("file_manifest") or {}):
                 continue
@@ -5298,6 +5967,16 @@ class BackupManager(QObject):
         except Exception as e:
             logger.warning(f"Orphan-title noise repair failed: {e}")
             failures += 1
+        # Branch pass: pre-restore safety copies made before they were tagged
+        # are still in the main history (see is_side_backup). Done BEFORE the
+        # planned_deletion backfill below, so the expiry it stamps is already
+        # computed per line.
+        try:
+            retagged = self.repair_pre_restore_tags()
+            repaired += retagged
+        except Exception as e:
+            logger.warning(f"Pre-restore tag repair failed: {e}")
+            failures += 1
         # Fifth repair pass: backups from before planned_deletion existed
         # (or that the daily retention sweep hasn't reached yet — see
         # BackupEntry.planned_deletion's own docstring) carry no expiry
@@ -5313,6 +5992,47 @@ class BackupManager(QObject):
             logger.warning(f"planned_deletion backfill failed: {e}")
             failures += 1
         return repaired, failures
+
+    def repair_pre_restore_tags(self) -> int:
+        """Tag the pre-restore safety copies that were made before restore_backup
+        tagged them, so they join the side branch (is_side_backup) instead of
+        the main history. They carry no marker — only the note a restore gave
+        them, in the language the app was in at the time — so the note is
+        matched against every locale's wording. Only untagged rows are touched;
+        a pure relabel of local bookkeeping, so nothing is flagged for publish.
+        Returns how many were tagged."""
+        import json as _json
+        notes: set[str] = set()
+        try:
+            from i18n import _I18N_DIR
+            for f in _I18N_DIR.glob("*.json"):
+                try:
+                    with open(f, encoding="utf-8") as fh:
+                        v = (_json.load(fh).get("backup") or {}).get("pre_restore_safety")
+                except (OSError, ValueError):
+                    continue
+                if v:
+                    notes.add(str(v).strip().casefold())
+        except Exception:
+            return 0
+        if not notes:
+            return 0
+        dirty: set[str] = set()
+        count = 0
+        with _index_lock:
+            for b in self._index:
+                meta = b.cloud_metadata or {}
+                if meta.get("pre_restore_safety"):
+                    continue
+                if (b.note or "").strip().casefold() in notes:
+                    b.cloud_metadata = {**meta, "pre_restore_safety": True}
+                    dirty.add(b.game_id)
+                    count += 1
+        for gid in dirty:
+            self._save_game_index(gid, mark_unpublished=False)
+        if count:
+            logger.info(f"Tagged {count} earlier pre-restore safety copy(ies) as side-branch")
+        return count
 
     def backfill_planned_deletion(self) -> int:
         """Stamp ``planned_deletion`` on every backup missing it. Returns
@@ -5434,7 +6154,7 @@ class BackupManager(QObject):
         """Label a legacy orphan save_path should be rewritten to, or "".
 
         Old manual backups recorded the absolute collection copy path (the
-        zip *source*, e.g. ``D:\\VN Games\\Save\\Game``) as save_paths. A
+        zip *source*, e.g. ``D:\\Games\\Saves\\Game``) as save_paths. A
         restore then treats the backup as archive-only. The manual dialog
         today records the destination / zip-root label instead; this derives
         the same label for an existing entry:
@@ -5810,10 +6530,53 @@ class BackupManager(QObject):
 
         return to_delete
 
+    # Backups that are NOT part of the game's own history: provisional ones
+    # (pre_confirmation — unconfirmed paths, an unresolved identity, a warning
+    # nobody answered) and the safety copy a restore takes of what it is about
+    # to overwrite (pre_restore_safety). They are a branch beside it, not part
+    # of it: kept, listed and restorable, but with a retention of their own,
+    # never the "newest trusted" restore target, never uploaded — and never
+    # counted against the main list. Promotion (promote_pre_confirmation_
+    # backups) is what merges a provisional one into the main line.
+    #
+    # The third kind is a version the user added BY HAND to a game that already
+    # has a history: saves from somewhere else that the history does not hold,
+    # which may be older than its newest. Filed as an ordinary backup it would
+    # be the game's newest by date — the state the next backup, the launch
+    # check and "restore the newest" all measure the live saves against — and
+    # a game that has simply been played since would read as having gone back.
+    MANUAL_VERSION_KEY = "manual_version"
+    _SIDE_KEYS = ("pre_confirmation", "pre_restore_safety", MANUAL_VERSION_KEY)
+
+    @classmethod
+    def is_side_backup(cls, entry) -> bool:
+        meta = getattr(entry, "cloud_metadata", None) or {}
+        return any(meta.get(k) for k in cls._SIDE_KEYS)
+
+    def _history_for_comparison(self, game_id: str) -> list:
+        """The game's backups newest first, versions added by hand last."""
+        rows = self.get_backups_for_game(game_id)
+        return ([b for b in rows if not self.is_manual_version(b)]
+                + [b for b in rows if self.is_manual_version(b)])
+
+    @classmethod
+    def is_manual_version(cls, entry) -> bool:
+        """A version added by hand (see MANUAL_VERSION_KEY). Its date is when it
+        was added, not when its saves were played — so wherever "the newest" is
+        what the live saves are measured against, it is passed over."""
+        return bool((getattr(entry, "cloud_metadata", None) or {}).get(cls.MANUAL_VERSION_KEY))
+
     def _enforce_limits(self, game_id: str):
         """Remove oldest backups when limits are exceeded.
         Always keeps at least `min_kept_backups` most recent backups regardless
         of age, so the user never loses all history.
+
+        The main history and the side branch (provisional and pre-restore
+        copies — see is_side_backup) are limited SEPARATELY, each by the same
+        count and age settings. They used to share one list, so a handful of
+        safety copies or unconfirmed captures took the places of real backups
+        (a copy made by force is always the newest, and the newest are the
+        protected ones) and pushed the oldest real one out.
 
         Also stamps ``planned_deletion`` on every backup that survives this
         pass — see that field's own docstring on ``BackupEntry`` for why:
@@ -5835,7 +6598,28 @@ class BackupManager(QObject):
         stamped = False
         with _index_lock:
             game_backups = [b for b in self._index if b.game_id == game_id]
-            to_delete = self.compute_deletions(game_backups, max_backups, retention_days, min_kept)
+            main_line = [b for b in game_backups if not self.is_side_backup(b)]
+            # A version added by hand is a line of its own. Among the safety
+            # copies it would be the newest — and so the one protected — only
+            # until the next restore takes a copy, and then age alone would
+            # remove something the user put there on purpose. It keeps what
+            # the main history keeps: the newest min_kept, whatever their age.
+            manual_line = [b for b in game_backups if self.is_manual_version(b)]
+            side_line = [b for b in game_backups
+                         if self.is_side_backup(b) and not self.is_manual_version(b)]
+            # The branch keeps its newest one whatever its age (like the main
+            # line), but never more than one is *protected* — it is a safety
+            # net, not history the min_kept promise is about. Except while
+            # there IS no main history yet (a game in its first session, every
+            # backup still provisional): then the branch is all there is, and
+            # it keeps the full promise, as it always did.
+            side_min_kept = min_kept if not main_line else min(min_kept, 1)
+            to_delete = (
+                self.compute_deletions(main_line, max_backups, retention_days, min_kept)
+                | self.compute_deletions(side_line, max_backups, retention_days,
+                                         side_min_kept)
+                | self.compute_deletions(manual_line, max_backups, retention_days,
+                                         min_kept))
 
             # Stamp survivors regardless of whether anything is being
             # deleted right now — a freshly-created backup needs its own
@@ -5843,19 +6627,22 @@ class BackupManager(QObject):
             # protected/unprotected status just changed (new siblings
             # pushed it out of the min_kept window, or in) needs it
             # recomputed. The same sort + "newest min_kept" split
-            # compute_deletions already did, reused rather than redone.
-            survivors = [b for b in game_backups if b.backup_id not in to_delete]
-            protected_ids: set[str] = set()
-            if min_kept > 0:
-                by_age = sorted(survivors, key=lambda b: b.created_dt)
-                newest = by_age[-min_kept:] if len(by_age) >= min_kept else by_age
-                protected_ids = {b.backup_id for b in newest}
-            for b in survivors:
-                new_val = ("" if b.backup_id in protected_ids else
-                          (b.created_dt + timedelta(days=retention_days)).isoformat())
-                if b.planned_deletion != new_val:
-                    b.planned_deletion = new_val
-                    stamped = True
+            # compute_deletions already did, reused rather than redone —
+            # per line, so the branch's newest never shields a main one.
+            for line, keep_n in ((main_line, min_kept), (side_line, side_min_kept),
+                                 (manual_line, min_kept)):
+                survivors = [b for b in line if b.backup_id not in to_delete]
+                protected_ids: set[str] = set()
+                if keep_n > 0:
+                    by_age = sorted(survivors, key=lambda b: b.created_dt)
+                    newest = by_age[-keep_n:] if len(by_age) >= keep_n else by_age
+                    protected_ids = {b.backup_id for b in newest}
+                for b in survivors:
+                    new_val = ("" if b.backup_id in protected_ids else
+                              (b.created_dt + timedelta(days=retention_days)).isoformat())
+                    if b.planned_deletion != new_val:
+                        b.planned_deletion = new_val
+                        stamped = True
 
             if not to_delete:
                 if stamped:

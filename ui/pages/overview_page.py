@@ -586,6 +586,10 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
     # page it belongs to is where the user is sent.
     open_sync        = Signal()
     refresh_all_requested = Signal()  # wipe + re-pump every open page
+    # The unknown-games carousel (see _sync_unknown_banner): the same two
+    # answers the overlay offers, handled by the same main-window code.
+    unknown_add_requested = Signal(str)       # exe path
+    unknown_dismiss_requested = Signal(str)   # "don't show again"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -770,6 +774,18 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         bl.addWidget(self._active_backup_btn)
         root.addWidget(self._active_banner)
 
+        # Games SaveSync noticed running that are not in the library: while
+        # nothing is being played this takes the idle banner's place, so they
+        # can be added from here without opening the overlay. One queue, two
+        # views — see ui.unknown_history.
+        from ui.widgets.unknown_banner import UnknownGamesBanner
+        self._unknown_banner = UnknownGamesBanner()
+        self._unknown_banner.setVisible(False)
+        self._unknown_banner.add_requested.connect(self.unknown_add_requested)
+        self._unknown_banner.dismiss_requested.connect(self.unknown_dismiss_requested)
+        self._unknown_banner.entries_changed.connect(self._sync_unknown_banner)
+        root.addWidget(self._unknown_banner)
+
         # Body scrolls only when the stack viewport cannot fit the dashboard
         # (resize-first — same rule as dialogs).
         self._page_scroll = QScrollArea()
@@ -829,6 +845,8 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             self._donut_chart.refresh_styles()
         if _safe(self._bar_chart):
             self._bar_chart.refresh_styles()
+        if _safe(self._unknown_banner):
+            self._unknown_banner.refresh_styles()
         # Dynamic children: activity rows are recreated on data refresh, so reach
         # the CURRENT instances through the layout (never a stale list).
         if _safe(self._activity_layout):
@@ -1078,6 +1096,19 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                 pass
             self._refresh_busy = None
 
+    def _sync_unknown_banner(self, playing: bool | None = None):
+        """The carousel replaces the idle banner when nothing is being played
+        and the queue has something in it; a running game brings the
+        active-game banner back."""
+        if playing is None:
+            try:
+                playing = bool(get_monitor().currently_playing())
+            except Exception:
+                playing = False
+        show = (not playing) and self._unknown_banner.has_entries()
+        self._unknown_banner.setVisible(show)
+        self._active_banner.setVisible(not show)
+
     def _update_in_game_state(self):
         """Poll the process monitor: while any game is running the refresh
         button stays disabled (see _on_refresh_clicked)."""
@@ -1086,6 +1117,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             playing = bool(get_monitor().currently_playing())
         except Exception:
             playing = False
+        self._sync_unknown_banner(playing)
         if playing == self._in_game:
             return
         self._in_game = playing
@@ -1127,6 +1159,8 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             self._active_name.setText(t("overview.no_active_game"))
             self._active_sub.setText("")
             self._active_backup_btn.setVisible(False)
+        self._unknown_banner.refresh()
+        self._sync_unknown_banner(bool(active_entries))
 
         # Stat cards — guard each widget access in case of teardown during theme change
         if _safe(self._card_games):
@@ -1634,6 +1668,8 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                 btn.setText(t(label_key))
         if _safe(self._active_backup_btn):
             self._active_backup_btn.setText(t("buttons.backup_now"))
+        if _safe(self._unknown_banner):
+            self._unknown_banner.update_locale()
 
     # ── Stats for overlay ─────────────────────────────────────────────────────
 

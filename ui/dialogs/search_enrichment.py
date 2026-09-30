@@ -3,9 +3,11 @@ SaveSync - Web-search candidate preview + same-tier enrichment merge UI.
 
 - CandidatePreviewDialog — arrow-carousel preview of search candidates; the
   candidate the user confirms is authoritative for every field it fills.
-- EnrichmentMergeDialog — chip-based "fill the EMPTY fields" panel offered
-  from the OTHER candidates of the same result set (same tier, never new
-  searches), grouped by source; tags/links always extend additively.
+- EnrichmentMergeDialog — chip-based "what do I take from each source" panel
+  over the confirmed candidate AND the other candidates of the same result set
+  (same tier, never new searches). Nothing is applied until the user picks:
+  every field starts on what is stored now; tags, covers, reviews and a
+  source's page link are additive.
 - _FlowLayout / _ChipGroup / _merge_chip — the wrapping chip machinery.
 """
 import logging
@@ -228,6 +230,13 @@ class CandidatePreviewDialog(QDialog):
         self._meta_lbl.setObjectName("enrich_meta")
         content.addWidget(self._meta_lbl)
 
+        # The languages the source says the game is offered in.
+        self._lang_lbl = QLabel()
+        self._lang_lbl.setWordWrap(True)
+        self._lang_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._lang_lbl.setObjectName("enrich_meta")
+        content.addWidget(self._lang_lbl)
+
         # The source's own verdict, when it has one and the form doesn't yet.
         self._review_lbl = QLabel()
         self._review_lbl.setWordWrap(True)
@@ -327,8 +336,8 @@ class CandidatePreviewDialog(QDialog):
 
         _current = diff.get('current') or {}
 
-        # A raw candidate title (forum thread names especially — see the
-        # f95zone examples throughout this dialog's own history) can run
+        # A raw candidate title (forum thread names especially — they are
+        # long throughout this dialog's own history) can run
         # 80-100+ characters with no natural break word-wrap can lean on,
         # pushing the card wider than its fixed layout instead of wrapping.
         # Same fix as the description snippet below: a hard cap with an
@@ -441,7 +450,12 @@ class CandidatePreviewDialog(QDialog):
 
         _dev_piece = _meta_piece('add_game.developer', 'developer', getattr(c, 'developer', '') or '')
         _yr_piece  = _meta_piece('add_game.year', 'year', diff.get('result_year') or '')
-        _meta_bits = [p for p in (_dev_piece, _yr_piece) if p]
+        # More pictures on offer (screenshots the game does not have yet).
+        _n_shots = len(diff.get('new_screenshots') or [])
+        _pic_piece = (f"<b>{_h.escape(t('add_game.merge_images'))}:</b> "
+                      f"<span style='color:{palette('accent')};'>+ {_n_shots}</span>"
+                      if _n_shots else '')
+        _meta_bits = [p for p in (_dev_piece, _yr_piece, _pic_piece) if p]
         self._meta_lbl.setText('&nbsp;&nbsp;&nbsp;'.join(_meta_bits))
         self._meta_lbl.setVisible(bool(_meta_bits))
 
@@ -525,6 +539,23 @@ class CandidatePreviewDialog(QDialog):
             self._tags_lbl.setVisible(True)
         else:
             self._tags_lbl.setVisible(False)
+
+        # ── Languages — up to three, then how many more, like the tags. ──
+        from core.library import normalize_languages
+        _langs = normalize_languages(getattr(c, 'languages', None))
+        if _langs:
+            _LANG_SAMPLE = 3
+            _line = (f"<b>{_h.escape(t('add_game.languages'))}:</b> "
+                     + ", ".join(_h.escape(x) for x in _langs[:_LANG_SAMPLE]))
+            if len(_langs) > _LANG_SAMPLE:
+                _line += (
+                    f" <span style='color:{palette('text_muted')};'>"
+                    f"{_h.escape(t('add_game.candidate_tags_more', count=len(_langs) - _LANG_SAMPLE))}"
+                    f"</span>")
+            self._lang_lbl.setText(_line)
+            self._lang_lbl.setVisible(True)
+        else:
+            self._lang_lbl.setVisible(False)
 
         self._thumb_lbl.setPixmap(QPixmap())
         self._thumb_lbl.setText("🎮")
@@ -695,15 +726,46 @@ def _merge_chip(text: str, tooltip: str = "") -> QPushButton:
     return b
 
 
-class EnrichmentMergeDialog(QDialog):
-    """One-shot merge preview for same-tier enrichment, chip-based.
+class _LinkFlag:
+    """Stands in for the chips of a source that offers only a page link, so its
+    header can switch it like any other source (isChecked/setChecked is all
+    GroupToggle asks of an item). Starts selected, like every additive piece."""
 
-    Pieces are shown as toggle chips DIVIDED BY SOURCE — the same visual
-    language as the dialog tag/URL chips. Single-value fields (description,
-    developer, year, image) are exclusive across sources: selecting one chip
-    deselects the same field chips elsewhere. Tag and link chips toggle
-    independently. Image offers render a real thumbnail. Nothing touches the
-    form until Apply. Back restores the candidate carousel (RESULT_BACK).
+    def __init__(self):
+        self._on = True
+
+    def isChecked(self) -> bool:
+        return self._on
+
+    def setChecked(self, on: bool) -> None:
+        self._on = bool(on)
+
+
+class EnrichmentMergeDialog(QDialog):
+    """Chip-based "what do I take from each source" panel.
+
+    Nothing has been written to the form by the time this opens, and nothing is
+    until Apply. The defaults are what makes Apply safe to press straight away:
+
+    - Name, description, developer and year have ONE slot on the form. Each gets
+      a section of its own (the field's name as the heading) with every
+      DIFFERENT incoming value as an exclusive chip — picking one deselects the
+      rest. A field that has a value starts on a "Keep current" chip, so nothing
+      is replaced unless one is picked. A field that is still EMPTY has no such
+      chip: the fetched value is the one already selected (the first source's,
+      when several differ), and deselecting it leaves the field empty. A value
+      several sources agree on is one chip naming all of them, and a value
+      equal to the current one is not offered again.
+    - Images, tags and reviews are additive (a game holds many of each), so they
+      are grouped by SOURCE, each kind on a row of its own under its own title,
+      and start selected — what the game already has is simply not offered.
+      The source's page link lives under its header: the header clears or
+      restores the source's whole selection (remembering exactly what was
+      ticked), and the link goes in with it whenever anything of the source is
+      selected.
+
+    Back restores the candidate carousel (RESULT_BACK); since nothing was
+    written, there is nothing to undo.
     """
 
     RESULT_BACK = 2
@@ -720,14 +782,20 @@ class EnrichmentMergeDialog(QDialog):
         self._model = model
         self._src_label = source_label_fn
         self._field_groups: dict[str, _ChipGroup] = {}
-        self._tag_boxes: list[tuple[QPushButton, str]] = []
-        self._url_boxes: list[tuple[QPushButton, str]] = []
-        self._review_boxes: list[tuple[QPushButton, list]] = []
-        self._img_boxes: list[tuple[QPushButton, str]] = []  # (chip, url) — additive, like tags
+        # field chip -> the source keys that offer that value (all of them,
+        # when several agree on it)
+        self._chip_sources: dict[QPushButton, list] = {}
+        self._tag_boxes: list[tuple[QPushButton, str, str]] = []      # chip, tag, source
+        self._review_boxes: list[tuple[QPushButton, list, str]] = []  # chip, reviews, source
+        self._language_boxes: list[tuple[QPushButton, list, str]] = []  # chip, languages, source
+        self._img_boxes: list[tuple[QPushButton, str, str]] = []      # chip, url, source
         self._img_chips: dict[str, QPushButton] = {}   # image url → thumbnail chip
         self._header_thumbs: dict[str, QLabel] = {}    # cover url → header preview
-        # source key → every chip offered under that source (for header toggle)
-        self._source_chips: dict[str, list[QPushButton]] = {}
+        # source key → the page links that come in with it
+        self._source_urls: dict[str, list] = {}
+        # source key → what its header switches: its chips, or — for a source
+        # that offers only a link — a _LinkFlag standing in for them
+        self._source_chips: dict[str, list] = {}
         self._source_headers: dict[str, QPushButton] = {}
         self._source_toggle = GroupToggle()
         self.setWindowModality(Qt.WindowModality.WindowModal)
@@ -801,8 +869,25 @@ class EnrichmentMergeDialog(QDialog):
             short = url
         return short if len(short) <= 42 else short[:41] + "…"
 
+    def _labels_for(self, sources: list) -> str:
+        """The distinct, human source names behind a chip, comma-joined."""
+        metas = self._model.get("source_meta") or {}
+        names: list[str] = []
+        for key in sources:
+            src_id = (metas.get(key) or {}).get("source_id") or ""
+            label = self._src_label(src_id) if src_id else ""
+            if label and label not in names:
+                names.append(label)
+        return ", ".join(names)
+
     def _source_header_row(self, source: str) -> QWidget:
-        """Cover + ``source · title ·`` + clickable URL (inspect) + chip toggle."""
+        """Cover + ``source · title`` + clickable URL (inspect) + select-all.
+
+        The ``source · title`` button clears this source's whole selection, or
+        restores exactly what was selected (GroupToggle.toggle). The source's
+        page link has no chip of its own: it comes in with the source, whenever
+        anything of it is selected (see selection()).
+        """
         row = QWidget()
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 8, 0, 2)
@@ -828,27 +913,30 @@ class EnrichmentMergeDialog(QDialog):
 
         src_id = meta.get("source_id") or source.split(" · ")[0] or source
         title = (meta.get("name") or "").strip()
-        # Toggle target is source · title; the URL is a separate inspect control.
+        urls = [u for u in (meta.get("urls") or []) if u]
         # title is a candidate's raw name — a forum-thread title especially can
-        # run 80-100+ characters (see CandidatePreviewDialog's own _snip_title)
-        # — and a QPushButton doesn't wrap, so left unbounded it pushed this
-        # header (and the dialog with it) wider than the screen.
+        # run 80-100+ characters — and a QPushButton doesn't wrap, so left
+        # unbounded it pushed this header (and the dialog with it) wider than
+        # the screen.
         head = self._src_label(src_id)
         if title:
             head = f"{head} · {self._short(title, 40)}"
+        if urls:
+            head = f"🔗 {head}"
         btn = QPushButton(head)
         btn.setFlat(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setToolTip(
-            f"{title}\n{t('add_game.merge_toggle_source')}" if title
-            else t("add_game.merge_toggle_source"))
+        tip = [title, t("add_game.merge_toggle_source")]
+        if urls:
+            tip.append(t("add_game.merge_header_link_tip"))
+            self._source_urls[source] = urls
+        btn.setToolTip("\n".join([x for x in tip if x] + urls))
+        btn.clicked.connect(lambda _=False, s=source: self._toggle_source(s))
         btn.setStyleSheet(
             f"QPushButton{{color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;"
             f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
             f"background:transparent;border:none;}}"
-            f"QPushButton:hover{{color:{palette('accent')};}}"
         )
-        btn.clicked.connect(lambda _=False, s=source: self._toggle_source(s))
         self._source_headers[source] = btn
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -900,8 +988,16 @@ class EnrichmentMergeDialog(QDialog):
         self._refresh_source_header(source)
 
     def _bulk_set_source(self, source: str):
-        """Separate select-all/clear-all button — see GroupToggle.bulk_set."""
-        self._source_toggle.bulk_set(source, self._source_chips.get(source) or [])
+        """Select-all / clear-all for one source, by what is on screen: select
+        everything unless everything is already selected, then clear it.
+
+        GroupToggle.bulk_set assumes a group starts fully selected and so its
+        first press clears, whatever is on screen — wrong for a group that was
+        partly unticked by hand: pressing ☑ to take them all cleared it."""
+        chips = self._source_chips.get(source) or []
+        turn_on = not all(c.isChecked() for c in chips)
+        for c in chips:
+            c.setChecked(turn_on)
         self._refresh_source_header(source)
 
     def _refresh_source_header(self, source: str):
@@ -915,7 +1011,6 @@ class EnrichmentMergeDialog(QDialog):
             f"QPushButton{{color:{color};font-size:{scaled(10, self)}px;font-weight:700;"
             f"letter-spacing:0.5px;text-align:left;padding:2px 0;"
             f"background:transparent;border:none;}}"
-            f"QPushButton:hover{{color:{palette('accent')};}}"
         )
 
     @staticmethod
@@ -949,22 +1044,29 @@ class EnrichmentMergeDialog(QDialog):
         chip.setChecked(checked)
         return chip
 
-    def _image_chip(self, url: str, checked: bool = True,
-                    title: str = "") -> QPushButton:
-        """Checkable cover thumbnail — readable without relying on memory.
+    def _image_chip(self, url: str, source: str, title: str = "",
+                    thumb: str = "", extra: bool = False) -> QPushButton:
+        """Checkable picture thumbnail — readable without relying on memory.
 
-        Additive like a tag chip, not exclusive: a game can hold many
-        covers (the add/edit dialog's own carousel), so picking one image
-        was never a reason to rule out another — each stays independently
-        checkable, default ON, and every checked one gets added rather than
-        one replacing whatever's already there."""
+        Additive like a tag chip, not exclusive: a game can hold many covers
+        (the add/edit dialog's own carousel), so picking one image was never a
+        reason to rule out another. A cover starts selected, like every additive
+        chip; every checked one gets added rather than one replacing whatever is
+        already there.
+
+        *extra* marks a screenshot: a picture of the game rather than its cover,
+        listed beside the cover and selected like it (untick the ones you do not
+        want). *thumb* is the small copy shown on the chip; *url* is the full
+        size that is downloaded."""
         chip = QPushButton("🖼")
         chip.setCheckable(True)
         chip.setCursor(Qt.CursorShape.PointingHandCursor)
         chip.setFixedSize(self._IMG_W + 8, self._IMG_H + 8)
         chip.setIconSize(QSize(self._IMG_W, self._IMG_H))
-        chip.setToolTip("\n".join(x for x in (title, url) if x))
+        chip.setToolTip("\n".join(x for x in (
+            title, t('add_game.merge_screenshot_tip') if extra else "", url) if x))
         chip.setProperty("opt_value", url)
+        chip.setProperty("opt_extra", bool(extra))
         chip.setStyleSheet(
             f"QPushButton{{background:{palette('bg_elevated')};color:{palette('text_muted')};"
             f"border:1px solid {palette('border')};border-radius:6px;font-size:{scaled(22, self)}px;padding:2px;}}"
@@ -972,10 +1074,24 @@ class EnrichmentMergeDialog(QDialog):
             f"QPushButton:checked{{border:2px solid {palette('accent')};"
             f"background:{palette('bg_card')};}}"
         )
-        chip.setChecked(checked)
-        self._img_boxes.append((chip, url))
-        self._img_chips[url] = chip
+        chip.setChecked(True)
+        self._img_boxes.append((chip, url, source))
+        self._img_chips[thumb or url] = chip
         return chip
+
+    def _titled_flow(self, col: QVBoxLayout, title: str) -> "_FlowLayout":
+        """A row of its own under a small title — one per kind of detail."""
+        lbl = QLabel(title)
+        lbl.setStyleSheet(
+            f"color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;"
+            f"letter-spacing:0.5px;padding:4px 0 0 2px;"
+        )
+        col.addWidget(lbl)
+        flow = _FlowLayout(spacing=6)
+        host = QWidget()
+        host.setLayout(flow)
+        col.addWidget(host)
+        return flow
 
     def _build(self):
         outer = QVBoxLayout(self)
@@ -998,29 +1114,18 @@ class EnrichmentMergeDialog(QDialog):
 
         # ── One section PER FIELD for the exclusive single-value fields ───
         # Name/description/developer/year only ever have ONE slot on the
-        # form, so every option for a given field — "Keep current" plus
-        # every differing value any source offered — lives together under
-        # one heading instead of being scattered across different
-        # per-source rows (where "Keep current" had no field label at all
-        # and its sibling alternative could be several rows away, under an
-        # unrelated source header — not selecting it did mean "keep the
-        # original", but nothing on screen made that legible). All chips
-        # for a field share one _ChipGroup (see _field_chip): picking any
-        # one — including "Keep current" — deselects the rest.
-        #
-        # When the field already has a value, "Keep current" starts
-        # checked and no alternative is auto-picked — the confirmed
-        # candidate's own field is never silently swapped for a peer's
-        # without the user deliberately choosing it. When the field is
-        # still EMPTY (no "Keep current" to anchor on), the first offered
-        # value auto-fills instead, same as before.
-        _current = self._model.get('current') or {}
-        _prev_label = t('add_game.merge_previous_value')
+        # form, so every option for a field — the value it holds now plus every
+        # DIFFERENT value a source offered — lives together under one heading.
+        # All chips of a field share one _ChipGroup: picking any one deselects
+        # the rest. A field with a value starts on "Keep current" (nothing
+        # changes unless a value is deliberately picked); an empty one starts
+        # on the first fetched value.
+        current = self._model.get('current') or {}
         for field in self._FIELDS:
             opts = self._model.get(field) or []
             if not opts:
                 continue
-            cur_val = (_current.get(field) or '').strip()
+            cur_val = (current.get(field) or '').strip()
             header = QLabel(self._field_title(field))
             header.setStyleSheet(
                 f"color:{palette('text_muted')};font-size:{scaled(10, self)}px;font-weight:700;"
@@ -1031,125 +1136,104 @@ class EnrichmentMergeDialog(QDialog):
             host = QWidget()
             host.setLayout(flow)
 
-            # Name, description, developer AND year are ALL applied
-            # UNCONDITIONALLY on confirm now (see _apply_result_init) — so
-            # by the time this dialog opens, "current" is already the
-            # just-applied candidate's own value, not something the user
-            # chose. Defaulting to "Keep current" here would default to
-            # silently accepting that change. When a "previous value"
-            # option exists (the pre_confirm_* snapshot, source-labelled
-            # _prev_label), default to THAT instead — nothing changes
-            # unless the user deliberately opts back into the new value.
-            # Image is the one field left that's still fill-only (never
-            # auto-applied without asking), so "Keep current" staying the
-            # default there is correct as-is — it isn't even in
-            # self._FIELDS, so this loop never reaches it.
-            _default_value = None
-            if field in ('name', 'description', 'developer', 'year'):
-                # prev_default is set whenever a previous value exists, even
-                # when that same value is already present under an ordinary
-                # (non-previous) option and no tagged chip was added for it
-                # — see _offer_previous_value's dedup skip.
-                _default_value = (self._model.get('prev_default') or {}).get(field)
-                if _default_value is None:
-                    for opt in opts:
-                        _sm = (self._model.get("source_meta") or {}).get(opt['source']) or {}
-                        if _sm.get('source_id') == _prev_label:
-                            _default_value = opt['value']
-                            break
-
-            first_taken = False
             if cur_val:
-                chip = self._field_chip(
-                    field, t('add_game.merge_keep_current', value=self._short(cur_val)),
-                    '', tooltip=cur_val, checked=(_default_value is None),
-                )
-                flow.addWidget(chip)
-                first_taken = _default_value is None
-            for opt in opts:
-                src_meta = (self._model.get("source_meta") or {}).get(opt['source']) or {}
-                src_id = src_meta.get('source_id') or ''
-                src_label = self._src_label(src_id) if src_id else ''
+                keep_text = t('add_game.merge_keep_current', value=self._short(cur_val))
+                flow.addWidget(self._field_chip(
+                    field, keep_text, '', tooltip=cur_val, checked=True))
+            for index, opt in enumerate(opts):
+                sources = list(opt.get('sources') or [opt['source']])
+                label = self._labels_for(sources)
                 # Elide the WHOLE composed text, not just opt['value'] before
                 # the source-label suffix is appended — eliding only the
                 # value left the suffix free to push the total past the
                 # limit this was supposed to enforce.
-                text = self._short(
-                    opt['value'] + (f"  ·  {src_label}" if src_label else ''))
-                is_default = _default_value is not None and opt['value'] == _default_value
+                text = self._short(opt['value'] + (f"  ·  {label}" if label else ''))
+                # An empty field has nothing to keep, so the first fetched
+                # value is the one already selected; a field with a value
+                # starts on "Keep current" and nothing incoming is.
                 chip = self._field_chip(
                     field, text, opt['value'], tooltip=opt['value'],
-                    checked=is_default or (not first_taken and _default_value is None),
-                )
-                first_taken = True
+                    checked=(not cur_val and index == 0))
+                self._chip_sources[chip] = sources
                 flow.addWidget(chip)
             col.addWidget(host)
 
         # ── One section per source for the ADDITIVE kinds ──────────────────
-        # Images/tags/urls/reviews are not exclusive — a game can hold many
-        # of each — so they stay grouped by source (their identity matters:
-        # which page a review or tag came from), each defaulting to checked
-        # (deselect what you don't want).
-        by_source: dict = {}
-        for kind in ('images', 'tags', 'urls', 'reviews'):
-            for opt in self._model.get(kind, []):
-                by_source.setdefault(opt['source'], {}).setdefault(kind, []).append(opt['value'])
-
-        for source, offers in by_source.items():
+        # Images/tags/reviews are not exclusive — a game can hold many of each
+        # — so they stay grouped by source (their identity matters: which page
+        # a review or tag came from), each kind on a row of its own under its
+        # own title. The source's page link lives under its header. Everything
+        # starts selected, so Apply just works; what the game already has is
+        # never offered.
+        model = self._model
+        for source, meta in (model.get('source_meta') or {}).items():
+            images = [o for o in model.get('images', []) if o['source'] == source]
+            tags = [o['value'] for o in model.get('tags', []) if o['source'] == source]
+            languages = [x for o in model.get('languages', []) if o['source'] == source
+                         for x in o['value']]
+            reviews = [o['value'] for o in model.get('reviews', []) if o['source'] == source]
+            if not (images or tags or languages or reviews or (meta.get('urls') or [])):
+                continue
             col.addWidget(self._source_header_row(source))
-            src_chips: list[QPushButton] = []
-            peer_title = ((self._model.get("source_meta") or {}).get(source) or {}).get("name") or ""
-            # Cover chip(s) get their OWN row, added before the text-field
-            # row below — a cover chip is ~5x the height of a tag/url chip
-            # (_IMG_H vs the fixed 22px chip height), and packing both kinds
-            # into one _FlowLayout let short chips land squeezed beside the
-            # tall cover on its line instead of starting on a fresh line
-            # underneath it.
-            images = offers.get('images', [])
+            src_chips: list = []
+            peer_title = (meta.get("name") or "")
             if images:
-                img_flow = _FlowLayout(spacing=6)
-                img_host = QWidget()
-                img_host.setLayout(img_flow)
-                for value in images:
-                    chip = self._image_chip(value, checked=True, title=peer_title)
-                    img_flow.addWidget(chip)
+                # Cover chip(s) get their OWN row: a cover chip is ~5x the
+                # height of a tag chip (_IMG_H vs the fixed 22px chip height),
+                # and packing both kinds into one _FlowLayout let short chips
+                # land squeezed beside the tall cover on its line.
+                flow = self._titled_flow(col, t('add_game.merge_images'))
+                for opt in images:
+                    chip = self._image_chip(
+                        opt['value'], source, title=peer_title,
+                        thumb=opt.get('thumb') or '', extra=bool(opt.get('extra')))
+                    flow.addWidget(chip)
                     src_chips.append(chip)
-                col.addWidget(img_host)
-            flow = _FlowLayout(spacing=6)
-            host = QWidget()
-            host.setLayout(flow)
-            for tag in offers.get('tags', []):
-                # Same elision as urls/field values below — an unbounded tag
-                # (e.g. a whole scraped phrase mistaken for a genre) could
-                # otherwise widen the chip past the dialog/screen.
-                chip = _merge_chip(self._short(tag), tooltip=tag)
+            if tags:
+                flow = self._titled_flow(col, t('library.tags'))
+                for tag in tags:
+                    # Same elision as field values — an unbounded tag (e.g. a
+                    # whole scraped phrase mistaken for a genre) could
+                    # otherwise widen the chip past the dialog/screen.
+                    chip = _merge_chip(self._short(tag), tooltip=tag)
+                    chip.setChecked(True)
+                    flow.addWidget(chip)
+                    self._tag_boxes.append((chip, tag, source))
+                    src_chips.append(chip)
+            if languages:
+                # One chip for ALL of a source's languages, showing only how
+                # many — the names are in its tooltip and on the candidate
+                # card. Additive and selected, like the tags.
+                flow = self._titled_flow(col, t('add_game.languages'))
+                chip = _merge_chip(
+                    t('add_game.merge_languages_chip', count=len(languages)),
+                    tooltip="\n".join(languages))
                 chip.setChecked(True)
                 flow.addWidget(chip)
-                self._tag_boxes.append((chip, tag))
+                self._language_boxes.append((chip, languages, source))
                 src_chips.append(chip)
-            for url in offers.get('urls', []):
-                chip = _merge_chip(self._short(url, 44), tooltip=url)
-                chip.setChecked(True)
-                flow.addWidget(chip)
-                self._url_boxes.append((chip, url))
-                src_chips.append(chip)
-            # One chip for ALL of a source's reviews: a score, who gave it and
-            # what they wrote are one verdict, so they are taken or left as
-            # one. Independent of the other sources' chips, the way tags are.
-            for reviews in offers.get('reviews', []):
-                chip = _merge_chip(self._reviews_chip_text(reviews),
-                                   tooltip=self._reviews_tooltip(reviews))
-                chip.setChecked(True)
-                flow.addWidget(chip)
-                self._review_boxes.append((chip, reviews))
-                src_chips.append(chip)
+            if reviews:
+                # One chip for ALL of a source's reviews: a score, who gave it
+                # and what they wrote are one verdict, so they are taken or
+                # left as one. Independent of the other sources' chips, the
+                # way tags are.
+                flow = self._titled_flow(col, t('reviews.preview'))
+                for group in reviews:
+                    chip = _merge_chip(self._reviews_chip_text(group),
+                                       tooltip=self._reviews_tooltip(group))
+                    chip.setChecked(True)
+                    flow.addWidget(chip)
+                    self._review_boxes.append((chip, group, source))
+                    src_chips.append(chip)
+            if not src_chips:
+                # Only a link on offer: the header itself is the switch.
+                src_chips.append(_LinkFlag())
             self._source_chips[source] = src_chips
             for chip in src_chips:
-                chip.toggled.connect(
-                    lambda _on, s=source: self._refresh_source_header(s))
+                if isinstance(chip, QPushButton):
+                    chip.toggled.connect(
+                        lambda _on, s=source: self._refresh_source_header(s))
             self._refresh_source_header(source)
-            if offers.get('tags') or offers.get('urls') or offers.get('reviews'):
-                col.addWidget(host)
 
         col.addStretch()
         scroll.setWidget(content)
@@ -1179,10 +1263,21 @@ class EnrichmentMergeDialog(QDialog):
 
     def _start_thumb_downloads(self):
         """Fetch cover previews off the GUI thread (same opener as candidate)."""
+        import queue
         from core.net import open_url as _open_url, image_fetch_request
+        todo: "queue.SimpleQueue" = queue.SimpleQueue()
         urls = set(self._img_chips) | set(self._header_thumbs)
         for url in urls:
-            def _dl(u=url):
+            todo.put(url)
+
+        # A few workers, not a thread per picture: with screenshots on offer
+        # there can be dozens of thumbnails, and they would all ask at once.
+        def _worker():
+            while True:
+                try:
+                    u = todo.get_nowait()
+                except queue.Empty:
+                    return
                 try:
                     req, _resolved = image_fetch_request(u)
                     with _open_url(req, timeout=10) as r:
@@ -1191,7 +1286,9 @@ class EnrichmentMergeDialog(QDialog):
                         self._thumb_ready.emit(u, data)
                 except Exception:
                     pass
-            threading.Thread(target=_dl, daemon=True).start()
+
+        for _ in range(min(6, len(urls))):
+            threading.Thread(target=_worker, daemon=True).start()
 
     def _on_thumb_ready(self, url: str, data: bytes):
         try:
@@ -1214,20 +1311,51 @@ class EnrichmentMergeDialog(QDialog):
 
     def selection(self) -> dict:
         """Chosen pieces: name/description/developer/year mapped to the
-        picked value or None (keep current / skip), plus image, tag, url and
-        review lists — reviews arrive already flattened, a whole source at
-        a time; images are additive like tags, never a single exclusive
-        pick."""
-        sel = {
-            'images': [v for cb, v in self._img_boxes if cb.isChecked()],
-            'tags': [v for cb, v in self._tag_boxes if cb.isChecked()],
-            'urls': [v for cb, v in self._url_boxes if cb.isChecked()],
-            'reviews': [r for cb, group in self._review_boxes
-                        if cb.isChecked() for r in group],
-        }
+        picked value or None (keep what is there), plus image, tag, language,
+        url and review lists — reviews arrive already flattened, a whole source at a
+        time; images are additive like tags, never a single exclusive pick, and
+        the screenshots (``extra_images``) are kept apart from the covers;
+        urls are the links of the sources that have anything selected.
+
+        ``sources`` names every source (by its model key) that contributed at
+        least one picked piece, for the caller's "this source was applied"
+        bookkeeping.
+        """
+        picked: set = set()
+        images = []
+        extra_images = []
+        for chip, url, source in self._img_boxes:
+            if chip.isChecked():
+                (extra_images if chip.property("opt_extra") else images).append(url)
+                picked.add(source)
+        tags = []
+        for chip, tag, source in self._tag_boxes:
+            if chip.isChecked():
+                tags.append(tag)
+                picked.add(source)
+        languages = []
+        for chip, names, source in self._language_boxes:
+            if chip.isChecked():
+                languages.extend(x for x in names if x not in languages)
+                picked.add(source)
+        reviews = []
+        for chip, group, source in self._review_boxes:
+            if chip.isChecked():
+                reviews.extend(group)
+                picked.add(source)
+        # A source's link comes in with it: whenever anything of it is selected.
+        urls = []
+        for source, links in self._source_urls.items():
+            if any(c.isChecked() for c in self._source_chips.get(source) or []):
+                urls.extend(u for u in links if u not in urls)
+                picked.add(source)
+        sel = {'images': images, 'extra_images': extra_images, 'tags': tags,
+               'languages': languages, 'urls': urls, 'reviews': reviews}
         for field, group in self._field_groups.items():
             btn = group.checkedButton()
-            sel[field] = btn.property('opt_value') if btn is not None else None
+            value = btn.property('opt_value') if btn is not None else None
+            sel[field] = value or None   # the keep chip carries '' → unchanged
+            if value:
+                picked.update(self._chip_sources.get(btn, []))
+        sel['sources'] = picked
         return sel
-
-
