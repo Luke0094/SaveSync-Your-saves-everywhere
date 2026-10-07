@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from core.library import GameEntry, get_library
 from core.config_manager import get_config
 from i18n import t
+from ui.exe_icon import show_exe_icon
 from ui.helpers import (display_scale, load_pixmap_any as _load_pixmap_any,
                         lock_min_size, open_in_file_manager, scaled,
                         scaled_for_screen)
@@ -141,6 +142,14 @@ def _display_sync_status(entry, playing: bool = False) -> str:
     return "no_saves"
 
 PLACEHOLDER_ICON = "🎮"
+
+
+def _show_placeholder(label: QLabel, entry: GameEntry, size: int) -> None:
+    """What a cover slot shows when the game has no cover image: the icon of
+    its own program at *size* (logical px), or the controller glyph when the
+    program has none. Replaces whatever the label showed before."""
+    show_exe_icon(label, entry.exe_path or "", size, PLACEHOLDER_ICON,
+                  display_scale())
 
 
 def _fmt_dt(iso: Optional[str]) -> str:
@@ -1786,7 +1795,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             self._cover.setPixmap(px)
             self._cover.setText("")
         else:
-            self._cover.setText(PLACEHOLDER_ICON)
+            _show_placeholder(self._cover, self._entry, scaled(56, self))
 
     def refresh(self, entry: GameEntry):
         self._entry = entry
@@ -1795,7 +1804,9 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         # are re-picked-up on the next hover instead of cycling stale frames.
         self._all_images = []
         new_img = _find_game_image(entry)
-        if new_img != self._img_path:
+        # No cover: the placeholder is the program's icon, so it follows the
+        # exe path too, not only a change of image.
+        if new_img != self._img_path or new_img is None:
             self._img_path = new_img
             self._update_cover()
         _disp_name = _clean_tag_display(entry.name)
@@ -1857,7 +1868,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         if px:
             self._thumb.setPixmap(px)
         else:
-            self._thumb.setText(PLACEHOLDER_ICON)
+            _show_placeholder(self._thumb, self._entry, scaled(32, self))
         row.addWidget(self._thumb)
 
         # Folder color dot
@@ -2004,14 +2015,14 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
     def refresh(self, entry: GameEntry):
         self._entry = entry
         new_img = _find_game_image(entry)
-        if new_img != self._img_path:
+        if new_img != self._img_path or new_img is None:
             self._img_path = new_img
             focus = getattr(entry, 'cover_focus', 'center')
             px = _make_pixmap(new_img, 48, 48, focus)
             if px:
                 self._thumb.setPixmap(px)
             else:
-                self._thumb.setText(PLACEHOLDER_ICON)
+                _show_placeholder(self._thumb, entry, scaled(32, self))
         self._name_lbl.setText(_clean_tag_display(entry.name))
         self._played_lbl.setText(f"{t('library.last_played')}: {_fmt_dt(entry.last_played)}")
         self._synced_lbl.setText(f"{t('library.last_synced')}: {_fmt_dt(entry.last_synced)}")

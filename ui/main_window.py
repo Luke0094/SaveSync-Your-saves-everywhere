@@ -40,6 +40,7 @@ from core.backup import get_backup_manager
 from core.machine import get_machine_id
 from hotkeys import get_hotkey_manager
 from sync import get_orchestrator
+from ui.exe_icon import show_exe_icon
 from ui.helpers import scaled
 
 
@@ -683,11 +684,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         status_col.setSpacing(0)
         status_col.setContentsMargins(0, 0, 0, 0)
 
+        # While a game runs, its own icon (the controller when its program
+        # has none) sits in front of its name; hidden the rest of the time.
+        self._sidebar_status_icon = QLabel()
+        self._sidebar_status_icon.setVisible(False)
         self._sidebar_status = QLabel(t("status.offline"))
         self._sidebar_status.setStyleSheet(
             f"color: {palette('text_muted')}; font-size: {scaled(10, self)}px; padding: 8px 16px 0 0;"
         )
-        status_col.addWidget(self._sidebar_status)
+        sidebar_status_row = QHBoxLayout()
+        sidebar_status_row.setContentsMargins(0, 0, 0, 0)
+        sidebar_status_row.setSpacing(0)
+        sidebar_status_row.addWidget(self._sidebar_status_icon)
+        sidebar_status_row.addWidget(self._sidebar_status, 1)
+        status_col.addLayout(sidebar_status_row)
 
         mid = get_machine_id()[:8]
         self._machine_lbl = QLabel(f"ID: {mid}\u2026")
@@ -6358,12 +6368,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _update_sidebar_status(self):
         playing = get_monitor().currently_playing()
         if playing:
-            self._sidebar_status.setText(f"🎮 {playing[0].name}")
             fs = scaled(10, self)
             pad_v = scaled(8, self)
             pad_h = scaled(16, self)
-            self._sidebar_status.setStyleSheet(f"color: {palette('accent')}; font-size: {fs}px; padding: {pad_v}px {pad_h}px;")
+            gap = scaled(4, self)
+            show_exe_icon(self._sidebar_status_icon, playing[0].exe_path,
+                          scaled(14, self), "🎮", self.devicePixelRatioF())
+            # The icon takes the left padding the single label used to have,
+            # and the name sits a few px after it.
+            self._sidebar_status_icon.setStyleSheet(
+                f"color: {palette('accent')}; font-size: {fs}px; "
+                f"padding: {pad_v}px 0 {pad_v}px {pad_h}px;")
+            self._sidebar_status_icon.setVisible(True)
+            self._sidebar_status.setText(playing[0].name)
+            self._sidebar_status.setStyleSheet(f"color: {palette('accent')}; font-size: {fs}px; padding: {pad_v}px {pad_h}px {pad_v}px {gap}px;")
         else:
+            self._sidebar_status_icon.setVisible(False)
             orch = get_orchestrator()
             fs = scaled(10, self)
             pad_v = scaled(8, self)

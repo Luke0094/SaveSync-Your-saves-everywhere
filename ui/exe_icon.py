@@ -1,11 +1,12 @@
 """
 SaveSync - Executable icons.
 
-The icon a program carries inside its .exe, for the places that show a game
-SaveSync has noticed but does not know yet (the overlay's detection card, the
-Overview's banner). A known game has a cover; an unknown one has only the
-program that is running, and its own icon is the one thing that tells two
-unfamiliar names apart at a glance.
+The icon a program carries inside its .exe, for the places that stand in for a
+game's cover: the overlay's detection and tracking cards, the Overview's
+banners, the sidebar's "now playing" line, and a library entry that has no
+cover image. A game SaveSync has only just noticed has nothing else to show,
+and for any game the program's own icon is the one thing that tells two
+unfamiliar names apart at a glance. A real cover always wins where there is one.
 
 Every failure answers None, and the caller keeps its controller glyph: a
 missing file, a program with no icon resource, a platform where the shell has
@@ -14,6 +15,7 @@ no per-executable icon, a drive that is not there any more.
 import logging
 import os
 import platform
+import time
 from collections import OrderedDict
 
 from PySide6.QtCore import QFileInfo, QSize, Qt
@@ -23,10 +25,18 @@ from PySide6.QtWidgets import QFileIconProvider
 logger = logging.getLogger(__name__)
 
 # (normalised path, device px) -> pixmap, or None for "has no usable icon".
-# Bounded: the unknown-game queue holds at most a few dozen programs.
+# Bounded, but sized for a library: every cover-less entry asks for its icon,
+# and an eviction costs a shell round-trip on the GUI thread to get it back.
 _CACHE: "OrderedDict[tuple[str, int], QPixmap | None]" = OrderedDict()
-_CACHE_MAX = 96
+_CACHE_MAX = 512
 _provider: "QFileIconProvider | None" = None
+
+# normalised path -> time.monotonic() when it was found missing. A missing file
+# is not remembered for good (a drive that is not mounted yet may be next
+# time), but it is remembered briefly: a library asks again on every hover and
+# refresh, and on an unreachable network drive each ask is a stall.
+_MISSING: "dict[str, float]" = {}
+_MISSING_TTL = 30.0
 
 
 def _has_icon_resource(path: str) -> bool:
@@ -64,15 +74,25 @@ def exe_icon_pixmap(exe_path: str, size: int, dpr: float = 1.0) -> "QPixmap | No
         return None
     dpr = max(1.0, float(dpr or 1.0))
     device_px = max(1, int(round(size * dpr)))
-    key = (os.path.normcase(exe_path), device_px)
+    norm = os.path.normcase(exe_path)
+    key = (norm, device_px)
     if key in _CACHE:
         _CACHE.move_to_end(key)
         return _CACHE[key]
+    gone_at = _MISSING.get(norm)
+    if gone_at is not None:
+        if time.monotonic() - gone_at < _MISSING_TTL:
+            return None
+        del _MISSING[norm]
 
     pixmap = None
     try:
         if not os.path.isfile(exe_path):
-            # Not remembered: a drive that is not mounted yet may be next time.
+            # Only briefly remembered: a drive that is not mounted yet may be
+            # there next time.
+            if len(_MISSING) >= _CACHE_MAX:
+                _MISSING.clear()
+            _MISSING[norm] = time.monotonic()
             return None
         if _has_icon_resource(exe_path):
             global _provider

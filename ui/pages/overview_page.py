@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
+from ui.exe_icon import show_exe_icon
 from ui.helpers import PageScrollMixin, safe_widget as _safe, scaled
 from ui.styles.theme import palette, ThemedMixin
 from core.config_manager import get_config
@@ -1152,11 +1153,17 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             eng = engine_display(engine_for_game(e))
             self._active_name.setText(
                 f"{e.name}  ·  {eng}" if eng else e.name)
+            # The running game's own icon — the same size and fallback as the
+            # unknown-games banner that takes this slot when nothing is playing.
+            show_exe_icon(self._active_icon, e.exe_path, scaled(28, self),
+                          "\U0001f3ae", self.devicePixelRatioF())
             self._active_sub.setText(t("overview.running_saves", count=len(e.save_paths)))
             self._active_backup_btn.setVisible(True)
             self._active_backup_btn.setProperty("_game_id", e.id)
         else:
             self._active_name.setText(t("overview.no_active_game"))
+            # Back to the glyph, or the last game's icon outlives its session.
+            self._active_icon.setText("\U0001f3ae")
             self._active_sub.setText("")
             self._active_backup_btn.setVisible(False)
         self._unknown_banner.refresh()
@@ -1750,6 +1757,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             active_engine = engine_display(engine_for_game(active[0]))
         return {
             "active_game":   active[0].name if active else None,
+            "active_exe":    active[0].exe_path if active else "",
             "active_engine": active_engine,
             "library_count": len(games),
             "last_backup":   last_bk_str,

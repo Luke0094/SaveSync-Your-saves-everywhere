@@ -1631,7 +1631,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._clear_notification_queue()
         self._set_mode("tracking")
         self._context_exe = exe_path
-        self._icon_label.setText("🎮")
+        # The game's own icon, as on the detection card; the controller when
+        # its program has none (or there is no program to look at).
+        from ui.exe_icon import show_exe_icon
+        show_exe_icon(self._icon_label, exe_path, scaled(24, self), "🎮",
+                      self._scale_dpr())
         self._title.setText(t("app.name"))
         eng = (engine or "").strip() or _engine_label_for_exe(exe_path)
         # Game name + engine on one line; status on the line below.
@@ -2481,7 +2485,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                     f"{_engine_badge_html(eng, self)}"
                 )
                 self._message.setText(t("overlay.game_launched", game=game_html))
-                self._icon_label.setText("🎮")
+                from ui.exe_icon import show_exe_icon
+                show_exe_icon(self._icon_label, stats.get("active_exe", ""),
+                              scaled(24, self), "🎮", self._scale_dpr())
             else:
                 self._message.setText(
                     f"<span style='color:{palette('text_hint')};'>"
