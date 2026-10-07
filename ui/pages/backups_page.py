@@ -393,10 +393,14 @@ class BackupRow(QFrame, ThemedMixin):
         for candidate in candidates:
             if candidate is None or candidate not in connected:
                 continue
-            root = getattr(candidate, "_root", None)
-            if not root or not Path(root).exists():
+            # The orchestrator's own answer, not candidate._root: OneDrive,
+            # Dropbox and Google Drive in their "synced folder" mode hold the
+            # folder on a LocalProvider delegate, so the provider itself has no
+            # _root — reading it there found nothing and sent the button to
+            # SaveSync's general backup folder instead.
+            root = orch.local_root_of(candidate)
+            if root is None or not root.exists():
                 continue
-            root = Path(root)
             # Where the zip actually lives: the folder recorded when it was
             # listed, else the id (a cloud-only entry's id IS the folder name).
             game_folder = ((self._entry.cloud_metadata or {}).get("remote_folder")

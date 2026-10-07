@@ -270,6 +270,52 @@ def dedupe_paths(paths) -> list[str]:
     return result
 
 
+def _rule_key(path_str: str) -> str:
+    """Cheap comparison key for the rejected-path rule: no disk access, so it
+    can run on every filesystem event the watcher delivers."""
+    s = str(path_str or "").strip()
+    if s.lower().startswith("registry:"):
+        return s.replace("/", "\\").lower()
+    return os.path.normcase(os.path.normpath(s))
+
+
+def is_rejected_save_path(game_id: str, path: str, confirmed_paths=None) -> bool:
+    """True when the user trashed exactly *path* as a save location for
+    *game_id* (config ``auto_scan_deleted_paths``) and it is not a save path of
+    the game now.
+
+    EXACT, on purpose: rejecting a folder does not reject what is inside it.
+    The game's main folder can be a false positive while the save folder under
+    it is the real thing, and trashing the first must never hide the second —
+    the same rule the proposal filter (filter_selectable_paths) has always had.
+
+    That answer used to be read only where candidates were PROPOSED, so a
+    rejected folder kept being detected, queued and logged by the watcher and
+    by live tracking all the same. This is the one question those places ask.
+    A path the game lists as a save path today wins (a folder can be kept after
+    an earlier session trashed it, spelled differently).
+    """
+    if not game_id or not path:
+        return False
+    try:
+        from core.config_manager import get_config
+        raw = (get_config().get("auto_scan_deleted_paths", {}) or {}).get(game_id)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    key = _rule_key(path)
+    if key not in {_rule_key(p) for p in raw if p}:
+        return False
+    if confirmed_paths is None:
+        try:
+            from core.library import get_library
+            entry = get_library().get_by_id(game_id)
+            confirmed_paths = list(entry.save_paths or []) if entry else []
+        except Exception:
+            confirmed_paths = []
+    return key not in {_rule_key(p) for p in confirmed_paths or [] if p}
+
 
 def _clean_ancestor_folder_name(n: str) -> str:
     """A folder name reduced to a title: version/build markers and

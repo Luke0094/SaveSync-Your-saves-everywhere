@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
@@ -230,6 +230,12 @@ MACHINE_FIELDS = ["node", "processor", "machine", "system"]
 MAX_LOCAL_BACKUPS = 6
 BACKUP_RETENTION_DAYS = 30
 MIN_KEPT_BACKUPS = 3
+
+# After a restore, the saves on disk are "whatever that restore put there" for
+# this long: the safety copy taken BEFORE a restore (the backup manager's and
+# the save editor's alike) is not repeated for another restore inside it. The
+# player is stepping through restore points, not playing in between.
+RESTORE_QUIET_SECONDS = 600
 
 
 # Insert-a-space camelCase boundary ("SuperGameStory" → "Super Game Story").

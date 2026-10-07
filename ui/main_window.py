@@ -280,6 +280,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             _dh = min(_dh, max(480, int(_ag.height() * 0.92)))
         self.resize(max(640, _dw), max(480, _dh))
         self._restore_window_state()
+        # The scale this window's current SIZE belongs to — not the scale now
+        # in force (_last_ui_scale), which moves while the window is hidden and
+        # the size does not. See fit_geometry_to_scale.
+        self._geometry_scale = _ui_scale(self)
         self._active_nav_idx   = 0
         self._nav_buttons: list[NavButton] = []
         self._overlay: Optional[OverlayWidget] = None
@@ -459,6 +463,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         _bm = get_backup_manager()
         _bm.index_validation_failed.connect(self._on_index_validation_failed)
         _bm.index_validation_recovered.connect(self._on_index_validation_recovered)
+        # A bound slot, not a lambda: restores run on worker threads, and only
+        # a slot on a QObject is queued back onto the GUI thread — which is
+        # where the in-game backup timer may be touched.
+        _bm.backup_restored.connect(self._on_backup_restored_reset_timer)
         self.launcher_exe_resolved.connect(self._on_launcher_exe_resolved)
         # backup_id SaveSync itself last restored, per game — landing on that
         # state is the intended outcome, not something to warn about.
@@ -828,6 +836,45 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     # page to settle; short enough that the startup garbage is handed back
     # before the user has done anything that would need it again.
     _STARTUP_TRIM_DELAY_MS = 4_000
+
+    def setVisible(self, visible: bool):
+        # Coming back from the tray: the monitors may have changed while the
+        # window was away, and nothing resized it then (only visible windows
+        # follow a scale change). Fit it to the scale in force BEFORE it
+        # appears, rather than showing the old size and correcting it.
+        if visible and not self.isVisible():
+            try:
+                self.fit_geometry_to_scale()
+            except Exception:
+                logger.debug("Could not fit the window to the current scale", exc_info=True)
+        super().setVisible(visible)
+
+    def fit_geometry_to_scale(self, target: "float | None" = None) -> None:
+        """Make the window's size match the UI scale now in force.
+
+        Every size in the window is multiplied by ui_scale, so a size means
+        nothing without the scale it was set at. ``_geometry_scale`` is that
+        scale. A scale change while the window is visible resizes it by the
+        ratio (scale_all_top_level_windows → here); one that happens while it
+        is HIDDEN in the tray changes nothing, so the ratio is applied from the
+        scale the size really belongs to when the window next appears. Ratios
+        are never taken against ``_last_ui_scale``: that value advances through
+        every change whether or not the window followed, and a window that was
+        skipped on the way down was multiplied by the whole climb on the way
+        back up — hence a window far too big after the tray.
+        """
+        from ui.helpers import ui_scale, scale_window_geometry
+        cur = float(target) if target else float(ui_scale(self))
+        base = getattr(self, "_geometry_scale", None)
+        if not base or base <= 0:
+            self._geometry_scale = cur
+            return
+        if abs(cur - base) < 0.02:
+            return
+        if not self.isMaximized():
+            logger.info(f"Main window size follows the scale {base:.2f} -> {cur:.2f}")
+            scale_window_geometry(self, base, cur)
+        self._geometry_scale = cur
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1633,12 +1680,35 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         try:
             if self.windowState() & Qt.WindowState.WindowMaximized:
                 return
+            # A window in the tray is fitted when it comes back (setVisible);
+            # growing it from here only added a size nothing had converted.
+            if not self.isVisible():
+                return
+            # A scale re-apply that is still pending will resize the window by
+            # the ratio itself; looking at the size before it has run compares
+            # against a window the scale change has not reached yet.
+            if self._ui_scale_reapply_timer.isActive():
+                QTimer.singleShot(300, self._refresh_window_geometry_after_screen)
+                return
             cfg = get_config()
             geo = cfg.get("window_geometry", None)
             if not isinstance(geo, dict):
                 return
             w = max(900, int(geo.get("w", 1100)))
             h = max(600, int(geo.get("h", 720)))
+            # The saved size belongs to the scale it was saved at. Used as it
+            # stands on a screen with a different scale it made the window far
+            # too big (or small) for its contents — convert it, the way
+            # _restore_window_state does.
+            try:
+                from ui.helpers import ui_scale as _ui_scale
+                saved_scale = float(geo.get("scale") or 0.0)
+                now_scale = float(_ui_scale(self))
+                if saved_scale > 0 and now_scale > 0 and abs(now_scale - saved_scale) > 0.02:
+                    w = max(200, int(round(w * now_scale / saved_scale)))
+                    h = max(200, int(round(h * now_scale / saved_scale)))
+            except Exception:
+                logger.debug("Could not convert the saved window size", exc_info=True)
             if self.width() >= w and self.height() >= h:
                 return
             screen = self.screen() or QApplication.primaryScreen()
@@ -1734,6 +1804,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # Rebuild overlay
             try:
                 if hasattr(self, '_overlay') and self._overlay is not None:
+                    # Its own stylesheet (when its monitor's scale is not the
+                    # application's) is a copy of the one just rebuilt.
+                    self._overlay.on_app_scale_changed()
                     self._overlay.updateGeometry()
                     self._overlay.update()
                     logger.info("Rebuilt overlay")
@@ -2410,7 +2483,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # disk is the same change, spread over a restart.
         try:
             from ui.helpers import ui_scale as _ui_scale
-            _scale = round(float(_ui_scale(self)), 4)
+            # The scale the SIZE belongs to, which is not the scale now in
+            # force when the window has been hidden through a monitor change.
+            _scale = round(float(getattr(self, "_geometry_scale", None)
+                                 or _ui_scale(self)), 4)
         except Exception:
             _scale = 0.0
         config.set("window_geometry", {
@@ -2726,6 +2802,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
 
     def _on_overlay_action(self, action: str, context: str):
+        # The overlay buttons that start (or answer for) a backup or a restore
+        # leave a line: a backup that appears right after a launch prompt could
+        # otherwise not be told apart from an automatic one.
+        if action in ("backup_now_unbacked", "backup_current", "backup_all",
+                      "restore_newest", "force_restore"):
+            logger.info(f"Overlay action chosen: {action}")
         # Matched FIRST: this context is "procname|game_id", not an exe path,
         # so it must never fall through to a branch that treats it as one.
         if action in ("confirm_process_match", "reject_process_match"):
@@ -4708,7 +4790,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     for p in added:
                         logger.info(
                             f"Live tracking (watchdog) surfaced save path "
-                            f"for {entry.name}: {p}")
+                            f"for {entry.name}: {p}{self._session_age_note(game_id)}")
                     # Live-update an already-open confirmation panel.
                     self._push_paths_to_open_scan_dialog(game_id, added)
                     # Kick the provisional-backup timer for a not-yet-confirmed
@@ -4722,6 +4804,23 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         self._start_ingame_backup_timer(entry)
         except Exception as e:
             logger.debug(f"Discovery bridge failed for {game_id}: {e}")
+
+    @staticmethod
+    def _session_age_note(game_id: str) -> str:
+        """" (+12s into the session)" for a discovery log line, or "".
+
+        Which mechanism found a folder and how long after launch is the whole
+        answer to "why did this one arrive later than that one" — the open-file
+        poll sees what the game holds open within seconds, the watcher only
+        what is written afterwards."""
+        try:
+            started = get_monitor().tracked_process_start_time(game_id)
+            if started > 0:
+                import time as _t
+                return f" (+{max(0, int(_t.time() - started))}s into the session)"
+        except Exception:
+            pass
+        return ""
 
     def _on_save_changed(self, game_id: str):
         """Save file changed (watchdog). One job now: DISCOVERY.
@@ -4874,8 +4973,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # that filesystem events can discover them (e.g. Godot AppData paths).
         self._watcher.watch_game(entry.id, entry.save_paths, game_name=entry.name)
 
-        # Always start in-game backup timer (uses confirmed paths or pre-scanned)
-        self._start_ingame_backup_timer(entry)
+        # Always start in-game backup timer (uses confirmed paths or pre-scanned).
+        # fresh_session: the first automatic backup is a full interval after
+        # launch, never seconds into it.
+        self._start_ingame_backup_timer(entry, fresh_session=True)
 
         # Always start live-tracking background scan so newly created saves
         # are picked up even when the game already has confirmed paths.
@@ -5007,7 +5108,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     # Merge newly found paths into pending (identity-based, so
                     # a differently-cased spelling of a folder the watcher
                     # already surfaced is not added a second time)
-                    from core.save_detector import path_identity as _pid
+                    from core.save_detector import (
+                        path_identity as _pid, is_rejected_save_path as _rejected)
                     with _lock:
                         existing_pending = self._pending_auto_scans.get(game_id, [])
                         merged = list(existing_pending)
@@ -5015,8 +5117,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         for p in paths:
                             if _pid(p) not in known:
                                 known.add(_pid(p))
+                                # Exactly the folders the user trashed for this
+                                # game are not discoveries, however often the
+                                # game opens something in them. Their
+                                # neighbours and children are judged on their
+                                # own (see is_rejected_save_path).
+                                if _rejected(game_id, p):
+                                    logger.debug(f"Live tracking: {p} was rejected for "
+                                                 f"{game_name} — not proposed")
+                                    continue
                                 merged.append(p)
-                                logger.info(f"Live tracking found new path for {game_name}: {p}")
+                                logger.info(f"Live tracking found new path for {game_name}: {p}"
+                                            f"{self._session_age_note(game_id)}")
                         self._pending_auto_scans[game_id] = merged
 
                     # Re-start backup timer if it has no paths yet
@@ -5040,11 +5152,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Also fire immediately (after a short delay so the process settles)
         QTimer.singleShot(1000, _poll)
 
-    def _start_ingame_backup_timer(self, entry: GameEntry):
+    def _start_ingame_backup_timer(self, entry: GameEntry, fresh_session: bool = False):
         """Start a repeating timer to backup saves every N seconds while playing.
 
         Uses the per-game auto_backup_enabled flag and backup_interval_sec.
         The first tick is deferred by the remaining interval since last backup.
+
+        *fresh_session*: the game has just been launched. Then the first tick
+        is a FULL interval away, whatever the last backup's age says: the
+        player has not played anything yet, the exit backup of the last session
+        already holds the saves as they were, and a backup landing seconds into
+        a launch is a copy of an unchanged state that the game's own start-up
+        writes (settings, an autosave slot, persistent data) turned into a
+        "new" one. A restart in the middle of a session (settings edit, a path
+        found later) keeps the remaining-interval rule below instead.
+
         A tick this timer fires still isn't what writes over an unresolved
         regression/unbacked warning — _ingame_backup_tick itself skips while
         one is pending (see _launch_notification_pending); that gate, not
@@ -5061,9 +5183,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         interval_ms = max(30, entry.backup_interval_sec) * 1000
 
-        # Calculate how long ago the last backup was
+        # How long ago the clock last started: the later of the last backup and
+        # the last restore. A restore puts saves on disk that no backup of this
+        # session produced, so counting from the backup before it let the first
+        # tick land seconds after the restore and back up the state the player
+        # had just chosen to go to.
         first_delay_ms = interval_ms
-        if entry.last_backed_up:
+        age_s = None
+        if entry.last_backed_up and not fresh_session:
             try:
                 from datetime import timezone
                 from dateutil.parser import parse as _parse
@@ -5071,18 +5198,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     __import__('datetime').datetime.now(timezone.utc)
                     - _parse(entry.last_backed_up)
                 ).total_seconds()
-                remaining_s = entry.backup_interval_sec - age_s
-                if remaining_s > 5:
-                    # Wait out the remaining interval before the first backup
-                    first_delay_ms = int(remaining_s * 1000)
-                    logger.debug(
-                        f"In-game backup timer: first tick in {remaining_s:.0f}s "
-                        f"(last backup was {age_s:.0f}s ago) for {entry.name}"
-                    )
-                else:
-                    first_delay_ms = interval_ms
             except Exception:
-                pass
+                age_s = None
+        try:
+            since_restore = (None if fresh_session
+                             else get_backup_manager().seconds_since_restore(entry.id))
+        except Exception:
+            since_restore = None
+        if since_restore is not None and (age_s is None or since_restore < age_s):
+            age_s = since_restore
+        if age_s is not None:
+            remaining_s = entry.backup_interval_sec - age_s
+            if remaining_s > 5:
+                # Wait out the remaining interval before the first backup
+                first_delay_ms = int(remaining_s * 1000)
+                logger.debug(
+                    f"In-game backup timer: first tick in {remaining_s:.0f}s "
+                    f"(last backup or restore was {age_s:.0f}s ago) for {entry.name}"
+                )
+            else:
+                first_delay_ms = interval_ms
 
         timer = QTimer(self)
         timer.setSingleShot(False)
@@ -5118,6 +5253,36 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if timer:
             timer.stop()
             timer.deleteLater()
+
+    @Slot(str)
+    def _on_backup_restored_reset_timer(self, game_id: str):
+        """A restore just finished: start the in-game backup clock over.
+
+        The running timer was counting towards a backup of the saves as they
+        were BEFORE the restore; its next tick would land on the restored
+        state at some arbitrary point in the interval and file it as a new
+        backup right after the player chose it. Restarting makes it a full
+        interval away (_start_ingame_backup_timer measures from the later of
+        the last backup and the restore). Timers are keyed by LIBRARY id while
+        the signal carries the backup's own, which differ for an adopted
+        archive — so any running timer whose game was restored just now is
+        restarted, not only the one the signal names.
+        """
+        try:
+            mgr = get_backup_manager()
+            for gid in list(self._ingame_backup_timers):
+                since = mgr.seconds_since_restore(gid)
+                if since is None or since > 30:
+                    continue
+                entry = get_library().get_by_id(gid)
+                if entry:
+                    self._start_ingame_backup_timer(entry)
+                    logger.info(
+                        f"In-game backup timer restarted for {entry.name} "
+                        f"after a restore")
+        except Exception:
+            logger.debug("Could not restart the in-game backup timer after a "
+                         "restore", exc_info=True)
 
     def _launch_notification_pending(self, game_id: str) -> bool:
         """True while a regression/unbacked warning for this game is still
@@ -5218,6 +5383,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 pre_confirmation=_pre_confirm,
                 identity_alternates=_identity_alts,
                 return_status=True,
+                # The periodic backup: marked so lists that report what
+                # happened (the Overview's recent activity) can leave out the
+                # one that repeats every few minutes for as long as a game runs.
+                extra_metadata={mgr.TIMER_BACKUP_KEY: True},
             )
             # Its own tag, independent of _identity_alts — see
             # mark_notif_gated's own docstring for why the two must stay
@@ -5661,6 +5830,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         get_backup_manager().promote_pre_confirmation_backups(
             entry.id, note=t('main.auto_confirmed'), include_identity_pending=True)
         self._recheck_cloud_after_identity_resolved(entry.id)
+        if moved:
+            # The save paths now point at the new install: back that up now.
+            self.on_game_config_changed(entry.id, "save paths (new version)")
 
     def _apply_path_overwrite(self, entry, new_exe_path: str):
         """Replace the primary path outright — the auto-registered version
@@ -5713,6 +5885,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         get_library().update_game(entry)
         if moved:
             self._carry_rebased_save_data(entry, new_exe_path, moved)
+            self.on_game_config_changed(entry.id, "save paths (new install)")
 
     def _resolve_overwrite_saves_conflict(self, game_id: str, new_exe_path: str, do_rebase: bool):
         """Answer to show_overwrite_saves_conflict — two different questions
@@ -5740,6 +5913,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 return
             if self._rebase_save_paths_to_new_exe(entry, new_exe_path, old_exe=old_exe):
                 get_library().update_game(entry)
+                self.on_game_config_changed(entry.id, "save paths (new install)")
             return
         conflicts = self._pending_carry_conflict.pop(key, None)
         if conflicts and do_rebase:
@@ -6615,6 +6789,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         dlg.background_status_changed.connect(
             lambda status, d=dlg: self._on_add_game_bg_status(d, status))
         dlg.game_added.connect(self._on_game_saved_from_dialog)
+        # Save paths / unticked folders or files / install changed by the edit:
+        # the new configuration is backed up now (see on_game_config_changed).
+        dlg.config_changed.connect(self.on_game_config_changed)
         dlg.finished.connect(lambda _r, d=dlg: self._on_add_game_dialog_finished(d))
 
     def _on_game_saved_from_dialog(self, entry):
@@ -6869,13 +7046,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _enqueue_backup(self, game_id: str, force_full: bool = False,
                         silent: bool = False, part_of_batch: bool = False,
-                        check_unbacked: bool = False, notif_gated: bool = False):
+                        check_unbacked: bool = False, notif_gated: bool = False,
+                        config_changed: bool = False):
         if not game_id:
             return
         with self._backup_lock:
             if game_id in self._backup_inflight or game_id in self._backup_queued:
                 return
             self._backup_queued.add(game_id)
+            if not part_of_batch:
+                # Who asked, in one line: force means "keep what is on disk"
+                # (the unbacked prompt's answer), notif_gated the exit backup,
+                # config_changed an edit — the rest is a manual Backup Now.
+                logger.info(f"Backup queued for {game_id[:8]}: force={bool(force_full)} "
+                            f"notif_gated={bool(notif_gated)} "
+                            f"config_changed={bool(config_changed)} "
+                            f"check_unbacked={bool(check_unbacked)}")
             self._backup_job_queue.append({
                 "game_id": game_id,
                 "force": bool(force_full),
@@ -6894,6 +7080,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # write (never skip outright) but only as a temporary
                 # pre_confirmation backup — see _run_backup_job.
                 "notif_gated": bool(notif_gated),
+                # The backup of a game whose save paths / exclusions / install
+                # just changed — see create_backup's config_changed.
+                "config_changed": bool(config_changed),
             })
 
     def _pump_backup_queue(self):
@@ -6994,8 +7183,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # giving each pre_confirmation reason its own is the whole fix.
         # Identity takes priority when (rarely) both apply at once: it's
         # the older, more fundamental mystery — which game this even is.
+        config_changed = bool(job.get("config_changed"))
         _note = (t('main.auto_pending_identity') if identity_alts
                 else t('main.auto_pending_review') if notif_pending
+                else t('main.auto_config_change') if config_changed
                 else "")
 
         def _do_backup():
@@ -7012,6 +7203,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 identity_alternates=identity_alts,
                 report_regression=True,
                 check_unbacked=check_unbacked,
+                config_changed=config_changed,
             )
             # Its own tag, independent of identity_alts — a game can be
             # BOTH an identity mystery and mid regression/unbacked warning
@@ -7094,14 +7286,51 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         threading.Thread(target=_do_archive, daemon=True).start()
 
     def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False,
-                     check_unbacked: bool = False, notif_gated: bool = False):
+                     check_unbacked: bool = False, notif_gated: bool = False,
+                     config_changed: bool = False):
         """Enqueue a single-game backup under the adaptive concurrency cap."""
         from core.concurrency import backup_max_inflight
         self._backup_max_inflight = backup_max_inflight()
         self._enqueue_backup(game_id, force_full=force_full, silent=silent,
                              part_of_batch=False, check_unbacked=check_unbacked,
-                             notif_gated=notif_gated)
+                             notif_gated=notif_gated, config_changed=config_changed)
         self._pump_backup_queue()
+
+    def on_game_config_changed(self, game_id: str, what: str = "") -> None:
+        """What a game's backups are MADE OF has just changed — its save paths,
+        the ones unticked, the files unticked inside them, which install it
+        points at. Back the new configuration up now, and let the provider know.
+
+        A rename already does the second half (BackupManager.apply_game_rename);
+        nothing did either for these, so until the next backup trigger the
+        history described a configuration that no longer existed — and the next
+        launch measured the saves against it and called the difference
+        "unbacked". The backup written here carries the new configuration, is
+        indexed (which marks the game unpublished for the provider) and, when
+        "sync after backup" is on, goes up like any other (see _on_backup_done).
+
+        Skipped while the paths are still to be confirmed: that backup would be
+        a trusted one, uploaded, of folders nobody has approved yet — the
+        provisional pipeline and the confirmation panel own that case.
+        """
+        entry = get_library().get_by_id(game_id)
+        if entry is None or not entry.save_paths:
+            return
+        if entry.requires_confirmation and not entry.save_paths_confirmed:
+            logger.info(f"Config change for {entry.name} ({what}): paths await "
+                        f"confirmation — no backup yet")
+            return
+        logger.info(f"Config change for {entry.name} ({what}): backing up the new configuration")
+        if entry.sync_status == "synced":
+            try:
+                get_library().update_game_fields(game_id, sync_status="pending")
+            except Exception:
+                logger.debug("Could not mark the game as pending sync", exc_info=True)
+        # notif_gated: while a launch regression / unbacked warning is still
+        # unanswered this is written as a temporary copy, like every other
+        # automatic trigger — a settings edit does not answer the warning.
+        self._backup_game(game_id, silent=True, config_changed=True,
+                          notif_gated=True)
 
     def _finish_backup_job(self, game_id: str, batch: bool = False,
                            created: bool = False):
@@ -7334,6 +7563,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 excluded_paths=entry.excluded_save_paths,
                 pre_confirmation=True,
                 return_status=True,
+                extra_metadata={get_backup_manager().TIMER_BACKUP_KEY: True},
             )
             if created:
                 from PySide6.QtCore import QMetaObject, Qt

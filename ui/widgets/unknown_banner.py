@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
 
 from i18n import t
 from ui import unknown_history
+from ui.exe_icon import show_exe_icon
 from ui.helpers import ElidedLabel, scaled
 from ui.styles.arrow_icons import chevron_button_style
 from ui.styles.theme import palette, ThemedMixin
@@ -128,6 +129,11 @@ class UnknownGamesBanner(QFrame, ThemedMixin):
         entry = self._entries[self._index]
         self._name.setFullText(entry.get("name") or "?")
         self._name.setToolTip(entry.get("exe", ""))
+        # The program's own icon; the controller when it has none to show.
+        # Set on every render, so stepping to the next entry never leaves the
+        # previous program's icon behind.
+        show_exe_icon(self._icon, entry.get("exe", ""), scaled(28, self),
+                      "\U0001f3ae", self.devicePixelRatioF())
         many = n > 1
         for w in (self._prev, self._next, self._counter):
             w.setVisible(many)

@@ -50,13 +50,16 @@ from ui.helpers import (force_topmost as _force_topmost, popup_is_open,
                         ScreenSignalMixin, SystemCursor, TRACE_Z, z_report)
 
 
-def _engine_badge_html(engine: str) -> str:
-    """Muted label for an engine name, or '' when there is nothing to show."""
+def _engine_badge_html(engine: str, widget=None) -> str:
+    """Muted label for an engine name, or '' when there is nothing to show.
+
+    *widget* is whoever the text is for: without one the size is measured on
+    the primary screen, which is not where the overlay necessarily appears."""
     engine = (engine or "").strip()
     if not engine:
         return ""
     return (
-        f" <span style='color:{palette('text_muted')};font-size:{scaled(11)}px;"
+        f" <span style='color:{palette('text_muted')};font-size:{scaled(11, widget)}px;"
         f"font-weight:500;'>· {html.escape(engine)}</span>"
     )
 
@@ -128,6 +131,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Scale bookkeeping (see _sync_scale_to_screen). Set before anything
+        # is built: building asks scale_screen() for every scaled() size.
+        self._applied_scale: float | None = None   # scale the chrome was last sized for
+        self._own_sheet_key = None                 # (theme, scale) of this window's own stylesheet
+        self._last_scale_log = None                # (screen, scale) last written to the log
+        self._resyncing = False
+        # Monitors being added, removed or renegotiating fire a burst of
+        # signals; the work waits for them to stop.
+        self._screen_settle_timer = QTimer(self)
+        self._screen_settle_timer.setSingleShot(True)
+        self._screen_settle_timer.setInterval(250)
+        self._screen_settle_timer.timeout.connect(self._resync_visible)
         self._context_exe         = ""
         self._hide_anim_connected = False
         self._hover_active        = False   # True while mouse is inside overlay
@@ -189,6 +204,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._build_ui()
         self._setup_animation()
         self._connect_screen_changes()
+        from ui.helpers import ui_scale
+        self._applied_scale = ui_scale(self)
         # Worker-thread → GUI-thread hop for the provider restore-list fetch
         # (queued automatically because the emit happens off-thread).
         self._restore_fetch_done.connect(self._on_restore_fetch_done)
@@ -1063,6 +1080,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         """Track what the overlay is currently showing; leaving the unknown
         view drops its browse queue so the carousel arrows fall back to the
         notification queue."""
+        # Every render starts here, before any text is written: the sizes baked
+        # into it must be the ones for the monitor it is about to appear on.
+        if mode:
+            self._sync_scale_to_screen("render")
         self._overlay_mode = mode
         if mode != "unknown":
             self._unknown_queue = None
@@ -1109,25 +1130,154 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             pass
 
     def _on_overlay_screen_changed(self, *_args):
-        """Re-scale this window's own chrome for the screen it is now on.
-
-        _recalculate_all_scaled_dimensions is the same app-wide registry
-        MainWindow's DPI reapply uses; it is safe to call from here alone
-        because each entry recomputes from ITS OWN widget's current
-        screen (ui_scale(widget) -> widget.screen()), so widgets elsewhere
-        in the app that have not moved come back with the same values they
-        already had — only this window's registered dimensions actually
-        change.
-        """
+        """This window's own screen / DPI changed: re-scale for the new one."""
         logger.info("Overlay: own screen/DPI change detected — re-scaling")
+        self._resync_visible(force=True)
+
+    # ── Scale follows the monitor the overlay appears on ─────────────────────
+    #
+    # The overlay is shown where the player's attention is — the screen under
+    # the cursor — which is often not the monitor it was last on, and a hidden
+    # window stays bound to that last monitor. Everything measured while it is
+    # hidden (the font sizes written into labels, the fixed widths) used to be
+    # measured for the WRONG one, and nothing re-did it once the window had
+    # moved: the box followed the new monitor's scale and the text inside kept
+    # the old one. With a monitor turned off and back on that is exactly the
+    # sequence — the overlay sits bound to the stand-in monitor, then appears
+    # on the real one.
+    #
+    # So the scale is read from the screen the overlay is ABOUT to be on
+    # (scale_screen, consulted by ui.helpers for this window and all its
+    # children), and _sync_scale_to_screen brings the fixed sizes and the
+    # stylesheet in line with it before anything is rendered.
+
+    def _get_active_screen(self):
+        """The screen the overlay is placed on: the one under the cursor."""
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        return screen
+
+    def scale_screen(self):
+        """The screen this window's sizes are measured on (see
+        ui.helpers._scale_screen_of): where it IS while it is on screen, where
+        it is about to appear while it is not."""
+        if self.isVisible():
+            try:
+                screen = QApplication.screenAt(self.frameGeometry().center())
+            except Exception:
+                screen = None
+            if screen is not None:
+                return screen
+        return self._get_active_screen()
+
+    def _scale_dpr(self) -> float:
+        """Device pixel ratio of scale_screen(), for pixmaps."""
         try:
-            from ui.helpers import _recalculate_all_scaled_dimensions
-            _recalculate_all_scaled_dimensions()
-            self.refresh_styles()
+            return float(self.scale_screen().devicePixelRatio() or 1.0)
         except Exception:
-            logger.debug("Overlay DPI reapply failed", exc_info=True)
-        # Existing screen-signal reaction: reposition for the new geometry.
-        self._on_screen_changed()
+            return 1.0
+
+    def _apply_own_stylesheet(self, force: bool = False) -> None:
+        """Give this window its own stylesheet when its monitor's scale is not
+        the one the application stylesheet was built for.
+
+        The application sheet is scaled once, for the primary screen. A widget
+        sheet outranks it, so a copy built for THIS monitor's scale makes the
+        text and padding agree with the box. When the two scales agree (the
+        usual case: one monitor, or monitors alike) the window has no sheet of
+        its own and inherits the application's exactly as before.
+        """
+        from ui.helpers import ui_scale
+        from ui.styles.theme import get_theme_manager
+        tm = get_theme_manager()
+        cur = ui_scale(self)
+        applied = tm.applied_scale
+        key = (None if applied is None or abs(cur - applied) < 0.02
+               else (tm.current, round(cur, 2)))
+        if key == self._own_sheet_key and not force:
+            return
+        self._own_sheet_key = key
+        try:
+            self.setStyleSheet("" if key is None else tm.qss_for_scale(cur))
+        except Exception:
+            logger.debug("Overlay: could not apply its own stylesheet", exc_info=True)
+
+    def _sync_scale_to_screen(self, why: str = "", force: bool = False) -> bool:
+        """Bring the fixed sizes and the stylesheet in line with the screen the
+        overlay is on or about to be on. True when the scale had to change.
+
+        Cheap when nothing changed (one scale lookup and a compare), so it runs
+        at the start of every render. Only this window's own registered
+        dimensions are recomputed — never the whole app's.
+        """
+        from ui.helpers import ui_scale, _recalculate_all_scaled_dimensions
+        cur = ui_scale(self)
+        prev = self._applied_scale
+        changed = force or prev is None or abs(cur - prev) >= 0.02
+        try:
+            name = self.scale_screen().name()
+        except Exception:
+            name = "?"
+        seen = (name, round(cur, 2))
+        if seen != self._last_scale_log:
+            # Only when the screen or the scale moved: one line per switch is
+            # what makes "which monitor was it sized for" answerable from the
+            # log, and one per notification would bury it.
+            logger.info("Overlay scale: screen=%s scale=%.2f%s (%s)", name, cur,
+                        f" (was {prev:.2f})" if prev is not None and changed else "",
+                        why or "render")
+            self._last_scale_log = seen
+        if changed:
+            self._applied_scale = cur
+            try:
+                _recalculate_all_scaled_dimensions(only_within=self)
+            except Exception:
+                logger.debug("Overlay: scaled-dimension recalculation failed", exc_info=True)
+            self.refresh_styles()          # also re-applies the own stylesheet
+        else:
+            self._apply_own_stylesheet()
+        return changed
+
+    def _rerender_current(self) -> None:
+        """Draw what is on screen again at the current scale.
+
+        Text is written with the scale of the moment it was rendered, so a
+        scale change while a notification is up leaves it stale until
+        re-rendered. Notifications and the unknown-game card know how to redraw
+        themselves; the rest are rebuilt by their next show.
+        """
+        try:
+            if self._overlay_mode == "notif" and self._notif_queue:
+                self._render_current_notification(in_place=True)
+            elif self._overlay_mode == "unknown" and self._unknown_queue is not None:
+                self._render_unknown_entry()
+                self._rerender_in_place()
+            else:
+                self.adjustSize()
+        except RuntimeError:
+            pass
+
+    def _resync_visible(self, force: bool = False) -> None:
+        """The monitors changed under a visible overlay (or it moved to another
+        one): re-scale it, redraw it, put it back in the corner."""
+        if self._resyncing or getattr(self, "_cleaned_up", False) or not self.isVisible():
+            return
+        self._resyncing = True
+        try:
+            if self._sync_scale_to_screen("screen change", force=force):
+                self._rerender_current()
+            self._position_top_right()
+        finally:
+            self._resyncing = False
+
+    def on_app_scale_changed(self) -> None:
+        """The application stylesheet was rebuilt (MainWindow's scale re-apply):
+        the overlay's own sheet and fixed sizes are relative to it."""
+        self._sync_scale_to_screen("application scale changed", force=True)
+        if self.isVisible():
+            self._rerender_current()
+            self._position_top_right()
 
     def _on_action(self, action: str):
         self.action_requested.emit(action, self._context_exe)
@@ -1410,7 +1560,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         h = entries[idx]
         game_name = h.get("name") or "?"
         self._context_exe = h.get("exe", "")
-        self._icon_label.setText("🎮")
+        # The program's own icon — it is the only thing that tells two
+        # unfamiliar names apart — with the controller when it has none.
+        from ui.exe_icon import show_exe_icon
+        show_exe_icon(self._icon_label, self._context_exe, scaled(24, self), "🎮",
+                      self._scale_dpr())
         self._title.setText(t("app.name"))
         self._message.setText(
             f"<b>{game_name}</b> {t('overlay.detected_msg')}<br>"
@@ -1447,7 +1601,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._message.setText(
             f"<span style='color:{palette('accent')};font-weight:700;'>"
             f"{t('overlay.add_to_library')}</span><br>"
-            f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng)}"
+            f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng, self)}"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -1482,7 +1636,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         eng = (engine or "").strip() or _engine_label_for_exe(exe_path)
         # Game name + engine on one line; status on the line below.
         game_html = (
-            f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng)}"
+            f"<b>{html.escape(game_name)}</b>{_engine_badge_html(eng, self)}"
         )
         self._message.setText(t("overlay.game_launched", game=game_html))
         self._hide_dashboard()
@@ -2324,7 +2478,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 eng = stats.get("active_engine") or _engine_label_for_exe()
                 game_html = (
                     f"<b>{html.escape(str(active))}</b>"
-                    f"{_engine_badge_html(eng)}"
+                    f"{_engine_badge_html(eng, self)}"
                 )
                 self._message.setText(t("overlay.game_launched", game=game_html))
                 self._icon_label.setText("🎮")
@@ -2461,6 +2615,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             except Exception:
                 pass
 
+        # Normally a no-op: the render that led here already did this (see
+        # _set_mode). It is the net for a path that did not, and sizes the
+        # frame for the screen it is about to be moved to.
+        self._sync_scale_to_screen("show")
         self._position_top_right()
 
         # ── Show + topmost ──────────────────────────────────────────────────
@@ -2772,10 +2930,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     def _get_active_screen_geometry(self):
         """Get the available geometry of the screen where the active window / cursor is."""
         # Use the screen under the cursor — most reliable when resolution changes
-        screen = QApplication.screenAt(QCursor.pos())
-        if screen is None:
-            screen = QApplication.primaryScreen()
-        return screen.availableGeometry()
+        return self._get_active_screen().availableGeometry()
 
     def _position_top_right(self):
         screen = self._get_active_screen_geometry()
@@ -2905,10 +3060,16 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # Screen add/remove/geometry wiring comes from ScreenSignalMixin;
     # only the reaction is overlay-specific:
     def _on_screen_changed(self, *_args):
-        """Re-position overlay when screen geometry changes."""
+        """A monitor was added, removed or changed geometry.
+
+        Hidden, there is nothing to fix: the next render reads the scale of the
+        screen it appears on (see _sync_scale_to_screen). Visible, the work
+        waits for the burst of signals a monitor change produces to stop, then
+        re-scales, redraws and re-positions in one go.
+        """
         if self.isVisible():
-            logger.debug("Screen geometry changed — repositioning overlay")
-            self._position_top_right()
+            logger.debug("Screen geometry changed — re-fitting overlay")
+            self._screen_settle_timer.start()
 
     def deleteLater(self):
         """Ensure hooks and screen signals are disconnected before destruction."""
@@ -2941,6 +3102,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         """Re-apply all inline styles after theme change."""
         from ui.styles.theme import get_theme_manager
         self._is_dark = get_theme_manager().is_dark()
+        # The own stylesheet is a copy of the theme: a new theme (or a new
+        # application scale) makes it out of date, so it is rebuilt here.
+        self._apply_own_stylesheet(force=True)
         self._refresh_badge_interactivity()
         # #overlay_icon / #overlay_separator / #overlay_suppress_btn are theme-owned.
         self._style_carousel_arrows()

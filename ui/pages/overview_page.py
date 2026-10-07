@@ -1267,7 +1267,8 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             "" if self._provider_online else t("overview.open_sync_to_connect"))
         self._provider_lbl.setStyleSheet(self._provider_style())
 
-        self._rebuild_activity(games, bk_rows)
+        self._rebuild_activity(games, bk_rows, snap.get("auto_ids") or frozenset(),
+                               snap.get("archive_ids") or frozenset())
 
     def _refresh_timestamps_only(self):
         """Update only the relative-time labels in the activity list.
@@ -1297,8 +1298,44 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                 except (ValueError, TypeError):
                     pass
 
-    def _rebuild_activity(self, games, bk_rows):
-        """Rebuild activity rows from lightweight backup tuples."""
+    @staticmethod
+    def _session_start_stamp(game, running: bool) -> str:
+        """When the game's last session STARTED, as an ISO stamp.
+
+        last_played is written at launch and again at exit, so once a session
+        is over it holds the moment it ENDED. Listed at that moment, the
+        session sat above every backup made while it was running — the
+        in-game ones, the first after launch — which then read as having
+        happened before the player had started playing. A session is shown
+        where it began, so what happened during it comes after it. A game that
+        is running now still carries its launch stamp (last_session_seconds is
+        the PREVIOUS session's, so it is not subtracted).
+        """
+        stamp = game.last_played
+        seconds = int(getattr(game, "last_session_seconds", 0) or 0)
+        if running or seconds <= 0 or not stamp:
+            return stamp
+        try:
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            d = _dt.fromisoformat(stamp)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=_tz.utc)
+            return (d - _td(seconds=seconds)).isoformat()
+        except (ValueError, TypeError):
+            return stamp
+
+    def _rebuild_activity(self, games, bk_rows, auto_ids=frozenset(),
+                          archive_ids=frozenset()):
+        """Rebuild activity rows from lightweight backup tuples.
+
+        *auto_ids*: backups made by the periodic in-game timer. They are left
+        out of THIS list — a game running for an hour would otherwise fill the
+        box with a backup every few minutes and push everything else off it —
+        but stay in *bk_rows*, so the 7-day chart still counts them.
+
+        *archive_ids*: game ids that are real archives (see
+        BackupManager.overview_index_snapshot); only those get the 📦 row.
+        """
         if not _safe(self._activity_layout):
             return
 
@@ -1309,7 +1346,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         bk_ids_hash = hash(tuple(r[0] for r in bk_rows)) if bk_rows else 0
         game_names_hash = hash(tuple(g.name for g in games)) if games else 0
         game_mod_hash = hash(tuple((g.id, g.last_played or "", g.last_synced or "", g.playtime_seconds, g.last_session_seconds) for g in games)) if games else 0
-        cache_key = (len(games), len(bk_rows),
+        cache_key = (len(games), len(bk_rows), len(auto_ids), tuple(sorted(archive_ids)),
                      games[-1].id if games else "",
                      bk_ids_hash,
                      game_names_hash,
@@ -1334,11 +1371,17 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         # bk_rows: (backup_id, game_id, created_at, size_human)
         bk_by_game: dict[str, list] = {}
         for _bid, gid, created_at, size_human in bk_rows:
-            if not gid:
+            if not gid or _bid in auto_ids:
                 continue
             bk_by_game.setdefault(gid, []).append((created_at, size_human))
         for gid in bk_by_game:
             bk_by_game[gid].sort(key=lambda x: x[0] or "", reverse=True)
+
+        try:
+            from core.monitor import get_monitor
+            _running_ids = {e.id for e in get_monitor().currently_playing()}
+        except Exception:
+            _running_ids = set()
 
         events = []
         for g in games:
@@ -1353,12 +1396,19 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                 session_info = (g.get_last_session_formatted()
                                 if g.last_session_seconds > 0
                                 else g.get_playtime_formatted())
-                events.append(("🎮", g.name, t('overview.played_prefix') + f" {session_info}", g.last_played))
+                events.append(("🎮", g.name, t('overview.played_prefix') + f" {session_info}",
+                               self._session_start_stamp(g, g.id in _running_ids)))
 
-        # Backups whose game is not in the library are ARCHIVES — folders
-        # handed over without adding the game. They were dropped here for
-        # the simple reason that this loop walks the library, so backing one
-        # up left the page saying nothing had happened.
+        # Backups whose game is not in the library. This loop walks the
+        # library, so without this branch backing one up left the page saying
+        # nothing had happened. Two different things land here and are not
+        # told apart by "not in the library":
+        #   - a real ARCHIVE: a save folder handed over without adding the
+        #     game (its rows carry the orphan flag) — 📦 "Archive backup";
+        #   - the leftovers of a game that was REMOVED from the library. Those
+        #     backups were made as a library game's, and nothing about them
+        #     changed when the game was removed (remove_game flags nothing), so
+        #     they are listed as the ordinary 💾 backups they are.
         _lib_ids = {g.id for g in games}
         _archives = [gid for gid in bk_by_game if gid not in _lib_ids]
         if _archives:
@@ -1369,10 +1419,12 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                     _name = _mgr.archive_display_name(_gid)
                     if not _name:
                         continue
+                    is_archive = _gid in archive_ids
+                    icon = "📦" if is_archive else "💾"
+                    prefix = t('overview.archive_backup_prefix' if is_archive
+                               else 'overview.backup_prefix')
                     for created_at, size_human in bk_by_game[_gid][:2]:
-                        events.append(("📦", _name,
-                                       t('overview.backup_prefix') + f" {size_human}",
-                                       created_at))
+                        events.append((icon, _name, f"{prefix} {size_human}", created_at))
             except Exception:
                 logger.debug("could not add archive activity", exc_info=True)
 

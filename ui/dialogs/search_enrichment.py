@@ -595,13 +595,27 @@ class CandidatePreviewDialog(QDialog):
         if cached is not None:
             self._set_thumb(cached)
             return
+        # This dialog is rebuilt on every Back, so its own cache dies with it;
+        # the session's store (core.net) is what keeps a cover from being
+        # fetched again for the next preview, the chips and the save.
+        from core.net import cached_image
+        shared = cached_image(url)
+        if shared is not None:
+            self._thumb_cache[url] = shared[1]
+            self._set_thumb(shared[1])
+            return
 
         def _fetch(u=url, tok=token):
             try:
-                from core.net import open_url as _open_url, image_fetch_request
+                from core.net import (open_url as _open_url, image_fetch_request,
+                                      remember_image, IMAGE_FETCH_LIMIT)
                 req, _resolved = image_fetch_request(u)
                 with _open_url(req, timeout=10) as r:
-                    data = r.read()
+                    data = r.read(IMAGE_FETCH_LIMIT + 1)
+                # Kept for the chips and the save only when it arrived whole
+                # and is a picture (remember_image decides); the preview
+                # itself shows whatever came.
+                remember_image(u, _resolved, data)
             except Exception:
                 return
             try:
@@ -1264,9 +1278,21 @@ class EnrichmentMergeDialog(QDialog):
     def _start_thumb_downloads(self):
         """Fetch cover previews off the GUI thread (same opener as candidate)."""
         import queue
-        from core.net import open_url as _open_url, image_fetch_request
+        from core.net import (open_url as _open_url, image_fetch_request,
+                              cached_image, remember_image, IMAGE_FETCH_LIMIT)
         todo: "queue.SimpleQueue" = queue.SimpleQueue()
         urls = set(self._img_chips) | set(self._header_thumbs)
+        pending = []
+        for url in urls:
+            # A picture the candidate preview already downloaded is on its chip
+            # (and header) the moment the dialog opens — the cover "arrives from
+            # the preview" and stays there, instead of being fetched again.
+            shared = cached_image(url)
+            if shared is not None:
+                self._on_thumb_ready(url, shared[1])
+            else:
+                pending.append(url)
+        urls = pending
         for url in urls:
             todo.put(url)
 
@@ -1281,8 +1307,11 @@ class EnrichmentMergeDialog(QDialog):
                 try:
                     req, _resolved = image_fetch_request(u)
                     with _open_url(req, timeout=10) as r:
-                        data = r.read(2_000_000)
+                        # Whole, not the first 2 MB: a picture is kept for the
+                        # save only if it arrived complete (remember_image).
+                        data = r.read(IMAGE_FETCH_LIMIT + 1)
                     if data:
+                        remember_image(u, _resolved, data)
                         self._thumb_ready.emit(u, data)
                 except Exception:
                     pass

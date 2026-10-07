@@ -1007,6 +1007,26 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
         except Exception:
             pass   # exclusion check is best-effort — never block a real event on it
 
+        # A folder the user trashed in the save-confirmation panel (or in
+        # Add/Edit Game) is a different, harder answer than the soft untick
+        # above, and used to be honoured only when candidates were PROPOSED —
+        # so its writes still counted as detections, queued the folder for
+        # provisional backups and kept it in the pending list. Dropped here,
+        # with everything else the watcher funnels through this handler.
+        #
+        # EXACT, not "anything underneath": a candidate is the folder a file
+        # sits in (see get_pending_save_paths), so a file is rejected when it
+        # IS a rejected path or sits directly in one. A save folder inside a
+        # rejected main folder is a different path and stays detectable.
+        try:
+            from core.save_detector import is_rejected_save_path
+            if (is_rejected_save_path(self._game_id, event.src_path)
+                    or is_rejected_save_path(self._game_id,
+                                             os.path.dirname(event.src_path))):
+                return
+        except Exception:
+            pass   # best-effort, like the check above
+
         # Correlation ANCHOR — set BEFORE any rejection below. This handler
         # only receives game-linked events (game-scoped watches, or common
         # -root events that passed the name filter), so even a file we then
@@ -2147,4 +2167,11 @@ def get_pending_save_paths(game_id: str, exe_dir: str = "") -> list[str]:
         if key not in seen:
             seen.add(key)
             out.append(cand)
+    # Files queued before the user rejected their folder (it can happen
+    # mid-session) are still in the pending set; they must not be proposed.
+    try:
+        from core.save_detector import is_rejected_save_path
+        out = [p for p in out if not is_rejected_save_path(game_id, p)]
+    except Exception:
+        pass
     return out

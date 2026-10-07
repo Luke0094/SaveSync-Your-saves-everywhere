@@ -1307,8 +1307,14 @@ def _register_scaled_dimension(widget: QWidget, dimension_type: str, original_va
     except Exception:
         pass
 
-def _recalculate_all_scaled_dimensions() -> None:
+def _recalculate_all_scaled_dimensions(only_within: "QWidget | None" = None) -> None:
     """Re-apply every registered scaled dimension at the CURRENT ui_scale.
+
+    *only_within*: restrict the pass to this widget and its descendants. A
+    window that follows the player between monitors (the overlay) re-scales on
+    its own; walking and re-laying-out every registered widget of the app —
+    every library card — for that would be a visible hitch in the game it is
+    drawn over, and would act on windows whose scale is not its business.
 
     Each registry entry keeps the weakref captured at registration — that is
     the exact connection to the live widget: it resolves for any widget that
@@ -1340,6 +1346,12 @@ def _recalculate_all_scaled_dimensions() -> None:
                 if widget is None:
                     dead.append((widget_id, dim_type))
                     continue
+                if only_within is not None and widget is not only_within:
+                    try:
+                        if not only_within.isAncestorOf(widget):
+                            continue
+                    except RuntimeError:
+                        continue
                 try:
                     if dim_type in ('size', 'min_size', 'max_size'):
                         # setFixedSize / setMinimumSize / setMaximumSize -
@@ -1567,9 +1579,34 @@ def windows_os_scale(widget: QWidget | None = None) -> float:
         return 1.0
 
 
+def _scale_screen_of(widget: QWidget | None):
+    """The screen *widget*'s scale is measured on, or None for "the primary".
+
+    Normally the screen the widget is on. A window that is shown wherever the
+    player's attention is rather than where it last was — the overlay — can
+    define ``scale_screen()`` to answer for the screen it is ABOUT to appear
+    on: while hidden, a window is still bound to the last monitor it was on,
+    and everything it measures before it is shown (text sizes baked into
+    labels, fixed widths) would come out for that one. Looked up on the
+    widget's top-level window, so every child of such a window agrees.
+    """
+    if widget is None:
+        return None
+    try:
+        top = widget.window()
+        pick = getattr(top, "scale_screen", None)
+        if callable(pick):
+            screen = pick()
+            if screen is not None:
+                return screen
+    except Exception:
+        logger.debug("scale_screen() failed", exc_info=True)
+    return widget.screen()
+
+
 def _work_area_width_physical(widget: QWidget | None = None) -> float:
     """Work-area width in physical pixels (DIPs × screen DPR)."""
-    screen = widget.screen() if widget is not None else None
+    screen = _scale_screen_of(widget)
     if screen is None:
         screen = QApplication.primaryScreen()
     if screen is None:
@@ -1587,7 +1624,7 @@ def _work_area_width_dip(widget: QWidget | None = None) -> int:
 
     Already accounts for OS Scale / Retina on Windows, macOS and Linux.
     """
-    screen = widget.screen() if widget is not None else None
+    screen = _scale_screen_of(widget)
     if screen is None:
         screen = QApplication.primaryScreen()
     if screen is None:
@@ -1827,7 +1864,14 @@ def scale_all_top_level_windows(prev: float, cur: float) -> None:
         try:
             if not w.isWindow() or not w.isVisible():
                 continue
-            scale_window_geometry(w, prev, cur)
+            fit = getattr(w, "fit_geometry_to_scale", None)
+            if callable(fit):
+                # A window that keeps track of the scale its size belongs to
+                # (the main window) is resized from THAT, not from the caller's
+                # *prev* — which is wrong for it after any change it sat out.
+                fit(cur)
+            else:
+                scale_window_geometry(w, prev, cur)
             if hasattr(w, "_last_ui_scale"):
                 w._last_ui_scale = cur
             # Re-center dialogs after scaling

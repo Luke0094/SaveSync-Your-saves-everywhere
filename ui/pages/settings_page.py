@@ -1753,6 +1753,10 @@ class SettingsPage(PageScrollMixin, QWidget):
             if saved_auto and current_auto:
                 restore_pre_scale_geometry(mw)
                 mw._last_ui_scale = saved_scale
+                # The size is the one saved before the preview: it belongs to
+                # the scale saved with it, whatever the preview moved on to.
+                if hasattr(mw, "_geometry_scale"):
+                    mw._geometry_scale = saved_scale
             else:
                 prev = getattr(mw, "_last_ui_scale", None)
                 if prev is not None and abs(prev - saved_scale) >= 0.02:

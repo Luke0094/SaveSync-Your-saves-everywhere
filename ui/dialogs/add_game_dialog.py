@@ -409,6 +409,10 @@ class _ExeVersionMenuRow(QWidget):
 
 class AddGameDialog(SearchFlowMixin, QDialog):
     game_added = Signal(object)   # GameEntry
+    # An edit changed what the game's backups are made of (save paths, ticked
+    # folders or files, which install it points at): game id, what changed.
+    # Emitted at the very end of the save, once the exclusions are on disk.
+    config_changed = Signal(str, str)
     search_finished = Signal(object, object)  # list[GameInfo] | GameInfo | None, error
     # gen, reachable — primary-page probe finished off the GUI thread
     primary_reachability_done = Signal(int, bool)
@@ -3407,10 +3411,48 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
         The picture is added to the carousel like any other and becomes the
         current one — see _start_extra_images for the ones that must not.
+
+        A picture the game already has on disk is selected as it is: fetching
+        it again only to have _store_downloaded_image find it identical and
+        delete the new copy was a download and a re-encode for nothing.
         """
+        stored = self._stored_file_for_url(url)
+        if stored:
+            logger.info(f"Picture already stored, not downloaded again: {stored}")
+            self._pending_pixmap = None
+            self._set_web_image(stored)
+            return
         fetched = self._fetch_image_bytes(url)
         if fetched is not None:
             self._store_downloaded_image(fetched[0], fetched[1])
+
+    def _stored_file_for_url(self, url: str) -> "str | None":
+        """The file this game already holds for the picture at *url*, or None.
+
+        Looked up without touching the network, by the URL as this session
+        stored it — the URL asked for and the one the /thumb/ rewrite really
+        fetched. By URL only: a file NAME is not enough to call two pictures the
+        same (``header.jpg`` and ``cover.jpg`` recur across unrelated images), and
+        a cover taken for one that merely shares a name is worse than a repeat
+        download.
+        """
+        if not url:
+            return None
+        from core.net import image_fetch_request
+        keys = [url]
+        try:
+            resolved = image_fetch_request(url)[1]
+            if resolved not in keys:
+                keys.append(resolved)
+        except Exception:
+            pass
+        for k in keys:
+            p = self._image_url_cache.get(k)
+            if p and Path(p).is_file():
+                for other in keys:
+                    self._image_url_cache.setdefault(other, p)
+                return p
+        return None
 
     @staticmethod
     def _fetch_image_bytes(url: str):
@@ -3419,38 +3461,23 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         Only the network: no Qt and no dialog state, so a worker thread may run
         it. Uses a realistic browser User-Agent and follows redirects; handles
         protocol-relative URLs (//example.com/img.jpg).
+
+        A picture the candidate preview or the chip dialog already downloaded
+        is handed back from the session's store instead of being fetched a
+        third time (core.net.fetch_image); one fetched here is kept for the
+        next caller. Headers and the /thumb/-to-full rewrite are the ones the
+        previews use — see core.net.image_fetch_request for why they're needed.
         """
         import logging
         logger = logging.getLogger(__name__)
 
         if not url:
             return None
-
-        # Normalise protocol-relative URLs
-        if url.startswith("//"):
-            url = "https:" + url
-        if not url.startswith("http"):
+        if not (url.startswith("http") or url.startswith("//")):
             logger.warning(f"Not downloading {url!r}: not an http(s) link")
             return None
-
-        try:
-            # Headers + /thumb/-to-full rewrite shared with the candidate-
-            # preview thumbnail fetch (search_enrichment.py) — see
-            # core.net.image_fetch_request for why they're needed.
-            from core.net import open_url as _open_url, image_fetch_request
-            req, url = image_fetch_request(url)
-            with _open_url(req, timeout=20) as response:
-                # Verify Content-Type is an image before reading
-                ct = response.headers.get("Content-Type", "")
-                if ct and not ct.startswith("image/") and "octet-stream" not in ct:
-                    logger.warning(f"Not an image: Content-Type {ct!r} for {url!r}")
-                    return None
-                image_data = response.read()
-            logger.info(f"Downloaded {len(image_data)}B, Content-Type: {ct!r}")
-            return url, image_data
-        except Exception as e:
-            logger.error(f"Failed to download image: {e}")
-            return None
+        from core.net import fetch_image
+        return fetch_image(url, timeout=20)
 
     def _icon_dir_path(self) -> Path:
         """This game's folder in the icon cache — only its path, nothing made.
@@ -3717,6 +3744,17 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         for as long as that takes."""
         import queue
         urls = [u for u in dict.fromkeys(urls or []) if u]
+        # What this session already stored is only added to the carousel — not
+        # fetched again to be found identical and deleted.
+        remaining = []
+        for u in urls:
+            stored = self._stored_file_for_url(u)
+            if stored:
+                logger.info(f"Extra picture already stored, not downloaded again: {stored}")
+                self._attach_extra_image(stored)
+            else:
+                remaining.append(u)
+        urls = remaining
         if not urls:
             return
         # Chosen NOW, like the covers of this same Apply: a name edited while
@@ -4246,6 +4284,17 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if "100% accurate" in current_text:
                 self._status_lbl.setText(current_text + " (auto-selected)")
                 logger.info("Live tracking paths auto-selected due to 100% accuracy")
+
+    @staticmethod
+    def _file_exclusions_snapshot(game_id: str) -> dict:
+        """The files unticked for *game_id*, as {save path: sorted names}, to
+        compare before and after an edit."""
+        try:
+            from core.config_manager import get_config as _gc
+            raw = (_gc().get("auto_scan_excluded_files", {}) or {}).get(game_id) or {}
+            return {str(k): sorted(v or []) for k, v in raw.items()}
+        except Exception:
+            return {}
 
     def _save_file_exclusions(self, game_id: str):
         """Persist per-path file exclusions from all PathRow file browsers to config."""
@@ -5334,6 +5383,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # hard-deleted (via _remove_path) can be detected and their
             # provisional backups pruned on save (see the resolve call below).
             _prev_save_paths = set(entry.save_paths or [])
+            # …and what else a backup is made of, to tell at the end whether
+            # the edit changed it (see config_changed).
+            _prev_excluded = set(entry.excluded_save_paths or [])
+            _prev_file_excl = self._file_exclusions_snapshot(entry.id)
             _prev_name = entry.name or ""
             _prev_versions = {p.casefold() for p in (entry.exe_path_versions or {})}
             entry.name       = name
@@ -5546,6 +5599,21 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
             # Save per-file exclusions from file browsers
             self._save_file_exclusions(entry.id)
+
+            # Only now, with every part of the new configuration on disk: a
+            # backup taken any earlier would have zipped the files the user
+            # has just unticked.
+            _changed = []
+            if set(entry.save_paths or []) != _prev_save_paths:
+                _changed.append("save paths")
+            if set(entry.excluded_save_paths or []) != _prev_excluded:
+                _changed.append("unticked folders")
+            if self._file_exclusions_snapshot(entry.id) != _prev_file_excl:
+                _changed.append("unticked files")
+            if (entry.exe_path or "") != old_exe:
+                _changed.append("install")
+            if _changed:
+                self.config_changed.emit(entry.id, ", ".join(_changed))
 
         else:
             raw_all_paths, raw_excluded_paths = self._get_all_and_excluded_paths()

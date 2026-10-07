@@ -1634,6 +1634,12 @@ class SyncOrchestrator(QObject):
                 return Path(root)
         return None
 
+    @classmethod
+    def local_root_of(cls, provider):
+        """Public face of _local_root_of, for the UI: where on this disk a
+        connected provider keeps its files, or None when it has no such folder."""
+        return cls._local_root_of(provider)
+
     def local_zip_index(self, provider):
         """``{folder (casefolded): {zip names}}`` for a provider's whole backup
         tree, or None when that cannot be said cheaply.

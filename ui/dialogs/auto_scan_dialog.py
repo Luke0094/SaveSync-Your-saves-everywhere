@@ -1632,6 +1632,10 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
                             exe_path=game.exe_path,
                             note="auto (post-scan)", max_size_mb=max_mb, force=False,
                             computed_folder_name=game.computed_folder_name,
+                            # The set of folders just changed (that is why this
+                            # runs): the regression / debounce gates would read
+                            # the difference as a warning sign.
+                            config_changed=True,
                         )
                         if backup:
                             game.mark_backed_up(get_machine_id())

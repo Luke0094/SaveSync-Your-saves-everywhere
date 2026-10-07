@@ -25,11 +25,12 @@ Two rules the whole module is built around:
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass, field as _field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from core.constants import USER_DATA_DIR
+from core.constants import USER_DATA_DIR, RESTORE_QUIET_SECONDS
 
 from .base import SaveEditorError, explain  # noqa: F401 — public via this module
 from . import registry as registry_module
@@ -1200,6 +1201,22 @@ def list_backups(path) -> list:
     return sorted(out, key=lambda item: _kept_order(item[0]), reverse=True)
 
 
+# file → epoch seconds of the last restore this process did onto it. In memory
+# on purpose: it answers "is the player still stepping through restore points",
+# and forgetting it across a restart errs towards taking the copy.
+_LAST_RESTORE: dict = {}
+
+
+def _restore_key(target) -> str:
+    return os.path.normcase(os.path.abspath(str(target)))
+
+
+def seconds_since_restore(target):
+    """Seconds since *target* was last restored in this session, or None."""
+    stamp = _LAST_RESTORE.get(_restore_key(target))
+    return None if stamp is None else max(0.0, time.time() - stamp)
+
+
 def restore_backup(backup, target) -> None:
     """Put a kept copy back.
 
@@ -1222,6 +1239,16 @@ def restore_backup(backup, target) -> None:
     not a softer one just because this call site is new. Losing the
     ability to protect the current state is not a reason to destroy it
     anyway.
+
+    Not repeated inside RESTORE_QUIET_SECONDS of the last restore of the same
+    file, whatever the file looks like now. Byte-identity alone (above) covers
+    a restore onto a state that is still one of the kept copies, but the game
+    rewrites a save the moment it is loaded (a persistent file, a timestamp),
+    so the file read back no longer matches ANY copy and every step through the
+    list used to add a pre-restore copy of the state the previous step had just
+    put there. Within that window the file is what the last restore wrote, not
+    something to protect. A restore after it has passed — the player loaded the
+    save, played on, now wants to go back — takes its copy as before.
     """
     b, t = Path(backup), Path(target)
     if not b.is_file():
@@ -1232,7 +1259,12 @@ def restore_backup(backup, target) -> None:
     except OSError as e:
         raise SaveEditorError("that copy could not be read",
                               "cheats.err_copy_gone") from e
-    backup_original(t, kind=KIND_PRE_RESTORE)
+    since = seconds_since_restore(t)
+    if since is not None and since < RESTORE_QUIET_SECONDS:
+        logger.info(f"No pre-restore copy of {t.name}: it was restored "
+                    f"{since:.0f}s ago (quiet window {RESTORE_QUIET_SECONDS}s)")
+    else:
+        backup_original(t, kind=KIND_PRE_RESTORE)
     # write_bytes rather than copy2: the restored file must read as a fresh
     # write. copy2 would carry the copy's old mtime across, making the restore
     # look like nothing changed to everything that keys off mtime — the
@@ -1244,6 +1276,8 @@ def restore_backup(backup, target) -> None:
         os.utime(t, None)
     except OSError:
         pass
+    # Only a restore that happened counts as the one the next is measured from.
+    _LAST_RESTORE[_restore_key(t)] = time.time()
     logger.info(f"Restored {t.name} from {b.name}")
 
 

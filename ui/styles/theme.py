@@ -134,6 +134,35 @@ class ThemeManager(QObject):
     def __init__(self):
         super().__init__()
         self._current = "dark"
+        # The ui_scale() the application stylesheet was last built at (None
+        # until the first apply). A window that lives on a different monitor
+        # than the one that scale was read from compares its own against this.
+        self._applied_scale: float | None = None
+
+    @property
+    def applied_scale(self) -> "float | None":
+        return self._applied_scale
+
+    def _build_qss(self, mod: ModuleType, scale: float) -> str:
+        """The theme's stylesheet with its design-time pixel lengths scaled."""
+        qss = mod.THEME
+        # SVG chevrons — CSS border triangles do not paint reliably on Windows.
+        from ui.styles.arrow_icons import ensure_arrow_icons
+        for key, url in ensure_arrow_icons(mod.ID).items():
+            qss = qss.replace(f"__ICON_{key.upper()}__", url)
+        # Accessibility UI scale: design-time font-size:Npx → scaled px.
+        from ui.helpers import scale_stylesheet_fonts
+        return scale_stylesheet_fonts(qss, scale)
+
+    def qss_for_scale(self, scale: float) -> str:
+        """The CURRENT theme's stylesheet at *scale*, without applying it.
+
+        For a top-level window that sits on a monitor whose scale is not the
+        one the application stylesheet was built for: given as that window's
+        own stylesheet it takes precedence over the application's, so its
+        text and padding agree with the monitor it is actually on.
+        """
+        return self._build_qss(get_theme_module(self._current), scale)
 
     def apply(self, theme: str, app: QApplication):
         # Swapping the application stylesheet makes Qt re-resolve style rules
@@ -163,15 +192,9 @@ class ThemeManager(QObject):
     def _apply_inner(self, theme: str, app: QApplication, overlay=None):
         mod = get_theme_module(theme)
         self._current = mod.ID
-        qss = mod.THEME
-        # SVG chevrons — CSS border triangles do not paint reliably on Windows.
-        from ui.styles.arrow_icons import ensure_arrow_icons
-        for key, url in ensure_arrow_icons(self._current).items():
-            qss = qss.replace(f"__ICON_{key.upper()}__", url)
-
-        # Accessibility UI scale: design-time font-size:Npx → scaled px.
-        from ui.helpers import scale_stylesheet_fonts, ui_scale
-        qss = scale_stylesheet_fonts(qss, ui_scale())
+        from ui.helpers import ui_scale
+        self._applied_scale = ui_scale()
+        qss = self._build_qss(mod, self._applied_scale)
 
         # Override Qt's built-in QPalette so Fusion doesn't paint
         # its default gray on view viewports and scroll areas.

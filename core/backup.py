@@ -20,6 +20,7 @@ _index_lock = threading.RLock()
 from PySide6.QtCore import QObject, Signal
 
 from core.constants import BACKUP_DIR, USER_DATA_DIR, MAX_LOCAL_BACKUPS, BACKUP_RETENTION_DAYS, MIN_KEPT_BACKUPS, SKIP_EXTENSIONS, SKIP_FILENAME_STEMS, get_install_folder_name
+from core.constants import RESTORE_QUIET_SECONDS as _RESTORE_QUIET_SECONDS
 from core.config_manager import get_config
 from core.machine import get_machine_id
 import i18n
@@ -829,6 +830,11 @@ class BackupManager(QObject):
         # uploads+downloads even with completely unchanged data.
         self._deleted_ids: dict[str, list[str]] = self._load_deleted_ids()
         self._last_validation_error: str = ""
+        # game_id → epoch seconds of the last restore THIS process finished for
+        # it. In memory on purpose: it only answers "did the player restore a
+        # moment ago" (see note_restore), and forgetting it across a restart
+        # errs towards taking the safety copy, never towards skipping one.
+        self._restore_stamps: dict[str, float] = {}
         self._load_all_indexes()
         # The zip-existence sweep is NOT run here. It used to start its own
         # retrying background thread on every launch, touching hundreds of
@@ -1577,6 +1583,7 @@ class BackupManager(QObject):
         report_regression: bool = False,
         check_unbacked: bool = False,
         extra_metadata: dict | None = None,
+        config_changed: bool = False,
     ) -> ("Optional[BackupEntry] | tuple[Optional[BackupEntry], bool] "
           "| tuple[Optional[BackupEntry], bool, Optional[BackupEntry] | str]"):
         """Create a zip backup of all save paths for a game.
@@ -1670,8 +1677,22 @@ class BackupManager(QObject):
                 force=True is the deliberate bypass (skips every dedup gate,
                 every one of these included): a reviewer's own "keep it
                 anyway" action re-calls this with force=True.
+            config_changed: What the backup is MADE OF just changed — a save
+                path added or dropped, a file unticked, another install
+                selected — and this is the backup of the new configuration.
+                The gates that read a difference from the history as a
+                warning sign are off for it: that history was taken with a
+                different set of folders, so "matches an older backup" is
+                what dropping a path normally looks like, not a regression,
+                and "matches nothing" is the new set meeting a history that
+                never saw it. The 30 s debounce and the mtime preflight (blind
+                to the exclusion lists) are off too. What stays is "identical
+                to the newest backup — nothing to write", which is why this is
+                not force=True: nothing changed, nothing is written twice.
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if config_changed:
+            skip_mtime_preflight = True
         # A held-back "unbacked" result is meaningless to a caller that
         # can't see the 3rd tuple slot — it would look like a plain dedup
         # skip, with no way to ever learn why nothing got written.
@@ -1881,7 +1902,7 @@ class BackupManager(QObject):
             # gate, not a second pass over the files. force=True is the
             # deliberate bypass (recent is then empty, so this never runs):
             # a reviewer's own "keep it anyway" action re-calls with it set.
-            for _older in recent[1:]:
+            for _older in (recent[1:] if not config_changed else ()):
                 _older_manifest = (_older.cloud_metadata or {}).get("file_manifest") or {}
                 if not self._manifest_is_comparable(_older_manifest):
                     continue
@@ -1910,7 +1931,7 @@ class BackupManager(QObject):
             # backed up in the first place. "unbacked" here is a sentinel,
             # not a BackupEntry — there is no matched entry to point at,
             # unlike the regression case above.
-            if check_unbacked:
+            if check_unbacked and not config_changed:
                 logger.warning(
                     f"Backup held back for '{game_name}': current state matches "
                     f"no known backup — unrecognized/untracked change")
@@ -1925,8 +1946,21 @@ class BackupManager(QObject):
                 age = (now - _deb.created_dt).total_seconds()
             except (ValueError, TypeError):
                 age = 999  # malformed timestamp, allow backup
-            if age < 30:
-                return _ret(_deb, False)
+            if age < 30 and not config_changed:
+                # Not for a change of WHICH folders are saved: a path confirmed
+                # or dropped seconds after the exit backup is not autosave
+                # churn, and holding it off — silently, the caller then logs
+                # "completed" for the old entry it was handed back — left the
+                # new path with no backup at all until the next launch measured
+                # it against a history that had never seen it.
+                if not self._save_roots_changed(new_manifest, _deb):
+                    logger.info(
+                        f"Backup skipped for '{game_name}' — the last one is "
+                        f"{age:.0f}s old (30s debounce)")
+                    return _ret(_deb, False)
+                logger.info(
+                    f"Backup for '{game_name}' goes ahead inside the 30s "
+                    f"debounce: the folders being saved changed")
 
         if not changed_arc_names:
             logger.info(f"Backup skipped for '{game_name}' — all {len(new_manifest)} files unchanged (per-file check)")
@@ -2757,7 +2791,17 @@ class BackupManager(QObject):
                             valid.append(str(_dest))
                     except OSError:
                         pass
-            if valid:
+            # Only when the copy would hold something no backup already does,
+            # and not while the player is still stepping through restore
+            # points — see _pre_restore_skip_reason. force=True below is for
+            # the WRITE (no debounce, no regression hold-back); whether to
+            # write at all is decided here.
+            _skip_safety = self._pre_restore_skip_reason(
+                (entry.game_id, lib_game_id), valid) if valid else ""
+            if _skip_safety:
+                logger.info(f"Pre-restore safety backup skipped for "
+                            f"'{entry.game_name}': {_skip_safety}")
+            if valid and not _skip_safety:
                 _exe = ""
                 _game = None
                 try:
@@ -2994,6 +3038,8 @@ class BackupManager(QObject):
 
                     if not work:
                         result.success = True
+                        if not target_dir:
+                            self.note_restore(entry.game_id, lib_game_id)
                         self.backup_restored.emit(entry.game_id)
                         return result
 
@@ -3024,6 +3070,10 @@ class BackupManager(QObject):
                     f"{len(result.restored)} written, {len(result.skipped)} skipped"
                 )
 
+            # A restore into a folder the player picked leaves the game's own
+            # saves alone, so it is not "the last restore" of the game.
+            if not target_dir:
+                self.note_restore(entry.game_id, lib_game_id)
             self.backup_restored.emit(entry.game_id)
             return result
 
@@ -3768,6 +3818,117 @@ class BackupManager(QObject):
             reverse=True,
         )
 
+    # A restore is usually not a single one: the player walks back through the
+    # list to find the right point. For this long after one, the saves on disk
+    # are "whatever the last restore put there", not something to protect.
+    RESTORE_QUIET_SECONDS = _RESTORE_QUIET_SECONDS
+
+    def note_restore(self, *game_ids: str) -> None:
+        """Record that a restore for these game ids has just finished.
+
+        Read back by seconds_since_restore (the pre-restore safety copy's quiet
+        window) and by the in-game backup timer, which must start a full
+        interval over after a restore instead of counting from the last backup.
+        More than one id because a restore can be requested under the backup's
+        own game id or under the library entry it was adopted into.
+        """
+        import time
+        now = time.time()
+        for gid in game_ids:
+            if gid:
+                self._restore_stamps[gid] = now
+
+    def last_restore_time(self, game_id: str) -> float:
+        """Epoch seconds of the last restore finished for *game_id*, or 0."""
+        return self._restore_stamps.get(game_id or "", 0.0)
+
+    def seconds_since_restore(self, *game_ids: str) -> Optional[float]:
+        """Seconds since the most recent restore among *game_ids*, or None when
+        none of them has been restored in this session."""
+        import time
+        stamps = [self._restore_stamps[g] for g in game_ids if g in self._restore_stamps]
+        if not stamps:
+            return None
+        return max(0.0, time.time() - max(stamps))
+
+    def stored_backup_for_current_state(self, game_id: str,
+                                        save_paths: list) -> Optional[BackupEntry]:
+        """The stored backup that already holds what *save_paths* contain right
+        now, or None when no backup of this game does.
+
+        Compared by content — the same per-file SHA-256 manifest and whole-state
+        hash create_backup records — so a file rewritten with identical bytes
+        still counts as stored and a changed byte does not. The state is derived
+        exactly the way create_backup derives it (same file filtering, same
+        archive names, the user's unticked files left out), which is what makes
+        the two hashes comparable at all.
+
+        Every backup of the game takes part: the main line, the side branch
+        (earlier safety copies, provisional captures) and versions added by
+        hand — any of them is a copy of the saves that can be restored. One
+        that is known corrupt or whose zip is gone is not a copy of anything.
+        An empty answer when the state cannot be hashed (never a false match).
+        """
+        from core.registry_saves import is_registry_path, registry_key_exists
+        try:
+            fs_paths = [Path(p) for p in save_paths
+                        if not is_registry_path(p) and Path(p).exists()]
+            valid_reg = [p for p in save_paths
+                         if is_registry_path(p) and registry_key_exists(p)]
+            if not fs_paths and not valid_reg:
+                return None
+            usable = []
+            for b in self.get_backups_for_game(game_id):
+                if (b.verify_state or "") in ("corrupt", "missing"):
+                    continue
+                manifest = (b.cloud_metadata or {}).get("file_manifest") or {}
+                if not self._manifest_is_comparable(manifest):
+                    continue
+                if not b.zip_path or not Path(b.zip_path).is_file():
+                    continue
+                usable.append((b, manifest))
+            if not usable:
+                return None
+            files = self._collect_save_files(
+                fs_paths, _declared_chain_dirs(game_id), None,
+                self._excluded_files_for(game_id))
+            # The newest backup's manifest as the "previous" one, so a file
+            # that has not changed since is never re-read (see _build_manifest).
+            manifest, _rf, _re, _changed, state = self._build_manifest(
+                files, valid_reg, usable[0][1])
+            if not manifest or not state:
+                return None
+            for b, bm in usable:
+                if state == self.state_hash_of(bm):
+                    return b
+        except Exception as e:
+            logger.debug(f"Could not compare the current saves of {game_id} with "
+                         f"its backups: {e}")
+        return None
+
+    def _pre_restore_skip_reason(self, game_ids: tuple, paths: list) -> str:
+        """Why the pre-restore safety copy is not needed, or "" when it is.
+
+        Two things must BOTH hold for a copy to be taken:
+
+        - the saves are not what a restore itself wrote a moment ago — the
+          player stepping through restore points would otherwise get a copy of
+          every point they just tried, each on top of the one before;
+        - no stored backup already holds this exact state — a copy of a backup
+          is a second file for the same bytes.
+        """
+        since = self.seconds_since_restore(*game_ids)
+        if since is not None and since < self.RESTORE_QUIET_SECONDS:
+            return (f"another restore finished {since:.0f}s ago "
+                    f"(quiet window {self.RESTORE_QUIET_SECONDS}s)")
+        # The backup's own game id and, for one adopted into the library, the
+        # library entry's: either may be where the matching copy is filed.
+        for gid in dict.fromkeys(g for g in game_ids if g):
+            stored = self.stored_backup_for_current_state(gid, paths)
+            if stored is not None:
+                return f"the current saves are already stored in backup {stored.backup_id}"
+        return ""
+
     def mark_last_restored(self, game_id: str, backup_id: str) -> None:
         """Flag *backup_id* as the state SaveSync itself most recently
         restored onto this game's save folder — landing on it again is the
@@ -4045,15 +4206,28 @@ class BackupManager(QObject):
           rows — (backup_id, game_id, created_at, size_human) tuples
           provisional_ids — game_ids with a pre_confirmation backup
           orphan_unit_count — unique orphan / no-library game_ids (donut Archivi)
+          auto_ids — backup_ids made by the periodic in-game timer (see
+                     is_timer_backup); a subset of rows, not removed from them
+          archive_ids — game_ids that are real ARCHIVES: a save folder handed
+                     over without a game (rows flagged orphan). NOT every
+                     game_id missing from the library: a game that was removed
+                     keeps its backups, which were made as a library game's and
+                     carry no such flag.
         """
         lib_ids = self.library_game_ids()
         provisional: set[str] = set()
         orphan_gids: set[str] = set()
+        archive_gids: set[str] = set()
+        auto_ids: set[str] = set()
         rows: list[tuple[str, str, str, str]] = []
         with _index_lock:
             for b in self._index:
                 meta = b.cloud_metadata or {}
                 gid = b.game_id or ""
+                if self.is_timer_backup(b):
+                    auto_ids.add(b.backup_id)
+                if gid and meta.get("orphan"):
+                    archive_gids.add(gid)
                 if meta.get("pre_confirmation") and gid:
                     provisional.add(gid)
                 if gid and (bool(meta.get("orphan")) or gid not in lib_ids):
@@ -4064,6 +4238,8 @@ class BackupManager(QObject):
             "rows": rows,
             "provisional_ids": provisional,
             "orphan_unit_count": len(orphan_gids),
+            "auto_ids": auto_ids,
+            "archive_ids": archive_gids,
         }
 
     @staticmethod
@@ -5660,8 +5836,9 @@ class BackupManager(QObject):
         instead of needing a watcher.
 
         *changes_explained_since*: a changed file written at or after this
-        timestamp does not count against the returned hash — it still counts
-        as changed everywhere else (create_backup's own manifest pass is
+        timestamp does not count against the returned hash — and neither does
+        a NEW file (one the newest backup never had) written at or after it —
+        it still counts as changed everywhere else (create_backup's own manifest pass is
         untouched by this; a real backup must reflect real bytes). This
         exists for the two callers that use this hash to decide whether to
         warn the player that something looks wrong (detect_regression, and
@@ -5710,12 +5887,19 @@ class BackupManager(QObject):
                 cutoff = changes_explained_since - self._PID_TRACKING_LAG_S
                 lenient = None
                 explained = []
+                from core.registry_saves import arc_name_is_registry
                 for arc in changed:
                     fp = manifest.get(arc, "")
                     parts = fp.split("|")
                     # 3 parts: a real file, not a "[deleted] ..." marker (a
                     # deletion has no fresh write to explain it — still counts).
-                    if len(parts) != 3 or arc not in prev:
+                    if len(parts) != 3:
+                        continue
+                    # A file the backup never had is only explained when it is
+                    # a FILE this session created: a registry key appearing
+                    # means a save path was added, which no process start
+                    # accounts for.
+                    if arc not in prev and arc_name_is_registry(arc):
                         continue
                     try:
                         mtime = float(parts[1])
@@ -5724,7 +5908,16 @@ class BackupManager(QObject):
                     if mtime >= cutoff:
                         if lenient is None:
                             lenient = dict(manifest)
-                        lenient[arc] = prev[arc]   # counts as unchanged here
+                        if arc in prev:
+                            lenient[arc] = prev[arc]   # counts as unchanged here
+                        else:
+                            # Created by this session — a game's first autosave
+                            # or a persistent file that did not exist at the
+                            # last backup. Not in the backup, so it counts as
+                            # not being in the state either; leaving it in
+                            # made a game that wrote one new file in its first
+                            # second read as "unbacked".
+                            lenient.pop(arc, None)
                         explained.append(arc)
                 if lenient is not None:
                     lenient_state = self.state_hash_of(lenient)
@@ -6553,11 +6746,69 @@ class BackupManager(QObject):
         meta = getattr(entry, "cloud_metadata", None) or {}
         return any(meta.get(k) for k in cls._SIDE_KEYS)
 
+    @staticmethod
+    def _save_roots_changed(manifest: dict, previous: "BackupEntry | None") -> bool:
+        """True when *manifest* covers different top-level folders/files than
+        *previous* did — a save path added or removed, as opposed to files
+        coming and going inside the ones already saved. False when there is
+        nothing to compare against (a manifest-less legacy row)."""
+        old = ((getattr(previous, "cloud_metadata", None) or {})
+               .get("file_manifest") or {})
+        if not old or not manifest:
+            return False
+
+        def _roots(m: dict) -> set:
+            return {str(a).replace("\\", "/").split("/", 1)[0].casefold() for a in m}
+
+        return _roots(manifest) != _roots(old)
+
     def _history_for_comparison(self, game_id: str) -> list:
         """The game's backups newest first, versions added by hand last."""
         rows = self.get_backups_for_game(game_id)
         return ([b for b in rows if not self.is_manual_version(b)]
                 + [b for b in rows if self.is_manual_version(b)])
+
+    # Set on the periodic in-game backups (and the provisional ones the same
+    # timer files before a game's paths are confirmed). They repeat every few
+    # minutes for as long as a game runs, which is why a list of what HAPPENED
+    # — the Overview's recent activity — leaves them out; every list of
+    # backups to choose from still shows them.
+    TIMER_BACKUP_KEY = "auto_timer"
+    _timer_notes_cache: "frozenset | None" = None
+
+    @classmethod
+    def _legacy_timer_notes(cls) -> frozenset:
+        """The notes the periodic backups carried before they were marked.
+
+        A note is translated text, so it is never how a NEW backup is told
+        apart (that is the marker). This is only for the rows already on disk
+        when the marker was introduced, and it reads the shipped languages
+        rather than the current one: a backup made under one language is still
+        listed under another.
+        """
+        if cls._timer_notes_cache is None:
+            notes: set = set()
+            try:
+                import i18n as _i18n
+                for path in Path(_i18n._I18N_DIR).glob("*.json"):
+                    with open(path, encoding="utf-8") as fh:
+                        main = (json.load(fh) or {}).get("main") or {}
+                    for key in ("auto_in_game", "auto_pending_identity",
+                                "auto_pending_review", "auto_pre_confirm"):
+                        if main.get(key):
+                            notes.add(str(main[key]).strip().casefold())
+            except Exception:
+                logger.debug("Could not read the periodic-backup notes", exc_info=True)
+            cls._timer_notes_cache = frozenset(notes)
+        return cls._timer_notes_cache
+
+    @classmethod
+    def is_timer_backup(cls, entry) -> bool:
+        """Made by the periodic in-game timer (see TIMER_BACKUP_KEY)."""
+        if (getattr(entry, "cloud_metadata", None) or {}).get(cls.TIMER_BACKUP_KEY):
+            return True
+        note = (getattr(entry, "note", "") or "").strip().casefold()
+        return bool(note) and note in cls._legacy_timer_notes()
 
     @classmethod
     def is_manual_version(cls, entry) -> bool:
