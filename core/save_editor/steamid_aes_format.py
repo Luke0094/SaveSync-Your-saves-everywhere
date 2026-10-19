@@ -70,8 +70,8 @@ def _find_recipe(path):
 
 
 class SteamIdAesFormat(_Format):
-    name = "SteamID-keyed save"
-    engine = "SteamID-keyed save"
+    name = "SteamID-keyed save"  # i18n-ignore (engine / format name, an identifier)
+    engine = "SteamID-keyed save"  # i18n-ignore (engine / format name, an identifier)
     verify_exact = False
 
     def __init__(self):

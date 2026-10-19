@@ -818,7 +818,7 @@ class PinManager(QObject):
                     return
             except RuntimeError:
                 continue
-        self._assert_topmost("another window came forward")
+        self._assert_topmost("another window came forward")  # i18n-ignore (log text)
         # And once more when the switch has settled. This fires WHILE Windows
         # is still re-ordering, so the first attempt can land before the game
         # has finished coming forward and be undone a moment later — the log
@@ -826,7 +826,7 @@ class PinManager(QObject):
         # the timer, a whole second afterwards. A second pass just after turns
         # that second into a blink.
         QTimer.singleShot(_SETTLE_MS,
-                          lambda: self._assert_topmost("just after the switch"))
+                          lambda: self._assert_topmost("just after the switch"))  # i18n-ignore (log text)
 
     def _sync_topmost_timer(self):
         """Watch, and keep watching, only while there is a pin on screen."""

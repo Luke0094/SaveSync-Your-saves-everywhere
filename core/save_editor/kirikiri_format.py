@@ -9,7 +9,7 @@ class KirikiriFormat(_Format):
     accounts for every character rather than that the file round-trips.
     """
     name = "KiriKiri"
-    engine = "KiriKiri / KAG"
+    engine = "KiriKiri / KAG"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         self._save = None

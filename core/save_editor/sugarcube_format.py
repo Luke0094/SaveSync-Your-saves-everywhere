@@ -9,7 +9,7 @@ from .lzstring_json_format import LzStringJsonFormat
 
 class SugarCubeFormat(LzStringJsonFormat):
     name = "Twine (SugarCube)"
-    engine = "Twine / SugarCube"
+    engine = "Twine / SugarCube"  # i18n-ignore (engine / format name, an identifier)
 
     def claims(self, data) -> bool:
         state = data.get("state") if isinstance(data, dict) else None

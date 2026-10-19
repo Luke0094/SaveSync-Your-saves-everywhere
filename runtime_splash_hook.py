@@ -67,18 +67,18 @@ def _get_config_path() -> str:
 
 def _get_localised_msg() -> str:
     """Return a localised 'already running' message (best-effort)."""
-    msg = "SaveSync is already running.\nCheck the system tray."
+    msg = "SaveSync is already running.\nCheck the system tray."  # i18n-ignore (table for the moment before i18n exists)
     try:
         cfg = _get_config_path()
         if os.path.isfile(cfg):
             with open(cfg, "r", encoding="utf-8") as f:
                 lang = json.load(f).get("language", "en")
             msgs = {
-                "it": "SaveSync è già in esecuzione.\nControlla la system tray.",
-                "es": "SaveSync ya está en ejecución.\nRevisa la bandeja del sistema.",
-                "fr": "SaveSync est déjà en cours d'exécution.\nVérifiez la barre des tâches.",
-                "de": "SaveSync läuft bereits.\nÜberprüfen Sie die Taskleiste.",
-                "pt": "SaveSync já está em execução.\nVerifique a bandeja do sistema.",
+                "it": "SaveSync è già in esecuzione.\nControlla la system tray.",  # i18n-ignore (table for the moment before i18n exists)
+                "es": "SaveSync ya está en ejecución.\nRevisa la bandeja del sistema.",  # i18n-ignore (table for the moment before i18n exists)
+                "fr": "SaveSync est déjà en cours d'exécution.\nVérifiez la barre des tâches.",  # i18n-ignore (table for the moment before i18n exists)
+                "de": "SaveSync läuft bereits.\nÜberprüfen Sie die Taskleiste.",  # i18n-ignore (table for the moment before i18n exists)
+                "pt": "SaveSync já está em execução.\nVerifique a bandeja do sistema.",  # i18n-ignore (table for the moment before i18n exists)
             }
             msg = msgs.get(lang, msg)
     except Exception:

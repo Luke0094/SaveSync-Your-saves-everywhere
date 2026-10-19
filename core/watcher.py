@@ -694,7 +694,7 @@ def _claim_correlated_for_anchor(game_id: str, anchor_ts: float) -> int:
                         if fk not in best_strong)
     for delta, file_key in weak_items[:_CORR_WEAK_CAP]:
         if _claim_event_for_game(game_id, file_key,
-                                 f"Δ={delta * 1000:.0f}ms from anchor, weak"):
+                                 f"Δ={delta * 1000:.0f}ms from anchor, weak"):  # i18n-ignore (log text)
             claimed += 1
     return claimed
 
@@ -1534,7 +1534,7 @@ def _get_common_save_roots(appid: str = "") -> list[Path]:
         home = Path.home()
         # macOS Ren'Py uses ~/.renpy and/or ~/Library/RenPy — neither is under
         # ~/Library/Application Support, so list them explicitly.
-        for rel in ("Library/Application Support", "Documents", ".renpy", "Library/RenPy"):
+        for rel in ("Library/Application Support", "Documents", ".renpy", "Library/RenPy"):  # i18n-ignore (folder name)
             p = home / rel
             if p.exists():
                 roots.append(p)

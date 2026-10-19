@@ -64,6 +64,18 @@ done
 "${PY}" -c 'import lz4' 2>/dev/null \
     || die "lz4 is not installed for ${PY} (pip install -r requirements.txt) -- without it PyInstaller silently drops core.engines.wolf_lz4 (Wolf RPG saves) rather than failing the build"
 
+# The same silent drop, for the P2P feature (friends, chat, transfers): core.p2p
+# imports libtorrent lazily and cryptography inside functions, so a build host
+# without them freezes an app whose P2P simply is not there - and exits 0.
+"${PY}" -c 'import libtorrent' 2>/dev/null \
+    || die "libtorrent is not installed for ${PY} (pip install -r requirements.txt) -- without it PyInstaller silently drops P2P transfer and friends rather than failing the build"
+"${PY}" -c 'import cryptography, yaml' 2>/dev/null \
+    || die "cryptography / PyYAML are not installed for ${PY} (pip install -r requirements.txt) -- the friends' keys and the Borderlands save format need them"
+# Qt Multimedia plays a received video inside the chat; without the module in
+# PySide6 the build still succeeds and the Play button is just never there.
+"${PY}" -c 'from PySide6 import QtMultimedia, QtMultimediaWidgets' 2>/dev/null \
+    || die "PySide6 has no QtMultimedia / QtMultimediaWidgets for ${PY} (pip install -r requirements.txt) -- chat videos would have no Play button"
+
 VERSION="$("${PY}" - <<'PYEOF'
 import re, pathlib
 src = pathlib.Path("core/constants.py").read_text(encoding="utf-8")
@@ -73,6 +85,16 @@ PYEOF
 )"
 ARCH="$(uname -m)"
 say "SaveSync ${VERSION} — ${ARCH}"
+
+# ── 0. the Tor program (private mode runs it, see core/p2p/tor.py) ──────
+# Fetched from the Tor Project and checked against a pinned SHA-256; it travels inside
+# the AppImage, nothing is installed on the user's PC.
+cd "${ROOT}"
+if [ ! -x "vendor/tor/linux-x86_64/tor" ]; then
+    say "Tor (vendor/tor/linux-x86_64)"
+    "${PY}" tools/fetch_tor.py linux-x86_64 \
+        || die "could not fetch the Tor program (tools/fetch_tor.py): private mode would be missing from this AppImage"
+fi
 
 # ── 1. freeze ───────────────────────────────────────────────────────────
 say "PyInstaller (onedir)"

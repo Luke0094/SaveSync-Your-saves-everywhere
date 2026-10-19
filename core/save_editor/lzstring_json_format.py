@@ -12,8 +12,8 @@ from .json_format import JsonFormat
 
 
 class LzStringJsonFormat(JsonFormat):
-    name = "LZString JSON"
-    engine = "HTML game"
+    name = "LZString JSON"  # i18n-ignore (engine / format name, an identifier)
+    engine = "HTML game"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         super().__init__()

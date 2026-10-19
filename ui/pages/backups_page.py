@@ -19,7 +19,7 @@ from i18n import t
 from core import fmt_size as _fmt_size
 from core.library import get_library, GameEntry
 from core.backup import get_backup_manager, BackupEntry
-from ui.backup_labels import ORIGIN_LABELS, origin_badge
+from ui.backup_labels import LOCAL_ORIGINS as _LOCAL_ORIGINS, ORIGIN_LABELS, origin_badge
 from ui.helpers import (
     PageScrollMixin, lock_min_size, open_in_file_manager,
     safe_widget as _safe, scaled,
@@ -30,7 +30,6 @@ from ui.modal_helpers import (
     warning_window_modal,
 )
 from ui.styles.theme import palette, ThemedMixin
-
 
 class _CloudZipScan(QThread):
     """What each folder-backed provider really holds, read off the disk
@@ -54,6 +53,30 @@ class _CloudZipScan(QThread):
                     out[getattr(p, "PROVIDER_ID", "")] = found
         except Exception:
             out = {}
+        self.done.emit(out)
+
+
+class _CloudListScan(QThread):
+    """What each connected provider lists (its master index), read away from
+    the GUI thread. Each read is a download — or, on a provider with no
+    master index, a walk over every folder — and on the GUI thread that was
+    a "please wait" that nothing could end: the event loop was inside the
+    network call, so the countdown froze and Cancel could not be pressed.
+    Normal priority — see _CloudZipScan."""
+    done = Signal(object)
+
+    def __init__(self, providers, parent=None):
+        super().__init__(parent)
+        self._providers = list(providers)
+
+    def run(self):
+        out: dict = {}
+        for p in self._providers:
+            try:
+                out[getattr(p, "PROVIDER_ID", "")] = p.list_all_cloud_backups() or {}
+            except Exception:
+                logger.debug("cloud listing failed for %s",
+                             getattr(p, "PROVIDER_ID", "?"), exc_info=True)
         self.done.emit(out)
 
 
@@ -516,6 +539,12 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._cloud_zip_map: dict = {}
         self._cloud_zip_at: float = 0.0
         self._cloud_zip_scan = None
+        # {provider id: {folder: [index rows]}} — each provider's master
+        # index as _CloudListScan last read it. Served stale while a fresh
+        # read runs (see _cloud_all), never fetched on the GUI thread.
+        self._cloud_list_map: dict = {}
+        self._cloud_list_at: float = 0.0
+        self._cloud_list_scan = None
         # Debounce timer: fires 120 ms after the last keystroke to avoid
         # rebuilding the combo + list on every character typed.
         self._search_timer = QTimer(self)
@@ -525,6 +554,15 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # First list build waits until the page is shown so busy_over can cover
         # it (hidden rebuilds have nothing to dim).
         self._pending_initial_load = True
+        # Something changed while the page was not on screen: rebuild once, when
+        # it is next shown, instead of on every event (see _reload_soon).
+        self._reload_when_shown = False
+        # "Sync all" ends one sync per game; the refresh they ask for is made
+        # once, after the last of them (see _on_sync_finished).
+        self._sync_refresh_timer = QTimer(self)
+        self._sync_refresh_timer.setSingleShot(True)
+        self._sync_refresh_timer.setInterval(1500)
+        self._sync_refresh_timer.timeout.connect(self._after_syncs_settled)
         self._build()
         self._connect_signals()
 
@@ -532,7 +570,23 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         super().showEvent(event)
         if self._pending_initial_load:
             self._pending_initial_load = False
+            self._reload_when_shown = False
             QTimer.singleShot(0, self._load_games)
+        elif self._reload_when_shown:
+            self._reload_when_shown = False
+            QTimer.singleShot(0, lambda: self._load_games(self._game_filter_text))
+
+    def _reload_soon(self, text_filter: str = "") -> None:
+        """Rebuild the list now if the page is on screen; otherwise note that
+        it must be rebuilt when it is shown. A hidden page used to rebuild for
+        every in-game backup, sync and scan - a deep copy of the whole index
+        and every row, for nobody to see."""
+        if getattr(self, "_pending_initial_load", False):
+            return
+        if not self.isVisible():
+            self._reload_when_shown = True
+            return
+        self._load_games(text_filter)
 
     def ensure_loaded(self):
         """Kick the first list build without blocking the page switch."""
@@ -756,20 +810,27 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         orch.sync_finished.connect(self._on_sync_finished)
 
     def _on_bulk_finished(self):
-        if not getattr(self, "_pending_initial_load", False):
-            self._load_games()
+        self._reload_soon()
 
     def _on_provider_state_changed(self, _pid: str = ""):
         """Refresh origin filter when provider connects/disconnects."""
+        self._cloud_list_at = 0.0
         self._rebuild_origin_filter()
-        if not getattr(self, "_pending_initial_load", False):
-            self._load_games()
+        self._reload_soon()
 
     def _on_sync_finished(self, _game_id: str, _result):
-        """Refresh after sync completes (new backups may have been created/downloaded)."""
+        """A sync completed (new backups may have been created/downloaded).
+
+        "Sync all" reports one of these per game, back to back. Each used to
+        reset the cloud-listing throttle and rebuild the list, so N games meant
+        N downloads of every provider's master index and N rebuilds. The work
+        is deferred until the burst has gone quiet and done once."""
+        self._sync_refresh_timer.start()      # restarts while syncs keep coming
+
+    def _after_syncs_settled(self):
+        self._cloud_list_at = 0.0     # what the provider lists has just changed
         self._rebuild_origin_filter()
-        if not getattr(self, "_pending_initial_load", False):
-            self._load_games()
+        self._reload_soon()
 
     def _on_lib_changed(self, arg):
         # If a game was removed and it was the selected game, clear selection.
@@ -789,8 +850,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 self._game_combo.blockSignals(False)
             self._selected_game_id = None
             self._game_filter_text = ""
-        if not getattr(self, "_pending_initial_load", False):
-            self._load_games()
+        self._reload_soon()
 
     def _on_backup_created(self, _):
         try:
@@ -799,8 +859,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         except Exception:
             pass
         self._rebuild_origin_filter()
-        if not getattr(self, "_pending_initial_load", False):
-            self._refresh_list()
+        # _load_games, not just _refresh_list: a backup for a title with
+        # no library game (a received P2P archive, a new archive) only
+        # appears in the title combo and search once it is rebuilt.
+        self._reload_soon(self._game_filter_text)
 
     def _on_backup_deleted(self, _backup_id: str):
         """A backup went away — from ANYWHERE.
@@ -818,11 +880,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 return
         except Exception:
             pass
-        if getattr(self, "_pending_initial_load", False):
-            return
-        self._load_games()
+        self._reload_soon()
 
     def disconnect_signals(self):
+        self._sync_refresh_timer.stop()
         try:
             get_library().game_added.disconnect(self._on_lib_changed)
         except (RuntimeError, TypeError):
@@ -941,16 +1002,18 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         if filt in ("all", "__sep__"):
             return True
         if filt == "local_only":
-            return origin == "local" and not synced_to
+            return origin in _LOCAL_ORIGINS and not synced_to
         if filt == "local_sync":
-            return origin == "local"
+            # Local AND synced: an entry that was never synced is "Local only",
+            # not here — the two filters split the local backups between them.
+            return origin in _LOCAL_ORIGINS and bool(synced_to)
         if filt == "archive_only":
             # Same bucket as the donut's "Archivi" slice: backups with NO
             # library game — Aggiungi-percorso archives (orphan flag) and
             # leftovers after a game was removed (game_id no longer in the
             # library). Cloud phantoms enter with their folder name as
             # game_id, which is never a library id, so they match too.
-            if origin == "local":
+            if origin in _LOCAL_ORIGINS:
                 bm = get_backup_manager()
                 if bm.is_orphan_entry(entry):
                     return True
@@ -975,12 +1038,94 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         found = self._cloud_zip_map.get(getattr(provider, "PROVIDER_ID", ""))
         return None if found is None else found.get((folder or "").casefold(), set())
 
+    def _cloud_all(self, provider):
+        """The provider's master index ({folder: rows}) from the background
+        read, or None until the first one has landed. Never blocks: a read
+        that is due is started here and re-runs the listing when it arrives."""
+        self._ensure_cloud_list_scan()
+        return self._cloud_list_map.get(getattr(provider, "PROVIDER_ID", ""))
+
+    def _cloud_rows(self, provider, folder: str):
+        """One folder's rows out of _cloud_all (case-insensitive), [] when
+        unknown or not read yet."""
+        listing = self._cloud_all(provider)
+        if not listing:
+            return []
+        if folder in listing:
+            return listing[folder]
+        wanted = (folder or "").casefold()
+        for name, rows in listing.items():
+            if name.casefold() == wanted:
+                return rows
+        return []
+
+    def _resolve_cloud_folder(self, provider, candidate: str) -> str:
+        """The remote folder holding *candidate*'s backups — exact name, then
+        with version/build tokens ignored — worked out on the cached listing
+        (resolve_remote_game_folder asks the provider, one call per game).
+        *candidate* itself when nothing matches."""
+        listing = self._cloud_all(provider) or {}
+        if candidate in listing:
+            return candidate
+        from core.constants import version_insensitive_slug
+        wanted = (candidate or "").casefold()
+        for name in listing:
+            if name.casefold() == wanted:
+                return name
+        slug = version_insensitive_slug(candidate)
+        if slug:
+            for name in listing:
+                if version_insensitive_slug(name) == slug:
+                    return name
+        return candidate
+
+    @staticmethod
+    def _scan_running(scan) -> bool:
+        """Whether *scan* (a finished one deletes itself) is still working."""
+        if scan is None:
+            return False
+        try:
+            return scan.isRunning()
+        except RuntimeError:
+            return False              # already deleted
+
+    def _ensure_cloud_list_scan(self):
+        import time as _time
+        scan = self._cloud_list_scan
+        if self._scan_running(scan):
+            return
+        if self._cloud_list_at and _time.monotonic() - self._cloud_list_at < 90.0:
+            return
+        try:
+            from sync import get_orchestrator
+            providers = list(get_orchestrator().get_connected_providers())
+        except Exception:
+            return
+        if not providers:
+            return
+        scan = _CloudListScan(providers, self)
+        scan.done.connect(self._on_cloud_list_scan)
+        scan.finished.connect(scan.deleteLater)     # parented to the page: else one per scan piles up
+        self._cloud_list_scan = scan
+        scan.start()
+
+    def _on_cloud_list_scan(self, result):
+        import time as _time
+        self._cloud_list_at = _time.monotonic()
+        self._cloud_list_scan = None
+        if result == self._cloud_list_map:
+            return
+        self._cloud_list_map = result
+        self._provider_only_extra_game_ids = None
+        self._provider_only_phantom_folders = None
+        self._reload_soon(self._game_filter_text)
+
     def _ensure_cloud_zip_scan(self):
         """Start reading what the providers hold, off the GUI thread, unless a
         recent scan has (or is doing) it."""
         import time as _time
         scan = self._cloud_zip_scan
-        if scan is not None and scan.isRunning():
+        if self._scan_running(scan):
             return
         if self._cloud_zip_at and _time.monotonic() - self._cloud_zip_at < 90.0:
             return
@@ -993,6 +1138,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             return
         scan = _CloudZipScan(providers, self)
         scan.done.connect(self._on_cloud_zip_scan)
+        scan.finished.connect(scan.deleteLater)     # see _ensure_cloud_list_scan
         self._cloud_zip_scan = scan
         scan.start()
 
@@ -1006,8 +1152,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # Whatever was worked out before the scan took everything at its word.
         self._provider_only_extra_game_ids = None
         self._provider_only_phantom_folders = None
-        if not getattr(self, "_pending_initial_load", False):
-            self._load_games()
+        self._reload_soon()
 
     def _cloud_backed(self, provider, folder: str, rows) -> int:
         """How many of a cloud folder's listed *rows* have their zip there;
@@ -1032,8 +1177,11 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
 
         # Categorise game IDs for each filter bucket. Definitions (exact spec):
         #   local_only   = has a local backup that has NEVER been synced anywhere
-        #   local_sync   = has ANY local backup at all, synced or not
-        #                  (local_only is always a subset of this)
+        #   local_sync   = has a local backup that HAS been synced somewhere.
+        #                  local_only and local_sync split the local backups
+        #                  between them: a backup is in one or the other.
+        #   (local_any_ids below is "ANY local backup, synced or not" — what
+        #   provider_only is exclusive with.)
         #   provider_only = has a CLOUD-side backup but ZERO local backups —
         #                  mutually exclusive with local_sync BY DEFINITION:
         #                  a game with even one local backup entry can never
@@ -1049,15 +1197,18 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         counts:          dict[str, int] = {}
         local_only_ids:  set[str]       = set()
         local_sync_ids:  set[str]       = set()   # ANY local backup, synced or not
+        local_synced_ids: set[str]      = set()   # has a local backup that is synced
         provider_ids:    set[str]       = set()   # filled in below, post-loop
 
         for b in all_backups:
             counts[b.game_id] = counts.get(b.game_id, 0) + 1
             origin    = getattr(b, "origin", "local")
             synced_to = b.cloud_metadata.get("synced_to", [])
-            if origin == "local":
+            if origin in _LOCAL_ORIGINS:
                 local_sync_ids.add(b.game_id)
-                if not synced_to:
+                if synced_to:
+                    local_synced_ids.add(b.game_id)
+                else:
                     local_only_ids.add(b.game_id)
 
         # A game whose backups exist ONLY on the cloud (never downloaded —
@@ -1074,11 +1225,18 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # titles too, matching the same extension made in _refresh_list().
         phantom_folders: dict[str, int] = {}   # folder_name -> backup count
         if filt in ("provider_only", "archive_only", "all") and provider is not None:
+            cloud_pending = False
             if self._provider_only_extra_game_ids is None:
                 extra: set[str] = set()
                 phantoms: dict[str, int] = {}
                 try:
-                    all_cloud = provider.list_all_cloud_backups()
+                    all_cloud = self._cloud_all(provider)
+                    if all_cloud is None:
+                        # Not read yet. The read runs off the GUI thread and
+                        # re-runs this when it lands; nothing is cached from
+                        # an empty answer.
+                        cloud_pending = True
+                        all_cloud = {}
                     cloud_folders = {f.lower(): f for f in all_cloud.keys()}
                     from core.constants import (get_install_folder_name,
                                                 get_folder_name_for_save,
@@ -1129,9 +1287,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                 phantoms[folder_original] = n
                 except Exception as e:
                     logger.debug(f"_load_games: provider_only combo pre-check failed: {e}")
-                self._provider_only_extra_game_ids = extra
-                self._provider_only_phantom_folders = phantoms
-            provider_ids = provider_ids | self._provider_only_extra_game_ids
+                if not cloud_pending:
+                    self._provider_only_extra_game_ids = extra
+                    self._provider_only_phantom_folders = phantoms
+            provider_ids = provider_ids | (self._provider_only_extra_game_ids or set())
             phantom_folders = self._provider_only_phantom_folders or {}
 
         tf = text_filter.lower()
@@ -1145,6 +1304,10 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         if _le:
             _le.blockSignals(True)
         selection_cleared = False
+        # What is physically in the field right now — spaces and all. Read
+        # before the rebuild below, which makes Qt write item labels into it.
+        prior_text = _le.text() if _le else ""
+        prior_cursor = _le.cursorPosition() if _le else 0
         try:
             self._game_combo.clear()
             self._search_candidates = []
@@ -1159,7 +1322,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                 # Source/origin filter
                 if filt == "local_only" and g.id not in local_only_ids:
                     continue
-                if filt == "local_sync" and g.id not in local_sync_ids:
+                if filt == "local_sync" and g.id not in local_synced_ids:
                     continue
                 if filt == "provider_only" and provider_id and g.id not in provider_ids:
                     continue
@@ -1199,7 +1362,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             if filt in ("all", "local_only", "local_sync", "archive_only", ""):
                 try:
                     for folder_name, backup_count in sorted(
-                            (mgr.orphan_folders() or {}).items(),
+                            self._orphan_folder_counts(mgr, filt).items(),
                             key=lambda kv: kv[0].lower()):
                         # Skip if already listed as a cloud phantom
                         if folder_name in phantom_folders:
@@ -1250,9 +1413,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             # typed text is restored verbatim — a background rebuild (backup
             # created, provider change) must never blank the search box.
             if _le:
-                if self._game_filter_text and _le.hasFocus():
-                    _le.setText(self._game_filter_text)
-                    _le.setCursorPosition(len(self._game_filter_text))
+                if _le.hasFocus():
+                    # Restore verbatim, NOT the stripped filter: a trailing
+                    # space is how the next word gets typed, and a lone space
+                    # is not something to wipe.
+                    if _le.text() != prior_text:
+                        _le.setText(prior_text)
+                    _le.setCursorPosition(min(prior_cursor, len(prior_text)))
                 else:
                     _le.clear()
         finally:
@@ -1272,6 +1439,22 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._update_suggest_popup()
 
         self._refresh_list()
+
+    def _orphan_folder_counts(self, mgr, filt: str) -> dict:
+        """folder -> backup count for the archives with no library game, under
+        *filt*. Under "Local only" / "Local + sync" only the backups that
+        filter lets through are counted (and a folder with none is left out),
+        so the title list agrees with what selecting it will show."""
+        if filt not in ("local_only", "local_sync"):
+            return mgr.orphan_folders() or {}
+        counts: dict = {}
+        for b in mgr.get_orphan_backups():
+            if not self._matches_origin_filter(b):
+                continue
+            folder = mgr._game_folder_for_entry(b)
+            if folder:
+                counts[folder] = counts.get(folder, 0) + 1
+        return counts
 
     def _clean_item_label(self, item_text: str) -> str:
         """Strip a combo item's display-only decoration — the trailing
@@ -1742,6 +1925,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             "backup_index": "batch.verify_index",
             "config_history_restore": "batch.verify_snapshot",
             "settings_integrity": "batch.verify_settings",
+            "icon_cache": "batch.verify_icons",
         }
 
         def _on_step(check_id: str, index: int, total_checks: int):
@@ -1780,6 +1964,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                     pass      # row already gone (list rebuilt mid-run)
 
         def _on_finished(result):
+            from core.startup import REG_FAILURES, describe_registration
             self._verify_btn.setEnabled(True)
             bad = result.archives_bad
             checked = result.archives_total
@@ -1792,12 +1977,20 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                 detail=result.snapshots_detail)
             if not result.settings_repaired:
                 msg += "\n" + t("backups.verify_settings_ok")
-            elif "could not" in result.settings_detail:
+            elif result.settings_detail in REG_FAILURES:
                 msg += "\n" + t("backups.verify_settings_bad",
-                                detail=result.settings_detail)
+                                detail=describe_registration(result.settings_detail))
             else:
                 msg += "\n" + t("backups.verify_settings_repaired",
-                                detail=result.settings_detail)
+                                detail=describe_registration(result.settings_detail))
+            if result.icon_leftovers_failed:
+                msg += "\n" + t("backups.verify_icons_bad",
+                                count=result.icon_leftovers_failed)
+            elif result.icon_leftovers_removed:
+                msg += "\n" + t("backups.verify_icons_cleaned",
+                                count=result.icon_leftovers_removed)
+            else:
+                msg += "\n" + t("backups.verify_icons_ok")
             self._set_verify_status(
                 msg, tone="success" if result.ok else "error")
             self._verify_btn.setToolTip(
@@ -1926,12 +2119,16 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # rebuild pumped a corpse and put a SECOND sheet on the page behind
         # it — two please-waits over one list, each wanting dismissing.
         if busy is not None and busy.alive():
+            self._sweep_list_sheets()
             busy.pump()
             return
         if busy is not None:
             self._stop_list_busy()
         from ui.widgets.busy_overlay import DeferredBusy
+        # Any sheet of this list still up at this point is a leftover.
+        self._sweep_list_sheets()
         self._list_busy = DeferredBusy(self, t("common.please_wait"), delay_ms=0)
+        self._list_busy.tag(self._LIST_SHEET_TAG)
         # Its Cancel has to end the rebuild, not just say so. Bumping the
         # generation is what every step of the chain already watches for.
         self._list_busy.set_on_cancel(self._cancel_list_build)
@@ -1959,6 +2156,8 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         if getattr(self, "_list_busy_gen", None) == gen:
             self._stop_list_busy()
 
+    _LIST_SHEET_TAG = "backups_list"
+
     def _stop_list_busy(self):
         busy = getattr(self, "_list_busy", None)
         if busy is not None:
@@ -1967,6 +2166,31 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
             except Exception:
                 pass
             self._list_busy = None
+        # And any sheet of this list that nobody is tracking any more. A
+        # sheet that lost its handle (a replaced or half-closed one) kept
+        # counting, and its Cancel — which lands here — closed only the
+        # CURRENT handle, so the one on screen stayed up for good.
+        self._sweep_list_sheets()
+
+    def _sweep_list_sheets(self):
+        """Close every list "please wait" sheet on the page except the one
+        being tracked."""
+        from ui.widgets.busy_overlay import BusyOverlay
+        keep = None
+        tracked = getattr(self, "_list_busy", None)
+        if tracked is not None:
+            keep = getattr(tracked, "_overlay", None)
+        try:
+            sheets = self.findChildren(BusyOverlay)
+        except RuntimeError:
+            return
+        for sheet in sheets:
+            if sheet is keep or getattr(sheet, "_tag", "") != self._LIST_SHEET_TAG:
+                continue
+            try:
+                sheet.close_overlay()
+            except RuntimeError:
+                pass
 
     def _refresh_list_deferred(self, gen: int):
         if gen != getattr(self, "_refresh_gen", 0):
@@ -2053,7 +2277,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # game with even one local backup entry belongs there instead,
         # regardless of whether that backup is also synced to a provider.
         local_sync_ids: set[str] = {b.game_id for b in mgr.get_all_backups()
-                                     if getattr(b, "origin", "local") == "local"}
+                                     if getattr(b, "origin", "local") in _LOCAL_ORIGINS}
 
         # For provider_only, the sub-combo selects "all providers" or a specific one
         sub_provider = None
@@ -2111,6 +2335,11 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                             _names = self._cloud_zip_names(_prov, remote_folder)
                             if _names is not None and f"{bid}.zip" not in _names:
                                 return    # the index names it, the folder does not hold it
+                        # rd is a row of the cached listing (_cloud_list_map):
+                        # work on a copy. Filling it in place made the next
+                        # scan's "nothing changed" comparison always fail, so
+                        # every scan rebuilt the whole list.
+                        rd = dict(rd)
                         rd.setdefault("game_id", fallback_gid)
                         rd.setdefault("game_name", fallback_name)
                         rd.setdefault("created_at", "")
@@ -2119,7 +2348,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                         rd.setdefault("zip_path", "")
                         rd.setdefault("size_bytes", 0)
                         rd.setdefault("note", "")
-                        rd.setdefault("cloud_metadata", {})
+                        rd["cloud_metadata"] = dict(rd.get("cloud_metadata") or {})
                         if remote_folder:
                             # Where the zip actually lives — download must
                             # target this folder even if the local install
@@ -2171,7 +2400,9 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                                  for f, g in _lib_folder_to_game.items()}
                             _local_backed_norm = {version_insensitive_slug(f)
                                                   for f in _local_backed_folders}
-                            all_cloud_backups = provider.list_all_cloud_backups()
+                            # From the background read (None until it lands, which
+                            # re-runs this listing) — never a download from here.
+                            all_cloud_backups = self._cloud_all(provider) or {}
                             for game_folder, backup_entries in all_cloud_backups.items():
                                 folder_lower = game_folder.lower()
                                 folder_norm = version_insensitive_slug(game_folder)
@@ -2192,42 +2423,11 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                                        fallback_name=display_name,
                                                        remote_folder=game_folder)
                         except Exception:
-                            # Fallback to old method if master index fails
-                            try:
-                                remote_files = provider.list_files("SaveSync")
-                                folders: set[str] = set()
-                                for rf in remote_files:
-                                    p = getattr(rf, "path", "") or ""
-                                    if not p.startswith("SaveSync/backup/"):
-                                        continue
-                                    if not p.endswith("/index.json"):
-                                        continue
-                                    # Extract <game_folder> from SaveSync/backup/<game_folder>/index.json
-                                    rel = p[len("SaveSync/backup/"):]
-                                    game_folder = rel.split("/", 1)[0].strip("/")
-                                    if game_folder:
-                                        folders.add(game_folder)
-                                from core.constants import version_insensitive_slug as _vslug
-                                _lib_norm_fb = {_vslug(f): g for f, g in _lib_folder_to_game.items()}
-                                _local_norm_fb = {_vslug(f) for f in _local_backed_folders}
-                                for game_folder in sorted(folders, key=lambda s: s.lower()):
-                                    folder_lower = game_folder.lower()
-                                    folder_norm = _vslug(game_folder)
-                                    if (folder_lower in _local_backed_folders
-                                            or folder_norm in _local_norm_fb):
-                                        continue
-                                    lib_game = (_lib_folder_to_game.get(folder_lower)
-                                                or _lib_norm_fb.get(folder_norm))
-                                    display_gid = lib_game.id if lib_game else game_folder
-                                    display_name = lib_game.name if lib_game else game_folder
-                                    if not _cloud_entry_matches_filter(display_name):
-                                        continue
-                                    for rd in provider.list_cloud_backups(game_folder):
-                                        _append_cloud_only(rd, fallback_gid=display_gid,
-                                                           fallback_name=display_name,
-                                                           remote_folder=game_folder)
-                            except Exception:
-                                pass
+                            # The old per-folder fallback downloaded every
+                            # folder's index from here, on the GUI thread;
+                            # list_all_cloud_backups already has that fallback,
+                            # and runs off it now.
+                            logger.debug("cloud-only listing failed", exc_info=True)
                     else:
                         # Specific game selected OR non-provider-only provider filter:
                         # fall back to checking only library games.
@@ -2239,9 +2439,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                 # Version/build-insensitive resolution against
                                 # the actual remote folders (install names may
                                 # carry a version suffix that changed).
-                                _resolved = orch.resolve_remote_game_folder(provider, [game_folder])
-                                if _resolved:
-                                    game_folder = _resolved
+                                game_folder = self._resolve_cloud_folder(provider, game_folder)
                                 fallback_name = entry.name
                             elif gid:
                                 # check_gid doesn't resolve to a real library
@@ -2259,7 +2457,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                 fallback_name = check_gid
                             else:
                                 continue
-                            for rd in provider.list_cloud_backups(game_folder):
+                            for rd in self._cloud_rows(provider, game_folder):
                                 _append_cloud_only(rd, fallback_gid=check_gid,
                                                    fallback_name=fallback_name,
                                                    remote_folder=game_folder)
@@ -2937,6 +3135,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
                                  t('backups.delete_cloud_failed', reason=t(key)))
         # What the tab worked out about the provider is out of date either way.
         self._cloud_zip_at = 0.0
+        self._cloud_list_at = 0.0
         self._provider_only_extra_game_ids = None
         self._provider_only_phantom_folders = None
         self._load_games()

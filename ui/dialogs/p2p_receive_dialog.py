@@ -1,54 +1,62 @@
-"""SaveSync - "Receive a save" dialog: generate a one-time token, wait for
-a sender to publish an offer against it, confirm before downloading
-anything. See core.p2p.transfer for the actual DHT-mailbox + BitTorrent
-mechanics this drives.
+"""SaveSync - "Receive a save" panel: shows the one-time token, an incoming
+offer (confirm before downloading anything) and the download's progress.
 
-Once downloaded, the save is filed as an ARCHIVE — a backup with no
-matching library game, the exact same shape "Aggiungi percorso" and a
-cloud-only backup for an unrecognised game already produce (see
-core.backup.get_orphan_backups: "Backups marked orphan, or whose game_id
-is not in the library"). There is no need to ask which of the receiver's
-games it belongs to right now, or to add a new one — it shows up under
-"archive" in the Backups page immediately, and restoring it (whenever that
-is actually wanted) is where the existing archive-restore flow already
-asks where the files should go, via a target folder rather than a library
-save_path. Filed through the same core.backup.import_backup path a
-cloud-synced backup uses, so nothing here is a special case for restore to
-handle differently.
+It is only a VIEW. The session itself lives in ui.p2p_receive_service, which
+keeps the token (good for 10 minutes from when it was made, and shown here
+counting down) alive with this panel closed, reopens the panel when an offer
+arrives and carries on downloading with it closed — see there, and
+core.p2p.transfer for the actual DHT-mailbox + BitTorrent mechanics. Next to
+Copy, the token can be handed straight to a friend (ui.p2p_friends_service).
 """
-import hashlib
 import logging
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QProgressBar, QFrame,
+    QProgressBar, QFrame, QTreeWidget, QTreeWidgetItem, QHeaderView, QMenu,
+    QMessageBox,
 )
 
 from i18n import t
 from ui.helpers import scaled, open_in_file_manager
+from ui.p2p_friends_service import format_remaining
+from ui.p2p_receive_service import (
+    WAITING, OFFER, DOWNLOADING, DONE, ERROR,
+)
 from ui.styles.theme import palette
 
 logger = logging.getLogger(__name__)
 
-_POLL_MS = 1000
+# How many received file names the panel lists before "and N more".
+_LIST_PREVIEW = 10
 
 
 class P2pReceiveDialog(QDialog):
-    def __init__(self, parent=None):
+    _friends = None         # the friends service, when the application has one
+
+    def __init__(self, service, parent=None):
         super().__init__(parent)
+        self._svc = service
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t("p2p.receive_title"))
         self._apply_window_chrome()
-        self._session = None
-        self._accepted_offer = False
-        self._saved_path = None
-        self._timer = QTimer(self)
-        self._timer.setInterval(_POLL_MS)
-        self._timer.timeout.connect(self._pump)
         self._build()
-        self._start_session()
+        self._svc.changed.connect(self._refresh)
+        self._svc.move_finished.connect(self._on_move_finished)
+        self._friends = getattr(self._svc, "friends", None)
+        if self._friends is not None:
+            self._friends.send_result.connect(self._on_friend_send_result)
+            self._friends.lock_changed.connect(self._refresh)
+            self._friends.acquire()
+        # Counts the token's time down (the service only speaks up when
+        # something changes).
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._refresh_valid)
+        self._tick.start()
+        self._svc.panel_opened()
+        self._refresh()
 
     def _apply_window_chrome(self):
         bg = QColor(palette("bg"))
@@ -70,7 +78,7 @@ class P2pReceiveDialog(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(20, 18, 20, 16)
         outer.setSpacing(12)
-        self.setMinimumWidth(scaled(380, self))
+        self.setMinimumWidth(scaled(520, self))
 
         self._intro_lbl = QLabel(t("p2p.receive_intro"))
         self._intro_lbl.setWordWrap(True)
@@ -85,7 +93,23 @@ class P2pReceiveDialog(QDialog):
         self._copy_btn = QPushButton(t("p2p.receive_copy"))
         self._copy_btn.clicked.connect(self._copy_token)
         token_row.addWidget(self._copy_btn)
+        # On the right of Copy: hand the token straight to a friend.
+        self._friend_btn = QPushButton(t("p2p.receive_friends_button"))
+        self._friend_btn.setToolTip(t("p2p.receive_friends_tooltip"))
+        self._friend_btn.clicked.connect(self._show_friend_menu)
+        token_row.addWidget(self._friend_btn)
         outer.addLayout(token_row)
+
+        # How long the token can still be used, and what became of the last
+        # one handed to a friend.
+        self._valid_lbl = QLabel("")
+        self._valid_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        outer.addWidget(self._valid_lbl)
+        self._friend_note_lbl = QLabel("")
+        self._friend_note_lbl.setWordWrap(True)
+        self._friend_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._friend_note_lbl.setVisible(False)
+        outer.addWidget(self._friend_note_lbl)
 
         self._status_lbl = QLabel(t("p2p.receive_waiting"))
         self._status_lbl.setWordWrap(True)
@@ -104,26 +128,113 @@ class P2pReceiveDialog(QDialog):
         outer.addWidget(self._offer_title_lbl)
 
         self._offer_detail_lbl = QLabel()
+        self._offer_detail_lbl.setWordWrap(True)
+        self._offer_detail_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         self._offer_detail_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
         self._offer_detail_lbl.setVisible(False)
         outer.addWidget(self._offer_detail_lbl)
 
+        # The percentage is always shown, on the bar itself as well as in the
+        # status line - whether it is one file or many.
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("%p%")
         self._progress.setVisible(False)
         outer.addWidget(self._progress)
+
+        self._speed_lbl = QLabel()
+        self._speed_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._speed_lbl.setVisible(False)
+        outer.addWidget(self._speed_lbl)
+
+        # One row per file with its own percentage and speed, for a transfer
+        # of several files (the overall bar above stays).
+        self._files_tree = QTreeWidget()
+        self._files_tree.setRootIsDecorated(False)
+        self._files_tree.setUniformRowHeights(True)
+        self._files_tree.setAlternatingRowColors(True)
+        self._files_tree.setHeaderLabels([t("p2p.col_file"), t("p2p.col_done"),
+                                          t("p2p.col_speed")])
+        hdr = self._files_tree.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._files_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._files_tree.setMinimumHeight(scaled(110, self))
+        self._files_tree.setMaximumHeight(scaled(210, self))
+        self._files_tree.setVisible(False)
+        self._tree_names: list = []
+        outer.addWidget(self._files_tree)
+
+        # ── Files received by hand, already in their folder ────────────
+        # Says where they went. Kept across closing the panel (the service
+        # holds the note) until OK; the files themselves are not tracked
+        # in any way and never added to the backup index.
+        self._recv_frame = QFrame()
+        recv = QVBoxLayout(self._recv_frame)
+        recv.setContentsMargins(0, 0, 0, 0)
+        recv.setSpacing(8)
+        self._recv_title_lbl = QLabel()
+        self._recv_title_lbl.setStyleSheet(f"font-weight:700;font-size:{scaled(13, self)}px;")
+        self._recv_title_lbl.setWordWrap(True)
+        recv.addWidget(self._recv_title_lbl)
+        self._recv_in_lbl = QLabel(t("p2p.receive_files_saved_in"))
+        self._recv_in_lbl.setWordWrap(True)
+        recv.addWidget(self._recv_in_lbl)
+        path_row = QHBoxLayout()
+        self._recv_path_lbl = QLabel()
+        self._recv_path_lbl.setWordWrap(True)
+        self._recv_path_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._recv_path_lbl.setStyleSheet("font-weight:600;")
+        path_row.addWidget(self._recv_path_lbl, 1)
+        self._recv_open_btn = QPushButton("📁")
+        self._recv_open_btn.setObjectName("toolbar_icon_btn")
+        self._recv_open_btn.setFixedSize(scaled(30, self), scaled(30, self))
+        self._recv_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._recv_open_btn.setToolTip(t("p2p.receive_open_folder"))
+        self._recv_open_btn.clicked.connect(self._open_received_folder)
+        path_row.addWidget(self._recv_open_btn, 0, Qt.AlignmentFlag.AlignTop)
+        recv.addLayout(path_row)
+        self._recv_list_lbl = QLabel()
+        self._recv_list_lbl.setWordWrap(True)
+        self._recv_list_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._recv_list_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        recv.addWidget(self._recv_list_lbl)
+        recv_btns = QHBoxLayout()
+        recv_btns.addStretch()
+        self._recv_ok_btn = QPushButton(t("common.ok"))
+        self._recv_ok_btn.setObjectName("primary_btn")
+        self._recv_ok_btn.clicked.connect(self._svc.dismiss_received)
+        recv_btns.addWidget(self._recv_ok_btn)
+        self._recv_move_btn = QPushButton(t("p2p.receive_move_to"))
+        self._recv_move_btn.clicked.connect(self._move_received)
+        recv_btns.addWidget(self._recv_move_btn)
+        recv.addLayout(recv_btns)
+        self._recv_frame.setVisible(False)
+        outer.addWidget(self._recv_frame)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._decline_btn = QPushButton(t("p2p.receive_decline"))
         self._decline_btn.setVisible(False)
-        self._decline_btn.clicked.connect(self._decline)
+        self._decline_btn.clicked.connect(self._svc.decline)
         btn_row.addWidget(self._decline_btn)
         self._accept_btn = QPushButton(t("p2p.receive_accept"))
         self._accept_btn.setObjectName("primary_btn")
         self._accept_btn.setVisible(False)
-        self._accept_btn.clicked.connect(self._accept)
+        self._accept_btn.clicked.connect(self._svc.accept)
         btn_row.addWidget(self._accept_btn)
+        # An accepted download can be stopped at any time (what had only partly
+        # arrived is removed; what had arrived whole stays).
+        self._cancel_btn = QPushButton(t("p2p.receive_cancel"))
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.clicked.connect(self._cancel_download)
+        btn_row.addWidget(self._cancel_btn)
         self._open_folder_btn = QPushButton(t("p2p.receive_open_folder"))
         self._open_folder_btn.setVisible(False)
         self._open_folder_btn.clicked.connect(self._open_folder)
@@ -132,43 +243,271 @@ class P2pReceiveDialog(QDialog):
 
         bottom_row = QHBoxLayout()
         self._new_token_btn = QPushButton(t("p2p.receive_new_token"))
-        self._new_token_btn.clicked.connect(self._start_session)
+        self._new_token_btn.clicked.connect(self._svc.new_session)
         bottom_row.addWidget(self._new_token_btn)
+        # Sending lives here too: anything can be shared, not only a backup
+        # (the Backups page sends one specific backup).
+        self._send_file_btn = QPushButton(t("p2p.send_file_button"))
+        self._send_file_btn.setToolTip(t("p2p.send_file_button_tooltip"))
+        self._send_file_btn.clicked.connect(self._send_file)
+        bottom_row.addWidget(self._send_file_btn)
         bottom_row.addStretch()
         close_btn = QPushButton(t("p2p.receive_close"))
         close_btn.clicked.connect(self.accept)
         bottom_row.addWidget(close_btn)
         outer.addLayout(bottom_row)
 
-    # ── Session lifecycle ────────────────────────────────────────────────
+    # ── View of the service's state ──────────────────────────────────────
 
-    def _start_session(self):
-        """Fresh token, fresh session — used both on open and for
-        "New token" (a token is meant to work once; asking for a new one is
-        how someone abandons a stale wait)."""
-        if self._session is not None:
-            self._session.close()
-        try:
-            from core.p2p.transfer import ReceiveSession
-            self._session = ReceiveSession()
-        except Exception as e:
-            logger.warning(f"P2P receive: could not start a session: {e}")
-            self._session = None
-            self._token_edit.setText("")
-            self._status_lbl.setText(t("p2p.receive_error", error=str(e)))
+    def _refresh(self):
+        svc = self._svc
+        state = svc.state
+        # A token is single use: once the offer is accepted and finished (or
+        # failed) it is spent, and must not stay up to be copied to the next
+        # sender.
+        live_token = state in (WAITING, OFFER, DOWNLOADING)
+        self._token_edit.setText(svc.token if live_token else "")
+        self._copy_btn.setEnabled(live_token and bool(svc.token))
+        # Only a token nobody has used yet can be handed on - and not while the
+        # friend list is locked: the menu would show who your friends are.
+        locked = self._friends is not None and self._friends.locked
+        self._friend_btn.setEnabled(state == WAITING and bool(svc.token)
+                                    and self._friends is not None and not locked)
+        self._friend_btn.setToolTip(t("p2p.receive_friends_locked") if locked
+                                    else t("p2p.receive_friends_tooltip"))
+        self._refresh_valid()
+
+        offer = svc.offer
+        # Once files received by hand are in, the note below says it all: the
+        # offer that brought them is no longer worth showing.
+        files_done = state == DONE and offer is not None and offer.kind == "file"
+        show_offer = (offer is not None and not files_done
+                      and state in (OFFER, DOWNLOADING, DONE))
+        self._offer_title_lbl.setVisible(show_offer)
+        self._offer_detail_lbl.setVisible(show_offer)
+        if show_offer:
+            name = (offer.sender_username or "").strip()
+            sfx = "_file" if offer.kind == "file" else ""
+            self._offer_title_lbl.setText(
+                t(f"p2p.receive_offer_title{sfx}", name=name) if name
+                else t(f"p2p.receive_offer_title_anon{sfx}"))
+            self._offer_detail_lbl.setText(self._offer_detail(offer))
+
+        self._accept_btn.setVisible(state == OFFER)
+        self._decline_btn.setVisible(state == OFFER)
+        self._cancel_btn.setVisible(state == DOWNLOADING and not svc.importing and not svc.cancelling)
+        self._new_token_btn.setEnabled(state in (WAITING, ERROR, DONE))
+        downloading = state == DOWNLOADING and not svc.importing
+        self._progress.setVisible(downloading)
+        self._speed_lbl.setVisible(downloading)
+        rows = svc.file_rows if downloading else []
+        self._files_tree.setVisible(len(rows) > 1)
+        if len(rows) > 1:
+            self._update_file_tree(rows)
+        self._open_folder_btn.setVisible(
+            state == DONE and not svc.imported_name and svc.saved_path is not None)
+
+        if state == WAITING:
+            self._status_lbl.setText(
+                t("p2p.receive_token_renewed_proxy") if svc.token_renewed_proxy
+                else t("p2p.receive_token_renewed") if svc.token_renewed
+                else t("p2p.receive_waiting"))
+        elif state == OFFER:
+            self._status_lbl.setText(t("p2p.receive_waiting_decision"))
+        elif state == DOWNLOADING and svc.importing:
+            self._status_lbl.setText(t("p2p.receive_importing"))
+        elif state == DOWNLOADING and svc.cancelling:
+            self._status_lbl.setText(t("p2p.receive_cancelling"))
+        elif state == DOWNLOADING:
+            self._progress.setValue(svc.pct)
+            self._status_lbl.setText(t("p2p.receive_downloading", percent=svc.pct))
+            if svc.idle_seconds >= 60:
+                self._status_lbl.setText(self._status_lbl.text() + "\n" + t(
+                    "p2p.receive_idle", minutes=max(1, int(svc.idle_seconds // 60))))
+                if getattr(svc.offer, "tls", False):
+                    self._status_lbl.setText(self._status_lbl.text() + " " + t("p2p.receive_idle_tls"))
+            from core.p2p.transfer import format_rate
+            mbs, mbps = format_rate(svc.rate)
+            self._speed_lbl.setText(t("p2p.speed_down", speed=mbs))
+            self._speed_lbl.setToolTip(mbps)
+        elif state == DONE and files_done:
+            self._status_lbl.setText(t("p2p.receive_complete"))
+        elif state == DONE:
+            if svc.imported_name:
+                self._status_lbl.setText(
+                    t("p2p.receive_imported_detail", name=svc.imported_name))
+            else:
+                # No entry to import against (an older SaveSync on the
+                # sender's side), or the import itself failed — the download
+                # is still there, just not filed anywhere.
+                self._status_lbl.setText(
+                    t("p2p.receive_done_detail", path=str(svc.saved_path)))
+        elif state == ERROR:
+            self._status_lbl.setText(t("p2p.receive_error", error=svc.error))
+        self._refresh_received()
+
+    def _update_file_tree(self, rows):
+        """Fill the per-file list: built once per transfer, then only the
+        cells that changed are rewritten (a transfer can hold thousands)."""
+        from core.p2p.transfer import format_rate
+        names = [r[0] for r in rows]
+        tree = self._files_tree
+        if names != self._tree_names:
+            tree.clear()
+            for rel, _size, _done, _speed in rows:
+                item = QTreeWidgetItem([rel, "", ""])
+                item.setToolTip(0, rel)
+                item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                tree.addTopLevelItem(item)
+            self._tree_names = names
+        for i, (_rel, size, done, speed) in enumerate(rows):
+            item = tree.topLevelItem(i)
+            if item is None:
+                continue
+            pct = 100 if size <= 0 else min(100, int(done * 100 / size))
+            pct_txt = f"{pct}%"
+            if item.text(1) != pct_txt:
+                item.setText(1, pct_txt)
+            if speed >= 5120 and pct < 100:      # under 5 KB/s is idle, not "0.0 MB/s"
+                mbs, mbps = format_rate(speed)
+                spd_txt, tip = mbs, mbps
+            else:
+                spd_txt, tip = "—", ""
+            if item.text(2) != spd_txt:
+                item.setText(2, spd_txt)
+                item.setToolTip(2, tip)
+
+    def _refresh_received(self):
+        from core import fmt_size
+        rec = self._svc.received
+        offer = self._svc.offer
+        if offer is not None and offer.kind != "file":
+            rec = None          # a save is coming: it goes to Backups, no path to show
+        self._recv_frame.setVisible(bool(rec))
+        if not rec:
             return
-        self._token_edit.setText(self._session.token)
-        self._accepted_offer = False
-        self._saved_path = None
-        self._status_lbl.setText(t("p2p.receive_waiting"))
-        self._offer_title_lbl.setVisible(False)
-        self._offer_detail_lbl.setVisible(False)
-        self._accept_btn.setVisible(False)
-        self._decline_btn.setVisible(False)
-        self._open_folder_btn.setVisible(False)
-        self._progress.setVisible(False)
-        self._new_token_btn.setEnabled(True)
-        self._timer.start()
+        files = rec["files"]
+        sender = rec.get("sender") or ""
+        self._recv_title_lbl.setText(
+            t("p2p.receive_files_title", count=len(files), size=fmt_size(rec["size"]))
+            + (f" - {sender}" if sender else ""))
+        self._recv_path_lbl.setText(str(rec["dir"]))
+        self._recv_path_lbl.setToolTip(str(rec["dir"]))
+        shown = files[:_LIST_PREVIEW]
+        text = "\n".join(shown)
+        if len(files) > len(shown):
+            text += "\n" + t("p2p.receive_files_more", count=len(files) - len(shown))
+        self._recv_list_lbl.setText(text)
+        busy = self._svc.moving
+        self._recv_ok_btn.setEnabled(not busy)
+        self._recv_move_btn.setEnabled(not busy)
+        self._recv_move_btn.setText(t("p2p.receive_moving") if busy else t("p2p.receive_move_to"))
+
+    @staticmethod
+    def _offer_detail(offer) -> str:
+        from core import fmt_size
+        lines = []
+        if offer.kind == "file":
+            if offer.folder:
+                lines.append(t("p2p.receive_offer_folder", folder=offer.folder))
+            lines.append(t("p2p.receive_offer_files", name=offer.filename,
+                           count=offer.count or 1, size=fmt_size(offer.size)))
+            if getattr(offer, "tls", False):
+                lines.append(t("p2p.receive_offer_tls"))
+            return "\n".join(lines)
+        if offer.game_name:
+            lines.append(t("p2p.receive_offer_game", game=offer.game_name))
+        if offer.folder:
+            lines.append(t("p2p.receive_offer_folder", folder=offer.folder))
+        lines.append(t("p2p.receive_offer_detail", filename=offer.filename,
+                       size=fmt_size(offer.size)))
+        if getattr(offer, "tls", False):
+            lines.append(t("p2p.receive_offer_tls"))
+        return "\n".join(lines)
+
+    # ── The token's clock, and handing it to a friend ───────────────────
+
+    def _refresh_valid(self):
+        svc = self._svc
+        if svc.state == WAITING and svc.token:
+            # A sender that has come and is still getting a big offer ready has
+            # used the token: its clock stops, and the wait is for them.
+            ps = getattr(svc, "private_state", None) or {}
+            if ps.get("state") == "failed":
+                text = t("p2p.receive_private_failed", error=ps.get("error", ""))
+            elif ps and ps.get("state") != "ready":
+                text = t("p2p.receive_private_starting", percent=int(ps.get("progress", 0)))
+            elif ps and not ps.get("published") and not svc.sender_preparing:
+                text = t("p2p.receive_private_publishing")
+            elif svc.sender_preparing:
+                text = t("p2p.receive_sender_preparing")
+            else:
+                text = t("p2p.receive_token_valid", time=format_remaining(svc.token_remaining))
+            self._valid_lbl.setText(text)
+        else:
+            self._valid_lbl.setText("")
+
+    def _cancel_download(self):
+        from ui.modal_helpers import question_window_modal
+        reply = question_window_modal(
+            self, t("p2p.receive_title"), t("p2p.receive_cancel_confirm"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._svc.cancel_download()
+
+    def _show_friend_menu(self):
+        friends = self._friends
+        if friends is None:
+            return
+        menu = QMenu(self)
+        people = friends.friends()
+        for f in people:
+            mark = "✓ " if f.connected else "⏳ "
+            act = menu.addAction(mark + t("p2p.receive_send_to", name=f.display))
+            act.triggered.connect(lambda _=False, fid=f.id: self._send_to_friend(fid))
+        if not people:
+            hint = menu.addAction(t("p2p.receive_friends_none"))
+            hint.setEnabled(False)
+        menu.addSeparator()
+        add = menu.addAction(t("p2p.receive_friends_manage"))
+        add.triggered.connect(self._open_friends)
+        menu.exec(self._friend_btn.mapToGlobal(self._friend_btn.rect().bottomLeft()))
+
+    def _open_friends(self):
+        # The friend list is a panel on the main window, not a window of its own: it
+        # could not be used from behind this dialog, so this one is put away first
+        # (closing it does not end the session, see done()) and the list opened as
+        # soon as it is gone.
+        win = self.parent()
+        opener = getattr(win, "_open_p2p_friends_panel", None)
+        if callable(opener):
+            self.accept()
+            QTimer.singleShot(0, lambda: opener(toggle=False))
+
+    def _send_to_friend(self, fid: str):
+        svc = self._svc
+        f = self._friends.friend(fid) if self._friends is not None else None
+        if f is None or svc.state != WAITING or not svc.token:
+            return
+        try:
+            svc.send_token_to_friend(fid)
+        except Exception as e:
+            self._friend_note_lbl.setText(t("p2p.receive_send_to_failed", name=f.display, error=str(e)))
+            self._friend_note_lbl.setVisible(True)
+            return
+        self._friend_note_lbl.setText(t("p2p.receive_sending_to", name=f.display))
+        self._friend_note_lbl.setVisible(True)
+
+    def _on_friend_send_result(self, fid: str, ok: bool):
+        f = self._friends.friend(fid) if self._friends is not None else None
+        name = f.display if f is not None else "?"
+        if ok:
+            self._friend_note_lbl.setText(t("p2p.receive_sent_to", name=name))
+        else:
+            self._friend_note_lbl.setText(t("p2p.receive_send_to_failed", name=name,
+                                            error=t("p2p.send_rejected")))
+        self._friend_note_lbl.setVisible(True)
 
     def _copy_token(self):
         from PySide6.QtWidgets import QApplication
@@ -176,159 +515,56 @@ class P2pReceiveDialog(QDialog):
         self._copy_btn.setText(t("p2p.receive_copied"))
         QTimer.singleShot(1500, lambda: self._copy_btn.setText(t("p2p.receive_copy")))
 
-    def _pump(self):
-        if self._session is None:
-            return
-        self._session.pump()
-        if not self._accepted_offer and self._session.offer is not None:
-            self._show_offer()
-        elif self._accepted_offer:
-            self._update_download_progress()
+    def _send_file(self):
+        """Pick a file or folder with the app's own picker, then send it."""
+        from ui.dialogs.p2p_send_flow import send_files_flow
+        send_files_flow(self)
 
-    def _show_offer(self):
-        offer = self._session.offer
-        name = (offer.sender_username or "").strip()
-        title = (t("p2p.receive_offer_title", name=name) if name
-                else t("p2p.receive_offer_title_anon"))
-        self._offer_title_lbl.setText(title)
-        self._offer_title_lbl.setVisible(True)
-        from core import fmt_size
-        self._offer_detail_lbl.setText(
-            t("p2p.receive_offer_detail", filename=offer.filename,
-              size=fmt_size(offer.size)))
-        self._offer_detail_lbl.setVisible(True)
-        self._accept_btn.setVisible(True)
-        self._decline_btn.setVisible(True)
-        self._new_token_btn.setEnabled(False)
-
-    def _accept(self):
-        if self._session is None or self._session.offer is None:
+    def _move_received(self):
+        """"Move to…": the folder picker, then the move itself."""
+        rec = self._svc.received
+        if not rec or self._svc.moving:
             return
-        from core.constants import USER_DATA_DIR
-        dest_dir = USER_DATA_DIR / "p2p_received"
-        try:
-            self._session.accept(dest_dir)
-        except Exception as e:
-            self._status_lbl.setText(t("p2p.receive_error", error=str(e)))
-            return
-        self._accepted_offer = True
-        self._accept_btn.setVisible(False)
-        self._decline_btn.setVisible(False)
-        self._progress.setVisible(True)
-        self._status_lbl.setText(t("p2p.receive_downloading", percent=0))
+        from ui.widgets.file_pickers import pick_folder
+        dest = pick_folder(self, t("p2p.receive_move_pick"),
+                           start_dir=str(rec["dir"]), save_target=True)
+        if dest:
+            self._svc.move_files(dest)
 
-    def _decline(self):
-        # A token is single-use by design — declining one offer means
-        # starting over with a fresh token rather than re-arming this one,
-        # so a token that was seen once cannot quietly be reused for a
-        # second, different offer.
-        self._start_session()
+    def _open_received_folder(self):
+        rec = self._svc.received
+        if rec:
+            open_in_file_manager(rec["dir"])
 
-    def _update_download_progress(self):
-        if self._session is None:
-            return
-        p = self._session.progress()
-        if p is None:
-            return
-        pct = int(round((p.get("progress") or 0) * 100))
-        self._progress.setValue(pct)
-        self._status_lbl.setText(t("p2p.receive_downloading", percent=pct))
-        if self._session.download_error:
-            self._status_lbl.setText(
-                t("p2p.receive_error", error=self._session.download_error))
-            self._timer.stop()
-            return
-        if self._session.download_done or pct >= 100:
-            self._timer.stop()
-            self._finish_download()
-
-    def _finish_download(self):
-        try:
-            entry_dict, zip_path = self._session.finalize()
-        except Exception as e:
-            self._status_lbl.setText(t("p2p.receive_error", error=str(e)))
-            return
-        self._saved_path = zip_path
-        imported_name = self._import_as_archive(entry_dict, zip_path)
-        if imported_name:
-            self._status_lbl.setText(t("p2p.receive_imported_detail", name=imported_name))
-            self._progress.setVisible(False)
-            return
-        # No entry to import against (an older SaveSync on the sender's
-        # side), or the import itself failed — the download is still
-        # there, just not filed anywhere; fall back to a bare save.
-        self._status_lbl.setText(t("p2p.receive_done_detail", path=str(self._saved_path)))
-        self._progress.setVisible(False)
-        self._open_folder_btn.setVisible(True)
-
-    def _import_as_archive(self, entry_dict: dict, zip_path) -> str:
-        """File the downloaded save as an ARCHIVE — a backup with no
-        matching library game, same as "Aggiungi percorso" or a cloud-only
-        backup for an unrecognised game (see core.backup.get_orphan_backups)
-        — through the same import_backup() path a cloud-synced backup uses.
-
-        The synthetic game_id is derived from the game's own computed
-        folder name (same helper _game_folder_for_entry/get_install_folder_
-        name use everywhere else) — NOT from who sent it. Two different
-        friends sending the same game land in the same archive and share
-        one rotation bucket, exactly like two backups of the same game
-        would; only the per-game AMOUNT is what p2p_max_per_game limits,
-        never "amount per sender". Returns the game name on success, "" on
-        failure (caller falls back to a bare save).
-        """
-        offer = self._session.offer if self._session else None
-        if not entry_dict or offer is None:
-            return ""
-        try:
-            from datetime import datetime, timezone
-            from core.backup import BackupEntry, get_backup_manager
-            from core.constants import get_install_folder_name
-
-            sender_machine = offer.sender_machine_id or ""
-            game_name = str(entry_dict.get("game_name") or offer.game_name or offer.filename)
-            folder_name = get_install_folder_name(
-                str(entry_dict.get("exe_path") or ""), game_name)
-            key = hashlib.sha1(folder_name.casefold().encode("utf-8")).hexdigest()[:16]
-            game_id = f"p2p_{key}"
-            zip_bytes = zip_path.read_bytes()
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            entry = BackupEntry(
-                game_id=game_id,
-                game_name=game_name,
-                backup_id=f"{game_id}_{stamp}",
-                created_at=datetime.now(timezone.utc).isoformat(),
-                machine_id=sender_machine,
-                save_paths=list(entry_dict.get("save_paths") or []),
-                zip_path="",
-                size_bytes=len(zip_bytes),
-                note=t("p2p.receive_archive_note",
-                      name=(offer.sender_username or sender_machine[:8] or "?")),
-                exe_path=str(entry_dict.get("exe_path") or ""),
-                save_chains=list(entry_dict.get("save_chains") or []),
-                content_chains=list(entry_dict.get("content_chains") or []),
-                origin="p2p",
-            )
-            bm = get_backup_manager()
-            if not bm.import_backup(entry, zip_bytes):
-                return ""
-            bm.enforce_p2p_limits(game_id)
-            return game_name
-        except Exception as e:
-            logger.warning(f"P2P receive: could not import as an archive: {e}")
-            return ""
+    def _on_move_finished(self, moved: int, failed, dest: str, new_rels=None):
+        # A move that worked needs no message: the path shown above has just
+        # changed to where the files are now. Only a failure is worth a popup.
+        if failed:
+            from ui.modal_helpers import warning_window_modal
+            lines = "\n".join(f"{rel}: {err}" for rel, err in failed[:5])
+            warning_window_modal(
+                self, t("p2p.receive_title"),
+                t("p2p.receive_move_failed", count=len(failed), errors=lines))
 
     def _open_folder(self):
-        if self._saved_path is not None:
-            open_in_file_manager(self._saved_path)
+        if self._svc.saved_path is not None:
+            open_in_file_manager(self._svc.saved_path)
 
-    def closeEvent(self, event):
-        self._timer.stop()
-        if self._session is not None:
-            self._session.close()
-        super().closeEvent(event)
-
-    def reject(self):
-        self._timer.stop()
-        if self._session is not None:
-            self._session.close()
-        super().reject()
+    def done(self, result):
+        # Closing the panel does NOT end the session — the service keeps the
+        # token alive for a while and reopens the panel when an offer comes.
+        self._tick.stop()
+        pairs = [(self._svc.changed, self._refresh),
+                 (self._svc.move_finished, self._on_move_finished)]
+        if self._friends is not None:
+            pairs.append((self._friends.send_result, self._on_friend_send_result))
+            pairs.append((self._friends.lock_changed, self._refresh))
+        for sig, slot in pairs:
+            try:
+                sig.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        if self._friends is not None:
+            self._friends.release()
+        self._svc.panel_closed()
+        super().done(result)

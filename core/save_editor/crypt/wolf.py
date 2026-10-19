@@ -270,7 +270,7 @@ class WolfValues:
             # values Wolf keeps near the end — safe to log in full.
             window = 256
             detail = (
-                f"; marker byte was also 0x{self.plain[self._body_offset]:02x} "
+                f"; marker byte was also 0x{self.plain[self._body_offset]:02x} "  # i18n-ignore (diagnostic for the log)
                 f"instead of 0x19" if not marker_ok else ""
             )
             raise WolfSaveError(

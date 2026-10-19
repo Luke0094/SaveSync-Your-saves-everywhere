@@ -3,8 +3,8 @@ from .base import SaveEditorError, SaveField, _Format
 class LcfFormat(_Format):
     """RPG Maker 2000/2003 ``.lsd``. See core/lcf: chunks this reader does not
     understand travel as their own bytes, so the file rebuilds exactly."""
-    name = "RPG Maker 2000/2003"
-    engine = "RPG Maker 2000/2003"
+    name = "RPG Maker 2000/2003"  # i18n-ignore (engine / format name, an identifier)
+    engine = "RPG Maker 2000/2003"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         self._save = None

@@ -54,6 +54,21 @@ class ClearableLineEdit(QLineEdit):
         self.setTextMargins(0, 0, 20, 0)
         self._position_clear_btn()
 
+    def sync_clear_button(self):
+        self._clear_btn.setVisible(bool(self.text()))
+
+    # Callers wrap programmatic edits in blockSignals() to avoid re-entering
+    # their own textChanged handlers, which also silences the signal that
+    # drives the "×" — it then stayed visible over an empty field. Syncing it
+    # here covers every such path.
+    def setText(self, text):
+        super().setText(text)
+        self.sync_clear_button()
+
+    def clear(self):
+        super().clear()
+        self.sync_clear_button()
+
     def add_leading_button(self, text: str, tooltip: str = "") -> QToolButton:
         """Embed a small button flush with the LEFT edge — a search-mode
         toggle, say. Opt-in: fields that never call this are unchanged.

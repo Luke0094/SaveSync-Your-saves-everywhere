@@ -5,9 +5,18 @@ Extracted verbatim from ui/dialogs/add_game_dialog.py: per-game icon cache
 folder migration on rename, and the WEBP compression pipeline that keeps
 downloaded artwork small (compress on write, one-off compaction of legacy
 uncompressed caches). Pure move — no behavior change.
+
+Also what a picture downloaded for a game becomes on disk (store_picture): no
+GUI in it, so the dialog's background job and the one that outlives a Save can
+both run it on a worker thread.
 """
 import logging
+import os
+import threading
+import time
+import uuid
 from pathlib import Path
+from typing import Iterable
 
 from core.constants import USER_DATA_DIR
 
@@ -295,5 +304,223 @@ def _ensure_cache_compressed(cache_dir: Path) -> None:
         _compressed_dir_mtime.pop(dir_key, None)
     if needed_work:
         logger.info(f"Compressed cached images in {cache_dir.name}")
+
+
+# ── Pictures downloaded for a game ──────────────────────────────────────────
+#
+# What a picture fetched from the web (a cover, a screenshot) ends up as on disk:
+# one JPEG in the game's cache folder. Nothing here touches the GUI, so a worker
+# thread can run it — the re-encode is the slow part, and it used to hold the
+# panel still for as long as it took.
+
+PICTURE_MAX_EDGE = 1280        # px, long edge; larger sources are shrunk to this
+_PICTURE_MIN_BYTES = 512       # below this it is an error page or a pixel, not art
+_store_lock = threading.Lock()
+# The name a picture is written under until it is complete (and its Qt probe, which
+# is that name + ".avif"): hidden from every folder scan, found again by the sweep.
+_PART_SUFFIXES = (".part", ".part.avif")
+# No writer of this process can predate it: a temp file older than this run is the
+# leftover of one that died.
+_PROCESS_START = time.time()
+
+
+def picture_stem(url: str) -> str:
+    """The file name (without extension) a picture from *url* is saved under."""
+    original_name = Path(url.split("?")[0]).stem
+    return "".join(c for c in original_name if c.isalnum() or c in "._- ")[:50]
+
+
+def _encode_picture(data: bytes, dest: Path) -> bool:
+    """Write *data* to *dest* as a JPEG, at most PICTURE_MAX_EDGE on the long edge.
+
+    Quality 88 with 4:4:4 chroma (the old 80 with 4:2:0 visibly grained flat-colour
+    art at card and modal sizes, for a negligible size difference). PIL first, with
+    the AVIF plugin when it is there — attachment CDNs serve AVIF under a .png/.jpg
+    URL — then Qt, whose system codecs read formats this PIL build cannot. False
+    when neither can decode it."""
+    try:
+        # Imported inside the try on purpose: a frozen build missing PIL._imaging
+        # raises ImportError here, and must fall through to Qt, not abort.
+        from PIL import Image
+        import io
+        try:
+            import pillow_avif  # noqa: F401 — registers the AVIF codec in PIL
+        except ImportError:
+            pass
+        img = Image.open(io.BytesIO(data))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img.thumbnail((PICTURE_MAX_EDGE, PICTURE_MAX_EDGE), resample)
+        img.save(str(dest), "JPEG", quality=88, optimize=True, subsampling=0)
+        return True
+    except Exception as exc:
+        logger.info(f"PIL could not encode the picture ({exc}) — trying Qt")
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage
+        qimg = QImage.fromData(data)
+        if qimg.isNull():
+            # Some system codecs (AVIF on Windows) only read from a file.
+            probe = dest.parent / f"{dest.name}.avif"
+            try:
+                probe.write_bytes(data)
+                qimg = QImage(str(probe))
+            finally:
+                probe.unlink(missing_ok=True)
+        if qimg.isNull():
+            return False
+        if max(qimg.width(), qimg.height()) > PICTURE_MAX_EDGE:
+            qimg = qimg.scaled(PICTURE_MAX_EDGE, PICTURE_MAX_EDGE,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        return bool(qimg.save(str(dest), "JPEG", 88))
+    except Exception as exc:
+        logger.info(f"Qt could not encode the picture either: {exc}")
+        return False
+
+
+def _identical_file(candidate: Path, folder: Path,
+                    extra: "Iterable[str | Path]" = ()) -> "Path | None":
+    """A file in *folder* (or among *extra*) with exactly the bytes of *candidate*.
+
+    Compared by size first, so only the files that could match are read."""
+    try:
+        size = candidate.stat().st_size
+    except OSError:
+        return None
+    digest = _file_md5(candidate)
+    if digest is None:
+        return None
+    others: list[Path] = []
+    try:
+        others = [p for p in folder.iterdir()
+                  if p.is_file() and not p.name.startswith(".")]
+    except OSError:
+        pass
+    others += [Path(p) for p in extra]
+    seen: set[Path] = set()
+    for other in others:
+        if other == candidate or other in seen:
+            continue
+        seen.add(other)
+        try:
+            if other.stat().st_size == size and _file_md5(other) == digest:
+                return other
+        except OSError:
+            continue
+    return None
+
+
+def store_picture(url: str, data: bytes, dest_dir: Path,
+                  same_as: "Iterable[str | Path]" = ()) -> "tuple[Path, bool] | None":
+    """Re-encode *data* (the picture at *url*) into *dest_dir* as a JPEG.
+
+    Returns ``(path, created)``: where the picture now is, and whether this call
+    wrote that file. A picture identical to one *dest_dir* already holds, or
+    that is among *same_as* (the files already in the carousel), is not written
+    twice — that file is returned, ``created`` False. None when *data* is not a
+    picture any decoder here can read. Safe on a worker thread."""
+    if len(data) < _PICTURE_MIN_BYTES:
+        logger.warning(f"Downloaded picture too small ({len(data)} bytes): {url!r}")
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stem = picture_stem(url) or "picture"
+    # Written under a name the folder scans ignore and renamed into place, so a
+    # reader never meets a half-written picture and two threads never share a name.
+    part = dest_dir / f".{uuid.uuid4().hex}{_PART_SUFFIXES[0]}"
+    try:
+        if not _encode_picture(data, part):
+            logger.warning(f"No decoder here can read the picture: {url!r}")
+            return None
+        with _store_lock:
+            same = _identical_file(part, dest_dir, same_as)
+            if same is not None:
+                return same, False
+            final = dest_dir / f"{stem}.jpg"
+            if final.exists():
+                # A different picture under the same name: both are kept.
+                final = dest_dir / f"{stem}_{uuid.uuid4().hex[:8]}.jpg"
+            os.replace(part, final)
+            return final, True
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def sweep_picture_leftovers(cache_root: "Path | None" = None,
+                            min_age: float = 600.0) -> "tuple[int, int]":
+    """Delete the temporary files store_picture leaves behind when the process is
+    killed, or crashes, in the middle of one. Returns ``(removed, could not remove)``.
+
+    Only what no writer can still own: older than this run, or untouched for
+    *min_age* seconds (an encode takes seconds, never minutes). A picture being
+    written right now is left alone."""
+    root = cache_root or _ICON_CACHE_DIR
+    now = time.time()
+    removed = failed = 0
+    try:
+        folders = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return 0, 0                      # no cache yet: nothing to sweep
+    for folder in folders:
+        try:
+            files = [f for f in folder.iterdir()
+                     if f.name.startswith(".") and f.name.endswith(_PART_SUFFIXES)]
+        except OSError:
+            continue
+        for f in files:
+            try:
+                if not f.is_file():
+                    continue
+                mtime = f.stat().st_mtime
+                if mtime >= _PROCESS_START and now - mtime < min_age:
+                    continue
+                f.unlink()
+                removed += 1
+            except FileNotFoundError:
+                continue                 # gone meanwhile: the writer finished
+            except OSError as exc:
+                failed += 1
+                logger.warning(f"Could not remove leftover {f.name} in {folder.name}: {exc}")
+    if removed:
+        logger.info(f"Removed {removed} leftover temporary picture file(s) from the icon cache")
+    return removed, failed
+
+
+def move_picture_into(path: "str | Path", folder: Path) -> Path:
+    """Move a picture into *folder* unless it is already there; a copy that
+    *folder* holds already is used instead, and this one dropped. Returns where
+    the picture is now. The folder it leaves is removed if that empties it."""
+    import shutil
+    src = Path(path)
+    if src.parent == folder:
+        return src
+    folder.mkdir(parents=True, exist_ok=True)
+    with _store_lock:
+        same = _identical_file(src, folder)
+        if same is not None:
+            src.unlink(missing_ok=True)
+            dest = same
+        else:
+            dest = folder / src.name
+            if dest.exists():
+                dest = folder / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}"
+            shutil.move(str(src), str(dest))
+    try:
+        src.parent.rmdir()
+    except OSError:
+        pass            # not empty (or already gone): nothing to tidy
+    return dest
+
+
+def discard_picture(path: "str | Path") -> None:
+    """Delete a picture this process wrote and no one holds a reference to, and
+    the folder it was in if that leaves it empty."""
+    p = Path(path)
+    try:
+        p.unlink(missing_ok=True)
+        p.parent.rmdir()
+    except OSError:
+        pass            # in use, or the folder holds more: leave it be
 
 

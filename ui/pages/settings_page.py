@@ -1,11 +1,11 @@
-import logging
-import os
-
-logger = logging.getLogger(__name__)
 """
 SaveSync - Settings Page
 Full settings with startup, monitor tuning, ignored processes, and more.
 """
+import logging
+import os
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
@@ -23,6 +23,11 @@ from ui.styles.theme import get_theme_manager, palette, theme_display_name, THEM
 from ui.helpers import PageScrollMixin, scaled, lock_min_size
 from ui.modal_helpers import information_window_modal, warning_window_modal
 from ui.widgets.hotkey_edit import HotkeyEdit
+
+
+# The P2P port box shows "Auto" at this value, one below the smallest real
+# port (1024); stored in the config as 0.
+_P2P_PORT_AUTO = 1023
 
 
 def _group(title: str) -> QGroupBox:
@@ -96,6 +101,9 @@ class WrappedCheckBox(QWidget):
         return super().blockSignals(b)
 
 
+_P2P_PROXY_CODES = ("ok", "unreachable", "timeout", "not_socks5", "auth_required", "auth_failed", "no_udp")
+
+
 class SettingsPage(PageScrollMixin, QWidget):
     hotkey_changed = Signal(str, str)   # old, new
     # Config replaced wholesale (reset / import / snapshot restore): the
@@ -103,6 +111,7 @@ class SettingsPage(PageScrollMixin, QWidget):
     # hotkey_changed cannot say what the old one was.
     hotkeys_reload = Signal()
     theme_changed  = Signal(str)
+    p2p_proxy_checked = Signal(str)     # the Test button's answer (core.p2p.proxy.check)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -627,7 +636,7 @@ class SettingsPage(PageScrollMixin, QWidget):
 
     def _build_section_p2p_retention(self):
         # A save someone sends you lands as its own archive (see
-        # ui.dialogs.p2p_receive_dialog), separate from the backup policy
+        # ui.p2p_receive_service), separate from the backup policy
         # above: that governs YOUR OWN games' regular backups, and applying
         # the same numbers here would mean one setting silently controlling
         # two unrelated things — a large "keep 50" meant for your own long
@@ -647,8 +656,343 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_retention_spin.setToolTip(t("settings.p2p_retention_days_tooltip"))
         self._p2p_retention_lbl = QLabel(t("settings.p2p_retention_days"))
         p2p_form.addRow(self._p2p_retention_lbl, self._p2p_retention_spin)
+
+        # Where files someone sends by hand are downloaded - straight into
+        # this folder, no staging and no copy afterwards. "" (the default) is
+        # SaveSync's own folder; the box always shows the path in effect.
+        self._p2p_files_dir = ""
+        dir_row = QWidget()
+        dir_lay = QHBoxLayout(dir_row)
+        dir_lay.setContentsMargins(0, 0, 0, 0)
+        self._p2p_files_dir_edit = QLineEdit()
+        self._p2p_files_dir_edit.setReadOnly(True)
+        self._p2p_files_dir_edit.setToolTip(t("settings.p2p_files_dir_tooltip"))
+        dir_lay.addWidget(self._p2p_files_dir_edit, 1)
+        self._p2p_files_dir_browse = QPushButton(t("settings.p2p_files_dir_browse"))
+        self._p2p_files_dir_browse.clicked.connect(self._browse_p2p_files_dir)
+        dir_lay.addWidget(self._p2p_files_dir_browse)
+        self._p2p_files_dir_reset = QPushButton(t("settings.p2p_files_dir_reset"))
+        self._p2p_files_dir_reset.clicked.connect(self._reset_p2p_files_dir)
+        dir_lay.addWidget(self._p2p_files_dir_reset)
+        self._p2p_files_dir_lbl = QLabel(t("settings.p2p_files_dir"))
+        self._p2p_files_dir_lbl.setToolTip(t("settings.p2p_files_dir_tooltip"))
+        p2p_form.addRow(self._p2p_files_dir_lbl, dir_row)
+        self._set_p2p_files_dir("")
+
+        # The port transfers listen on ("Auto" = a free one each time) and
+        # whether the router is asked to open it by itself (UPnP / NAT-PMP).
+        # Read when a transfer starts, so a change applies to the next one.
+        port_row = QWidget()
+        port_lay = QHBoxLayout(port_row)
+        port_lay.setContentsMargins(0, 0, 0, 0)
+        self._p2p_port_spin = QSpinBox()
+        self._p2p_port_spin.setRange(_P2P_PORT_AUTO, 65535)
+        self._p2p_port_spin.setSpecialValueText(t("settings.p2p_port_auto"))
+        self._p2p_port_spin.setToolTip(t("settings.p2p_port_tooltip"))
+        port_lay.addWidget(self._p2p_port_spin)
+        self._p2p_upnp_cb = QCheckBox(t("settings.p2p_upnp"))
+        self._p2p_upnp_cb.setToolTip(t("settings.p2p_upnp_tooltip"))
+        self._p2p_upnp_cb.setChecked(True)
+        port_lay.addWidget(self._p2p_upnp_cb)
+        port_lay.addStretch(1)
+        self._p2p_port_lbl = QLabel(t("settings.p2p_port"))
+        self._p2p_port_lbl.setToolTip(t("settings.p2p_port_tooltip"))
+        p2p_form.addRow(self._p2p_port_lbl, port_row)
+        self._set_p2p_port(0)
+
+        # TLS instead of BitTorrent's own encryption for the transfers this PC sends
+        # (and a socket for it when receiving): see core.p2p.tls. Not with the proxy.
+        self._p2p_tls_cb = QCheckBox(t("settings.p2p_tls"))
+        self._p2p_tls_cb.setToolTip(t("settings.p2p_tls_tooltip"))
+        p2p_form.addRow(self._p2p_tls_cb)
+        self._p2p_tls_note_lbl = QLabel(t("settings.p2p_tls_note"))
+        self._p2p_tls_note_lbl.setWordWrap(True)
+        self._p2p_tls_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        p2p_form.addRow(self._p2p_tls_note_lbl)
+
+        # Private mode: transfers and friends go through Tor, which travels with the
+        # application (core.p2p.tor); the DHT is not used at all. Not with the proxy
+        # (two ways of hiding the address) nor TLS (Tor is encrypted end to end).
+        self._p2p_tor_cb = QCheckBox(t("settings.p2p_tor"))
+        self._p2p_tor_cb.setToolTip(t("settings.p2p_tor_tooltip"))
+        p2p_form.addRow(self._p2p_tor_cb)
+        self._p2p_tor_note_lbl = QLabel(t("settings.p2p_tor_note"))
+        self._p2p_tor_note_lbl.setWordWrap(True)
+        self._p2p_tor_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        p2p_form.addRow(self._p2p_tor_note_lbl)
+        self._p2p_tor_status_lbl = QLabel("")
+        self._p2p_tor_status_lbl.setWordWrap(True)
+        p2p_form.addRow(self._p2p_tor_status_lbl)
+        self._p2p_tor_timer = QTimer(self)
+        self._p2p_tor_timer.setInterval(1000)
+        self._p2p_tor_timer.timeout.connect(self._p2p_tor_refresh)
+        self._p2p_tor_timer.start()
+
+        # Hiding this PC's address: every P2P connection (friends and transfers)
+        # goes through a SOCKS5 proxy, or none goes at all (core.p2p.proxy). The
+        # login is kept apart from config.json, encrypted for this PC.
+        self._p2p_proxy_code = ""
+        self._p2p_proxy_cb = QCheckBox(t("settings.p2p_proxy"))
+        self._p2p_proxy_cb.setToolTip(t("settings.p2p_proxy_tooltip"))
+        p2p_form.addRow(self._p2p_proxy_cb)
+        proxy_row = QWidget()
+        proxy_lay = QHBoxLayout(proxy_row)
+        proxy_lay.setContentsMargins(0, 0, 0, 0)
+        self._p2p_proxy_host_edit = QLineEdit()
+        self._p2p_proxy_host_edit.setMaxLength(253)
+        self._p2p_proxy_host_edit.setPlaceholderText(t("settings.p2p_proxy_host_ph"))
+        proxy_lay.addWidget(self._p2p_proxy_host_edit, 1)
+        self._p2p_proxy_port_spin = QSpinBox()
+        self._p2p_proxy_port_spin.setRange(1, 65535)
+        self._p2p_proxy_port_spin.setValue(1080)
+        proxy_lay.addWidget(self._p2p_proxy_port_spin)
+        self._p2p_proxy_lbl = QLabel(t("settings.p2p_proxy_server"))
+        p2p_form.addRow(self._p2p_proxy_lbl, proxy_row)
+        login_row = QWidget()
+        login_lay = QHBoxLayout(login_row)
+        login_lay.setContentsMargins(0, 0, 0, 0)
+        self._p2p_proxy_user_edit = QLineEdit()
+        self._p2p_proxy_user_edit.setMaxLength(255)
+        self._p2p_proxy_user_edit.setPlaceholderText(t("settings.p2p_proxy_user_ph"))
+        login_lay.addWidget(self._p2p_proxy_user_edit, 1)
+        self._p2p_proxy_pw_edit = QLineEdit()
+        self._p2p_proxy_pw_edit.setMaxLength(255)
+        self._p2p_proxy_pw_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._p2p_proxy_pw_edit.setPlaceholderText(t("settings.p2p_proxy_password_ph"))
+        login_lay.addWidget(self._p2p_proxy_pw_edit, 1)
+        self._p2p_proxy_login_lbl = QLabel(t("settings.p2p_proxy_login"))
+        p2p_form.addRow(self._p2p_proxy_login_lbl, login_row)
+        test_row = QWidget()
+        test_lay = QHBoxLayout(test_row)
+        test_lay.setContentsMargins(0, 0, 0, 0)
+        self._p2p_proxy_test_btn = QPushButton(t("settings.p2p_proxy_test"))
+        self._p2p_proxy_test_btn.clicked.connect(self._p2p_proxy_test)
+        test_lay.addWidget(self._p2p_proxy_test_btn)
+        self._p2p_proxy_status_lbl = QLabel("")
+        self._p2p_proxy_status_lbl.setWordWrap(True)
+        test_lay.addWidget(self._p2p_proxy_status_lbl, 1)
+        p2p_form.addRow(test_row)
+        self._p2p_proxy_note_lbl = QLabel(t("settings.p2p_proxy_note"))
+        self._p2p_proxy_note_lbl.setWordWrap(True)
+        self._p2p_proxy_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        p2p_form.addRow(self._p2p_proxy_note_lbl)
+        self._p2p_proxy_cb.toggled.connect(self._p2p_proxy_sync)
+        self._p2p_tor_cb.toggled.connect(self._p2p_proxy_sync)
+        self._p2p_proxy_host_edit.textChanged.connect(self._p2p_proxy_sync)
+        self._p2p_proxy_port_spin.valueChanged.connect(self._p2p_proxy_sync)
+        self.p2p_proxy_checked.connect(self._on_p2p_proxy_checked)
+        self._p2p_proxy_sync()
+
+        # Friends: whether SaveSync keeps listening for the tokens friends send
+        # (otherwise only while the Friends or Receive window is open).
+        self._p2p_friends_online_cb = QCheckBox(t("settings.p2p_friends_online"))
+        self._p2p_friends_online_cb.setToolTip(t("settings.p2p_friends_online_tooltip"))
+        self._p2p_friends_online_cb.setChecked(True)
+        p2p_form.addRow(self._p2p_friends_online_cb)
+
+        # Whether a picture or video a friend sent can be played inside the chat
+        # when asked for - the one place SaveSync decodes a file from someone else.
+        self._p2p_media_cb = QCheckBox(t("settings.p2p_friends_media"))
+        self._p2p_media_cb.setToolTip(t("settings.p2p_friends_media_tooltip"))
+        self._p2p_media_cb.setChecked(True)
+        p2p_form.addRow(self._p2p_media_cb)
+
+        # How long the friend list may sit unused before it locks itself (when a
+        # lock password is set in the Friends window; 0 = only the Lock button).
+        self._p2p_autolock_spin = QSpinBox()
+        self._p2p_autolock_spin.setRange(0, 1440)
+        self._p2p_autolock_spin.setSpecialValueText(t("settings.p2p_autolock_never"))
+        self._p2p_autolock_spin.setSuffix(f" {t('backups.archive_auto_minutes')}")
+        self._p2p_autolock_spin.setToolTip(t("settings.p2p_friends_autolock_tooltip"))
+        self._p2p_autolock_lbl = QLabel(t("settings.p2p_friends_autolock"))
+        self._p2p_autolock_lbl.setToolTip(t("settings.p2p_friends_autolock_tooltip"))
+        p2p_form.addRow(self._p2p_autolock_lbl, self._p2p_autolock_spin)
+
+        # The way back in when the lock password is forgotten: delete the list and
+        # start again. It is HERE, on a page that is never locked, because the
+        # Friends window may be (the lock screen has the same button).
+        self._p2p_lock_wired = False
+        reset_row = QWidget()
+        reset_lay = QHBoxLayout(reset_row)
+        reset_lay.setContentsMargins(0, 0, 0, 0)
+        self._p2p_lockstate_lbl = QLabel("")
+        self._p2p_lockstate_lbl.setWordWrap(True)
+        self._p2p_lockstate_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        reset_lay.addWidget(self._p2p_lockstate_lbl, 1)
+        self._p2p_reset_btn = QPushButton(t("settings.p2p_friends_reset"))
+        self._p2p_reset_btn.setToolTip(t("settings.p2p_friends_reset_tooltip"))
+        self._p2p_reset_btn.clicked.connect(self._p2p_friends_reset)
+        reset_lay.addWidget(self._p2p_reset_btn)
+        self._p2p_reset_lbl = QLabel(t("settings.p2p_friends_list"))
+        self._p2p_reset_lbl.setToolTip(t("settings.p2p_friends_reset_tooltip"))
+        p2p_form.addRow(self._p2p_reset_lbl, reset_row)
+        self._p2p_friends_refresh()
         self._scroll_layout.addWidget(p2p_grp)
         return p2p_grp, "settings.section_p2p_retention"
+
+    def _p2p_friends_refresh(self, *_args) -> None:
+        """What the friend list's lock says (no password / locked / open), and
+        whether it can be reset from here (the friends service has to exist)."""
+        from ui.p2p_friends_service import get_friends_service
+        svc = get_friends_service()
+        if svc is None:
+            text = ""
+        elif not svc.has_lock_password:
+            text = t("settings.p2p_friends_lock_none")
+        elif svc.locked:
+            text = t("settings.p2p_friends_lock_closed")
+        else:
+            text = t("settings.p2p_friends_lock_open")
+        self._p2p_lockstate_lbl.setText(text)
+        self._p2p_reset_btn.setEnabled(svc is not None)
+        if svc is not None and not self._p2p_lock_wired:
+            self._p2p_lock_wired = True
+            svc.lock_changed.connect(self._p2p_friends_refresh)
+            svc.changed.connect(self._p2p_friends_refresh)
+
+    def _p2p_friends_reset(self) -> None:
+        """Delete the friend list (after asking): for a forgotten lock password,
+        or a fresh start. Works while the list is locked - that is the point."""
+        from ui.p2p_friends_service import get_friends_service
+        svc = get_friends_service()
+        if svc is None:
+            return
+        from ui.dialogs.p2p_friends_reset import reset_friend_list
+        if reset_friend_list(self, svc):
+            self._p2p_friends_refresh()
+            try:
+                self._load_suppression_list()       # (the silenced friends are gone from it)
+            except Exception:
+                logger.debug("Settings: refreshing the silenced list failed", exc_info=True)
+
+    def _p2p_proxy_sync(self, *_args) -> None:
+        """The proxy's boxes are for use only while it is switched on - and say
+        so when it is on but not filled in (P2P is then paused, not direct)."""
+        from core.p2p import proxy as _px
+        tor = self._p2p_tor_cb.isChecked()
+        on = self._p2p_proxy_cb.isChecked() and not tor
+        # (TLS needs sockets that listen, which a proxy forbids: the proxy wins, and
+        # the box says so rather than leaving it to be found out. Private mode (Tor)
+        # is end to end already and has no listening socket either, so it wins over
+        # both - and a proxy and Tor are two ways of one thing, so one at a time.)
+        self._p2p_tls_cb.setEnabled(not on and not tor)
+        self._p2p_tls_note_lbl.setText(t("settings.p2p_tls_note_tor") if tor
+                                       else t("settings.p2p_tls_note_proxy") if on else t("settings.p2p_tls_note"))
+        self._p2p_proxy_cb.setEnabled(not tor)
+        self._p2p_tor_cb.setEnabled(not self._p2p_proxy_cb.isChecked() or tor)
+        for w in (self._p2p_proxy_host_edit, self._p2p_proxy_port_spin, self._p2p_proxy_user_edit,
+                  self._p2p_proxy_pw_edit, self._p2p_proxy_test_btn):
+            w.setEnabled(on)
+        self._p2p_tor_refresh()
+        filled = (_px.valid_host(self._p2p_proxy_host_edit.text())
+                  and _px.valid_port(self._p2p_proxy_port_spin.value()))
+        if on and not filled:
+            self._p2p_proxy_set_status("not_set")
+        elif self._p2p_proxy_code in ("not_set", "ok") or not on:
+            self._p2p_proxy_set_status("")
+
+    def _p2p_tor_refresh(self, *_args) -> None:
+        """What to say under the private-mode box: whether the Tor program is in this
+        installation, and - once it is switched on and saved - how Tor is doing."""
+        from core.p2p import tor as _tor
+        if not self._p2p_tor_cb.isChecked():
+            text, color = "", palette("text_secondary")
+        elif not _tor.service().available():
+            text, color = "✗ " + t("settings.p2p_tor_missing"), palette("error")
+        else:
+            st = _tor.service().status() if _tor.enabled() else {"state": "stopped"}
+            if st["state"] == "ready":
+                text, color = "✓ " + t("settings.p2p_tor_ready"), palette("success")
+            elif st["state"] == "starting":
+                text, color = t("settings.p2p_tor_starting", percent=int(st.get("progress", 0))), palette("text_secondary")
+            elif st["state"] == "failed":
+                text, color = "✗ " + t("settings.p2p_tor_failed", error=st.get("error", "")), palette("error")
+            else:
+                text, color = t("settings.p2p_tor_saved_note"), palette("text_secondary")
+        self._p2p_tor_status_lbl.setText(text)
+        self._p2p_tor_status_lbl.setStyleSheet(f"color:{color};")
+
+    def _p2p_proxy_set_status(self, code: str) -> None:
+        """Show the Test button's answer (or "testing", "not_set", "" for nothing)."""
+        self._p2p_proxy_code = code
+        if not code:
+            text, color = "", palette("text_secondary")
+        elif code == "testing":
+            text, color = t("settings.p2p_proxy_testing"), palette("text_secondary")
+        elif code == "ok":
+            text, color = "✓ " + t("settings.p2p_proxy_test_ok"), palette("success")
+        elif code == "not_set":
+            text, color = "✗ " + t("settings.p2p_proxy_not_set"), palette("error")
+        else:
+            text, color = "✗ " + t(f"settings.p2p_proxy_test_{code}"), palette("error")
+        self._p2p_proxy_status_lbl.setText(text)
+        self._p2p_proxy_status_lbl.setStyleSheet(f"color:{color};")
+
+    def _p2p_proxy_test(self) -> None:
+        """Ask the proxy as typed (not as saved) what P2P needs of it, off the
+        GUI thread."""
+        from core.p2p import proxy as _px
+        host, port = self._p2p_proxy_host_edit.text().strip(), self._p2p_proxy_port_spin.value()
+        if not (_px.valid_host(host) and _px.valid_port(port)):
+            self._p2p_proxy_set_status("not_set")
+            return
+        px = _px.Proxy(host, port, self._p2p_proxy_user_edit.text().strip(),
+                       self._p2p_proxy_pw_edit.text())
+        self._p2p_proxy_test_btn.setEnabled(False)
+        self._p2p_proxy_set_status("testing")
+
+        def work():
+            try:
+                code = _px.check(px)
+            except Exception:
+                code = "unreachable"
+            try:
+                self.p2p_proxy_checked.emit(code)
+            except RuntimeError:
+                pass                    # (the page is gone)
+
+        import threading
+        threading.Thread(target=work, name="p2p-proxy-test", daemon=True).start()
+
+    def _on_p2p_proxy_checked(self, code: str) -> None:
+        self._p2p_proxy_test_btn.setEnabled(self._p2p_proxy_cb.isChecked() and not self._p2p_tor_cb.isChecked())
+        self._p2p_proxy_set_status(code if code in _P2P_PROXY_CODES else "unreachable")
+
+    def _set_p2p_port(self, port) -> None:
+        """Show *port* in the port box (0 or anything unusable = Auto)."""
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = 0
+        self._p2p_port_spin.setValue(port if 1024 <= port <= 65535 else _P2P_PORT_AUTO)
+
+    def _p2p_port_value(self) -> int:
+        """The port as stored: 0 for Auto."""
+        value = self._p2p_port_spin.value()
+        return value if value >= 1024 else 0
+
+    def _set_p2p_files_dir(self, value: str) -> None:
+        """Show *value* (\"\" = SaveSync's own folder) as the folder for files
+        received by hand."""
+        from core.p2p.paths import default_files_dir
+        self._p2p_files_dir = (value or "").strip()
+        self._p2p_files_dir_edit.setText(self._p2p_files_dir or str(default_files_dir()))
+        self._p2p_files_dir_reset.setEnabled(bool(self._p2p_files_dir))
+
+    def _browse_p2p_files_dir(self) -> None:
+        from core.p2p.paths import default_files_dir
+        from ui.widgets.file_pickers import pick_folder
+        current = self._p2p_files_dir or str(default_files_dir())
+        chosen = pick_folder(self, t("settings.p2p_files_dir_pick"),
+                             start_dir=current if Path(current).is_dir() else "",
+                             save_target=True)
+        if chosen:
+            self._set_p2p_files_dir(chosen)
+            self._mark_dirty()
+
+    def _reset_p2p_files_dir(self) -> None:
+        self._set_p2p_files_dir("")
+        self._mark_dirty()
 
     def _build_section_process_monitor(self):
         # ── Process monitor ───────────────────────────────────────────────────
@@ -1152,6 +1496,18 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._edit_copy_days_spin.valueChanged.connect(self._mark_dirty)
         self._p2p_max_spin.valueChanged.connect(self._mark_dirty)
         self._p2p_retention_spin.valueChanged.connect(self._mark_dirty)
+        self._p2p_port_spin.valueChanged.connect(self._mark_dirty)
+        self._p2p_upnp_cb.stateChanged.connect(self._mark_dirty)
+        self._p2p_tls_cb.stateChanged.connect(self._mark_dirty)
+        self._p2p_tor_cb.stateChanged.connect(self._mark_dirty)
+        self._p2p_proxy_cb.stateChanged.connect(self._mark_dirty)
+        self._p2p_proxy_host_edit.textChanged.connect(self._mark_dirty)
+        self._p2p_proxy_port_spin.valueChanged.connect(self._mark_dirty)
+        self._p2p_proxy_user_edit.textChanged.connect(self._mark_dirty)
+        self._p2p_proxy_pw_edit.textChanged.connect(self._mark_dirty)
+        self._p2p_friends_online_cb.stateChanged.connect(self._mark_dirty)
+        self._p2p_media_cb.stateChanged.connect(self._mark_dirty)
+        self._p2p_autolock_spin.valueChanged.connect(self._mark_dirty)
         self._min_kept_spin.valueChanged.connect(self._mark_dirty)
         self._max_size_spin.valueChanged.connect(self._mark_dirty)
         self._poll_spin.valueChanged.connect(self._mark_dirty)
@@ -1192,6 +1548,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         "provisional_backup": "settings.suppression_provisional_notif",
         "sync":              "settings.suppression_sync_notif",
         "regression":        "settings.suppression_regression_notif",
+        "friend_message":    "settings.suppression_friend_notif",
     }
 
     def _game_label(self, game_id: str) -> str:
@@ -1207,6 +1564,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         from core.library import get_library
         if game_id.startswith("folder:"):       # an archive answered before it had a game
             return game_id[len("folder:"):]
+        if game_id.startswith("friend:"):       # a friend whose messages were silenced
+            return self._friend_label(game_id[len("friend:"):])
         entry = get_library().get_by_id(game_id)
         if entry is not None and entry.name:
             return entry.name
@@ -1218,6 +1577,22 @@ class SettingsPage(PageScrollMixin, QWidget):
         except Exception:
             logger.debug("Backup index unavailable for label lookup", exc_info=True)
         return t("settings.removed_game", id=game_id[:8])
+
+    @staticmethod
+    def _friend_label(friend_id: str) -> str:
+        """A name for a friend whose notifications were silenced. The friends'
+        names are not shown while their list is locked: a short fingerprint of
+        the key says which one it is."""
+        try:
+            from ui.p2p_friends_service import get_friends_service
+            svc = get_friends_service()
+            f = svc.friend(friend_id) if svc is not None else None
+            if f is not None:
+                return t("settings.suppression_friend_name", name=f.display)
+            from core.p2p.friends import fingerprint, pub_from_id
+            return t("settings.suppression_friend_name", name=fingerprint(pub_from_id(friend_id)))
+        except Exception:
+            return t("settings.suppression_friend_name", name=friend_id[:8])
 
     def _suppression_kinds(self, game_id: str, scan_accept: dict,
                            notif_suppress: dict, cloud_no_local,
@@ -1308,7 +1683,16 @@ class SettingsPage(PageScrollMixin, QWidget):
 
         config = get_config()
         scan_accept: dict       = config.get("scan_auto_accept_games", {})
-        notif_suppress: dict    = config.get("suppressed_ingame_notifs", {})
+        notif_suppress: dict    = dict(config.get("suppressed_ingame_notifs", {}))
+        # (silenced friends live in the sealed friend file, not in the settings: there
+        # are none to show while the list is locked)
+        try:
+            from ui.p2p_friends_service import get_friends_service
+            svc = get_friends_service()
+            for f in (svc.silenced_friends() if svc is not None else []):
+                notif_suppress[f"friend:{f.id}"] = ["friend_message"]
+        except Exception:
+            logger.debug("Settings: listing the silenced friends failed", exc_info=True)
         cloud_no_local: list    = config.get("suppressed_cloud_no_local", [])
         from core.backup import BackupManager
         archive_skips: dict     = BackupManager.skipped_archives()
@@ -1360,6 +1744,14 @@ class SettingsPage(PageScrollMixin, QWidget):
 
     def _remove_suppression(self, game_id: str):
         """Remove all suppressions for a specific game and refresh the list."""
+        if game_id.startswith("friend:"):       # a silenced friend: taken off in the friend file
+            from ui.p2p_friends_service import get_friends_service
+            svc = get_friends_service()
+            if svc is not None:
+                svc.set_silenced(game_id[len("friend:"):], False)
+            self._load_suppression_list()
+            return
+
         from core.config_manager import get_config
         config = get_config()
 
@@ -1454,6 +1846,19 @@ class SettingsPage(PageScrollMixin, QWidget):
             "edit_copy_days": self._edit_copy_days_spin.value(),
             "p2p_max_per_game": self._p2p_max_spin.value(),
             "p2p_retention_days": self._p2p_retention_spin.value(),
+            "p2p_files_dir": self._p2p_files_dir,
+            "p2p_port": self._p2p_port_value(),
+            "p2p_upnp": self._p2p_upnp_cb.isChecked(),
+            "p2p_tls": self._p2p_tls_cb.isChecked(),
+            "p2p_tor": self._p2p_tor_cb.isChecked(),
+            "p2p_proxy": self._p2p_proxy_cb.isChecked(),
+            "p2p_proxy_host": self._p2p_proxy_host_edit.text().strip(),
+            "p2p_proxy_port": self._p2p_proxy_port_spin.value(),
+            "p2p_proxy_user": self._p2p_proxy_user_edit.text().strip(),
+            "p2p_proxy_password": self._p2p_proxy_pw_edit.text(),
+            "p2p_friends_online": self._p2p_friends_online_cb.isChecked(),
+            "p2p_friends_media": self._p2p_media_cb.isChecked(),
+            "p2p_friends_autolock_minutes": self._p2p_autolock_spin.value(),
             "min_kept": self._min_kept_spin.value(),
             "max_size": self._max_size_spin.value(),
             "poll": self._poll_spin.value(),
@@ -1529,6 +1934,26 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._edit_copy_days_spin.setValue(config.get("save_edit_copy_days", 7))
         self._p2p_max_spin.setValue(config.get("p2p_max_per_game", 3))
         self._p2p_retention_spin.setValue(config.get("p2p_retention_days", 7))
+        self._set_p2p_files_dir(str(config.get("p2p_files_dir", "") or ""))
+        self._set_p2p_port(config.get("p2p_port", 0))
+        self._p2p_upnp_cb.setChecked(bool(config.get("p2p_upnp", True)))
+        self._p2p_tls_cb.setChecked(bool(config.get("p2p_tls", False)))
+        self._p2p_tor_cb.setChecked(bool(config.get("p2p_tor", False)))
+        self._p2p_proxy_cb.setChecked(bool(config.get("p2p_proxy", False)))
+        self._p2p_proxy_host_edit.setText(str(config.get("p2p_proxy_host", "") or ""))
+        try:
+            self._p2p_proxy_port_spin.setValue(int(config.get("p2p_proxy_port", 1080)))
+        except (TypeError, ValueError):
+            self._p2p_proxy_port_spin.setValue(1080)
+        from core.p2p import proxy as _px
+        _user, _pw = _px.load_credentials()
+        self._p2p_proxy_user_edit.setText(_user)
+        self._p2p_proxy_pw_edit.setText(_pw)
+        self._p2p_proxy_sync()
+        self._p2p_friends_online_cb.setChecked(bool(config.get("p2p_friends_online", True)))
+        self._p2p_media_cb.setChecked(bool(config.get("p2p_friends_media", True)))
+        self._p2p_autolock_spin.setValue(int(config.get("p2p_friends_autolock_minutes", 10)))
+        self._p2p_friends_refresh()
         self._min_kept_spin.setValue(config.get("min_kept_backups", 3))
         self._max_size_spin.setValue(config.get("max_backup_size_mb", 512))
         self._poll_spin.setValue(config.get("process_poll_interval", 1))
@@ -1654,6 +2079,21 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("save_edit_copy_days",    self._edit_copy_days_spin.value())
         config.set("p2p_max_per_game",       self._p2p_max_spin.value())
         config.set("p2p_retention_days",     self._p2p_retention_spin.value())
+        config.set("p2p_files_dir",          self._p2p_files_dir)
+        config.set("p2p_port",               self._p2p_port_value())
+        config.set("p2p_upnp",               self._p2p_upnp_cb.isChecked())
+        config.set("p2p_tls",                self._p2p_tls_cb.isChecked())
+        config.set("p2p_tor",                self._p2p_tor_cb.isChecked())
+        config.set("p2p_proxy",              self._p2p_proxy_cb.isChecked())
+        config.set("p2p_proxy_host",         self._p2p_proxy_host_edit.text().strip())
+        config.set("p2p_proxy_port",         self._p2p_proxy_port_spin.value())
+        from core.p2p import proxy as _px
+        _user, _pw = self._p2p_proxy_user_edit.text().strip(), self._p2p_proxy_pw_edit.text()
+        if not _px.save_credentials(_user, _pw) and (_user or _pw):
+            warning_window_modal(self, t("settings.p2p_proxy"), t("settings.p2p_proxy_login_not_saved"))
+        config.set("p2p_friends_online",     self._p2p_friends_online_cb.isChecked())
+        config.set("p2p_friends_media",      self._p2p_media_cb.isChecked())
+        config.set("p2p_friends_autolock_minutes", self._p2p_autolock_spin.value())
         config.set("min_kept_backups",       self._min_kept_spin.value())
         config.set("max_backup_size_mb",     self._max_size_spin.value())
         config.set("process_poll_interval",  self._poll_spin.value())
@@ -1866,6 +2306,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._load_unified_ignored_list()
             self._load_excluded_paths_list()
             self._load_suppression_list()
+            self._p2p_friends_refresh()
         except Exception as e:
             logger.debug(f"Settings lists refresh on show failed: {e}")
 
@@ -2260,6 +2701,10 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._apply_reset_btn_style(self._inline_reset)
         self._relock_settings_chrome()
         self._saved_lbl.setStyleSheet(f"color: {palette('success')};")
+        self._p2p_proxy_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._p2p_tls_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._p2p_lockstate_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._p2p_proxy_set_status(self._p2p_proxy_code)
         if not self._hotkey_edit._capturing:
             self._hotkey_edit._set_idle_style()
 
@@ -2343,6 +2788,47 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_retention_lbl.setText(t("settings.p2p_retention_days"))
         self._p2p_retention_spin.setToolTip(t("settings.p2p_retention_days_tooltip"))
         self._p2p_retention_spin.setSuffix(" " + t("settings.days_suffix"))
+        self._p2p_files_dir_lbl.setText(t("settings.p2p_files_dir"))
+        self._p2p_files_dir_lbl.setToolTip(t("settings.p2p_files_dir_tooltip"))
+        self._p2p_files_dir_edit.setToolTip(t("settings.p2p_files_dir_tooltip"))
+        self._p2p_files_dir_browse.setText(t("settings.p2p_files_dir_browse"))
+        self._p2p_files_dir_reset.setText(t("settings.p2p_files_dir_reset"))
+        self._p2p_port_lbl.setText(t("settings.p2p_port"))
+        self._p2p_port_lbl.setToolTip(t("settings.p2p_port_tooltip"))
+        self._p2p_port_spin.setToolTip(t("settings.p2p_port_tooltip"))
+        self._p2p_port_spin.setSpecialValueText(t("settings.p2p_port_auto"))
+        self._p2p_upnp_cb.setText(t("settings.p2p_upnp"))
+        self._p2p_upnp_cb.setToolTip(t("settings.p2p_upnp_tooltip"))
+        self._p2p_tls_cb.setText(t("settings.p2p_tls"))
+        self._p2p_tls_cb.setToolTip(t("settings.p2p_tls_tooltip"))
+        self._p2p_tor_cb.setText(t("settings.p2p_tor"))
+        self._p2p_tor_cb.setToolTip(t("settings.p2p_tor_tooltip"))
+        self._p2p_tor_note_lbl.setText(t("settings.p2p_tor_note"))
+        self._p2p_proxy_cb.setText(t("settings.p2p_proxy"))
+        self._p2p_proxy_cb.setToolTip(t("settings.p2p_proxy_tooltip"))
+        self._p2p_proxy_lbl.setText(t("settings.p2p_proxy_server"))
+        self._p2p_proxy_host_edit.setPlaceholderText(t("settings.p2p_proxy_host_ph"))
+        self._p2p_proxy_login_lbl.setText(t("settings.p2p_proxy_login"))
+        self._p2p_proxy_user_edit.setPlaceholderText(t("settings.p2p_proxy_user_ph"))
+        self._p2p_proxy_pw_edit.setPlaceholderText(t("settings.p2p_proxy_password_ph"))
+        self._p2p_proxy_test_btn.setText(t("settings.p2p_proxy_test"))
+        self._p2p_proxy_note_lbl.setText(t("settings.p2p_proxy_note"))
+        self._p2p_proxy_set_status(self._p2p_proxy_code)
+        self._p2p_proxy_sync()          # (the TLS note follows the proxy's state)
+        self._p2p_friends_online_cb.setText(t("settings.p2p_friends_online"))
+        self._p2p_friends_online_cb.setToolTip(t("settings.p2p_friends_online_tooltip"))
+        self._p2p_media_cb.setText(t("settings.p2p_friends_media"))
+        self._p2p_media_cb.setToolTip(t("settings.p2p_friends_media_tooltip"))
+        self._p2p_autolock_lbl.setText(t("settings.p2p_friends_autolock"))
+        self._p2p_autolock_lbl.setToolTip(t("settings.p2p_friends_autolock_tooltip"))
+        self._p2p_autolock_spin.setToolTip(t("settings.p2p_friends_autolock_tooltip"))
+        self._p2p_autolock_spin.setSpecialValueText(t("settings.p2p_autolock_never"))
+        self._p2p_autolock_spin.setSuffix(f" {t('backups.archive_auto_minutes')}")
+        self._p2p_reset_lbl.setText(t("settings.p2p_friends_list"))
+        self._p2p_reset_lbl.setToolTip(t("settings.p2p_friends_reset_tooltip"))
+        self._p2p_reset_btn.setText(t("settings.p2p_friends_reset"))
+        self._p2p_reset_btn.setToolTip(t("settings.p2p_friends_reset_tooltip"))
+        self._p2p_friends_refresh()
         self._min_kept_lbl.setText(t("settings.min_kept_backups"))
         self._min_kept_spin.setToolTip(t("settings.min_kept_backups_tooltip"))
         self._max_size_lbl.setText(t("settings.max_size_mb"))

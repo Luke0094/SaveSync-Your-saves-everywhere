@@ -129,8 +129,13 @@ involved at all.
   always asks (keep local / keep cloud / keep both)
 - **Quick restore from the overlay** — browse local *and* cloud backups without
   leaving the game; cloud entries download transparently
-- **Direct P2P transfer** — send a specific backup straight to another
-  SaveSync install, no server or cloud provider involved (see
+- **Direct P2P transfer** — send a specific backup, or any file or folder,
+  straight to another SaveSync install, no server or cloud provider involved,
+  encrypted between the two of you. Backups arrive in the Backups page; files go
+  straight into a folder you choose, with OK / Move to… at the end. A friend
+  list hands your one-time token over in a click, writes with a little
+  formatting, and offers files, folders and videos that download like any other
+  transfer (see
   [P2P save transfer](#p2p-save-transfer))
 
 ### Library
@@ -154,9 +159,14 @@ involved at all.
 - **More pictures** — Steam, VNDB, itch.io, DLsite and forum threads (the
   pictures posted in the first message) also list screenshots.
   The chip dialog shows them beside the cover, selected like the rest (untick
-  what you do not want); the ticked ones are downloaded in the background
-  (Save waits for them) and added to the carousel.
-  The cover is never replaced, and Cancel removes only what that session added
+  what you do not want); the ticked ones, covers included, are downloaded in the
+  background and added to the carousel. The panel stays usable and Save does not
+  wait (rename a new game meanwhile and what came in moves to its new folder, the
+  rest goes straight there): what is still coming goes on into the saved game, without the panel (a
+  cover that arrives after Save becomes its cover, unless you picked another or
+  changed it since; a picture that fails is reported in the status bar), and
+  Cancel before Save drops it.
+  A screenshot never replaces the cover, and Cancel removes only what that session added
   A source applied before still shows its preview while it has pictures the game
   lacks (worked out from the cache's file names, nothing is downloaded to know)
 - **Languages** — DLsite, Steam and VNDB say which languages a game is offered
@@ -232,8 +242,13 @@ git-ignored (hundreds of MB); carry it alongside the project folder.
 
 ```bash
 pip install pyinstaller
+python tools/fetch_tor.py            # once: the Tor program private mode runs (into vendor/tor)
 pyinstaller --clean savesync.spec
 ```
+
+`tools/fetch_tor.py` downloads the Tor Project's own program (about 10 MB), refuses it unless its
+SHA-256 is the one pinned in the script, and the spec packs `vendor/tor` into the build. A build made
+without it still works; private mode then says the Tor program is missing and sends nothing.
 
 Output: `dist/SaveSync-<version>-win-<arch>.exe` (e.g.
 `SaveSync-1.4.1-win-AMD64.exe`) — single file, animated splash, no console.
@@ -249,7 +264,8 @@ pip install pyinstaller
 
 Output: `dist/SaveSync-<version>-<arch>.AppImage` — one file, executable,
 no installation. `appimagetool` is fetched into `build/` if it is not on
-PATH; nothing is installed system-wide.
+PATH; nothing is installed system-wide. The script also fetches the Tor program
+for private mode (`tools/fetch_tor.py linux-x86_64`) if `vendor/tor` lacks it.
 
 **Why the two end up different sizes:** both are "one file you double-click",
 but they get there differently. The Windows build is PyInstaller's *onefile*
@@ -440,7 +456,12 @@ savesync/
 │   ├── pending_batch_jobs.py      # Persisted multi-operation batch queues
 │   ├── p2p/                       # Direct P2P save transfer (BitTorrent + DHT mailbox)
 │   │   ├── __init__.py
-│   │   └── transfer.py            # ReceiveSession, send_backup — see "P2P save transfer" below
+│   │   ├── transfer.py            # ReceiveSession, send_backup, send_files — see "P2P save transfer" below
+│   │   ├── secret.py              # Keys and sealing derived from a token or a friendship
+│   │   ├── friends.py             # Friend codes, per-direction mailboxes, the encrypted friend file
+│   │   ├── friend_net.py          # DHT session that reads/writes the friends' mailboxes
+│   │   ├── tls.py                 # Optional TLS for transfers: the certificate authority derived from the token
+│   │   └── paths.py               # Folder received files are downloaded into (Settings)
 │   ├── resolvers.py               # Launcher URLs, executable resolution
 │   ├── exe_scan.py                # Folder scan for installed game executables
 │   ├── game_api.py                # Web metadata search orchestration
@@ -570,47 +591,748 @@ Closing it unanswered leaves the game on temporary backups until you choose.
 
 ## P2P save transfer
 
-Sends one backup archive straight to another SaveSync install, peer to peer
-— no server either side has to run, and no cloud provider involved at all.
+Sends a save — or any file or folder — straight to another SaveSync install,
+peer to peer. No server either side has to run, and no cloud provider involved
+at all; the two people need nothing in common but SaveSync (1.4.6 or later, on
+both sides). It is encrypted between the two of you — see
+[Privacy](#privacy-what-the-network-sees).
 
-**Sending.** Click ➡️ on a specific backup (Backups page). SaveSync creates a
-torrent for that file and seeds it, then waits for the token the receiver
-gives you to be redeemed.
+There are two things you can send, and they end up in different places:
 
-**Receiving.** Open 📥 (bottom left of the sidebar) to generate a one-time
-token and hand it to whoever is sending. You see who's sending what
-(`"<name> wants to send you save.zip"`) and must accept before anything
-downloads. A token is discarded after one use.
+| You send | It arrives | Tracked by SaveSync? |
+|---|---|---|
+| **A backup** — ➡️ on a row of the Backups page | In the receiver's **Backups** page, as an archive with a `📥 P2P` badge, ready to restore | Yes, like any other backup, including the retention below |
+| **A file or folder** — **Send a file…** in the Receive panel | Straight into a folder the receiver picks in Settings | No. Never in Backups, never listed, never deleted by SaveSync |
 
-**Finding each other with no server.** The receiver's token IS the 32-byte
-seed for a keypair generated fresh for that transfer. The sender derives the
-same keypair from it and writes the magnet link plus their identity into a
-BitTorrent DHT "mutable item" (BEP44) addressed by that keypair; the
-receiver, already watching that same address, reads it straight back. Only
-the public DHT every BitTorrent client already uses is involved — nothing
-touches a server SaveSync runs.
+### Sending
 
-| What travels where | Why |
-|---|---|
-| DHT mailbox: magnet link, sender name/machine id, game name, filename, size | BEP44 items cap out around 1000 bytes — only room for what's needed to decide *before* downloading |
-| `manifest.json` inside the torrent itself | The full backup entry (save paths, exe path, chains) — no size cap, read only after accepting |
+1. The receiver opens 📥 (bottom left of the sidebar) and gives you the token
+   it shows — pasted, or sent to you in one click if you are friends (see
+   [Friends](#friends)).
+2. Pick what to send:
+   - **A backup:** click ➡️ on it in the Backups page.
+   - **A file or folder:** open 📥, press **Send a file…** and pick it with the
+     app's own picker. A page lists every file inside; untick the ones that
+     shouldn't leave (at least one stays on). It goes as it is — not zipped,
+     with no game or backup entry attached.
+3. Paste the token and press **Send**.
 
-**After accept**, the save files into the Backups page as an archive — the
-same no-library-game shape "Aggiungi percorso" already produces — tagged
-with its own `📥 P2P` badge, restorable immediately. No need to add the game
-to the library or match it to one up front: the same automatic name-matching
-that already links an unrecognised cloud archive to a game handles this
-identically.
+SaveSync then seeds the transfer until it's picked up. The window shows how
+many peers are connected, the upload speed (MB/s, with Mbps on hover) and a
+percentage where 100% means one full copy has gone out. Closing it before then
+asks "Close anyway?", and closing it ends the transfer.
+
+**Nothing is copied to be sent.** The file is *hard-linked* under a temporary
+name, not duplicated, so sending 50 GB doesn't need another 50 GB of disk. That
+needs a drive that supports links (NTFS, ext4, APFS…); on one that doesn't
+(exFAT, a network share) SaveSync says so rather than quietly making a copy. The
+one catch: a link is not a snapshot, so a file that is still being written
+*while* it's sent can fail the receiver's integrity check. A backup archive
+never changes; for your own files, send ones that are at rest.
+
+### Receiving
+
+Open 📥 to get a one-time token and give it to whoever is sending. When they
+send, the panel shows who and what — for a backup the game, its folder and the
+file (`"<name> wants to send you save.zip"`), for files the folder and how many
+— and **nothing downloads until you accept**. You can also decline.
+
+- A token works **once**, and a used one is no longer shown or copyable.
+- A token is good for **10 minutes from the moment it was made**; the panel
+  counts the time down and, if it runs out unused, shows a new token and says
+  so. Close the panel and the same token carries on until then; the panel
+  reopens by itself when something arrives. A download you've started keeps
+  running with the panel closed, and a tray message tells you when it's done.
+- While downloading you see a percentage and the speed; a transfer of several
+  files also lists each file with its own percentage and speed. It doesn't
+  read 100% until the last byte is in and written to disk.
+
+**A backup** is filed into the Backups page as an archive — the same
+no-library-game shape "Aggiungi percorso" already produces — tagged with its
+own `📥 P2P` badge, restorable immediately. The downloaded file is *moved* into
+your backup folder, not read into memory and copied, so it never exists twice,
+and the emptied download folder is removed. Filing it doesn't freeze the
+window. No need to add the game to the library or match it to one up front: the
+same automatic name-matching that already links an unrecognised cloud archive
+to a game handles this identically.
+
+**Files and folders** are downloaded *directly into the folder set in
+Settings* — by default SaveSync's own `p2p_files` folder next to its config.
+Before a byte is fetched SaveSync works out where every file will go and tells
+the download to write it there, so there is no staging area and no copy
+afterwards: 50 GB takes 50 GB of space, not 100.
+
+- The sender's layout is kept (`Slot1/data/save.bin` arrives as
+  `<your folder>/Slot1/data/save.bin`), and folders that already exist are
+  merged into.
+- **Nothing is ever overwritten.** A name that's taken keeps both files; the new
+  one becomes `name (2).ext`.
+- A name that tries to climb out of the folder (`..`) is refused.
+
+When it's done the panel says *Your files have been downloaded in:* with the
+path, a 📁 button that opens it, and two buttons under it:
+
+- **OK** — dismisses the note. The files stay where they are.
+- **Move to…** — moves them to another folder: a real move (a rename on the same
+  drive; across drives each file is copied and the original removed), with the
+  same layout and the same "(2)" rule there. Only folders the transfer itself
+  created are tidied away; ones that were already there are left alone.
+
+That note lives in memory only. SaveSync keeps no list of received files and
+never deletes them.
+
+### Settings
+
+| Setting | Where | Default | What it does |
+|---|---|---|---|
+| `p2p_username` | Behaviour → *P2P display name* | empty | The name the receiver sees in your offer |
+| `p2p_max_per_game` | P2P received saves → *Archives to keep per game* | 3 | Received **saves** beyond this are pruned, oldest first |
+| `p2p_retention_days` | P2P received saves → *Delete after* | 7 | Received **saves** older than this are pruned (the newest is always kept) |
+| `p2p_files_dir` | P2P received saves → *Folder for received files* | empty = `<SaveSync data>/p2p_files` | Where files and folders sent by hand are downloaded. *Browse…* picks one, *Default* goes back |
+| `p2p_port` | P2P received saves → *Connection port* | 0 (*Auto*) | The port used to send and receive. Auto picks a free one each time; otherwise 1024–65535 |
+| `p2p_upnp` | P2P received saves → *UPnP* | on | Asks the router to open that port by itself (UPnP / NAT-PMP) |
+| `p2p_friends_online` | P2P received saves → *Check friends for tokens in the background* | on | Keeps SaveSync listening for the tokens friends send while it runs; off = only while the Friends panel or the Receive window is open |
+| `p2p_friends_autolock_minutes` | P2P received saves → *Lock friends after* | 10 | Minutes the friend list may sit unused before it locks itself (0 = never); only applies when a lock password is set |
+| `p2p_friends_media` | P2P received saves → *Play pictures and videos from friends inside the chat* | on | Whether **Show picture**, **Play video** and **Watch while downloading** exist on a received attachment. Off = SaveSync never reads a file somebody else made, in any way |
+| `p2p_tls` | P2P received saves → *Use TLS for transfers* | off | Sends over TLS instead of BitTorrent's RC4, with no fallback; needs a reachable port, and is not used while the proxy is on; see [TLS](#tls-optional) |
+| `p2p_proxy`, `p2p_proxy_host`, `p2p_proxy_port` | P2P received saves → *Hide my address behind a SOCKS5 proxy* | off | Sends every P2P connection (friends and transfers) through that proxy, or none at all; see [Hiding your address](#hiding-your-address). The proxy's login is kept encrypted on this PC, not in `config.json` |
+| `p2p_tor` | P2P received saves → *Private mode: hide this PC's address with Tor* | off | Friends and transfers go through Tor (the program comes with SaveSync) and the DHT is not used at all; both ends need it. Not with the proxy or TLS; see [Private mode](#private-mode-tor) |
+
+The port and UPnP apply from the next transfer; a session that's already open
+keeps what it started with. The proxy applies at once to the friends' chat and to
+a token that is waiting (it is replaced by a new one); a transfer that is already
+running finishes the way it began.
 
 **Retention** is a separate cap from the regular backup policy, since a save
 someone keeps sending you isn't the same kind of history as your own games'
-backups: max archives per game (default **3**) and days kept (default **7**,
-newest always protected), shared across whoever sends that game rather than
-counted per sender, pruned on the same scheduled sweep the regular backup
-retention already runs on.
+backups. It is shared across whoever sends that game rather than counted per
+sender, and runs on the same scheduled sweep the regular backup retention does.
+It only ever touches received *saves* — files and folders sent by hand are
+outside it.
+
+### Friends
+
+Instead of pasting a token into another app, add the people you send things to
+as friends: write to each other (with a little formatting), offer each other
+files, and hand each other tokens in a click. 👥 in the sidebar, right after 📥,
+slides the list out of the sidebar, over the page beside it (click 👥 again, ✕ or
+press Esc to put it away; it also goes when the window is minimized or put away to
+the tray, so that nothing arrives unnoticed into a chat nobody is looking at).
+
+- **Your friend code** is a 56-character string that identifies you to your
+  friends; the Friends panel shows it with a **Copy** button. Give it to a
+  friend and add theirs with **Add** (a name is optional). **Each of you has to
+  add the other**: until they do, the entry reads *waiting for them to add you*,
+  and it turns *connected* as soon as something of theirs is seen. Your name
+  for friends is the P2P display name in Settings.
+- **Handing over a token.** In the Receive panel, **👥 Friends** on the right of
+  *Copy* lists your friends; pick one and the token goes to them directly. It
+  arrives as a message (see below) with a countdown. **Click it, pick what to
+  send, and the transfer starts** — nothing to paste. For a backup, the send
+  dialog (➡️ on a backup) offers the tokens friends have sent in a drop-down.
+- **Messages.** Click a friend to open their chat and write in
+  the box under it: Enter sends, Shift+Enter starts a new line. (The **⋯** on a
+  friend's row renames or removes them.) A message is up
+  to 400 bytes (about 400 letters; fewer in scripts that need more bytes per
+  character, the counter says). Tokens they hand you sit in the same conversation
+  as cards, with their countdown and a **Send…** button: each friend's tokens are
+  in that friend's chat, there is no separate list of them. Each of your texts shows how far it got: ⏳ waiting to go out, ✓ stored
+  in the network for them to pick up, ✓✓ **delivered** (their SaveSync has it).
+  The conversation is kept on this PC, in the friend file (encrypted like the rest
+  of it), up to 300 entries per friend; **Clear** deletes it here — your friend's
+  copy is theirs.
+- **Formatting and links.** A message may use a few marks and nothing else:
+  `**bold**`, `*italic*` (or `_italic_`), `~~struck~~`, `` `code` ``, a line that
+  starts with `> ` for a quote, and three backticks around a block of code. No
+  headings, tables, images or `[label](address)` links (a label that says one
+  thing and opens another is how links get faked). The marks travel as ordinary
+  text, so a friend on an older SaveSync just sees them, and *your PC* reads them
+  when it shows the message; whatever a friend writes is never taken for HTML.
+  A web address (`http://` or `https://` with a real domain name — not an IP
+  address, `localhost`, a name that only exists on a local network, or one with a
+  user name in it) becomes a link, always **shown as the address it opens**; an
+  international name is shown in the plain ASCII form the browser will use, so
+  look-alike letters cannot pass for others. **Clicking a link asks first**: the
+  host on its own line, a warning for look-alike names and plain `http`, Cancel as
+  the default. At most five links per message are live. **Nothing is fetched** for
+  a link — no preview, no icon, no image or video from the address — because every
+  one of those would tell whoever runs that address that you read the message,
+  when, and from where.
+- **Attachments.** The **+** next to the box offers a file or folder — or drag
+  files and folders onto the conversation (or the box), as many at once as you like
+  — and you get the same list as when sending by hand, to untick any file. It is an **offer**: your
+  friend gets a card with the name, how many files and the size, and *nothing
+  moves* until they press **Accept**. Accepting makes a fresh transfer token on
+  their PC and answers with it; your PC — which has to be running, within a day of
+  the offer — then sends to it with the usual sealed transfer: links, never copies,
+  mandatory encryption. **Size does not matter**: it is the same transfer as
+  sending by hand, with no limit on how big a file is or how long it takes (see *A
+  token's time* below), and a big one shows how far it has got while it is being
+  got ready. **Receiving is a download, always**: whatever the file is — a save, a
+  picture, a video — it comes whole into their *Folder for received files*
+  (Settings) and stays there. A video can also be **watched while it is still
+  arriving**, as an extra that changes nothing about the download. Both cards show
+  progress and speed, then *sent* / *saved*; a saved card has **Show in folder**
+  first and, as extras that work on the saved copy, **Show picture** for a plain
+  picture and **Play video** for a video. **Either end can stop a transfer at any
+  time** — see *Stopping a transfer* below. The rules, on both sides:
+  - what arrives must be **exactly what was offered** — the same number of files
+    and the same total size — or it is refused before a byte is fetched. A
+    different offer that turns up on that token is shown as an ordinary offer for
+    you to decide on, never taken by itself;
+  - **programs and scripts are never sent or taken**: `.exe .scr .bat .cmd .ps1
+    .vbs .js .jar .lnk .msi .dll .reg .iso` and the like, macro-enabled Office
+    files, judged by the real last extension (`photo.jpg.exe` is a program, and so
+    is `a.exe.`). Put it in a `.zip` if it must go. Names Windows treats specially
+    (`CON`, `x:stream`, direction-override characters), more than 1000 files, and
+    files that changed after the offer (the size no longer matches) are refused too;
+  - received files are marked **as coming from the Internet**, the same mark a
+    browser leaves, so Windows's own checks apply when you open one;
+  - SaveSync **never opens or runs** a received file. The only things it ever
+    decodes are a picture or a video you ask to see, on that click and no other
+    (Settings can turn both off):
+    - a **picture** — PNG, JPEG, GIF, WebP or BMP, under 8 MB and 16 megapixels,
+      first frame only, header checked before a pixel is read, with a memory cap;
+    - a **video** — MP4, M4V, MOV, 3GP, MKV, WebM, AVI, WMV/ASF, OGV, FLV, MPEG or
+      MPEG-TS, in a small player inside the card (play/pause, seek, volume, close;
+      no full screen): **Play video** plays the downloaded copy, and **Watch while
+      downloading** (on a single-file video that is still arriving, once its start is
+      in) plays it as it comes. The download is not touched either way: the file
+      still lands whole in your folder, and whether or not you ever press Play. A
+      video that is still arriving is read through a device that hands the player
+      only pieces that have fully arrived **and match the torrent's own hash**, so
+      the player sees exactly the bytes the finished file will have, never a
+      half-written piece; the end of the file (where an MP4 keeps its index) and any
+      place you seek to are fetched first, and a part that has not arrived yet shows
+      *waiting for the download*. What plays depends on the codecs of this PC's media
+      library: the container is not the codec, and a video it cannot play says so.
+      The file must really be that container (its first bytes are checked, a
+      playlist or a program wearing a video's name is refused), a plain file and not
+      a link, still exactly the size that was offered; the player is handed the
+      file's *bytes* — no path, no other file, no network address — and only one
+      plays at a time, with no autoplay. It is dropped if it has not loaded in 20
+      seconds or the library reports an error, and closed when you leave the
+      conversation. **This is the riskiest thing in the chat:** a media library
+      parsing a file somebody else made runs inside SaveSync, and a flaw in a decoder
+      is a flaw in SaveSync. Play videos from people you trust, or turn it off. A
+      link to a video elsewhere (a video site) is never embedded: that would contact
+      it;
+  - there must be room in the folder (the size plus 64 MB), or Accept says so; an
+    offer nobody takes up lapses after a day, and several offers waiting at once
+    fill the mailbox like texts do (the + then says so).
+- **Announcing.** A message from a friend is announced like any other SaveSync
+  notification: who it is from, a preview (the first words of the text, without
+  its marks; *"offers you holiday.zip"*; or *"Marco sent you a token - 9:41 left"*), a primary **Open message** button that opens
+  that friend's conversation, and **Don't show again**, which silences *that
+  friend only*. A silenced friend is listed in Settings, in the same list as the
+  per-game ones; remove the entry there and their messages are announced again.
+  The silence is kept in the friend file (encrypted, see *Locking the list*), not in
+  `config.json`: a line there would have spelled out who your friends are to anything
+  that read the settings (and to a config export).
+  Nothing is announced while you already have that friend's conversation open
+  (what arrives there is read as it comes).
+- **Nothing lost.** A mailbox can only hold a little, so texts are numbered and
+  *acknowledged*: yours stay on your PC, and go back into the mailbox every time it
+  is written, until your friend's SaveSync says it has them — also after a restart.
+  If so many are still waiting that one more would not fit (about ten short ones, or
+  two or three long ones), the box says so and Send is off, instead of an older
+  message being pushed out. The network keeps what you wrote for about two hours,
+  refreshed while SaveSync runs; so a message reaches a friend who is offline as soon
+  as they are back, provided your SaveSync is running or has not yet been closed for
+  longer than that — otherwise it waits (⏳) on your PC and goes out the next time you
+  start it. If their numbers skip (they wrote before you added them, say) a note
+  reads *N message(s) did not reach you*.
+- **Badges.** The 👥 button in the sidebar shows how many *different* friends have
+  something unread (two messages from one friend count once). In the Friends
+  panel each friend has a badge with the exact number of unread messages (texts,
+  attachment offers and tokens alike); opening their conversation reads them and the badges come
+  down. A token card says whether the token is usable (with its countdown), used,
+  replaced by a newer one, or expired.
+- **Stopping a transfer.** Either end can call one off at any time, and the other
+  end is told. **Receiving:** *Cancel* on the card (or *Cancel transfer* in the
+  Receive panel) asks first, then stops the download: the files that had arrived
+  *whole* stay in the folder (the panel's usual *OK / Move to…* note lists them),
+  whatever was only *partly* received is removed together with the folders this
+  transfer made — nothing else is touched, not even a file of yours with the same
+  name — and the card goes back to *offered*, so you can accept again from scratch;
+  the sender's card says you stopped it. **Sending:** *Cancel* on the card (or
+  closing the send window and answering *Close anyway*) stops seeding and tells the
+  receiving SaveSync, which stops and cleans up the same way; the card there reads
+  *cancelled*. An offer taken back before anyone accepted it turns the card at the
+  other end into *cancelled* too, and so does a cancel while the files are still
+  being got ready. Both ends are told two ways — a short message between you, and
+  (for a send) a sealed notice in the transfer's own mailbox that the receiving
+  session keeps reading while it downloads — so one lost message does not leave
+  the other end waiting. If the sending PC is switched off, or SaveSync is simply
+  closed there, nothing can be sent and no notice is: a download that has had
+  nothing arrive for a minute says so (on the card and in the Receive panel) and that
+  the sender may be offline — it is **never given up on by itself**, since a
+  connection has no time limit, so you can keep waiting or cancel.
+- **A token's time** — **10 minutes from the moment it was made, wherever it ends
+  up, for the sender to make FIRST CONTACT; nothing else is limited by it**: one
+  pasted later is refused as *expired*, the Receive panel replaces a token that
+  runs out unused, and a friend's row disappears at zero. The two clocks need not
+  agree: the deadline shown is the earlier of what the token's own stamp and its
+  sender's "seconds left" say. An offer that arrived in time stays until you
+  answer it, and once it is accepted the transfer runs for as long as it takes —
+  there is no time limit on a connection and none on a file's size. Getting a big
+  offer ready (every byte of it is hashed) can take longer than ten minutes, so a
+  sender that is still busy after 45 seconds leaves a small sealed *hold* in the
+  mailbox and renews it every 30: the receiver reads it as the sender having
+  arrived, stops counting the token down (the panel says the sender is getting the
+  files ready) and keeps waiting for as long as the sender keeps saying it is
+  working — five minutes without a word and it gives up. A sender that never
+  makes contact in time, or whose first connection does not happen within 12
+  minutes of publishing the offer, is the only way a send is dropped for time.
+- **Staying reachable.** While SaveSync runs it looks in your friends' mailboxes
+  every few seconds when a window is open and about every 20 seconds otherwise,
+  so a token arrives while you play. Turn *Check friends for tokens in the
+  background* off and it only looks while the Friends panel or the Receive window is open.
+  With no friends it uses no network at all for this.
+- **Removing** a friend stops SaveSync listening to them (and drops any token
+  of theirs); they are not told.
+- **Locking the list.** The ⋯ menu next to *Lock* sets a **lock password**, and it
+  is a real encryption, not only a screen: the friend file is sealed under a random
+  data key that the file keeps wrapped by your password (scrypt, 128 MiB, about a
+  third of a second per try; ChaCha20-Poly1305). Without a password the file is
+  sealed under a key this PC makes for itself - which any program running as your
+  Windows user can derive, so it only keeps the file from being read off the disk
+  elsewhere. With one, **nothing on this PC can open the file without the password**,
+  and the file does not need this PC's key at all.
+  The list is closed when SaveSync starts, after the minutes you choose without
+  using it (*Lock friends after*, Settings, 10 by default, *Never* = only the button)
+  and whenever you press **🔒 Lock**. Closing it saves it, stops the friends'
+  network, and forgets the key and everything decrypted (the friends, the
+  conversations, your identity, the mailbox keys): the program holds nothing it
+  could be made to show. If a transfer is still going on it is closed on screen
+  at once and sealed when the transfer is over. Python cannot wipe memory, only let
+  go of it, so this keeps the list from a program that reads the file, not from one
+  that reads this process while the list is open.
+  **While it is locked nothing is listened for**, so nothing arrives, is announced
+  or counted on the badge; what friends send waits for you - their texts stay in
+  their outbox until you acknowledge them, and the mailbox keeps them in the DHT -
+  and is taken the moment you unlock. (After a start, listening begins the first
+  time you open the list.) Because the key only exists behind the password, a
+  forgotten one cannot be recovered - see the next point. After five wrong passwords in
+  a row it waits 30 seconds (that slows a person typing; against someone who has
+  only the file, the cost of each try is the scrypt work).
+  Nothing is generated for you and nothing is set until you do it: you choose the
+  password (any text, at least 8 characters now that it protects a file offline),
+  type it twice to confirm it, and changing or removing it asks for the current one
+  first.
+- **Forgot the lock password?** The only way back in is to delete the list: press
+  **Forgot the password?** on the lock screen, or **Reset…** next to *Friend list* in
+  Settings (which is never locked, and keeps working while the list is). After one
+  plain question it deletes, for good, your friend code and every friend, all
+  conversations and unsent messages, the lock password, anything being sent or
+  received through friends (and the token waiting in the Receive panel), and what
+  Settings remembers about friends. You get a new friend code; nobody on the old list
+  can reach you, or be reached, until you add each other again. Files you already
+  received, link files you made and all other settings stay. The files are
+  deleted, not shredded - and a list that had a lock password was sealed under it,
+  which is what keeps its leftovers unreadable.
+- **Another PC.** The friend file is tied to this machine and login, so it cannot
+  simply be copied. **Link another PC…** (⋯ menu) writes a link file protected by a
+  password you choose (at least 8 characters, stretched with scrypt); on the other
+  PC use **Import from another PC…** and type it. Both then are *you* to your
+  friends — but two PCs on one identity overwrite each other's mailbox, so after
+  writing the file SaveSync offers to remove the friends from this PC. What an
+  import or a removal replaces is kept next to the file. Anyone holding the file
+  *and* the password can read your friends and write as you: keep both safe.
+
+### If it doesn't connect
+
+The two machines find each other through the public BitTorrent network — at a
+meeting point only they know, see below — and then connect directly. That
+usually takes a few seconds, longer on a slow network. If the sender sits at 0
+peers:
+
+- Keep **UPnP** on (the default) so the router opens the port itself.
+- If your router has UPnP switched off, set a fixed **Connection port** in
+  Settings and forward it (TCP and UDP) to your PC. Only one of the two sides
+  needs to be reachable. A fixed port is what makes a hand-made forward
+  possible; with *Auto* the port changes every time.
+- A fixed port that's already in use (say, a second transfer in the same app)
+  moves up to the next free one rather than failing.
+- Turn UPnP off only if you forward by hand and don't want the router asked.
+- With *Use TLS for transfers* on, one of the two PCs needs a port that can be
+  reached, and nothing falls back to the plain kind: see [TLS](#tls-optional).
+- Both sides need the same generation of SaveSync: an older build can't read the
+  offer, and the sender just keeps waiting.
+
+### Speed
+
+A transfer is meant to use all of your line. What decides that, measured on this PC
+(one gigabyte, both ends on loopback, so the line itself is not in it):
+
+- **TCP first.** The connection is tried over TCP, which runs at the speed of the
+  line (about 220 MB/s here), and over uTP - the fallback that gets through a router
+  with no open port - only if nobody has connected after 6 seconds. uTP is
+  user-space and tops out at about 47 MB/s here whatever its settings, so it is the
+  difference between a gigabit line being full and a fifth used. Opening a port
+  (UPnP on, the default, or a forward) lets the first one work. Behind the SOCKS5
+  proxy uTP is the only way there is.
+- **The disk cache.** Received data now goes through the operating system's cache.
+  The old default wrote every piece straight through to the disk, which held a fast
+  transfer to 90-150 MB/s here.
+- **Finding each other sooner.** The first announce at the meeting point is made
+  before the DHT has a single node and is lost; the next few now follow after 2, 3,
+  5 and 8 seconds, instead of one after 20 - the two PCs meet in seconds instead of
+  tens of seconds.
+- **What it did not need.** A longer request queue, bigger socket buffers and a
+  bigger piece size were tried and changed nothing measurable (the queue also on an
+  emulated path of 100-600 ms at 300 Mbit/s); a very small piece size (16 KB) is far
+  slower, so the automatic size is kept. Switching encryption off made no
+  difference either: RC4 and the piece checks are not what limits a transfer.
+- **What cannot be measured here:** your real line. A real internet path has
+  slow-start and other traffic of its own, and a file goes the speed of the slower of
+  the two PCs' lines.
+
+### TLS (optional)
+
+*Use TLS for transfers* (Settings) swaps BitTorrent's own encryption (RC4 under a
+secret info-hash, see *Privacy* below) for TLS - an authenticated modern cipher -
+through libtorrent's "SSL torrents". Nothing is copied; the files stay links.
+
+- **A transfer is TLS or it does not happen.** Every connection is TLS and each
+  side must show a certificate signed by that transfer's own authority; a peer that
+  is not speaking TLS is refused. There is no fallback to the other kind. The
+  setting is the *sender's* choice (the offer says so, and the Receive panel shows
+  a 🔒); a PC with it on also opens an SSL socket while it waits to receive. A PC
+  with it off can still take a TLS offer, but only from a sender whose port can be
+  reached.
+- **No certificate travels.** The authority is derived, on both PCs, from the token
+  they share (the offer is sealed under it): the same key and certificate byte for
+  byte, because Ed25519 signs deterministically and every field is fixed. Each side
+  makes a certificate of its own, a fresh key every time, and has it signed by the
+  authority - which only somebody holding the token can do. TLS 1.3 key exchange
+  is ephemeral, so a token that comes to light later opens nothing that was
+  recorded. A stranger who somehow got the torrent's description, but not the token,
+  is turned away at the handshake (tested), as is a plain connection to the plain port.
+- **Two steps instead of a magnet link**, because a magnet link cannot start an SSL
+  torrent: the receiver has to be given the torrent's description. The offer carries
+  the description of a tiny first torrent (about 140 bytes, a version-2 torrent so
+  that it stays that size), that torrent carries the real one's description, and then
+  the real transfer begins - the same one as ever, so watching while downloading,
+  cancelling from either end and the checks on arrival work as they do without TLS.
+  It adds a second or two at the start.
+- **It needs a port that can be reached** on at least one of the two PCs (UPnP is on
+  by default). The SSL sockets are not the one the DHT uses, so the address the DHT
+  learns for them is the port named outright, not the one a router mapped for the
+  DHT: where a pair connects only by punching through routers, which plain
+  transfers do, TLS may not. When it cannot connect, nothing falls back; the cure is
+  a forwarded port (set the *Connection port*; the SSL port is the next one up) or
+  turning TLS off. This part was tested on loopback only - UPnP and real routers are
+  not something this PC could try.
+- **Not with the proxy.** TLS over uTP needs a socket that listens, which a proxy
+  forbids, so with the proxy on TLS is not used (the Settings box says so) and
+  transfers are the plain, proxied kind.
+- **Cost:** about 40% slower than RC4 in the same loopback test (136 against 220 MB/s),
+  still above what a gigabit line carries.
+- **Who sees what:** the SNI of a TLS connection is the torrent's info-hash in the
+  clear - random to anyone else, and useless without a certificate.
+
+### Hiding your address
+
+Peer to peer cannot hide an address by itself: the friend on the other end
+connects to your PC, and the DHT nodes that keep the mailboxes see who asks them.
+The only way out is to let something else be seen instead - a **SOCKS5 proxy**
+(many VPN services offer one). In Settings, switch on *Hide my address behind a
+SOCKS5 proxy*, give its address and port (and a login if it wants one) and press
+**Test**.
+
+- **Through it, or not at all.** Every P2P packet and connection - the DHT, the
+  mailboxes, the transfers, both ways - goes through the proxy. If it is down,
+  refuses, or has no UDP, nothing is sent: never "directly instead". Switched on
+  but not filled in, P2P is paused the same way, and the Friends panel says so.
+- **Nobody connects in.** SaveSync stops listening and stops asking the router for
+  a port (UPnP / NAT-PMP). The two PCs meet the way two PCs behind routers do: each
+  reaches for the address the other showed in the DHT, which is the proxy's.
+- **It needs a proxy that carries UDP** (SOCKS5 "UDP ASSOCIATE") and gives you one
+  address for all your traffic. **Test** says if UDP is missing; Tor's SOCKS port
+  has none, so it cannot be used. Hiding one side is the safest; hiding both
+  works when the proxy lets the other's packets in, as a router would - if a
+  transfer never connects, that is the first thing to suspect.
+- **Changing it.** The friends' network restarts by itself; a waiting token (or an
+  offer you have not accepted yet) is dropped for a new one; a transfer already
+  running finishes the way it began.
+- **The login** is kept in `p2p_proxy.dat`, encrypted for this PC - not in
+  `config.json`, and never in a config export.
+- **What it does not hide:** the proxy's operator (and the line up to it) still
+  knows your PC and sees that you use P2P, when and how much. The name of the
+  DHT's starting server is looked up by your PC's own DNS, not through the proxy.
+- **Why not I2P.** I2P was designed and tried (libtorrent left exactly as it is,
+  talking only to 127.0.0.1, small bridges carrying its connections over I2P
+  streams: a transfer, cancel and all, worked against a pretend router) but dropped: its
+  router needs 10-20 minutes before it is usable the first time, and offline messages
+  would need roughly 20-50 PCs of SaveSync users on I2P. Tor is what private mode
+  uses instead.
+
+### Private mode (Tor)
+
+A proxy puts somebody else's address where yours was, and needs one. **Private mode**
+(Settings, *Private mode: hide this PC's address with Tor*) needs nothing: SaveSync carries
+a copy of Tor (the Tor Project's own program, kept in `vendor/tor`, fetched and checked by
+`tools/fetch_tor.py`), starts it when it is first needed and ends it with the application.
+The two PCs meet inside Tor, at *onion addresses*, and neither ever sees the other's
+address - nor do the relays, nor the DHT, which is not used at all while this is on.
+
+- **Transfers.** The receiver's token says it is a private one (it is one byte longer) and
+  leads to an onion address that both sides work out from it; the receiver waits there, the
+  sender reaches it, and the offer, the "I am still preparing" notes and a cancel cross on a
+  control stream, sealed under the token as ever. libtorrent is left exactly as it is -
+  hardlinked staging, pieces, cancel, watching a video while it arrives - but listens on
+  127.0.0.1 only, makes its connections from there only, and has no DHT, no router
+  port-mapping, no local discovery and no uTP (`core/p2p/transfer.py`,
+  `_tor_session_settings`). Small loopback bridges carry its connections over Tor
+  (`core/p2p/tor_link.py`).
+- **Friends.** Each friendship has two onion addresses, one for each end, that both
+  friends work out from the secret they share; this PC serves its own and reaches for the
+  friend's. The very same sealed slot a mailbox would hold - hello, tokens, numbered
+  texts, the acknowledgement - goes down that stream whenever it changes
+  (`core/p2p/tor_friends.py`). The DHT mailboxes are not touched, so there is no longer
+  anything for a DHT node to match: a mailbox that one address writes and another reads is
+  what let two addresses be tied together there, and Tor carries no UDP to hide it.
+- **Both ends need it.** A private token cannot be used by a PC that is not in private mode
+  and a plain token is refused by one that is - it would show that PC's address - each with a
+  message saying so; friends talk to friends in the same mode.
+- **What it costs.** Nothing waits in the network for a friend who is off: a text stays in
+  your outbox (numbered, kept until acknowledged, as always) and goes the moment you are both
+  on; a token needs the friend on while it is good, and is reported as not delivered after three
+  minutes otherwise. Transfers run at a few hundred kilobytes a second, not megabytes. The
+  first start on a PC downloads the list of relays (measured: 42, 56 and 126 seconds); every
+  later one takes about three.
+- **Speed.** A Tor circuit carries about 0.06-0.18 MB/s on the PC this was measured on, so each
+  transfer uses six, side by side, each its own peer: the bridges give a connection a peer id of
+  its own and take the listen port and the "upload only" notices out of the extended
+  handshake - without that libtorrent keeps one connection of the six and closes the rest, and
+  a receiver that has not yet put the files in their places makes it drop the one it has and never
+  call the sender back. BitTorrent's own encryption is off (Tor is end to end already). The six
+  circuits are made while the receiver is still reading the offer, so the transfer starts at
+  once when it accepts. Measured through two real Tor programs, 25 MB with sub-folders arrived
+  bit-identical in 78 seconds - 0.32 MB/s on average, 0.35-0.43 once under way - where one
+  circuit gave 0.17; more than six circuits added nothing (8 and 12 gave the same, and three
+  entry guards instead of one did not help either). A circuit that fails is replaced by one on a
+  new circuit and the transfer goes on. The ceiling is the Tor network's, not this program's.
+- **Getting there.** Reaching an onion service takes seconds and now and then minutes (a slow
+  relay; a service so new that the directories do not have it yet - seen: 61 s, and once 300 s of
+  time-outs). So a try that is slow is not waited for alone: after 15 seconds a second goes out on
+  other circuits, then a third, and the first to answer is used; a try that FAILS is not raced
+  (the service is not up). And a token made in private mode is handed to a friend only once its
+  own address can be found.
+- **Measured.** An onion service is found about 3 seconds after it starts; the offer arrived
+  11-17 seconds after the sender began (and once 61 s, before the racing existed), the first bytes
+  2.5 seconds after accepting; a link between two friends was up in 9 seconds, a text crossed in
+  under a second.
+- **Safety.** If Tor cannot start - no program, no network - nothing is sent: never
+  "directly instead". libtorrent is told to connect from 127.0.0.1 only, so a connection to
+  the internet could not be made even by mistake; the receiver never connects out and the
+  sender takes none in, because a peer says which port it listens on and here that would be
+  a port of this very PC, chosen by the other side. What arrives on the control stream is
+  believed only if it opens under the token (or the friendship's key); a stream that does
+  not begin with the byte that says what it is, or whose BitTorrent handshake is not
+  BitTorrent's, is dropped; at most 24 connections are served at once.
+- **What it does not hide.** That this PC uses Tor (your provider sees a Tor connection, not
+  where it goes), and the size and timing of what crosses. Tor is a network run by volunteers:
+  a transfer of hundreds of megabytes is a real load on it, so keep private mode for what needs
+  it.
+- **Two things learned the hard way, for whoever works on it.** Whatever sits behind an onion
+  service must never speak first - tor 0.4.9 on Windows then leaves the first bytes on its
+  buffer for good (BitTorrent's connecting side always speaks first, so libtorrent is fine; a
+  test server that greets is not). And a circuit takes 3-60 seconds to set up, so libtorrent's
+  handshake timeout is raised from 10 s to two minutes.
+
+### How it works
+
+**The mailbox.** The receiver's token is 15 random bytes (shown in base32);
+hashing it gives the seed for a keypair generated fresh for that transfer. The
+sender derives the same keypair from the token and writes the offer — magnet
+link, their identity, what is being sent — into a BitTorrent DHT "mutable item"
+(BEP44) addressed by that keypair; the receiver, already watching that address,
+reads it back. The offer is **sealed** first (ChaCha20-Poly1305, with a key
+derived from the token), so the DHT nodes that store it hold noise: only the two
+of you can open it, and an altered or foreign item is rejected. If the DHT
+hasn't taken the item yet, the sender publishes it again before giving up -
+and again if no answer comes at all. Every mailbox item, of any kind, is padded to
+the same size before it is sealed (the padding is trailing spaces in the JSON, which
+any reader ignores), so a node cannot tell a short text from a long one, or a hold
+from an offer, by its size.
+
+**The meeting point.** The magnet link carries the torrent's info-hash, and
+that is what a stranger would need to find the download. So it is never
+announced: the torrent has no tracker, and the DHT, local-network discovery and
+peer exchange are all switched off for it. Instead both sides announce their
+address under a "rendezvous" hash derived from the token — it has no connection
+to the info-hash — look that up, and connect to whatever the other left there.
+
+**Friends.** Each person has an X25519 identity key that stays on their machine;
+the friend code is its public half plus a checksum, so a typo is caught. From
+the two keys two friends derive — separately for each *direction* — a key pair
+for a DHT mutable item (the friend's mailbox) and a sealing key. To the DHT that
+is two random-looking keys per friendship: no names, no contact list, nothing
+that ties a mailbox to a person. **They change every six hours:** the keys also
+come from the number of the six-hour period (an "epoch") the clock is in, so a node
+that stores or sees a mailbox cannot recognise it later. Each friendship's periods
+begin at an offset taken from what the two share (not all at once, which would be a
+burst from every SaveSync there is). A mailbox is written under the period my clock
+is in; a friend whose clock is up to ten minutes off still finds it, because the
+period before is read for the first 2 hours 10 minutes of a period (an item can
+live that long in the DHT, so a friend who was away still gets it) and the next
+one for the last ten minutes. What is waiting is written again under the new keys
+when a period begins, and a message seen twice is taken once. What the mailbox holds, sealed
+(ChaCha20-Poly1305), is a "hello" with the sender's name, the tokens sent in the
+last few minutes, the texts the friend has not acknowledged yet and the sender's
+own acknowledgement of theirs, at most about 900 bytes; each message has an id and
+is taken once, and the sender writes it again every 45 minutes so it does not
+expire from the DHT. A text carries a number inside a random "numbering" of its
+own (an epoch, made with the first one): the friend answers with "I have up to n
+of that epoch", the sender drops what is covered and marks it delivered, and a
+skipped number shows up as a gap rather than going unnoticed. A text is never
+dropped to make room: when the mailbox is full the next one is refused. Only the two friends can derive the sealing key, which is also what
+tells the receiver a message really is from that friend. The identity and the
+list are kept in one file, `p2p_friends.dat` in SaveSync's data folder - sealed
+under the lock password when there is one (see *Locking the list*), otherwise under
+the same machine-bound key as the cloud credentials - and are never part of a
+config export. If the file can't be read it is set aside, not
+overwritten, and a new identity is made. A link file is the identity and the list
+sealed (ChaCha20-Poly1305) under a key from your password (scrypt).
+
+**The token's time.** The ten minutes are for the sender reaching the mailbox, not
+for what comes after. Before the torrent exists every piece of the offer has to be
+hashed, which takes as long as the offer is big; if that outlasts 45 seconds the
+sender writes `{"hold": n}` (sealed like the offer) into the same mailbox, again
+every 30 seconds, and writes the real offer only after the last hold has been
+stored (a mailbox keeps the highest sequence number). The receiver reads a hold as
+first contact: the token stops counting down, and the wait ends only when the
+offer comes, the person cancels, or five minutes pass without a renewal. After the
+offer is accepted nothing has a clock — not the download, not the seeding, not
+the connection.
+
+**Stopping, and watching meanwhile.** A *cancel* between friends is a small
+message naming the offer and saying who stops (*withdraw*: the sender took it
+back; *stop*: the receiver stopped an attempt) — dropped before any text when the
+mailbox is crowded, like a token. For a send in progress the sender also writes a
+sealed `{"cancel": 1}` into the token's mailbox and keeps its session alive a few
+seconds so that it is stored; the receiving session looks at that mailbox every
+five seconds while it downloads. Stopping a download removes the torrent, waits
+until libtorrent has let go of the files, notes which were whole, and deletes the
+rest on a worker thread, retrying where Windows still holds a file. Watching
+while downloading (`core/p2p/transfer.py`, `TorrentStream`) asks the torrent for
+the pieces under the read position first and the next few behind them, switches
+the download to in-order from the first real read, and before handing out a byte
+reads the piece back from the disk and compares its SHA-1 with the torrent's — a
+piece the torrent has but the disk does not yet is waited for, never guessed.
+
+**Chat formatting and attachments.** The marks in a message are read when it is
+shown (`core/p2p/markup.py`): the text is cut into plain text, code, links and
+emphasis, every character is HTML-escaped, and the label is given only the few
+tags that module writes itself, with a link as an index into the list it checked
+— so a message has no way to bring a tag, an address or a resource of its own. An
+attachment offer is a numbered text with a small description (name, number of
+files, size), so it is as reliable as a text and an older SaveSync shows it as one;
+the accepting token is an ordinary token message that names the offer it answers.
+The sender sends with the same sealed transfer as everything else, naming the
+offer inside the sealed part; the receiving PC takes the arrival by itself only
+when it is that offer (same number of files, same size), and before anything is
+fetched it checks the file list the torrent holds — names, kinds, counts, sizes
+(`core/p2p/attachments.py`).
+
+**The connection.** BitTorrent's protocol encryption is mandatory both ways (RC4;
+a plain peer is refused), and its key includes the info-hash, which only the two
+of you know. A client that doesn't know it can't join the transfer or read it. The
+info-hash is in the sealed offer and nowhere else, and the torrent's name carries
+128 random bits, so it cannot be worked out even for a file everybody has.
+
+| What travels where | Why |
+|---|---|
+| Sealed DHT mailbox: magnet link, sender name and machine id, game name, filename, size — and for files, how many and the folder they came from | BEP44 items cap out around 1000 bytes: room only for what's needed to decide *before* downloading. Long names are trimmed to fit |
+| `manifest.json` inside a **backup's** torrent | The full backup entry (save paths, exe path, chains) and the archive's real file name — no size cap, read only after accepting |
+| **Files and folders:** nothing extra | The torrent holds just the files, laid out as they are: no manifest, no wrapper folder |
+
+For files, the receiver fetches the file list first, gives each file its final
+path, and only then starts the download — so nothing is written anywhere else
+and an existing file can't be hit by accident. A download counts as finished
+only once the torrent has been released and the files are closed; until then the
+last bytes may still be on their way to the disk.
+
+### Privacy: what the network sees
+
+- **Hidden:** the offer (who sends, what, how big, the magnet link), the
+  torrent's info-hash, the file names and the contents. The public network sees
+  a sealed blob in the mailbox and two machines announcing and looking up a hash
+  that means nothing to anyone else. No tracker is contacted.
+- **Not hidden:** that two IP addresses met at that hash and then exchanged
+  traffic — as in any peer-to-peer connection — and that they use the BitTorrent
+  network. A SOCKS5 proxy puts its address there instead of yours; see
+  [Hiding your address](#hiding-your-address). **Private mode** hides it from the
+  other side and from the DHT alike, which it does not use; see
+  [Private mode](#private-mode-tor).
+- **The token is the secret.** Whoever has it can read an offer meant for you or
+  send you one (you still have to accept). Hand it over through a channel you
+  trust — or to a friend, which sends it sealed; it works once, for ten minutes,
+  and a spent one disappears from the panel.
+- **Friends:** the network sees mailboxes that belong to nobody in particular, not
+  who your friends are — and not what is in them or how long it is (every item is padded to
+  one size), only that a sealed item changed, and when. A mailbox's key changes every six hours, so
+  one node cannot follow the same pair for long (the two addresses that write and read it
+  can still be matched within a period, by timing; only a proxy or private mode changes that - in
+  private mode there is no mailbox at all). Your conversations are kept on this PC, in the friend file, and
+  nowhere else but your friend's own PC. The lock password and the link password are two different
+  things: the first encrypts the friend file on this PC and closes the list, the second
+  is what protects a link file if it is copied or lost. Your identity key never leaves your machine; whoever got
+  hold of it could read what your friends still have stored for you (tokens that
+  have long run out) and pose as you to them — there is no forward secrecy for
+  these short-lived messages.
+- **Formatting, links, attachments:** none of it makes SaveSync contact anything
+  but your friend. A link is opened by your browser only after you confirm it, and
+  no preview is fetched; a file is offered, not pushed, and checked against its
+  offer; see *Attachments* above for what is refused.
+- **The cipher is BitTorrent's** (RC4 with a secret key, not a modern
+  authenticated cipher), and the files are not encrypted a second time inside:
+  that would mean writing an encrypted copy of everything sent, which a
+  link-only send avoids on purpose (50 GB must not cost 100 GB). Integrity is
+  BitTorrent's piece hashes, taken from the sealed offer. What makes this hold is
+  the secrecy of the info-hash, not RC4 itself: RC4 is old, but its known weaknesses
+  need many encryptions under one key or a guessable one, and here every transfer
+  has its own key (made from a 160-bit secret) with the first 1024 bytes of the
+  stream thrown away. BitTorrent's key exchange is small by today's standards, but
+  the info-hash is mixed into the key, so breaking the exchange alone gives
+  nothing. It is not what a modern cipher would give; that would need the encrypted
+  copy.
+- **TLS is the stronger, optional choice** (see [TLS](#tls-optional)): an
+  authenticated modern cipher with forward secrecy, still without a copy of the
+  files. It is not the default because it needs a reachable port and cannot be
+  hole-punched or proxied the way the plain transfer can; RC4 under the secret
+  info-hash works everywhere.
+- The name an offer shows is whatever the sender typed as their display name, so
+  accept only what you're expecting.
+
+P2P needs the `libtorrent` package, which is in `requirements.txt` and bundled in
+the release builds.
 
 Relevant files: `core/p2p/transfer.py` (the DHT-mailbox + BitTorrent
-mechanics), `ui/dialogs/p2p_send_dialog.py`, `ui/dialogs/p2p_receive_dialog.py`.
+mechanics, sending and receiving, the token's 10-minute clock),
+`core/p2p/proxy.py` (the SOCKS5 option: settings, the login, the Test),
+`core/p2p/tls.py` (the optional TLS transfer: certificates derived from the token),
+`core/p2p/tor.py` (private mode: the Tor program, its control port, onion addresses made
+from a secret), `core/p2p/tor_link.py` (the loopback plumbing between libtorrent and Tor:
+control stream, circuits), `core/p2p/tor_friends.py` (the friends' direct link over Tor),
+`tools/fetch_tor.py` (fetches and checks the Tor program into `vendor/tor`),
+`core/p2p/secret.py` (the keys derived from the token or a friendship),
+`core/p2p/friends.py` (friend codes, per-direction mailboxes, the encrypted
+friend file), `core/p2p/friend_net.py` (the DHT session that reads and writes the
+friends' mailboxes), `core/p2p/markup.py` (the marks and links a message may
+use), `core/p2p/attachments.py` (what an attachment may be, and the checks on its
+arrival), `ui/dialogs/p2p_link_dialog.py` (the "open this link?" question),
+`ui/widgets/safe_image.py` (the one place a picture is decoded),
+`ui/widgets/safe_video.py` (the one place a video is played),
+`ui/widgets/stream_device.py` (what lets it read a file that is still arriving), `ui/p2p_friends_service.py` (the friend list, received
+tokens and their countdowns), `ui/dialogs/p2p_friends_dialog.py` (the Friends
+panel that slides out of the sidebar), `ui/dialogs/p2p_friends_reset.py` (the question before the friend list is deleted), `ui/dialogs/p2p_send_flow.py` (pick, confirm, send), `core/p2p/paths.py`
+(where received files go), `ui/p2p_receive_service.py` (keeps the receive session alive with the panel
+closed, files the archive, does the move), `ui/dialogs/p2p_send_dialog.py`,
+`ui/dialogs/p2p_send_confirm_dialog.py` (the list of files to send),
+`ui/dialogs/p2p_receive_dialog.py`.
 
 ---
 
@@ -1369,6 +2091,7 @@ Other automatic I/O habits worth knowing:
 | `check_for_updates` | true | Look for a newer release (`update_check_interval_sec`, 0 = at startup only) |
 | `extra_watch_paths` | [] | Additional folders the filesystem watcher should keep an eye on |
 | `theme` / `language` | `dark` / `en` | Appearance and tool language |
+| `p2p_username`, `p2p_max_per_game`, `p2p_retention_days`, `p2p_files_dir`, `p2p_port`, `p2p_upnp`, `p2p_friends_online`, `p2p_friends_autolock_minutes`, `p2p_proxy`, `p2p_proxy_host`, `p2p_proxy_port` | see the P2P section | P2P display name, how many received saves to keep and for how long, the folder files sent by hand are downloaded into, the connection port and UPnP, whether friends are checked in the background, and the optional SOCKS5 proxy — described under *Settings* in [P2P save transfer](#p2p-save-transfer) |
 | `ui_scale_auto` / `ui_scale_factor` | true / 1.0 | Follow the screen's DPI, or pin a factor by hand |
 
 Everything else in `config.json` is remembered state rather than a
@@ -1390,7 +2113,7 @@ the current state (`pre_restore` / `pre_import`) so you can undo.
 
 One ordered list of checks, run from exactly two places — automatically on
 the schedule you set (`self_checks_frequency`, default 7 days) and on demand
-from the ⚕️ button on the Backups page. Both run the same five:
+from the ⚕️ button on the Backups page. Both run the same six:
 
 | Check | What it does |
 |-------|--------------|
@@ -1399,6 +2122,7 @@ from the ⚕️ button on the Backups page. Both run the same five:
 | archive verification | opens every zip and CRC-checks its contents — the only check that proves a backup can actually be restored |
 | config snapshots | a sandbox restore over a full rotated history |
 | settings integrity | the OS autostart registration against what `launch_on_startup` wants — repairs a stale entry left by an old build (its path/filename baked in changes every update) or removes one left behind after the setting was turned off |
+| picture cache | deletes the hidden temporary files (`.<hex>.part`) a picture download leaves in a game's icon folder if the app is killed while writing one; a file a download could still own (this run, under 10 minutes old) is left alone |
 
 Progress appears in the sidebar, and past 30 seconds the notice offers a
 **Cancel**: cancellation is cooperative and lands between archives, so a

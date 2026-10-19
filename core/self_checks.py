@@ -25,6 +25,7 @@ cleaned up after itself):
     backup_archives        open every archive and CRC its contents
     config_history_restore config-snapshot restore guard
     settings_integrity     OS autostart registration vs what config wants
+    icon_cache             temporary picture files a killed download left behind
 
 Everything runs on one worker thread; callbacks fire there, so GUI callers
 must marshal to their own thread (a Qt signal).
@@ -52,6 +53,7 @@ CHECK_IDS = (
     "backup_archives",
     "config_history_restore",
     "settings_integrity",
+    "icon_cache",
 )
 
 
@@ -72,6 +74,9 @@ class CheckResult:
     # settings_integrity
     settings_repaired: bool = False
     settings_detail: str = ""
+    # icon_cache
+    icon_leftovers_removed: int = 0
+    icon_leftovers_failed: int = 0
 
     @property
     def ok(self) -> bool:
@@ -278,7 +283,8 @@ def _check_settings_integrity(result, fail, backup_ids, skip_recent_hours,
     core.startup.check_and_repair_registration() already does this repair
     silently at every launch; this just makes the outcome visible here too,
     on demand and on the schedule, instead of only in the log."""
-    from core.startup import check_and_repair_registration
+    from core.startup import (check_and_repair_registration, describe_registration,
+                              REG_FAILURES)
     try:
         repaired, detail = check_and_repair_registration()
     except Exception as e:
@@ -288,10 +294,34 @@ def _check_settings_integrity(result, fail, backup_ids, skip_recent_hours,
     result.settings_detail = detail
     if not repaired:
         logger.info("Check ok: settings_integrity")
-    elif "could not" in detail:
-        fail("settings_integrity", detail)
+    elif detail in REG_FAILURES:
+        fail("settings_integrity", describe_registration(detail))
     else:
         logger.info("Check ok: settings_integrity — %s", detail)
+
+
+def _check_icon_cache(result, fail, backup_ids, skip_recent_hours,
+                      on_backup_result, cancel):
+    """A picture is written under a hidden temporary name and renamed into place
+    when it is whole (ui.image_cache.store_picture). If the app is killed in
+    between, the temporary file stays in the game's cache folder: no screen lists
+    it, so nothing would ever remove it. Anything no download can still own is
+    deleted here; a picture being written right now is left alone."""
+    from ui.image_cache import sweep_picture_leftovers
+    removed, failed = sweep_picture_leftovers()
+    result.icon_leftovers_removed = removed
+    result.icon_leftovers_failed = failed
+    if failed:
+        try:
+            from i18n import t
+            detail = t("self_checks.icon_cache_failed", count=failed)
+        except Exception:
+            detail = str(failed)         # no running app to say it with
+        fail("icon_cache", detail)
+    elif removed:
+        logger.info("Check ok: icon_cache — %d leftover file(s) removed", removed)
+    else:
+        logger.info("Check ok: icon_cache")
 
 
 _RUNNERS = {
@@ -300,4 +330,5 @@ _RUNNERS = {
     "backup_archives": _check_backup_archives,
     "config_history_restore": _check_config_history_restore,
     "settings_integrity": _check_settings_integrity,
+    "icon_cache": _check_icon_cache,
 }

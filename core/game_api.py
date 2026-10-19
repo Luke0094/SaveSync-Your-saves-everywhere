@@ -415,7 +415,7 @@ def search_game_info_multi(game_name: str, appid: Optional[str] = None,
     # When primary name is a generic stem with no non-generic secondary hints
     # to guide the search, skip all web fallback — the query is uninformative.
     if enable_targeted_fallback or enable_generic_fallback:
-        apis_tried = "Steam, PCGamingWiki, VNDB"
+        apis_tried = "Steam, PCGamingWiki, VNDB"  # i18n-ignore (log text)
         logger.info(
             f"No result from primary APIs ({apis_tried}) for {primary!r}"
         )

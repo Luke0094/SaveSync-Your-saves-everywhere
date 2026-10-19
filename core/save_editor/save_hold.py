@@ -181,7 +181,7 @@ class SaveHold(QObject):
             # holding values requires a write, so stop rather than mangle it.
             from .base import explain
             err = SaveEditorError(
-                "this save can be read but not rewritten safely",
+                "this save can be read but not rewritten safely",  # i18n-ignore (English twin of cheats.err_read_only, for the log)
                 "cheats.err_read_only")
             logger.info(f"Hold stopped on read-only {self._path.name}")
             self.failed.emit(explain(err))

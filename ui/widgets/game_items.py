@@ -158,7 +158,7 @@ def _fmt_dt(iso: Optional[str]) -> str:
     from i18n import format_dt
     dt = to_local_dt(iso)
     if dt is None: return iso
-    return format_dt(dt, "%d %b %Y")
+    return format_dt(dt, "%d %b %Y")  # i18n-ignore (CSS / date format)
 
 
 def _fmt_dt_short(iso: Optional[str]) -> str:

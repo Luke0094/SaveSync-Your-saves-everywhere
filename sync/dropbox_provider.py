@@ -66,7 +66,7 @@ class DropboxProvider(SyncProvider):
                 return self._connect_token()
         except ImportError:
             logger.error("dropbox package not installed — run: pip install dropbox")
-            self.last_error = "dropbox package not installed"
+            self.last_error = i18n.t('dropbox.err_package_missing')
             return False
         except Exception as e:
             logger.error(f"Dropbox connect error: {e}")
@@ -254,11 +254,11 @@ class DropboxProvider(SyncProvider):
         _lbl_success = _lbl(label_success, "dropbox.oauth_callback_success",
                             "Authorization successful")
         _lbl_close = _lbl(label_close, "dropbox.oauth_callback_close",
-                          "You can close this tab.")
+                          "You can close this tab.")  # i18n-ignore (source-language fallback, see above)
         _lbl_failed = _lbl(label_failed, "dropbox.oauth_callback_failed",
                            "Authorization failed")
         _lbl_retry = _lbl(label_retry, "dropbox.oauth_callback_retry",
-                          "Please try again.")
+                          "Please try again.")  # i18n-ignore (source-language fallback, see above)
         import urllib.parse
         import webbrowser
 
@@ -294,7 +294,7 @@ class DropboxProvider(SyncProvider):
                 captured["state"] = params.get("state", [None])[0]
                 captured["error"] = params.get("error", [None])[0]
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", "text/html; charset=utf-8")  # i18n-ignore
                 self.end_headers()
                 from html import escape as _esc
                 if captured["code"]:

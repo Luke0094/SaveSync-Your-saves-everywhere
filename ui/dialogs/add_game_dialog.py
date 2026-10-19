@@ -37,7 +37,8 @@ from core.constants import get_folder_name_for_save, get_install_folder_name
 logger = logging.getLogger(__name__)
 
 from ui.image_cache import (_ICON_CACHE_DIR, migrate_icon_cache,
-                            _ensure_cache_compressed, _file_md5)
+                            _ensure_cache_compressed, picture_stem, move_picture_into)
+from ui.dialogs.picture_batch import PictureBatch, LatePictures
 from ui.widgets.search_inputs import _GhostLineEdit, _SuggestPopup
 from ui.widgets.path_row import PathRow
 from ui.dialogs.detect_worker import DetectWorker
@@ -424,9 +425,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     background_idle = Signal()
     # Sidebar status dot: "running" | "done" | "failed"
     background_status_changed = Signal(str)
-    # generation, url, bytes ("" when the download failed) — one more picture
-    # fetched off the GUI thread, see _start_extra_images
-    _extra_image_ready = Signal(int, str, bytes)
+    # Save with pictures still coming: they carry on without this dialog, into the
+    # game just stored (see LatePictures). Whoever opened the dialog takes it from here.
+    pictures_detached = Signal(object)
 
     def __init__(self, name: str = "", exe_path: str = "",
                  entry: Optional[GameEntry] = None, parent=None):
@@ -469,15 +470,24 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # already there writes none). Cancel removes these and only these — the
         # folder also holds what earlier sessions saved.
         self._session_new_files: set[str] = set()
-        # More pictures of the game (screenshots), fetched in the background and
-        # only ever ADDED to the carousel. _extra_gen invalidates a batch that
-        # was cancelled or outlived the dialog.
-        self._extra_gen = 0
-        self._extra_pending = 0
+        # The pictures ticked in the merge dialog (covers and screenshots), fetched
+        # in the background by a batch of their own and only ever ADDED to the
+        # carousel. None until the first is asked for; handed on at Save, if any
+        # are still coming (see _detach_pictures).
+        self._pictures: Optional[PictureBatch] = None
         self._extra_total = 0
         self._extra_failed = 0
-        self._extra_dest: Optional[Path] = None
-        self._extra_image_ready.connect(self._on_extra_image_ready)
+        # Which picture a cover may still take over: the one on show when the batch
+        # began, then each cover that took its place. Anything else on show means
+        # the person chose it, and a cover arriving later leaves it be.
+        self._cover_seen: Optional[str] = None
+        self._cover_rank = -1
+        # A new game's cache folder is named after what is typed in the name and exe
+        # fields; once typing pauses, the pictures follow it (see _follow_icon_folder).
+        self._icon_folder_timer = QTimer(self)
+        self._icon_folder_timer.setSingleShot(True)
+        self._icon_folder_timer.setInterval(500)
+        self._icon_folder_timer.timeout.connect(self._follow_icon_folder)
         self._session_initial_image_path: Optional[str] = None  # Image at dialog open (set on first search)
         self._session_image_captured: bool = False               # Guards the one-time capture above
         self._shortcut_name: Optional[str] = None  # Name extracted from shortcut filename
@@ -2928,16 +2938,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _on_name_changed(self, text: str):
         """Enable/disable web search button based on name field + bg mutex."""
         self._sync_bg_action_gates()
+        self._icon_folder_timer.start()
 
     def _sync_bg_action_gates(self):
         """Gate Save + search / URL-fetch / detect while a bg op runs.
 
         Form fields and manual save-path rows stay editable; Cancel stays
-        available. Save is locked so a mid-flight search cannot be committed.
+        available. Save is locked so a mid-flight search cannot be committed -
+        but not for pictures still coming in: those carry on after Save, into
+        the game it has just stored (see _detach_pictures).
         """
         busy = self._has_shelvable_work()
         if hasattr(self, "_add_btn"):
-            self._add_btn.setEnabled(not busy)
+            self._add_btn.setEnabled(not self._save_blocked())
         name_ok = bool(self._name_edit.text().strip()) if hasattr(self, "_name_edit") else False
         if hasattr(self, "_web_search_btn"):
             self._web_search_btn.setEnabled((not busy) and name_ok)
@@ -3221,6 +3234,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     def _on_exe_changed(self):
         """Handle exe path text changes for auto image detection."""
         self._update_exe_version_label()
+        self._icon_folder_timer.start()
         exe_path = self._exe_edit.text().strip()
         self._sync_exe_add_btn_label(exe_path)
         if exe_path and Path(exe_path).exists():
@@ -3387,45 +3401,6 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             missing.append(t('add_game.image'))
         return missing
 
-    def _find_duplicate_detected_image(self, path: Path) -> str | None:
-        """Hash *path* against every file already in the carousel; return
-        the existing path with identical content, or None."""
-        try:
-            new_hash = _file_md5(path)
-        except OSError:
-            return None
-        if new_hash is None:
-            return None
-        for existing in getattr(self, '_detected_images', None) or []:
-            if existing == str(path):
-                continue
-            try:
-                if _file_md5(Path(existing)) == new_hash:
-                    return existing
-            except OSError:
-                continue
-        return None
-
-    def _download_and_set_image(self, url: str):
-        """Download an image and make it the one on show (the cover).
-
-        The picture is added to the carousel like any other and becomes the
-        current one — see _start_extra_images for the ones that must not.
-
-        A picture the game already has on disk is selected as it is: fetching
-        it again only to have _store_downloaded_image find it identical and
-        delete the new copy was a download and a re-encode for nothing.
-        """
-        stored = self._stored_file_for_url(url)
-        if stored:
-            logger.info(f"Picture already stored, not downloaded again: {stored}")
-            self._pending_pixmap = None
-            self._set_web_image(stored)
-            return
-        fetched = self._fetch_image_bytes(url)
-        if fetched is not None:
-            self._store_downloaded_image(fetched[0], fetched[1])
-
     def _stored_file_for_url(self, url: str) -> "str | None":
         """The file this game already holds for the picture at *url*, or None.
 
@@ -3454,31 +3429,6 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 return p
         return None
 
-    @staticmethod
-    def _fetch_image_bytes(url: str):
-        """(final url, bytes) for *url*, or None when it is not a picture.
-
-        Only the network: no Qt and no dialog state, so a worker thread may run
-        it. Uses a realistic browser User-Agent and follows redirects; handles
-        protocol-relative URLs (//example.com/img.jpg).
-
-        A picture the candidate preview or the chip dialog already downloaded
-        is handed back from the session's store instead of being fetched a
-        third time (core.net.fetch_image); one fetched here is kept for the
-        next caller. Headers and the /thumb/-to-full rewrite are the ones the
-        previews use — see core.net.image_fetch_request for why they're needed.
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        if not url:
-            return None
-        if not (url.startswith("http") or url.startswith("//")):
-            logger.warning(f"Not downloading {url!r}: not an http(s) link")
-            return None
-        from core.net import fetch_image
-        return fetch_image(url, timeout=20)
-
     def _icon_dir_path(self) -> Path:
         """This game's folder in the icon cache — only its path, nothing made.
 
@@ -3501,8 +3451,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     @staticmethod
     def _cache_stem(url: str) -> str:
         """The file name (without extension) a picture from *url* is saved under."""
-        original_name = Path(url.split("?")[0]).stem
-        return "".join(c for c in original_name if c.isalnum() or c in "._- ")[:50]
+        return picture_stem(url)
 
     def _known_image_stems(self) -> set:
         """The pictures this game already has, as the file names (lower case, no
@@ -3527,196 +3476,6 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 stems.add(m.group(1))
         return stems
 
-    def _store_downloaded_image(self, url: str, image_data: bytes, *,
-                                select: bool = True, dest_dir: "Path | None" = None):
-        """Re-encode *image_data* into the icon cache and put it in the carousel.
-
-        *select* True makes it the picture on show (a cover); False only adds
-        it, leaving the cover, the position and the preview as they were.
-        *dest_dir* is the cache folder to write to (default: this game's now).
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        # Cleared up front: only the Qt-decode-success branch below sets this
-        # again. Without the reset, a download whose format Qt can't decode
-        # (falls through to the PIL/AVIF/raw-bytes branches, none of which
-        # touch _pending_pixmap) left a PREVIOUS successful download's pixmap
-        # sitting here, and _set_web_image happily painted that stale image
-        # over the new one instead of reading the new file from disk.
-        self._pending_pixmap = None
-
-        try:
-            import uuid
-
-            if len(image_data) < 512:
-                logger.warning(f"Downloaded image too small ({len(image_data)} bytes): {url!r}")
-                return False
-
-            magic = image_data[:16].hex().upper()
-
-            # Save directly to cache in a subfolder named after the game
-            game_icon_dir = dest_dir or self._icon_dest_dir()
-            game_icon_dir.mkdir(parents=True, exist_ok=True)
-
-            # The file name a picture gets comes from its URL (see _cache_stem)
-            safe_name = self._cache_stem(url)
-            # Always save as .jpg (compression converts to JPEG)
-            filename = f"{safe_name}.jpg"
-            cache_path = game_icon_dir / filename
-
-            # If file exists, check if it's the same (by hash) or rename
-            if cache_path.exists():
-                import hashlib
-
-                new_hash = hashlib.md5(image_data).hexdigest()
-                try:
-                    existing_hash = hashlib.md5(cache_path.read_bytes()).hexdigest()
-                except (OSError, IOError):
-                    existing_hash = None
-
-                if existing_hash == new_hash:
-                    pass  # Same file — reuse
-                else:
-                    filename = f"{safe_name}_{uuid.uuid4().hex[:8]}.jpg"
-                    cache_path = game_icon_dir / filename
-
-            _was_there = cache_path.exists()
-
-            # AVIF from attachment CDNs: register pillow_avif before Qt so
-            # the PIL re-encode path below can open the buffer even when Qt
-            # has no AVIF plugin (common on Windows without the store codec).
-            _is_avif = image_data[:12][4:8] == b"ftyp" and b"avif" in image_data[:32]
-            if _is_avif:
-                try:
-                    import pillow_avif  # noqa: F401
-                except ImportError:
-                    pass
-
-            # Try to decode with Qt first (JPEG/PNG/WebP; AVIF only with plugins)
-            _qt_ok = False
-            _px = QPixmap()
-            if (not _is_avif) and _px.loadFromData(image_data) and not _px.isNull():
-                self._pending_pixmap = _px
-                _qt_ok = True
-
-            def _encode_jpeg(pil_img, dest: str):
-                """Re-encode for the cache: clamp huge sources to 1280px on the
-                long edge (LANCZOS, shrink-only) and save as high-quality JPEG.
-                quality=88 + 4:4:4 chroma (subsampling=0) instead of the old
-                quality=80 + default 4:2:0, which visibly grained flat-color
-                art at card/modal sizes for a negligible size difference."""
-                from PIL import Image as _PILImg
-                if pil_img.mode != "RGB":
-                    pil_img = pil_img.convert("RGB")
-                _lanczos = getattr(_PILImg, "Resampling", _PILImg).LANCZOS
-                pil_img.thumbnail((1280, 1280), _lanczos)
-                pil_img.save(dest, "JPEG", quality=88, optimize=True, subsampling=0)
-
-            # Save with correct extension based on actual content
-            if _qt_ok:
-                try:
-                    # Imported INSIDE the try on purpose: a broken/absent PIL
-                    # (a frozen build missing PIL._imaging raises ImportError
-                    # here) must fall through to the Qt encoder below, not
-                    # abort the whole download — Qt has already decoded the
-                    # image at this point, so the only thing PIL adds is the
-                    # JPEG re-encode.
-                    from PIL import Image as _PILImage
-                    import io as _io
-                    _pil_img = _PILImage.open(_io.BytesIO(image_data))
-                    _encode_jpeg(_pil_img, str(cache_path))
-                    logger.info(f"Saved as JPEG via PIL: {cache_path.name}")
-                except Exception as _pil_err:
-                    logger.info(f"PIL re-encode unavailable ({_pil_err}) — using Qt")
-                    # Qt encodes the already-decoded pixmap instead, applying
-                    # the same 1280px clamp so the cache stays comparable.
-                    _px_save = self._pending_pixmap
-                    if max(_px_save.width(), _px_save.height()) > 1280:
-                        _px_save = _px_save.scaled(
-                            1280, 1280,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        )
-                    if _px_save.save(str(cache_path), "JPEG", 88):
-                        logger.info(f"Saved as JPEG via Qt: {cache_path.name}")
-                    else:
-                        png_path = cache_path.with_suffix(".png")
-                        if _px_save.save(str(png_path), "PNG"):
-                            cache_path = png_path
-                            logger.info(f"Saved as PNG via Qt: {png_path.name}")
-                        else:
-                            cache_path.write_bytes(image_data)
-                            logger.warning("Qt/PIL both failed to encode, saved raw bytes")
-            else:
-                logger.warning(f"Qt could not decode (magic: {magic}) — trying PIL")
-                _saved = False
-                try:
-                    from PIL import Image as _PILImage
-                    import io as _io
-                    try:
-                        import pillow_avif
-                    except ImportError:
-                        pass
-                    _pil_img = _PILImage.open(_io.BytesIO(image_data))
-                    _encode_jpeg(_pil_img, str(cache_path))
-                    self._pending_pixmap = QPixmap(str(cache_path))
-                    logger.info(f"PIL decoded (AVIF plugin?) and saved as JPEG: {cache_path.name}")
-                    _saved = True
-                except Exception:
-                    pass
-                if not _saved:
-                    # Try system AVIF codec via file (Windows 11 + AVIF Extension)
-                    _avif_p = cache_path.with_suffix(".avif")
-                    _avif_p.write_bytes(image_data)
-                    _px2 = QPixmap(str(_avif_p))
-                    if not _px2.isNull():
-                        self._pending_pixmap = _px2
-                        cache_path = _avif_p
-                        logger.info(f"Loaded via system AVIF codec: {_avif_p.name}")
-                        _saved = True
-                    else:
-                        _avif_p.unlink(missing_ok=True)
-                if not _saved:
-                    cache_path.write_bytes(image_data)
-                    logger.warning(f"No decoder available for format (magic: {magic}) — saved raw")
-
-            # A repeat download of the SAME picture can land under a
-            # different filename than any earlier copy already in the
-            # carousel: the collision check above (around cache_path.exists())
-            # only catches a same-NAME clash, and even then it hashes the
-            # RAW fetch against an on-disk file that already went through
-            # re-encoding above — apples to oranges, so it almost never
-            # matches. That let a repeat fetch of the same URL (e.g.
-            # re-confirming the same candidate across separate sessions)
-            # quietly add a visually-identical, differently-named file every
-            # time — the "duplicated images in the carousel" symptom. Catch
-            # it here by content, against every file already detected,
-            # after all the encode branches above have settled on final
-            # on-disk bytes.
-            _dup = self._find_duplicate_detected_image(cache_path)
-            if _dup and _dup != str(cache_path):
-                try:
-                    cache_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                cache_path = Path(_dup)
-            elif not _was_there:
-                self._session_new_files.add(str(cache_path))
-
-            if select:
-                # Apply the downloaded image to the carousel immediately
-                self._set_web_image(str(cache_path))
-            else:
-                self._attach_extra_image(str(cache_path))
-            # Track URL ↔ local path mapping for subsequent unchanged checks
-            self._image_url_cache[url] = str(cache_path)
-            self._image_path_to_url[str(cache_path)] = url
-            return True
-        except Exception as e:
-            logger.error(f"Failed to download image: {e}")
-            return False
-
     # ── More pictures (screenshots) ──────────────────────────────────────────
 
     def _attach_extra_image(self, path: str):
@@ -3726,7 +3485,6 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         moved the selection here would turn the last screenshot into the cover.
         Only when there is no picture at all does the first one become it —
         a game needs one."""
-        self._pending_pixmap = None
         if not self._detected_images and not self._image_path:
             self._set_web_image(path)
             return
@@ -3737,55 +3495,126 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             self._detected_images.append(path)
         self._update_nav_buttons()
 
-    def _start_extra_images(self, urls) -> None:
-        """Fetch the ticked screenshots off the GUI thread and add each to the
+    def _start_extra_images(self, urls, covers=()) -> None:
+        """Fetch the ticked pictures off the GUI thread and add each to the
         carousel as it arrives. A few at a time: a store lists a dozen, each a
         few hundred KB, and downloading them on the GUI thread would freeze it
-        for as long as that takes."""
-        import queue
-        urls = [u for u in dict.fromkeys(urls or []) if u]
+        for as long as that takes.
+
+        *covers* are the ones ticked as pictures of the game (the chips), *urls*
+        the screenshots. A cover is also put on show when it arrives, the later
+        in the list the better, unless the person has chosen another picture
+        meanwhile (see _land_picture); a screenshot only joins the carousel."""
+        covers = [u for u in dict.fromkeys(covers or []) if u]
+        urls = [u for u in dict.fromkeys(urls or []) if u and u not in covers]
+        jobs = [(u, rank) for rank, u in enumerate(covers)] + [(u, -1) for u in urls]
+        if not self._extra_pending:
+            self._cover_seen, self._cover_rank = self._image_path, -1
         # What this session already stored is only added to the carousel — not
         # fetched again to be found identical and deleted.
         remaining = []
-        for u in urls:
+        for u, rank in jobs:
             stored = self._stored_file_for_url(u)
             if stored:
-                logger.info(f"Extra picture already stored, not downloaded again: {stored}")
-                self._attach_extra_image(stored)
+                logger.info(f"Picture already stored, not downloaded again: {stored}")
+                self._land_picture(rank, stored)
             else:
-                remaining.append(u)
-        urls = remaining
-        if not urls:
+                remaining.append((u, rank))
+        if not remaining:
             return
-        # Chosen NOW, like the covers of this same Apply: a name edited while
-        # they download must not scatter them across two folders.
-        self._extra_dest = self._icon_dest_dir()
-        gen = self._extra_gen
-        logger.info(f"Extra pictures: downloading {len(urls)} into {self._extra_dest.name!r}")
-        self._extra_pending += len(urls)
-        self._extra_total += len(urls)
+        # Chosen NOW: a name edited while they download must not scatter them
+        # across two folders.
+        dest = self._icon_dest_dir()
+        logger.info(f"Pictures: downloading {len(remaining)} into {dest.name!r}")
+        if self._pictures is None:
+            self._pictures = PictureBatch()
+            self._pictures.picture_done.connect(self._on_picture_done)
+        self._pictures.add(remaining, dest, same_as=self._detected_images)
+        self._extra_total += len(remaining)
         self._bg_work_kind = "images"
         self._emit_bg_status("running")
         self._show_extra_progress()
-        todo: "queue.SimpleQueue" = queue.SimpleQueue()
-        for u in urls:
-            todo.put(u)
 
-        def _worker():
-            while True:
-                try:
-                    u = todo.get_nowait()
-                except queue.Empty:
-                    return
-                got = self._fetch_image_bytes(u) if gen == self._extra_gen else None
-                try:
-                    self._extra_image_ready.emit(gen, got[0] if got else u,
-                                                 got[1] if got else b"")
-                except RuntimeError:
-                    return          # the dialog is gone
+    @property
+    def _extra_pending(self) -> int:
+        """Pictures asked for and not in yet."""
+        return self._pictures.pending if self._pictures is not None else 0
 
-        for _ in range(min(3, len(urls))):
-            threading.Thread(target=_worker, daemon=True).start()
+    def _cancel_pictures(self) -> None:
+        """Stop fetching: what has not come in is dropped, and so is the count."""
+        if self._pictures is not None:
+            self._pictures.cancel()
+        self._extra_total = self._extra_failed = 0
+
+    def _follow_icon_folder(self, folder: "Path | None" = None) -> None:
+        """Bring this dialog's pictures to the game's cache folder when it is not
+        the one they were written to.
+
+        A NEW game's folder is named after what is typed in the name and exe
+        fields, so renaming it while pictures download changes it. What already came
+        in is moved to the new folder, and what comes next is written there (the
+        batch reads its destination per picture). An edit keeps its folder until
+        Save, which moves it whole (migrate_icon_cache): nothing to follow before
+        then. *folder* is where the game ends up for good, when Save knows better
+        than the fields do (a title already taken is numbered apart)."""
+        batch = self._pictures
+        if batch is None or batch.dest is None or self._force_close:
+            return
+        old, new = batch.dest, folder or self._icon_dir_path()
+        if new == old:
+            return
+        new.mkdir(parents=True, exist_ok=True)
+        self._created_icon_dirs.add(new)
+        batch.redirect(new)
+        # Only what this batch brought in: the old folder may be another game's.
+        moved: dict[str, str] = {}
+        for path in list(self._image_path_to_url):
+            src = Path(path)
+            if src.parent != old or not src.is_file():
+                continue
+            try:
+                moved[path] = str(move_picture_into(src, new))
+            except OSError:
+                logger.exception(f"Picture could not follow the game to {new.name!r}: {path}")
+        logger.info(f"Pictures now go to {new.name!r} (was {old.name!r}); "
+                    f"{len(moved)} already in were moved")
+        if not moved:
+            return
+
+        def remap(p):
+            return moved.get(p, p)
+
+        self._detected_images = list(dict.fromkeys(remap(p) for p in self._detected_images))
+        self._image_url_cache = {u: remap(p) for u, p in self._image_url_cache.items()}
+        self._image_path_to_url = {remap(p): u for p, u in self._image_path_to_url.items()}
+        self._session_new_files = {remap(p) for p in self._session_new_files}
+        self._cover_seen = remap(self._cover_seen)
+        if self._image_path in moved:
+            self._image_path = moved[self._image_path]
+            self._update_image_preview(self._image_path)
+        if self._image_path in self._detected_images:
+            self._current_image_idx = self._detected_images.index(self._image_path)
+        self._update_nav_buttons()
+
+    def _land_picture(self, rank: int, path: str) -> None:
+        """Add the picture stored at *path* to the carousel, and keep track of the
+        cover.
+
+        Pictures arrive in whatever order the network gives them. A cover (rank >= 0,
+        its place among the ticked ones) is put on show if it ranks after any that
+        already was, so the last one ticked is the one left on show - and only while
+        what is on show is still what the batch put there: another picked by hand
+        (the arrows, Browse, the trash) is not taken away from the person. A
+        screenshot (rank -1) only joins the carousel."""
+        follows = self._image_path == self._cover_seen
+        select = follows and rank > self._cover_rank
+        if select:
+            self._set_web_image(path)
+            self._cover_rank = rank
+        else:
+            self._attach_extra_image(path)
+        if follows:
+            self._cover_seen = self._image_path
 
     def _show_extra_progress(self):
         done = self._extra_total - self._extra_pending
@@ -3794,24 +3623,24 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._status_lbl.setStyleSheet(
             f"color:{palette('accent')};font-size:{scaled(12, self)}px;")
 
-    def _on_extra_image_ready(self, gen: int, url: str, data: bytes):
-        self._extra_pending = max(0, self._extra_pending - 1)
-        if gen != self._extra_gen:
-            # Cancelled, or the dialog was closed: nothing is stored, and
-            # nothing is shown for a batch nobody is waiting on any more.
-            if not self._extra_pending:
-                self._extra_total = 0
-            return
+    def _on_picture_done(self, rank: int, url: str, path: str, created: bool):
         stored = False
-        if data:
-            stored = self._store_downloaded_image(
-                url, data, select=False, dest_dir=self._extra_dest) is not False
+        if path:
+            try:
+                if created:
+                    self._session_new_files.add(path)
+                self._image_url_cache[url] = path
+                self._image_path_to_url[path] = url
+                self._land_picture(rank, path)
+                stored = True
+            except Exception:
+                logger.exception(f"Picture could not be added to the carousel: {url!r}")
         if not stored:
             self._extra_failed += 1
-            logger.warning(f"Extra picture not added: {url!r}"
-                           f"{'' if data else ' (nothing was downloaded)'}")
+            logger.warning(f"Picture not added: {url!r}"
+                           f"{'' if path else ' (nothing was downloaded)'}")
         else:
-            logger.info(f"Extra picture added: {url!r}")
+            logger.info(f"Picture added: {url!r}")
         if self._extra_pending:
             self._show_extra_progress()
             return
@@ -3840,6 +3669,22 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             except RuntimeError:
                 pass
 
+    def _detach_pictures(self, entry) -> None:
+        """Save does not wait for pictures: those still coming carry on without this
+        dialog, into the game that was just stored (see LatePictures). Cancel is the
+        way to drop them - before Save."""
+        batch = self._pictures
+        if batch is None or not batch.pending:
+            return
+        self._pictures = None
+        batch.picture_done.disconnect(self._on_picture_done)
+        late = LatePictures(
+            batch, entry, cover_rank=self._cover_rank,
+            follows_cover=self._image_path == self._cover_seen)
+        logger.info(f"Saved {entry.name!r} with {late.total} picture(s) still coming - "
+                    "they go on into the game")
+        self.pictures_detached.emit(late)
+
     def _set_web_image(self, image_path: str):
         """Set the downloaded web image - adds to existing detected images."""
         self._image_path = image_path
@@ -3853,15 +3698,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         else:
             self._current_image_idx = self._detected_images.index(image_path)
 
-        # Use pending pixmap pre-loaded from original bytes if available
-        pending = getattr(self, '_pending_pixmap', None)
-        if pending and not pending.isNull():
-            scaled = scaled_for_screen(pending, 90, 56)
-            self._img_preview.setPixmap(scaled)
-            self._img_preview.setText("")
-            self._pending_pixmap = None
-        else:
-            self._update_image_preview(image_path)
+        self._update_image_preview(image_path)
         self._update_nav_buttons()
 
     @staticmethod
@@ -4377,7 +4214,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Save completed — always close for real, never shelve."""
         self._force_close = True
         self._cancel_event.set()
-        self._extra_gen += 1
+        self._cancel_pictures()         # (those handed on at Save are not ours any more)
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -4387,7 +4224,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """Cancel — stop background work and discard the dialog."""
         self._force_close = True
         self._cancel_event.set()
-        self._extra_gen += 1
+        self._cancel_pictures()
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -4411,7 +4248,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         thrown away because a search was called off.
         """
         self._cancel_event.set()
-        self._extra_gen += 1
+        self._cancel_pictures()
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -4546,9 +4383,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         return t(f"add_game.shelved_tooltip_{mode}_done")
 
     def _has_shelvable_work(self) -> bool:
-        """Exe resolve, web search, or path detect still in flight — ✕ shelves."""
+        """Exe resolve, web search, path detect or pictures still in flight — ✕ shelves."""
+        return self._save_blocked() or self._extra_pending > 0
+
+    def _save_blocked(self) -> bool:
+        """Work that has to finish before Save: what it finds is not on the form yet.
+        Pictures are not among it - they only add to the game, and Save does not wait."""
         return bool(self._exe_resolve_active or self._web_search_active
-                    or self._detection_in_progress or self._extra_pending > 0)
+                    or self._detection_in_progress)
 
     def _shelve(self):
         """Hide while background work continues; sidebar brings this back.
@@ -4607,7 +4449,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             return
         self._force_close = True
         self._cancel_event.set()
-        self._extra_gen += 1
+        self._cancel_pictures()
         self._exe_resolve_active = False
         self._web_search_active = False
         self._pending_search_payload = None
@@ -5519,9 +5361,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # lose the current icon — see migrate_icon_cache for the cases
             # (the old both-exist branch deleted the old folder wholesale,
             # icon included, when enrichment renamed without a new image).
+            _cover_follows = self._image_path == self._cover_seen
             self._image_path = migrate_icon_cache(
                 old_folder_name, new_folder_name, self._image_path,
             )
+            if _cover_follows:
+                self._cover_seen = self._image_path     # (moved with the folder)
 
             # Compress external images into cache; cached images are already compressed.
             _prev_icon = entry.icon_path
@@ -5679,6 +5524,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             entry.computed_folder_name = get_library().unique_folder_name(
                 entry.computed_folder_name, entry.id
             )
+            # The pictures that came in under whatever was typed meanwhile belong
+            # in this folder, numbered apart from a game of the same title if need
+            # be; the cover's path is read from where they are now.
+            self._follow_icon_folder(_ICON_CACHE_DIR / get_install_folder_name(
+                entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name))
             # Compress external images into cache; cached images are already compressed.
             entry.icon_path = self._ensure_cached_icon(
                 self._image_path, entry.exe_path, entry.name, entry.id, entry.computed_folder_name,
@@ -5726,4 +5576,5 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                         shortcut_dir=getattr(self, "_shortcut_dir", None) or "",
                     )
 
+        self._detach_pictures(entry)
         self.accept()

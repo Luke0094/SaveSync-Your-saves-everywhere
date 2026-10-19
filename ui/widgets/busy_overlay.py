@@ -51,6 +51,12 @@ _OFFER_CANCEL_AFTER_S = 30
 # (that would be a delay we invent ourselves).
 _SHOW_AFTER_MS = 100
 
+# How long after Cancel a sheet may stay up waiting for the work to confirm it
+# stopped (see BusyOverlay._on_cancel). Longer than any caller's own grace
+# period; past it the sheet goes regardless, so Cancel can never leave a
+# "please wait" that nothing is going to take down.
+_CANCEL_BACKSTOP_MS = 8000
+
 
 class BusyOverlay(QWidget):
     """A translucent sheet over its parent with a centred message."""
@@ -105,6 +111,10 @@ class BusyOverlay(QWidget):
         self.sidebar_tick = None
 
         self._cancelled = False
+        self._closed = False
+        # Lets an owner recognise its own sheets among the page's children
+        # (see BackupsPage._sweep_list_sheets).
+        self._tag = ""
         self._shown_seconds = -1
         self._revealed = False
         self._start_time = time.monotonic()
@@ -151,6 +161,13 @@ class BusyOverlay(QWidget):
             self._shelve_btn.show()
         elapsed = max(0, int(time.monotonic() - self._start_time))
         self._update_countdown(elapsed)
+        # The label is laid out NOW, with its final text and style. Painting
+        # straight after show() used the size it was given while hidden —
+        # before the stylesheet (font, padding) had applied and before the
+        # "(0s)" was in it — so the text came out clipped until something
+        # later happened to run a layout pass: a few seconds, when the work
+        # holds the event loop.
+        self._relayout()
         self.repaint()
         flags = (QEventLoop.ProcessEventsFlag.AllEvents
                  if (self._cancel_btn.isVisible() or self._shelve_btn.isVisible())
@@ -177,7 +194,22 @@ class BusyOverlay(QWidget):
             self._cancel_btn.show()
             self._cancel_btn.setEnabled(True)
         if self._revealed and self.isVisible():
+            # Resize the label to the new text before painting it; the
+            # queued layout pass would only run after this paint.
+            self._relayout()
             self._label.repaint()
+
+    def _relayout(self):
+        """Lay the sheet out immediately instead of at the next event-loop turn."""
+        try:
+            self.ensurePolished()
+            self._label.ensurePolished()
+            lay = self.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+        except RuntimeError:
+            pass
 
 
 
@@ -198,13 +230,18 @@ class BusyOverlay(QWidget):
         self._cancel_btn.setEnabled(False)
         self._label.setText(t("common.cancelling"))
         if self._revealed:
+            self._relayout()
             self.repaint()
         handler = getattr(self, "on_cancel", None)
         if handler is not None:
             try:
                 handler()
             except Exception:
-                pass
+                # A handler that failed will not confirm anything: the sheet
+                # used to sit on "Cancelling…" for good.
+                logger.debug("busy overlay cancel handler failed", exc_info=True)
+                QTimer.singleShot(0, self.close_overlay)
+                return
             # A registered handler owns stopping the actual work, which is
             # free to take longer than this sheet's own close delay — a
             # QThread blocked mid-round of a CPU search, say. Closing on a
@@ -213,7 +250,9 @@ class BusyOverlay(QWidget):
             # anything was still happening) vanished, leaving whatever sat
             # underneath looking stuck instead of merely still finishing.
             # The caller closes this once the work actually confirms it
-            # stopped — see cheats_page._on_save_load_finished.
+            # stopped — see cheats_page._on_save_load_finished. If it never
+            # does, the backstop below takes the sheet down regardless.
+            QTimer.singleShot(_CANCEL_BACKSTOP_MS, self._cancel_backstop)
             return
         QTimer.singleShot(200, self.close_overlay)
 
@@ -300,7 +339,16 @@ class BusyOverlay(QWidget):
         painter.fillRect(self.rect(), self._dim)
         painter.end()
 
+    def _cancel_backstop(self):
+        try:
+            if not self._closed:
+                logger.warning("busy overlay: cancel was not confirmed in time — closing it")
+                self.close_overlay()
+        except RuntimeError:
+            pass          # already deleted
+
     def close_overlay(self):
+        self._closed = True
         self._countdown.stop()
         p = self.parentWidget()
         if p is not None:
@@ -408,6 +456,12 @@ class DeferredBusy:
         """Pump the underlying overlay timer and paint events."""
         if self._overlay is not None and not self._closed:
             self._overlay.pump()
+
+    def tag(self, name: str):
+        """Mark the sheet as belonging to *name*, so its owner can find (and
+        sweep) its own sheets among a page's children."""
+        if self._overlay is not None and not self._closed:
+            self._overlay._tag = name
 
     def set_on_cancel(self, fn):
         """What the sheet's Cancel button should actually stop.

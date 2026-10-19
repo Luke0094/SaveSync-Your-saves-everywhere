@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QDir, QEvent, QTimer, QStandardPaths, QUrl
 
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QDialog, QFileDialog
 
 from i18n import t
 from ui.helpers import scaled
@@ -1186,6 +1186,47 @@ class SavePathPickerDialog(_LnkAwareDialog):
             # label depends on *mode*, decided per construction rather
             # than per subclass — see _FILENAME_LABEL_KEY's own docstring.
             self._FILENAME_LABEL_KEY = "file_picker.folder_path"
+
+
+class FileOrFolderPickerDialog(_LnkAwareDialog):
+    """Pick ONE file or ONE folder, whichever the person points at.
+
+    The other pickers commit to a kind: Qt's file mode ExistingFile treats
+    Open on a folder as "go into it", and Directory mode refuses a file. Here
+    a folder is entered by double-clicking it (or typing a path), and the
+    confirm button takes whatever is selected — a file, a selected folder, or
+    the folder currently shown when nothing else is picked (the path box
+    mirrors it, see _sync_path_field).
+    """
+
+    _ACCEPT_LABEL_KEY = "file_picker.select"
+    _FILENAME_LABEL_KEY = "file_picker.folder_path"
+
+    def __init__(self, parent, caption: str):
+        super().__init__(parent, caption)
+        self.setFileMode(QFileDialog.FileMode.ExistingFile)
+        self.setNameFilter(t("file_picker.filter_all_files"))
+
+    def accept(self):
+        files = self.selectedFiles()
+        if (len(files) == 1 and not files[0].lower().endswith('.lnk')
+                and Path(files[0]).is_dir()):
+            # A folder chosen outright: skip QFileDialog.accept, which would
+            # only navigate into it in this mode.
+            QDialog.accept(self)
+            return
+        super().accept()
+
+
+def pick_file_or_folder(parent, caption: str, start_dir: str = "") -> str:
+    """Shared "a file or a folder" picker. Returns "" when cancelled."""
+    path = _run_picker(FileOrFolderPickerDialog(parent, caption), start_dir)
+    if path.lower().endswith('.lnk'):
+        from core.resolvers import resolve_lnk_target
+        target = resolve_lnk_target(path).strip().strip('"')
+        if target and Path(target).exists():
+            return target
+    return path
 
 
 def pick_executable(parent, caption: str, name_filter: str = "",

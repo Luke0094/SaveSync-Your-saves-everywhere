@@ -229,7 +229,7 @@ def executable_name_filter(all_files_label: str = "") -> str:
             from i18n import t
             all_files_label = t("file_picker.filter_any_file")
         except Exception:
-            all_files_label = "All files"
+            all_files_label = "All files"  # i18n-ignore (source-language fallback; the text is file_picker.filter_any_file)
     try:
         from i18n import t
         exe_label = t("file_picker.filter_executables")

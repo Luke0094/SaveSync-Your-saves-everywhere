@@ -139,7 +139,7 @@ _LABELS = {
     TYRANO: "TyranoScript",
     BAKIN: "RPG Developer Bakin",
     SRPGSTUDIO: "SRPG Studio",
-    ALICESOFT: "AliceSoft System",
+    ALICESOFT: "AliceSoft System",  # i18n-ignore (engine / format name, an identifier)
     ARTEMIS: "Artemis",
     WOLFRPG: "Wolf RPG Editor",
     TADS: "TADS",
@@ -148,7 +148,7 @@ _LABELS = {
     NWJS: "NW.js",
     ELECTRON: "Electron",
     PROTOBUF: "Protocol Buffers",
-    KNOWN_HEADER: "Known save header",
+    KNOWN_HEADER: "Known save header",  # i18n-ignore (engine / format name, an identifier)
 }
 
 _cache: dict = {}

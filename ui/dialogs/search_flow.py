@@ -730,7 +730,7 @@ class SearchFlowMixin:
         self._sync_bg_action_gates()
         missing = self._get_missing_fields()
         # Pictures still coming in show their progress on this line instead; the
-        # same note is shown when they are done (see _on_extra_image_ready).
+        # same note is shown when they are done (see _on_picture_done).
         if missing and not self._extra_pending:
             self._status_lbl.setText(
                 t('add_game.fields_still_missing', fields=", ".join(missing)))
@@ -1545,11 +1545,6 @@ class SearchFlowMixin:
             self._developer_edit.setText(sel['developer'])
         if sel.get('year'):
             self._year_edit.setText(sel['year'])
-        # Additive, like tags/urls below — each checked image is downloaded
-        # and added to the carousel (_set_web_image never removes an
-        # existing one), never a replacement of the current cover.
-        for _img_url in sel.get('images', []) or []:
-            self._download_and_set_image(_img_url)
         if sel.get('tags'):
             self._apply_web_tags(sel['tags'])
         if sel.get('languages'):
@@ -1586,16 +1581,20 @@ class SearchFlowMixin:
         # After the line above, so the progress it starts is what stays on show.
         logger.info(f"_apply_merge_selection: images={len(sel.get('images') or [])} "
                     f"extra_images={len(sel.get('extra_images') or [])}")
-        if sel.get('extra_images'):
+        # Additive, like tags/urls above — each checked image is downloaded in the
+        # background and added to the carousel (never removing an existing one),
+        # never a replacement of the current cover. The form stays usable while
+        # they come in, and Save does not wait for them.
+        pictures = list(sel.get('images') or []) + list(sel.get('extra_images') or [])
+        if pictures:
             try:
-                self._start_extra_images(sel['extra_images'])
+                self._start_extra_images(sel.get('extra_images'), covers=sel.get('images'))
             except Exception:
                 # A slot's exception only reaches the console: say so in the log,
                 # and on screen, rather than losing the pictures without a word.
-                logger.exception("Extra pictures could not be started")
+                logger.exception("Pictures could not be started")
                 self._status_lbl.setText(t('add_game.images_some_failed',
-                                           failed=len(sel['extra_images']),
-                                           total=len(sel['extra_images'])))
+                                           failed=len(pictures), total=len(pictures)))
         return True
 
     def _result_site_urls(self, result) -> list[str]:

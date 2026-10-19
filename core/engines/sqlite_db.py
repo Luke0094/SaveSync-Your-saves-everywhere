@@ -62,7 +62,7 @@ class SqliteDb:
         for table in tables:
             if table in _SKIP_TABLES:
                 continue
-            cols = list(cur.execute(f'PRAGMA table_info("{table}")'))
+            cols = list(cur.execute(f'PRAGMA table_info("{table}")'))  # i18n-ignore (SQL)
             if not cols:
                 continue
             # col: (cid, name, type, notnull, dflt, pk)

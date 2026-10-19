@@ -1248,7 +1248,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             for iso, label in day_labels:
                 cnt = day_counts[iso]
                 try:
-                    _readable = format_dt(datetime.strptime(iso, "%Y-%m-%d"), "%d %b %Y")
+                    _readable = format_dt(datetime.strptime(iso, "%Y-%m-%d"), "%d %b %Y")  # i18n-ignore (CSS / date format)
                 except ValueError:
                     _readable = iso
                 bars.append((label, cnt, f"{_readable} · {t('overview.day_backups', count=cnt)}"))

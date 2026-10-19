@@ -78,11 +78,11 @@ class RcloneProvider(SyncProvider):
     def connect(self) -> bool:
         if not self._rclone:
             logger.error("rclone not found in PATH")
-            self.last_error = "rclone not found in PATH"
+            self.last_error = i18n.t('rclone.err_not_found')
             return False
         if not self._remote:
             logger.error("No rclone remote specified")
-            self.last_error = "no rclone remote specified"
+            self.last_error = i18n.t('rclone.err_no_remote')
             return False
         try:
             result = self._run(["lsd", f"{self._remote}:", "--max-depth", "1"],
@@ -97,7 +97,7 @@ class RcloneProvider(SyncProvider):
             return False
         except subprocess.TimeoutExpired:
             logger.error("rclone connect timed out")
-            self.last_error = "rclone connect timed out"
+            self.last_error = i18n.t('rclone.err_timeout')
             return False
         except Exception as e:
             # PermissionError on a non-executable binary, decode errors on

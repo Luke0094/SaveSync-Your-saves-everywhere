@@ -136,10 +136,10 @@ ANTICHEAT_STEMS = expand_stems({
 
 # Redistributables and prerequisites a game installer drops in its folder.
 REDIST_STEMS = expand_stems({
-    "vcredist", "vcredist x86", "vcredist x64", "dxsetup", "dxwebsetup",
+    "vcredist", "vcredist x86", "vcredist x64", "dxsetup", "dxwebsetup",  # i18n-ignore (file-name stems, data)
     "directx", "dotnetfx", "ndp452-kb2901907-x86-x64-allos-enu",
-    "oalinst", "openal", "ue4prereqsetup x64", "ueprereqsetup x64",
-    "d3dcompiler 47",
+    "oalinst", "openal", "ue4prereqsetup x64", "ueprereqsetup x64",  # i18n-ignore (file-name stems, data)
+    "d3dcompiler 47",  # i18n-ignore (file-name stems, data)
 })
 
 # Interpreters and archivers that a game folder may contain but that are
@@ -156,7 +156,7 @@ RUNTIME_STEMS = expand_stems({
 # this, so they are safe anywhere a stem is tested.
 HELPER_TOOL_STEMS = expand_stems({
     "gamepro", "start with tool",
-    "remove tool files from game", "use me to open the tool",
+    "remove tool files from game", "use me to open the tool",  # i18n-ignore (file-name stems, data)
 })
 
 # The same idea in bare dictionary words. Kept apart because these are ALSO

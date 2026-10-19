@@ -11,8 +11,8 @@ class AliceSoftFormat(_Format):
     that are offered, and with the game in the library they carry the names
     the game gave them.
     """
-    name = "AliceSoft System 4"
-    engine = "AliceSoft System"
+    name = "AliceSoft System 4"  # i18n-ignore (engine / format name, an identifier)
+    engine = "AliceSoft System"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         self._save = None

@@ -16,6 +16,7 @@ handshake on every call. Verification itself is never disabled.
 import logging
 import ssl
 import threading
+import time
 from collections import OrderedDict
 import urllib.error
 import urllib.parse
@@ -120,7 +121,7 @@ def open_url(url_or_req, timeout: float = 10):
         resp = urllib.request.urlopen(url_or_req, timeout=timeout, context=alt)
         with _lock:
             _preferred_ctx = alt
-        which = "bundled certifi CA store" if alt is not None else "OS trust store"
+        which = "bundled certifi CA store" if alt is not None else "OS trust store"  # i18n-ignore (log text)
         logger.info(
             f"Certificate store rejected a valid-looking chain — switched to {which} "
             f"for subsequent HTTPS requests ({e})"
@@ -212,10 +213,14 @@ def remember_image(url: str, resolved_url: str, data: bytes) -> bool:
     return True
 
 
-def fetch_image(url: str, timeout: float = 20):
+def fetch_image(url: str, timeout: float = 20, total_timeout: float = 90):
     """``(url fetched, bytes)`` for a picture — from the session's store when it
     is there, from the network otherwise (and then kept). None when it cannot
-    be had or the host did not answer with a picture. Safe on a worker thread."""
+    be had or the host did not answer with a picture. Safe on a worker thread.
+
+    *timeout* is the wait for each reply from the host; *total_timeout* bounds the
+    whole picture, so a host that keeps sending a few bytes at a time cannot hold
+    the caller for as long as it likes."""
     hit = cached_image(url)
     if hit is not None:
         return hit
@@ -224,12 +229,25 @@ def fetch_image(url: str, timeout: float = 20):
         return None
     try:
         req, resolved = image_fetch_request(url)
+        deadline = time.monotonic() + total_timeout
         with open_url(req, timeout=timeout) as response:
             ct = response.headers.get("Content-Type", "")
             if ct and not ct.startswith("image/") and "octet-stream" not in ct:
                 logger.warning(f"Not an image: Content-Type {ct!r} for {resolved!r}")
                 return None
-            data = response.read(IMAGE_FETCH_LIMIT + 1)
+            chunks, size = [], 0
+            # read1: hands back what has arrived, where read(n) waits for all n
+            # bytes — and with it the deadline below would never get a look in.
+            read_some = getattr(response, "read1", response.read)
+            while size <= IMAGE_FETCH_LIMIT:
+                chunk = read_some(min(65536, IMAGE_FETCH_LIMIT + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"more than {total_timeout:.0f}s for {resolved!r}")
+            data = b"".join(chunks)
     except Exception as e:
         logger.error(f"Failed to download image: {e}")
         return None

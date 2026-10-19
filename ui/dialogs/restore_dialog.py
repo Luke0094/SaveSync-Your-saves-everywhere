@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from i18n import t
-from ui.backup_labels import ORIGIN_LABELS, origin_badge
+from ui.backup_labels import LOCAL_ORIGINS, ORIGIN_LABELS, origin_badge
 from ui.helpers import finalize_adaptive_dialog_size, scaled
 from ui.modal_helpers import question_window_modal, warning_window_modal
 from core import fmt_size as _fmt_size
@@ -160,7 +160,7 @@ class RestoreDialog(QDialog):
             synced_to = bk.cloud_metadata.get("synced_to", [])
             if (
                 filt == "all"
-                or (filt == "local" and origin == "local")
+                or (filt == "local" and origin in LOCAL_ORIGINS)
                 or filt == origin
                 or filt in synced_to
             ):

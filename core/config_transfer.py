@@ -634,7 +634,7 @@ def self_check_config_history_restore() -> tuple[bool, str]:
             p = s["path"]
             meta_file = p / "metadata.json"
             if not meta_file.exists():
-                return False, f"checkpoint {p.name}: metadata.json missing"
+                return False, f"checkpoint {p.name}: metadata.json missing"  # i18n-ignore (self-check diagnostic for bug reports)
             try:
                 meta_file.read_text(encoding="utf-8")
             except Exception as e:
@@ -674,16 +674,16 @@ def self_check_config_history_restore() -> tuple[bool, str]:
             assert oldest is not None
             config_bytes, library_bytes = _read_snapshot_payload(oldest)
             if not config_bytes:
-                return False, "oldest snapshot config missing after read"
+                return False, "oldest snapshot config missing after read"  # i18n-ignore (self-check diagnostic for bug reports)
             # Simulate prune removing the folder that was just read.
             shutil.rmtree(oldest)
             if oldest.exists():
-                return False, "sandbox oldest snapshot still on disk after prune"
+                return False, "sandbox oldest snapshot still on disk after prune"  # i18n-ignore (self-check diagnostic for bug reports)
             data = json.loads(config_bytes.decode("utf-8"))
             if data.get("snap") != 0:
-                return False, f"payload snap={data.get('snap')!r}, expected 0"
+                return False, f"payload snap={data.get('snap')!r}, expected 0"  # i18n-ignore (self-check diagnostic for bug reports)
             if library_bytes is None:
-                return False, "oldest snapshot library missing after read"
+                return False, "oldest snapshot library missing after read"  # i18n-ignore (self-check diagnostic for bug reports)
             # Separate sandbox: enforce must drop extras beyond the cap.
             # Pass the dir explicitly — never rebind CONFIG_HISTORY_DIR (that
             # raced with live save_config_snapshot / auto-export).
@@ -703,7 +703,7 @@ def self_check_config_history_restore() -> tuple[bool, str]:
             left = [p for p in hist2.iterdir() if p.is_dir()]
             if len(left) > MAX_CONFIG_HISTORY:
                 return False, (
-                    f"history prune left {len(left)} dirs "
+                    f"history prune left {len(left)} dirs "  # i18n-ignore (self-check diagnostic for bug reports)
                     f"(max {MAX_CONFIG_HISTORY})"
                 )
         return True, ""

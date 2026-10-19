@@ -1019,12 +1019,12 @@ class SyncPage(PageScrollMixin, QWidget, ThemedMixin):
                     candidates.append(Path(env_path))
                 candidates += [
                     home / "OneDrive",
-                    home / "OneDrive - Personal",
+                    home / "OneDrive - Personal",  # i18n-ignore (folder name)
                 ]
             elif system == "Darwin":
                 candidates = [
                     home / "OneDrive",
-                    home / "OneDrive - Personal",
+                    home / "OneDrive - Personal",  # i18n-ignore (folder name)
                     home / "Library" / "CloudStorage" / "OneDrive-Personal",
                 ]
             else:

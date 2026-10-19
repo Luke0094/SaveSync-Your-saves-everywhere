@@ -39,7 +39,7 @@ _TARGETS = {
     "Rags.Player": ("Name", "Player"),
     "Rags.Room": ("Name", "Rooms"),
     "Rags.Timer": ("Name", "Timers"),
-    "Rags.StatusBarItem": ("Name", "Status bar"),
+    "Rags.StatusBarItem": ("Name", "Status bar"),  # i18n-ignore (the engine's own vocabulary)
 }
 # Members that are the engine's own bookkeeping rather than anything to edit.
 _SKIP_MEMBERS = {"UniqueID", "UniqueIdentifier", "value__"}

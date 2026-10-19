@@ -42,6 +42,8 @@ def _xwayland_session() -> bool:
                 or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland")
 
 _AUTO_HIDE_MS  = 5000    # default timeout if user doesn't hover
+# A message from a friend has a button to read it: it stays a little longer.
+_FRIEND_AUTO_HIDE_MS = 12000
 _FADE_IN_MS    = 200
 _FADE_OUT_MS   = 280
 
@@ -122,6 +124,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # Emitted when exclusive fullscreen prevents the overlay from showing.
     # Carries (title, message) so the caller can provide audio/toast feedback.
     exclusive_blocked = Signal(str, str)
+    # "Don't show again" on a friend's message (the friend's id): the friend is silenced
+    # in the sealed friend file, not in config.json - which would list the friends.
+    friend_silenced = Signal(str)
     # Provider restore-list fetch completed (payload: entries, game_id,
     # local_ids, seq). Emitted FROM THE WORKER THREAD — a queued signal is
     # the only safe hop back to the GUI thread; the old QTimer.singleShot
@@ -179,7 +184,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # Notification queue: list of (icon, title, message, auto_hide_ms)
         # plus parallel (game_id, notif_type) metadata for the suppress link.
         self._notif_queue: list[tuple[str, str, str, int]] = []
-        self._notif_meta: list[tuple[str, str]] = []
+        # Per queue entry: (game_id, notif_type, action). *action* is None or
+        # (button label, action name, context): a notification with a primary
+        # button of its own (a friend's message: open it).
+        self._notif_meta: list[tuple] = []
         self._notif_index: int = 0
 
         # Unknown-game queue browsing: when non-None, the overlay is showing
@@ -1274,7 +1282,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     def on_app_scale_changed(self) -> None:
         """The application stylesheet was rebuilt (MainWindow's scale re-apply):
         the overlay's own sheet and fixed sizes are relative to it."""
-        self._sync_scale_to_screen("application scale changed", force=True)
+        self._sync_scale_to_screen("application scale changed", force=True)  # i18n-ignore (log text)
         if self.isVisible():
             self._rerender_current()
             self._position_top_right()
@@ -2196,15 +2204,22 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     def _push_notification(self, icon: str, title: str, message: str,
                            auto_hide_ms: int = _AUTO_HIDE_MS,
-                           game_id: str = "", notif_type: str = "") -> None:
+                           game_id: str = "", notif_type: str = "",
+                           action: "tuple | None" = None) -> None:
         """Add a notification to the queue and display it.
 
         game_id + notif_type: when both set, a "don't show again" link is
         offered for that specific game × notification type combination.
         If this game+type pair is already suppressed in config, skip silently.
+        (The "game" can be anything with a stable id: a friend is
+        "friend:<id>", and shows in Settings' list of what was silenced like
+        any game does.)
+
+        *action*: (button label, action name, context) adds a primary button
+        that raises ``action_requested(name, context)``.
         """
         if self._defer_if_priority(lambda: self._push_notification(
-                icon, title, message, auto_hide_ms, game_id, notif_type)):
+                icon, title, message, auto_hide_ms, game_id, notif_type, action)):
             return
         # Cleared only AFTER the defer guard: while a priority prompt is on
         # screen its buttons rely on _context_exe — wiping it here would
@@ -2222,7 +2237,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             return
 
         self._notif_queue.append(entry)
-        self._notif_meta.append((game_id, notif_type))
+        self._notif_meta.append((game_id, notif_type, action))
         self._notif_index = len(self._notif_queue) - 1
         self._render_current_notification()
 
@@ -2237,19 +2252,24 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._set_mode("notif")
         idx = self._notif_index
         icon, title, message, auto_hide_ms = self._notif_queue[idx]
-        game_id, notif_type = (self._notif_meta[idx]
-                               if idx < len(self._notif_meta) else ("", ""))
+        meta = self._notif_meta[idx] if idx < len(self._notif_meta) else ("", "", None)
+        game_id, notif_type = meta[0], meta[1]
+        action = meta[2] if len(meta) > 2 else None
 
         self._icon_label.setText(icon)
         self._title.setText(title)
         self._message.setText(message)
         self._hide_dashboard()
         self._clear_buttons()
+        if action:
+            label, act, ctx = action
+            self._context_exe = ctx
+            self._add_btn(self._btn_area, label, act, primary=True)
 
         # Per-game suppress link when this notif carries an identity
         if game_id and notif_type:
             self._set_suppress_link(
-                "dont_show_ingame",
+                "dont_show_friend" if game_id.startswith("friend:") else "dont_show_ingame",
                 lambda _checked=False, gid=game_id, nt=notif_type:
                     self._suppress_ingame_notif(gid, nt))
         else:
@@ -2317,15 +2337,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         the carousel, drop the suppressed one and STAY on the queue at the
         same position (in place: countdown and hover untouched); only an
         emptied queue hides the overlay."""
-        from core.config_manager import get_config
-        config = get_config()
-        suppressed: dict = dict(config.get("suppressed_ingame_notifs", {}))
-        if game_id not in suppressed:
-            suppressed[game_id] = []
-        if notif_type not in suppressed[game_id]:
-            suppressed[game_id].append(notif_type)
-        config.set("suppressed_ingame_notifs", suppressed)
-        logger.info(f"Suppressed in-game {notif_type!r} notifications for game {game_id}")
+        if game_id.startswith("friend:"):
+            self.friend_silenced.emit(game_id[len("friend:"):])
+            logger.info("Silenced a friend's message notifications")
+        else:
+            from core.config_manager import get_config
+            config = get_config()
+            suppressed: dict = dict(config.get("suppressed_ingame_notifs", {}))
+            if game_id not in suppressed:
+                suppressed[game_id] = []
+            if notif_type not in suppressed[game_id]:
+                suppressed[game_id].append(notif_type)
+            config.set("suppressed_ingame_notifs", suppressed)
+            logger.info(f"Suppressed in-game {notif_type!r} notifications for game {game_id}")
         if len(self._notif_queue) > 1 and 0 <= self._notif_index < len(self._notif_queue):
             idx = self._notif_index
             self._notif_queue.pop(idx)
@@ -2440,6 +2464,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         )
         self._push_notification("◌", t("app.name"), msg, _AUTO_HIDE_MS,
                                  game_id=game_id, notif_type="provisional_backup")
+
+    def show_friend_message(self, friend_id: str, name: str, preview: str) -> None:
+        """A friend's message arrived (see ui.p2p_friends_service): who it is
+        from and a line of it, a primary button that opens it, and a "don't
+        show again" that silences THIS friend only (it is listed in Settings,
+        where it can be taken off). Messages from several friends stack in the
+        carousel like any other notification."""
+        msg = (f"<b>{html.escape(name)}</b> — "
+               f"<span style='color:{palette('text_secondary')};'>{html.escape(preview)}</span>")
+        self._push_notification(
+            "👥", t("p2p.friends_notice_title"), msg, _FRIEND_AUTO_HIDE_MS,
+            game_id=f"friend:{friend_id}", notif_type="friend_message",
+            action=(t("p2p.friends_notice_open"), "open_friend_messages", friend_id))
 
     def show_sync_done(self, game_name: str, game_id: str = ""):
         """Queue a sync-result notification. Multiple results stack in the carousel.
@@ -2824,7 +2861,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._hide_for_exclusive()
         elif not popup_is_open():
             self._take_the_front()
-            self._trace_z("the window in front changed")
+            self._trace_z("the window in front changed")  # i18n-ignore (log text)
 
     # ── Topmost helpers ──────────────────────────────────────────────────────
 
@@ -2882,7 +2919,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 self._trace_z("borderless fullscreen")
         elif self._is_overlay_obscured():
             self._take_the_front()
-            self._trace_z("obscured by a window")
+            self._trace_z("obscured by a window")  # i18n-ignore (log text)
 
     def _take_the_front(self):
         """Raise the overlay — then hand the front straight back to the pins.
@@ -2895,7 +2932,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         _force_topmost(self)
         try:
             from ui.widgets.pins import get_pin_manager
-            get_pin_manager().assert_topmost_all("the overlay came forward")
+            get_pin_manager().assert_topmost_all("the overlay came forward")  # i18n-ignore (log text)
         except Exception:
             logger.debug("overlay: could not put the pins back on top",
                          exc_info=True)

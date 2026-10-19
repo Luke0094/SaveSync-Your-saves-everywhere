@@ -267,7 +267,7 @@ _DLSITE_WORK_RE = re.compile(
 # Purchase geo-block banner on DLsite work pages. Metadata (OG title, …) may
 # still be present underneath; a shell with only this message is unusable.
 _DLSITE_REGION_LOCK_RE = re.compile(
-    r'you cannot buy this product from the country/region you live in',
+    r'you cannot buy this product from the country/region you live in',  # i18n-ignore (page text to match / log text)
     re.IGNORECASE,
 )
 _DLSITE_SORRY_TITLE_RE = re.compile(r'^\s*sorry\b', re.IGNORECASE)
@@ -2607,7 +2607,7 @@ def _iter_search_engine_html(query: str):
             if avail <= 0:
                 _engine_block(
                     "searxng",
-                    f"all {pool_n} instances failed/challenged",
+                    f"all {pool_n} instances failed/challenged",  # i18n-ignore (page text to match / log text)
                 )
             else:
                 logger.info(
@@ -2633,7 +2633,7 @@ def _iter_search_engine_html(query: str):
                 # page. Detect by status ONLY — the page <title> echoes the
                 # query, so text markers would false-positive on games whose
                 # name contains words like "anomaly".
-                _engine_block("ddg", "HTTP 202 anomaly page")
+                _engine_block("ddg", "HTTP 202 anomaly page")  # i18n-ignore (page text to match / log text)
                 break
             if status == 200 and html:
                 logger.debug(f"ddg answered {query!r} ({len(html)}B)")
@@ -2852,7 +2852,7 @@ def _search_targeted_sites(primary: str,
         if info and info.name:
             score = max(_fuzzy_score(h, info.name) for h in _scoring_hints)
             score = min(100.0, score + score_bonus)
-            bonus_str = f", base+{score_bonus:.0f}bonus" if score_bonus else ""
+            bonus_str = f", base+{score_bonus:.0f}bonus" if score_bonus else ""  # i18n-ignore (page text to match / log text)
             accepted = score >= MIN_SCORE
             logger.info(
                 f"Web fallback via {source_name}: {info.name!r} "

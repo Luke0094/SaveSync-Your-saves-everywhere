@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.5.0"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
@@ -100,13 +100,13 @@ _CHROMIUM_INTERNAL_NAMES = frozenset({
     "webrtc logs", "browsermetrics", "module info cache", "widevinecdm",
     "safe browsing", "sync data", "extension rules", "extension state",
     "extension scripts", "local extension settings",
-    "sync extension settings", "managed extension settings",
-    "platform notifications", "feature engagement tracker",
-    "site characteristics database", "autofillstrikedatabase",
+    "sync extension settings", "managed extension settings",  # i18n-ignore (process names to ignore, data)
+    "platform notifications", "feature engagement tracker",  # i18n-ignore (process names to ignore, data)
+    "site characteristics database", "autofillstrikedatabase",  # i18n-ignore (process names to ignore, data)
     "budgetdatabase", "segmentation_platform",
     "optimization_guide_hint_cache_store",
     "optimization_guide_model_and_features_store",
-    "optimization guide predictions", "affiliation database",
+    "optimization guide predictions", "affiliation database",  # i18n-ignore (process names to ignore, data)
     "data_reduction_proxy_leveldb", "persistentorigintrials",
     "origin trials", "attributionreporting", "commerce_subscription_db",
     "subresource filter", "ssl error assistant", "variations seed",
@@ -547,7 +547,10 @@ def _normalize_folder_name(name: str) -> str:
     """Sanitize folder name for filesystem."""
     import re
     name = re.sub(r'[<>:"/\\|?*]', '_', name).strip()
-    if not name:
+    # "." and ".." (and "..." — Windows drops trailing dots) are not names,
+    # they are the folder itself / its parent: a path built from one climbs
+    # out of the directory it was meant to sit in.
+    if not name.strip(". "):
         name = "Unknown"
     return name[:128]
 

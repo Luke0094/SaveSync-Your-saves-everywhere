@@ -255,11 +255,35 @@ def ensure_data_directory() -> Path:
     return data_dir
 
 
+# What check_and_repair_registration() found, as codes rather than sentences: the
+# callers decide from them whether a repair failed, and the window says them in the
+# player's language (describe_registration) — a sentence cannot do both.
+REG_REPAIRED = "repaired"
+REG_REPAIR_FAILED = "repair_failed"
+REG_REMOVED = "removed"
+REG_REMOVE_FAILED = "remove_failed"
+REG_FAILURES = (REG_REPAIR_FAILED, REG_REMOVE_FAILED)
+
+
+def describe_registration(detail: str) -> str:
+    """*detail* from check_and_repair_registration() in the player's language.
+    An error's own text (the one thing that is not a code) is kept as it is."""
+    if detail not in (REG_REPAIRED, REG_REPAIR_FAILED, REG_REMOVED, REG_REMOVE_FAILED):
+        return detail
+    try:
+        import i18n
+        return i18n.t(f"self_checks.registration_{detail}")
+    except Exception:
+        return detail                    # no running app to say it with
+
+
 def check_and_repair_registration() -> tuple[bool, str]:
     """Reconcile the OS autostart registration with what the saved config
     wants, repairing either direction. Returns ``(repaired, detail)`` —
     *repaired* is True when something needed fixing (whether or not the fix
-    itself succeeded; *detail* says which).
+    itself succeeded); *detail* is one of the REG_* codes (REG_FAILURES when the
+    fix did not work), or an error's text, and describe_registration() puts it
+    into words.
 
     Windows and Linux builds both bake the version into the shipped
     executable's own filename/path (see savesync.spec / build_appimage.sh),
@@ -283,13 +307,10 @@ def check_and_repair_registration() -> tuple[bool, str]:
             if registered and _get_registered_command() == _get_exe():
                 return False, ""
             ok = set_launch_on_startup(True)
-            return True, ("repaired a stale or missing autostart entry" if ok
-                          else "could not repair the autostart entry")
+            return True, (REG_REPAIRED if ok else REG_REPAIR_FAILED)
         if registered:
             ok = set_launch_on_startup(False)
-            return True, ("removed a stray autostart entry left over after "
-                          "the setting was turned off" if ok
-                          else "could not remove a stray autostart entry")
+            return True, (REG_REMOVED if ok else REG_REMOVE_FAILED)
         return False, ""
     except Exception as e:
         return True, str(e)[:200]
@@ -430,8 +451,8 @@ def check_dependencies() -> dict:
 
     optional_modules = {
         'psutil':    'process monitoring',
-        'watchdog':  'real-time save file detection',
-        'keyring':   'secure credential storage',
+        'watchdog':  'real-time save file detection',  # i18n-ignore (log text)
+        'keyring':   'secure credential storage',  # i18n-ignore (log text)
     }
 
     missing_optional = []

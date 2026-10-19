@@ -72,7 +72,7 @@ class GoogleDriveProvider(SyncProvider):
                 return self._connect_oauth()
         except ImportError:
             logger.error("google-api-python-client not installed")
-            self.last_error = "google-api-python-client not installed"
+            self.last_error = i18n.t('google_drive.err_package_missing')
             return False
         except Exception as e:
             logger.error(f"Google Drive connect error: {e}")
@@ -116,7 +116,7 @@ class GoogleDriveProvider(SyncProvider):
                     creds.refresh(Request())
                 except Exception as e:
                     logger.error(f"Google OAuth token refresh failed: {e}")
-                    self.last_error = "token refresh failed — please re-authenticate"
+                    self.last_error = i18n.t('google_drive.err_token_refresh')
                     if token_path.exists():
                         try:
                             token_path.unlink()
@@ -144,7 +144,7 @@ class GoogleDriveProvider(SyncProvider):
                     creds = flow.run_local_server(port=0)
                 else:
                     logger.error("No OAuth credentials available")
-                    self.last_error = "no OAuth credentials available"
+                    self.last_error = i18n.t('google_drive.err_no_credentials')
                     return False
             token_path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(str(token_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -165,7 +165,7 @@ class GoogleDriveProvider(SyncProvider):
 
         json_path = self._credentials.get("service_account_json", "")
         if not json_path or not Path(json_path).exists():
-            self.last_error = "service account JSON file not found"
+            self.last_error = i18n.t('google_drive.err_service_account_missing')
             return False
         creds = Credentials.from_service_account_file(json_path, scopes=_SCOPES)
         self._service = self._build_service(creds)

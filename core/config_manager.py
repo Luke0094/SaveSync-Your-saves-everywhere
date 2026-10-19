@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 _DEFAULTS: dict[str, Any] = {
     "language": "en",
     "theme": "dark",
-    # Accessibility / display scale. Auto ideal = logical_work_width / 2560
-    # (Qt DIPs; same look as manual 100% on typical 4K @ OS 150%). Works the
+    # Accessibility / display scale. Auto ideal = logical work area against
+    # 2560x1440, whichever of width/height is smaller (Qt DIPs; same look as
+    # manual 100% on typical 4K @ OS 150%). Works the
     # same on Windows / macOS / Linux — DIPs already embed OS scale. Window
     # geometry must grow with ui_scale. Manual = ui_scale_factor 50–150%.
     "ui_scale_auto": True,
@@ -138,6 +139,17 @@ _DEFAULTS: dict[str, Any] = {
     "p2p_username": "",             # shown to a peer receiving a P2P save transfer
     "p2p_max_per_game": 3,          # oldest P2P-received archives beyond this are pruned
     "p2p_retention_days": 7,        # P2P-received archives older than this are pruned
+    "p2p_files_dir": "",            # where hand-picked files are received; "" = SaveSync's own folder
+    "p2p_port": 0,                  # port the transfer listens on; 0 = a free one, chosen each time
+    "p2p_upnp": True,               # ask the router to open that port (UPnP / NAT-PMP)
+    "p2p_friends_online": True,     # check friends' mailboxes in the background (else only while a window needs it)
+    "p2p_friends_autolock_minutes": 10,   # lock the friend list after this many minutes unused (0 = never; needs a lock password)
+    "p2p_friends_media": True,      # let a friend's picture or video be shown inside the chat (when asked for)
+    "p2p_tls": False,               # send transfers over TLS (SSL torrents) instead of BitTorrent's RC4; needs a reachable port, not with the proxy (core.p2p.tls)
+    "p2p_proxy": False,             # send ALL P2P traffic through a SOCKS5 proxy (hides this PC's address); never falls back to direct
+    "p2p_tor": False,               # private mode: transfers and friends go through Tor (the program travels with the app); hides this PC's address from the other side and from the DHT, which is not used then (core.p2p.tor)
+    "p2p_proxy_host": "",           # the proxy (its login is kept apart, encrypted: core.p2p.proxy)
+    "p2p_proxy_port": 1080,
     "sync_timeout": 120,            # timeout in seconds for sync provider operations
     "schema_version": 1,
     "auto_scan_confirmed_games": [],  # Games where auto-scan was confirmed
@@ -331,6 +343,19 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "p2p_username": lambda x: isinstance(x, str),
     "p2p_max_per_game": lambda x: isinstance(x, int) and x >= 1,
     "p2p_retention_days": lambda x: isinstance(x, int) and x >= 1,
+    "p2p_files_dir": lambda x: isinstance(x, str),
+    "p2p_port": lambda x: (isinstance(x, int) and not isinstance(x, bool)
+                           and (x == 0 or 1024 <= x <= 65535)),
+    "p2p_upnp": lambda x: isinstance(x, bool),
+    "p2p_friends_online": lambda x: isinstance(x, bool),
+    "p2p_friends_media": lambda x: isinstance(x, bool),
+    "p2p_tls": lambda x: isinstance(x, bool),
+    "p2p_proxy": lambda x: isinstance(x, bool),
+    "p2p_tor": lambda x: isinstance(x, bool),
+    "p2p_proxy_host": lambda x: isinstance(x, str),
+    "p2p_proxy_port": lambda x: isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= 65535,
+    "p2p_friends_autolock_minutes": lambda x: (isinstance(x, int) and not isinstance(x, bool)
+                                               and 0 <= x <= 1440),
     "schema_version": lambda x: isinstance(x, int) and x >= 1,
 }
 

@@ -15,8 +15,8 @@ from .steamid_aes import SteamIdRecipe
 # ``Saved/SaveGames/<SteamID64>/`` folder, which is also where
 # steamid_aes.steamid64_in_path reads the id straight off the path.
 BORDERLANDS_4 = SteamIdRecipe(
-    name="Borderlands 4",
-    folder_marker="Borderlands 4",
+    name="Borderlands 4",  # i18n-ignore (engine / format name, an identifier)
+    folder_marker="Borderlands 4",  # i18n-ignore (engine / format name, an identifier)
     base_key=bytes((
         0x35, 0xEC, 0x33, 0x77, 0xF3, 0x5D, 0xB0, 0xEA,
         0xBE, 0x6B, 0x83, 0x11, 0x54, 0x03, 0xEB, 0xFB,

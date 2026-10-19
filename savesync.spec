@@ -124,6 +124,16 @@ _datas = [
     (str(ROOT / 'assets' / 'icon.png'), 'assets'),
 ]
 
+# The Tor program that private mode runs (core.p2p.tor), fetched and checked by
+# tools/fetch_tor.py. Data, not a binary: PyInstaller would try to trace its libraries.
+# Without it the build still works and private mode says the program is missing.
+_TOR_DIR = ROOT / 'vendor' / 'tor' / 'windows-x86_64'
+if (_TOR_DIR / 'tor.exe').is_file():
+    _datas.append((str(_TOR_DIR), 'tor'))
+else:
+    print('WARNING: vendor/tor/windows-x86_64 is missing - private mode will not work in this build '
+          '(python tools/fetch_tor.py windows-x86_64)')
+
 from PyInstaller.utils.hooks import (collect_submodules as _collect_submodules,
                                      collect_dynamic_libs as _collect_dynamic_libs)
 
@@ -197,8 +207,18 @@ a = Analysis(
         # other heavy/optional dependency in this list) plus the dialogs
         # that only ever get imported on demand when the sidebar/backup-row
         # buttons that open them are actually clicked.
-        'libtorrent', 'core.p2p', 'core.p2p.transfer',
+        'libtorrent', 'core.p2p', 'core.p2p.transfer', 'core.p2p.paths',
+        'core.p2p.secret', 'core.p2p.friends', 'core.p2p.friend_net',
+        'core.p2p.markup', 'core.p2p.attachments', 'core.p2p.proxy', 'core.p2p.tls',
+        'core.p2p.tor', 'core.p2p.tor_link', 'core.p2p.tor_friends',
+        'ui.p2p_friends_service', 'ui.dialogs.p2p_friends_dialog', 'ui.dialogs.p2p_friends_reset', 'ui.dialogs.p2p_send_flow',
+        'ui.dialogs.p2p_link_dialog', 'ui.widgets.safe_image', 'ui.widgets.safe_video', 'ui.widgets.stream_device',
+        # (played by Qt Multimedia, imported only when a video is played: the
+        # FFmpeg backend plugin rides along with it)
+        'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets',
+        'ui.widgets.count_badge',
         'ui.dialogs.p2p_receive_dialog', 'ui.dialogs.p2p_send_dialog',
+        'ui.dialogs.p2p_send_confirm_dialog',
         'ui.pages.cheats_page',
         'sync.local_provider',
         'sync.google_drive', 'sync.onedrive_provider', 'sync.dropbox_provider',
@@ -235,6 +255,11 @@ a = Analysis(
         # saves — a submodule this codebase had not exercised before, same
         # caution as the aead entry right above it.
         'cryptography.hazmat.primitives.padding',
+        # core.p2p: HKDF / Ed25519 (secret.py), X25519 / scrypt (friends.py) and the
+        # TLS certificates (tls.py) are lazy-imported inside functions - same caution.
+        'cryptography.hazmat.primitives.kdf.hkdf', 'cryptography.hazmat.primitives.kdf.scrypt',
+        'cryptography.hazmat.primitives.asymmetric.x25519', 'cryptography.hazmat.primitives.asymmetric.ed25519',
+        'cryptography.hazmat.primitives.serialization', 'cryptography.x509',
         'PIL', 'pillow_avif', 'jaraco.functools', 'jaraco.context', 'jaraco.text',
         # core.engines.wolf_lz4: lz4.block decompresses/recompresses the
         # payload, numpy vectorises its seed search, numba JIT-compiles

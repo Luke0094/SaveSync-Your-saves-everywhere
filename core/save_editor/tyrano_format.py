@@ -16,7 +16,7 @@ class TyranoFormat(JsonFormat):
     part the game itself set.
     """
     name = "TyranoScript"
-    engine = "TyranoScript / TyranoBuilder"
+    engine = "TyranoScript / TyranoBuilder"  # i18n-ignore (engine / format name, an identifier)
     # The wrapper rebuilds exactly and every sample proves it, but the JSON
     # inside is re-serialised, and JavaScript and Python do not have to spell
     # every float the same way. Checking the VALUES is the claim that actually

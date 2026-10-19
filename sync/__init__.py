@@ -532,7 +532,7 @@ class SyncWorker(QThread):
             game_folder = get_install_folder_name(self._exe_path, self._game_name, self._game_id, self._computed_folder_name)
 
             if self.isInterruptionRequested():
-                self.finished.emit(SyncResult(success=False, message="Sync cancelled"))
+                self.finished.emit(SyncResult(success=False, message=i18n.t('sync.cancelled')))
                 return
 
             # Ensure a fresh backup exists before uploading. Prefer a single
@@ -614,7 +614,7 @@ class SyncWorker(QThread):
                     logger.warning("Sync: remote folder migration failed", exc_info=True)
 
             if self.isInterruptionRequested():
-                self.finished.emit(SyncResult(success=False, message="Sync cancelled"))
+                self.finished.emit(SyncResult(success=False, message=i18n.t('sync.cancelled')))
                 return
 
             # Sync to each provider sequentially
@@ -623,7 +623,7 @@ class SyncWorker(QThread):
             for provider in active:
                 if self.isInterruptionRequested():
                     combined.success = False
-                    combined.message = "Sync cancelled"
+                    combined.message = i18n.t('sync.cancelled')
                     break
                 try:
                     result = self._sync_one_provider(

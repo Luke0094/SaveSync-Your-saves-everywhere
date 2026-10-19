@@ -349,6 +349,15 @@ from core.skip_dirs import BACKUP_SKIP_DIRS as _BACKUP_SKIP_DIRS
 logger = logging.getLogger(__name__)
 
 
+def _say(key: str, **kwargs) -> str:
+    """*key* in the user's language. The key itself when there is no running app
+    to say it (the repair scripts import this module without one)."""
+    try:
+        return i18n.t(key, **kwargs)
+    except Exception:
+        return key
+
+
 # ── Process freeze helpers (Windows-only) ────────────────────────────────────
 
 def _set_process_suspended(pid: int, suspend: bool) -> bool:
@@ -1029,11 +1038,18 @@ class BackupManager(QObject):
                 logger.info(f"Backup index: removed stale entry {bid} (zip missing)")
         return removed
 
-    def import_backup(self, entry: BackupEntry, zip_data: bytes) -> bool:
+    def import_backup(self, entry: BackupEntry, zip_data: bytes = b"", *,
+                      source_path=None) -> bool:
         """Import a backup ZIP downloaded from cloud into the local backup dir.
 
         Writes the zip to the standard backup path, adds the entry to the
         index.  Returns True on success.
+
+        *source_path*: a zip already on this machine (a P2P download) given
+        instead of *zip_data*. It is MOVED into place, not read into memory and
+        written again: a large archive then costs no second copy, in RAM or on
+        disk, and the download is not left behind to be deleted afterwards. If
+        the import fails, it is put back where it was.
         """
         # Derive folder name: prefer current library entry's computed_folder_name
         # so that backups from another machine (with stale save_paths) are still
@@ -1058,12 +1074,21 @@ class BackupManager(QObject):
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / f"{entry.backup_id}.zip"
 
+        tmp = dest_path.with_suffix(".tmp")
         try:
-            tmp = dest_path.with_suffix(".tmp")
-            tmp.write_bytes(zip_data)
+            if source_path is not None:
+                shutil.move(str(source_path), str(tmp))
+            else:
+                tmp.write_bytes(zip_data)
             tmp.replace(dest_path)
         except Exception as e:
             logger.error(f"Failed to write imported backup {entry.backup_id}: {e}")
+            if source_path is not None and tmp.exists() and not Path(source_path).exists():
+                # The download is the only copy there is: give it back.
+                try:
+                    shutil.move(str(tmp), str(source_path))
+                except Exception:
+                    logger.error(f"Could not put the download back: it is at {tmp}")
             return False
 
         # Every field, and not a list of them. save_chains and
@@ -1584,6 +1609,7 @@ class BackupManager(QObject):
         check_unbacked: bool = False,
         extra_metadata: dict | None = None,
         config_changed: bool = False,
+        bypass_debounce: bool = False,
     ) -> ("Optional[BackupEntry] | tuple[Optional[BackupEntry], bool] "
           "| tuple[Optional[BackupEntry], bool, Optional[BackupEntry] | str]"):
         """Create a zip backup of all save paths for a game.
@@ -1659,6 +1685,13 @@ class BackupManager(QObject):
                 matched (for a review panel) or the held-back entry just
                 comes back silently the same shape "already current" always
                 has.
+            bypass_debounce: The backup after the game EXITED. The 30 s
+                debounce exists to stop autosave churn from writing a backup
+                per save; it must not apply here, where holding the backup off
+                leaves the end of the session unbacked (the next launch then
+                reports it as an unbacked change) — e.g. an in-game timer
+                backup moments before closing, or a manual one. Content
+                identical to the newest backup is still skipped.
             extra_metadata: Merged into the entry's cloud_metadata BEFORE it is
                 indexed — so a marker that decides which line of history the
                 row belongs to (see MANUAL_VERSION_KEY) is already there when
@@ -1946,7 +1979,7 @@ class BackupManager(QObject):
                 age = (now - _deb.created_dt).total_seconds()
             except (ValueError, TypeError):
                 age = 999  # malformed timestamp, allow backup
-            if age < 30 and not config_changed:
+            if age < 30 and not config_changed and not bypass_debounce:
                 # Not for a change of WHICH folders are saved: a path confirmed
                 # or dropped seconds after the exit backup is not autosave
                 # churn, and holding it off — silently, the caller then logs
@@ -2648,7 +2681,7 @@ class BackupManager(QObject):
         entry = self.get_backup(backup_id)
         if not entry:
             logger.error(f"Backup not found: {backup_id}")
-            return RestoreResult(success=False, errors=["Backup not found"])
+            return RestoreResult(success=False, errors=[_say('backup.restore_err_not_found')])
 
         # ── Chain redirect ──────────────────────────────────────────────────
         # A folder handed over by hand is a COPY of a destination: it holds
@@ -2758,7 +2791,7 @@ class BackupManager(QObject):
         saved_zip_path = Path(entry.zip_path)
         if not saved_zip_path.exists():
             logger.error(f"Backup zip missing: {saved_zip_path}")
-            return RestoreResult(success=False, errors=["Backup zip missing"])
+            return RestoreResult(success=False, errors=[_say('backup.restore_err_zip_missing')])
 
         # Copy zip to temp to protect from _enforce_limits deletion.
         # Use TemporaryDirectory as context manager to guarantee cleanup
@@ -2842,7 +2875,7 @@ class BackupManager(QObject):
         zip_path = _restore_zip
         if not zip_path.exists():
             # Let the finally block handle cleanup via _restore_tmp_ctx
-            return RestoreResult(success=False, errors=["Backup zip removed"])
+            return RestoreResult(success=False, errors=[_say('backup.restore_err_zip_removed')])
 
         result = RestoreResult(success=True)
         frozen = False
@@ -2877,7 +2910,8 @@ class BackupManager(QObject):
                                 target = "registry:" + str(_doc.get("key", ""))
                             except Exception:
                                 result.failed.append(arc)
-                                result.errors.append(f"{arc}: unreadable registry payload")
+                                result.errors.append(
+                                    _say('backup.restore_err_registry_payload', name=arc))
                                 continue
                         data = zf.read(arc)
                         try:
@@ -2890,7 +2924,8 @@ class BackupManager(QObject):
                             result.restored.append(arc)
                         else:
                             result.failed.append(arc)
-                            result.errors.append(f"{arc}: registry import failed")
+                            result.errors.append(
+                                _say('backup.restore_err_registry_import', name=arc))
 
                 fs_save_paths = [p for p in entry.save_paths if not _is_reg(p)]
                 if target_dir:
@@ -3078,7 +3113,7 @@ class BackupManager(QObject):
             return result
 
         except zipfile.BadZipFile:
-            return RestoreResult(success=False, errors=["Corrupt backup zip"])
+            return RestoreResult(success=False, errors=[_say('backup.restore_err_zip_corrupt')])
         except Exception as e:
             logger.error(f"Restore failed: {e}")
             return RestoreResult(success=False, errors=[str(e)])
@@ -3919,14 +3954,14 @@ class BackupManager(QObject):
         """
         since = self.seconds_since_restore(*game_ids)
         if since is not None and since < self.RESTORE_QUIET_SECONDS:
-            return (f"another restore finished {since:.0f}s ago "
+            return (f"another restore finished {since:.0f}s ago "  # i18n-ignore (log text)
                     f"(quiet window {self.RESTORE_QUIET_SECONDS}s)")
         # The backup's own game id and, for one adopted into the library, the
         # library entry's: either may be where the matching copy is filed.
         for gid in dict.fromkeys(g for g in game_ids if g):
             stored = self.stored_backup_for_current_state(gid, paths)
             if stored is not None:
-                return f"the current saves are already stored in backup {stored.backup_id}"
+                return f"the current saves are already stored in backup {stored.backup_id}"  # i18n-ignore (log text)
         return ""
 
     def mark_last_restored(self, game_id: str, backup_id: str) -> None:
@@ -6235,7 +6270,7 @@ class BackupManager(QObject):
         schedule, just not deferred until that game's next backup).
 
         A P2P archive's game_id is entirely made up of "p2p" entries (see
-        ui.dialogs.p2p_receive_dialog) — routed to enforce_p2p_limits
+        ui.p2p_receive_service) — routed to enforce_p2p_limits
         instead, so an archive that predates this stamp, or that a sweep
         hasn't reached yet, gets judged against p2p_max_per_game /
         p2p_retention_days rather than the regular backup policy.
@@ -6499,7 +6534,7 @@ class BackupManager(QObject):
             if not zp.exists():
                 state, detail = "missing", zp.name
             elif not zipfile.is_zipfile(zp):
-                state, detail = "corrupt", "not a zip archive"
+                state, detail = "corrupt", _say('backup.verify_not_zip')
             else:
                 with zipfile.ZipFile(zp) as zf:
                     bad = zf.testzip()
@@ -6517,7 +6552,8 @@ class BackupManager(QObject):
                                 if n.replace("\\", "/") not in by_norm]
                         if gone:
                             state = "changed"
-                            detail = f"{len(gone)} file(s) missing, e.g. {gone[0]}"
+                            detail = _say('backup.verify_files_missing',
+                                          count=len(gone), example=gone[0])
                         elif deep and manifest:
                             for arc, fp in manifest.items():
                                 want = self._fp_content(fp)
@@ -6964,13 +7000,13 @@ class BackupManager(QObject):
         about YOUR OWN games' regular backup history, and a save someone
         else keeps sending you is not the same kind of thing. The bucket
         is per GAME (see the folder-name-derived game_id in
-        ui.dialogs.p2p_receive_dialog), not per sender — two friends
+        ui.p2p_receive_service), not per sender — two friends
         sending the same game share one limit, not one each. The newest
         is always kept regardless of age, same guarantee _enforce_limits'
         own min_kept gives its own backups.
 
         Called reactively after each P2P import (see
-        ui.dialogs.p2p_receive_dialog) for immediate feedback, exactly
+        ui.p2p_receive_service) for immediate feedback, exactly
         like _enforce_limits runs right after create_backup — but, same
         as that method, it also stamps planned_deletion on every survivor
         so a P2P archive that just sits there (no further sends for that

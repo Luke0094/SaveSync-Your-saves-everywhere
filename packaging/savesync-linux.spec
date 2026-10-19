@@ -81,6 +81,16 @@ datas = [
     (str(ROOT / 'assets' / 'icon.ico'), 'assets'),
 ]
 
+# The Tor program that private mode runs (core.p2p.tor), fetched and checked by
+# tools/fetch_tor.py. Added as data, not as a binary: PyInstaller would otherwise try to
+# trace its libraries. Without it the build still works and private mode says it is missing.
+_TOR_DIR = ROOT / 'vendor' / 'tor' / 'linux-x86_64'
+if (_TOR_DIR / 'tor').is_file():
+    datas.append((str(_TOR_DIR), 'tor'))
+else:
+    print('WARNING: vendor/tor/linux-x86_64 is missing - private mode will not work in this build '
+          '(python tools/fetch_tor.py linux-x86_64)')
+
 hiddenimports = []
 for package in ('core', 'ui', 'sync', 'hotkeys', 'i18n'):
     hiddenimports += collect_submodules(package)
@@ -89,7 +99,7 @@ hiddenimports += [
     # pynput and keyring pick their backend at run time, so analysis sees
     # neither. The X11 ones are the Linux halves of what the Windows spec
     # names; SecretService is what a desktop keyring answers on.
-    'pynput.keyboard._xorg', 'pynput.mouse._xorg',
+    'pynput', 'pynput.keyboard._xorg', 'pynput.mouse._xorg',
     'pynput.keyboard._uinput',
     'keyring.backends', 'keyring.backends.SecretService',
     'keyring.backends.chainer', 'keyring.backends.fail',
@@ -99,6 +109,12 @@ hiddenimports += [
     'googleapiclient.discovery',
     'cryptography.hazmat.primitives.ciphers.aead',
     'cryptography.hazmat.primitives.padding',
+    # core.p2p lazy-imports these inside functions (HKDF and Ed25519 in secret.py,
+    # X25519 and scrypt in friends.py, and the TLS certificates in tls.py): the
+    # same caution as the aead entry above - a frozen build must not drop one.
+    'cryptography.hazmat.primitives.kdf.hkdf', 'cryptography.hazmat.primitives.kdf.scrypt',
+    'cryptography.hazmat.primitives.asymmetric.x25519', 'cryptography.hazmat.primitives.asymmetric.ed25519',
+    'cryptography.hazmat.primitives.serialization', 'cryptography.x509',
     'PIL', 'pillow_avif',
     'jaraco.functools', 'jaraco.context', 'jaraco.text',
     'dateutil', 'dateutil.parser',
@@ -128,6 +144,12 @@ hiddenimports += [
     # frozen build (works from source, where the full pip install has
     # every plugin on disk).
     'PySide6.QtSvg',
+    # ui.widgets.safe_video plays a received video inside the chat and imports
+    # QtMultimedia / QtMultimediaWidgets lazily, so analysis never sees them (the
+    # Windows spec names them for the same reason). They were EXCLUDED below, which
+    # left the AppImage without a Play button - silently: safe_video.available()
+    # answers False when the import fails. Qt's FFmpeg backend plugin rides along.
+    'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets',
 ]
 
 _libtorrent_binaries = collect_dynamic_libs('libtorrent')
@@ -155,7 +177,7 @@ a = Analysis(                                    # noqa: F821
         *([] if _HAVE_TK else ['tkinter']), 'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
         'PySide6.Qt3DCore', 'PySide6.Qt3DRender', 'PySide6.QtCharts',
         'PySide6.QtDataVisualization', 'PySide6.QtQuick3D',
-        'PySide6.QtMultimediaWidgets', 'PySide6.QtBluetooth',
+        'PySide6.QtBluetooth',
         'PySide6.QtNfc', 'PySide6.QtSerialPort', 'PySide6.QtWebSockets',
         'PySide6.QtDesigner', 'PySide6.QtHelp', 'PySide6.QtTest',
     ],

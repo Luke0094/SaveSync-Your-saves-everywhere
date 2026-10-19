@@ -14,8 +14,8 @@ class StructHeaderFormat(_Format):
     succeeds — save_editor.make_doc reads them off the instance for
     exactly this reason.
     """
-    name = "Known save header"
-    engine = "Known save header"
+    name = "Known save header"  # i18n-ignore (engine / format name, an identifier)
+    engine = "Known save header"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         self._save = None

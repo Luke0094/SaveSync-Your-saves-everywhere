@@ -1009,8 +1009,8 @@ _CHROMIUM_MANAGED_DIRS = frozenset({
     "module info cache", "widevinecdm", "safe browsing", "sync data",
     "extension rules", "extension state", "extension scripts",
     "local extension settings", "sync extension settings",
-    "managed extension settings", "platform notifications",
-    "feature engagement tracker", "site characteristics database",
+    "managed extension settings", "platform notifications",  # i18n-ignore (process names to ignore, data)
+    "feature engagement tracker", "site characteristics database",  # i18n-ignore (process names to ignore, data)
     "autofillstrikedatabase", "budgetdatabase", "segmentation_platform",
     "optimization_guide_hint_cache_store", "affiliation database",
     "optimization_guide_model_and_features_store",
@@ -1578,9 +1578,9 @@ _PREFIX_SAVE_SUBDIRS = (
     "AppData/Local",            # {LOCALAPPDATA}
     "AppData/LocalLow",
     "Documents",
-    "Documents/My Games",
-    "Documents/Electronic Arts",
-    "Documents/Rockstar Games",
+    "Documents/My Games",  # i18n-ignore (folder names, data)
+    "Documents/Electronic Arts",  # i18n-ignore (folder names, data)
+    "Documents/Rockstar Games",  # i18n-ignore (folder names, data)
     "Saved Games",
 )
 

@@ -24,9 +24,9 @@ from .struct_header import HeaderField, HeaderLayout
 _JUST_CAUSE_2_PC_SIZE = 891904
 
 JUST_CAUSE_2 = HeaderLayout(
-    name="Just Cause 2",
-    engine="Avalanche Engine (Just Cause 2)",
-    source="JC2.Save (x-cubed/JC2MapViewer), SaveFileHeader.cs",
+    name="Just Cause 2",  # i18n-ignore (engine / format name, an identifier)
+    engine="Avalanche Engine (Just Cause 2)",  # i18n-ignore (engine / format name, an identifier)
+    source="JC2.Save (x-cubed/JC2MapViewer), SaveFileHeader.cs",  # i18n-ignore (engine / format name, an identifier)
     fields=[
         HeaderField("unk1", "Unknown (unk1)", "<i"),
         HeaderField("unk2", "Unknown (unk2)", "<i"),

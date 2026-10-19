@@ -31,7 +31,7 @@ class WebDAVProvider(SyncProvider):
             password = self._credentials.get("password", "")
             if not url:
                 logger.error("WebDAV: no URL provided")
-                self.last_error = "no URL provided"
+                self.last_error = i18n.t('webdav.err_no_url')
                 return False
             if url.startswith("http://"):
                 logger.warning(
@@ -58,7 +58,7 @@ class WebDAVProvider(SyncProvider):
             return True
         except ImportError:
             logger.error("webdavclient3 not installed — run: pip install webdavclient3")
-            self.last_error = "webdavclient3 not installed"
+            self.last_error = i18n.t('webdav.err_package_missing')
             return False
         except Exception as e:
             logger.error(f"WebDAV connect error: {e}")

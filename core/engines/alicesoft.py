@@ -485,7 +485,7 @@ class RSave:
         self.heap = [self._heap_object(r) for _ in range(r._count())]
         if self.version >= 6:
             self.func_names = r.string_array()
-        r.expect(len(buf), "end of the slot")
+        r.expect(len(buf), "end of the slot")  # i18n-ignore (parser diagnostic)
 
     def _return_record(self, r: _Reader) -> dict:
         addr = r.int32()

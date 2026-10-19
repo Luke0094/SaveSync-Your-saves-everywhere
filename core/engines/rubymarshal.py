@@ -318,7 +318,7 @@ class _Reader:
             b = RBignum(sign, words)
             self.objects.append(b)
             return b
-        if t in "cm M":
+        if t in "cm M":  # i18n-ignore (type codes)
             if t == " ":
                 raise MarshalError("unexpected byte")
             name = self.take(self.long())

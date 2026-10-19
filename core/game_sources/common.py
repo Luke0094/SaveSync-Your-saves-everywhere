@@ -48,7 +48,7 @@ def source_label(raw_source: str) -> str:
         return ""
     if "+web" in raw_source:
         base = raw_source.replace("+web", "")
-        return f"{_SOURCE_LABELS.get(base, base)} + web"
+        return t("add_game.source_plus_web", source=_SOURCE_LABELS.get(base, base))
     if raw_source == "web":
         return t("add_game.web_source_generic")
     return _SOURCE_LABELS.get(raw_source, raw_source)

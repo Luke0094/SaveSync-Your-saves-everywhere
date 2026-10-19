@@ -9,7 +9,7 @@ class Es3Format(JsonFormat):
     bookkeeping rather than anything to edit. See crypt/es3 for where the
     password comes from.
     """
-    name = "Easy Save 3"
+    name = "Easy Save 3"  # i18n-ignore (engine / format name, an identifier)
     engine = "Unity (Easy Save 3)"
     verify_exact = False
 

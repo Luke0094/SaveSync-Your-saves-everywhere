@@ -60,7 +60,7 @@ class OneDriveProvider(SyncProvider):
                 return self._connect_oauth()
         except ImportError as e:
             logger.error(f"Missing dependency for OneDrive OAuth: {e} — run: pip install msal requests")
-            self.last_error = "msal/requests not installed"
+            self.last_error = i18n.t('onedrive.err_package_missing')
             return False
         except Exception as e:
             logger.error(f"OneDrive connect error: {e}")
@@ -87,7 +87,7 @@ class OneDriveProvider(SyncProvider):
         self._token = self._credentials.get("access_token", "")
         if not self._token:
             logger.error("No OneDrive access token provided")
-            self.last_error = "no access token provided"
+            self.last_error = i18n.t('onedrive.err_no_token')
             return False
         self._setup_session()
         # Set a default expiry so _ensure_session() can detect when the token
@@ -245,7 +245,7 @@ class OneDriveProvider(SyncProvider):
             return True
 
         logger.error("OneDrive OAuth: no cached token available and no device flow initiated")
-        self.last_error = "no cached token and no device flow"
+        self.last_error = i18n.t('onedrive.err_no_cached_token')
         return False
 
     # ── Pre-auth helper (called from main thread by sync_page) ───────────────
@@ -353,7 +353,7 @@ class OneDriveProvider(SyncProvider):
                     logger.error(
                         "OneDrive personal access token expired (~1h lifetime, "
                         "no refresh possible) — re-authenticate from Settings")
-                    self.last_error = "access token expired — re-authenticate"
+                    self.last_error = i18n.t('onedrive.err_token_expired')
                     self._connected = False
                 return False
         # Refresh token if expired (thread-safe)
@@ -416,18 +416,18 @@ class OneDriveProvider(SyncProvider):
                                     "OneDrive token refresh failed: "
                                     "no access token in response")
                                 self._refresh_backoff_until = time.time() + 60
-                                self.last_error = "token refresh failed"
+                                self.last_error = i18n.t('onedrive.err_token_refresh')
                                 return False
                         else:
                             logger.error(
                                 "OneDrive token refresh failed: no accounts found")
                             self._refresh_backoff_until = time.time() + 60
-                            self.last_error = "token refresh failed — no accounts"
+                            self.last_error = i18n.t('onedrive.err_token_refresh_no_accounts')
                             return False
                     except Exception as e:
                         logger.error(f"OneDrive token refresh failed: {e}")
                         self._refresh_backoff_until = time.time() + 60
-                        self.last_error = f"token refresh failed: {e}"
+                        self.last_error = i18n.t('onedrive.err_token_refresh_error', error=e)
                         return False
         return True
 

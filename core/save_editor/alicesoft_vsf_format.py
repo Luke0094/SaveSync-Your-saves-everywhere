@@ -15,8 +15,8 @@ class AliceSoftVsfFormat(_Format):
     position and its type rather than a guessed-at name, the same honesty
     AliceSoftFormat already extends to a numbered global it cannot name.
     """
-    name = "AliceSoft VSF"
-    engine = "AliceSoft System"
+    name = "AliceSoft VSF"  # i18n-ignore (engine / format name, an identifier)
+    engine = "AliceSoft System"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         self._save = None

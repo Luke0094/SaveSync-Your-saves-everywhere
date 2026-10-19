@@ -1,5 +1,52 @@
 """Shared types and helpers for save-format adapters."""
+import json
 from dataclasses import dataclass
+from pathlib import Path
+
+_english_strings = None
+
+
+def english(key: str, **params) -> str:
+    """*key* in English, read straight from the English locale file.
+
+    For what goes to the log, which stays one language whatever the player
+    chose — and so needs no running app: the editor also runs headless."""
+    global _english_strings
+    if _english_strings is None:
+        try:
+            from i18n import _I18N_DIR
+            with open(Path(_I18N_DIR) / "en.json", encoding="utf-8") as fh:
+                _english_strings = json.load(fh)
+        except Exception:
+            _english_strings = {}
+    val = _english_strings
+    for part in key.split("."):
+        val = val.get(part) if isinstance(val, dict) else None
+    if not isinstance(val, str):
+        return key
+    try:
+        return val.format(**params)
+    except (KeyError, IndexError, ValueError):
+        return val
+
+
+class Phrase:
+    """A phrase said twice: in English for the log, in the player's language for
+    the window. Built from a locale key and the values to fill in; ``str()`` is
+    the English, ``local()`` the player's."""
+
+    def __init__(self, key: str, **params):
+        self.key = key
+        self.params = params
+
+    def __str__(self) -> str:
+        return english(self.key, **self.params)
+
+    def local(self) -> str:
+        from i18n import t
+        said = t(self.key, **self.params)
+        # t() hands the key back when there is nothing to say it with.
+        return str(self) if said == self.key else said
 
 
 class SaveEditorError(Exception):
@@ -23,7 +70,11 @@ def explain(error) -> str:
     key = getattr(error, "key", "")
     if not key:
         return str(error)
-    said = t(key, **getattr(error, "params", {}))
+    # A value that is itself a Phrase (the reason a save cannot be edited) is
+    # said in the player's language before it is put into the sentence.
+    params = {k: (v.local() if isinstance(v, Phrase) else v)
+              for k, v in getattr(error, "params", {}).items()}
+    said = t(key, **params)
     # t() hands the key back when there is nothing to say it with; the
     # English message is a far better answer than a dotted key.
     return str(error) if said == key else said

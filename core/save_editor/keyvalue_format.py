@@ -4,7 +4,7 @@ from .base import SaveEditorError, SaveField, _Format
 
 class KeyValueFormat(_Format):
     """``key = value`` text. See ``core.engines.keyvalue``."""
-    name = "Key/value text"
+    name = "Key/value text"  # i18n-ignore (engine / format name, an identifier)
     engine = "Text (key = value)"
 
     def __init__(self):

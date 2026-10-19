@@ -32,7 +32,7 @@ from pathlib import Path
 
 from core.constants import USER_DATA_DIR, RESTORE_QUIET_SECONDS
 
-from .base import SaveEditorError, explain  # noqa: F401 — public via this module
+from .base import SaveEditorError, Phrase, explain  # noqa: F401 — public via this module
 from . import registry as registry_module
 # Only the three this module names directly. Every other reader reaches it
 # through the registry, which is the point of having one: adding a format
@@ -47,31 +47,21 @@ logger = logging.getLogger(__name__)
 # Anything else is named for the player rather than silently mangled.
 # Named for the player, and with what is actually missing for each — saying
 # which is the difference between a limitation and a shrug.
+#
+# The engine is a name; the reason is a Phrase (a locale key under cheats.reason_*):
+# English in the log, the player's language in the window.
 _RECOGNISED_ONLY = {
-    ".es3": ("Unity (Easy Save 3)",
-             "it is encrypted and its password is not in the game's files "
-             "where Easy Save usually leaves it — put the key in an "
-             "es3.key file beside the save and it will open"),
+    ".es3": ("Unity (Easy Save 3)", Phrase("cheats.reason_es3_key")),
     # AliceSoft .asd carries several things in the same container, and all
     # the ones with values in them open (see AliceSoftFormat). What reaches
     # here is one that has none to offer, or one that is encrypted.
-    ".asd": ("AliceSoft System 4",
-             "it carries no values that can be named — the gallery lists are "
-             "a run of numbers with nothing saying what they unlock, and the "
-             "engine scrambles some of the rest"),
-    ".vsf": ("AliceSoft System 4",
-             "it is the flag file beside the save, and it carries no names to "
-             "show a value under"),
+    ".asd": ("AliceSoft System 4", Phrase("cheats.reason_alicesoft_asd")),  # i18n-ignore (engine name)
+    ".vsf": ("AliceSoft System 4", Phrase("cheats.reason_alicesoft_vsf")),  # i18n-ignore (engine name)
     # RPG Developer Bakin — "YUKRDATA", then its Yukar runtime's own object
     # stream. Same reason: read, not described.
-    ".sgs": ("RPG Developer Bakin",
-             "its values are written as a plain object stream with nothing "
-             "naming or typing them"),
+    ".sgs": ("RPG Developer Bakin", Phrase("cheats.reason_bakin_sgs")),
     # Classic MJR TADS 3 machine state — binary VM snapshot, not a value list.
-    ".t3v": ("TADS",
-             "it is a TADS 3 VM state snapshot; the values inside are not "
-             "named for editing — TAD-kit system.rec and JSON saves open "
-             "normally"),
+    ".t3v": ("TADS", Phrase("cheats.reason_tads_t3v")),
 }
 
 
@@ -331,8 +321,9 @@ def describe(path) -> str:
     return known[0] if known else ""
 
 
-def why_not(path) -> str:
-    """Why that file cannot be opened, in a few words."""
+def why_not(path):
+    """Why that file cannot be opened, in a few words: a Phrase, or "" for a file
+    nothing is known about."""
     known = _RECOGNISED_ONLY.get(Path(path).suffix.lower())
     return known[1] if known else ""
 
@@ -630,10 +621,10 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
         if hasattr(fmt, "verify_value_round_trip"):
             try:
                 if not fmt.verify_value_round_trip():
-                    remember_readonly(cls, fmt, "value round trip differs")
+                    remember_readonly(cls, fmt, "value round trip differs")  # i18n-ignore (log text)
                     continue
             except Exception:
-                remember_readonly(cls, fmt, "value round trip failed")
+                remember_readonly(cls, fmt, "value round trip failed")  # i18n-ignore (log text)
                 continue
             doc = make_doc(cls, fmt, read_only=False)
             if doc is None:
@@ -645,7 +636,7 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
         try:
             rebuilt = fmt.dump()
         except Exception:
-            remember_readonly(cls, fmt, "dump failed after load")
+            remember_readonly(cls, fmt, "dump failed after load")  # i18n-ignore (log text)
             continue
         # Asked of the reader, not of its class: a format can only know
         # which guarantee it can offer once it has seen the file. Naninovel
@@ -665,10 +656,10 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
                 probe.load(rebuilt)
                 if ([(f.label, f.value) for f in probe.fields()]
                         != [(f.label, f.value) for f in fmt.fields()]):
-                    remember_readonly(cls, fmt, "value round trip differs")
+                    remember_readonly(cls, fmt, "value round trip differs")  # i18n-ignore (log text)
                     continue
             except Exception:
-                remember_readonly(cls, fmt, "value round trip failed")
+                remember_readonly(cls, fmt, "value round trip failed")  # i18n-ignore (log text)
                 continue
         elif rebuilt != data:
             remember_readonly(cls, fmt, "round trip differs")
@@ -840,10 +831,8 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
     # that only needs its key.
     if _in_unreal_save_folder(p) and _looks_encrypted_unreal(data):
         from core.save_editor.crypt.unreal_crypt import KEY_FILE
-        reason = (f"the game encrypted it with a key of its own, and none was "
-                  f"found — put the key in a {KEY_FILE} file beside the save")
-        if not game_dir:
-            reason += ", or add the game to the library"
+        reason = Phrase("cheats.reason_unreal_key" if game_dir
+                        else "cheats.reason_unreal_key_add_game", key_file=KEY_FILE)
         raise SaveEditorError(
             f"{p.name} is an Unreal Engine save, which SaveSync cannot edit "
             f"yet: {reason}",
@@ -852,8 +841,7 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
     # Artemis puts its settings, its across-playthroughs data and its slots
     # all into a .dat. Only the first opens; the other two are worth naming.
     if data[:3] == b"BOW":
-        reason = ("its values sit in a tagged tree, and following one wrongly "
-                  "would write a number into the wrong place")
+        reason = Phrase("cheats.reason_artemis")
         raise SaveEditorError(
             f"{p.name} looks like an Artemis save, which SaveSync cannot edit "
             f"yet: {reason}",
@@ -875,11 +863,8 @@ def _detect(p: Path, data: bytes, registry: str, game_dir, progress,
     # else claimed, so it cannot take a save away from a reader that works.
     engine_said, have_game = _engine_that_encrypts(p, game_dir)
     if engine_said:
-        reason = ("the engine encrypts it, and the key is inside the game's "
-                  "own program rather than in the save")
-        if not have_game:
-            reason += (" — add the game to the library so SaveSync has its "
-                       "executable to look in")
+        reason = Phrase("cheats.reason_engine_encrypted" if have_game
+                        else "cheats.reason_engine_encrypted_add_game")
         raise SaveEditorError(
             f"{p.name} looks like a {engine_said} save, which SaveSync cannot "
             f"edit yet: {reason}",
@@ -902,10 +887,7 @@ _ENCRYPTING_ENGINES = ("srpgstudio",)
 # Saying so, and naming the step that would fix it, is the difference between
 # a dead end and an instruction.
 _KEY_LIVES_IN_THE_GAME = {
-    ".es3": ("it is encrypted, and the password is baked into the game's own "
-             "build rather than kept in the save — add the game to the "
-             "library and SaveSync will read it out of there, or put the key "
-             "in an es3.key file beside the save"),
+    ".es3": Phrase("cheats.reason_es3_in_game"),
 }
 
 

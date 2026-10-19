@@ -4,7 +4,7 @@ from .base import SaveEditorError, SaveField, _Format
 
 class PlayerPrefsFormat(_Format):
     """Unity PlayerPrefs registry export. See ``core.engines.playerprefs``."""
-    name = "Unity PlayerPrefs"
+    name = "Unity PlayerPrefs"  # i18n-ignore (engine / format name, an identifier)
     engine = "Unity"
     verify_exact = False
 

@@ -4,7 +4,7 @@ from .base import SaveEditorError, SaveField, _Format
 
 class TadsRecFormat(_Format):
     """TAD-kit ``system.rec`` slots. See ``core.engines.tads``."""
-    name = "TADS record"
+    name = "TADS record"  # i18n-ignore (engine / format name, an identifier)
     engine = "TADS"
     # dump() re-joins tokens with single spaces, so a record that held
     # multiple spaces is NOT byte-exact. The guarantee is only known per

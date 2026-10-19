@@ -8,7 +8,7 @@ class RagsFormat(_Format):
     there are three million values of it.
     """
     name = "RAGS"
-    engine = "Rapid Adventure Game System"
+    engine = "Rapid Adventure Game System"  # i18n-ignore (engine / format name, an identifier)
 
     def __init__(self):
         self._save = None

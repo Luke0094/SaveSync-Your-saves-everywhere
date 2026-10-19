@@ -349,6 +349,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # broken a handler each time.
         self._sync_after_backup_ids: set[str] = set()
         self._backup_queued: set[str] = set()
+        # games whose exit backup arrived while another backup of them ran
+        self._exit_backup_rerun: set[str] = set()
         self._backup_batch: dict | None = None    # active Tutti tally + persist
         self._backup_max_inflight: int = 2
         self._manual_path_dlg = None
@@ -493,6 +495,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._setup_auto_export_config()
         self._setup_update_check()
         self._setup_startup_self_checks()
+        self._setup_p2p_friends()
         # A previous run may have died between suspending a game for a forced
         # restore and resuming it. The game would still be frozen, with
         # nothing on screen to explain why.
@@ -713,6 +716,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._p2p_receive_btn.setToolTip(t("p2p.receive_button_tooltip"))
         self._p2p_receive_btn.clicked.connect(self._open_p2p_receive_dialog)
         status_row_lay.addWidget(self._p2p_receive_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # Right after it: the friend list - people to write to and to hand a
+        # transfer token to directly. It slides out of this sidebar (a toggle).
+        self._p2p_friends_btn = QPushButton("\U0001F465")
+        self._p2p_friends_btn.setObjectName("toolbar_icon_btn")
+        self._p2p_friends_btn.setFixedSize(scaled(28, self), scaled(28, self))
+        self._p2p_friends_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._p2p_friends_btn.setToolTip(t("p2p.friends_button_tooltip"))
+        self._p2p_friends_btn.clicked.connect(lambda _=False: self._open_p2p_friends_panel())
+        status_row_lay.addWidget(self._p2p_friends_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        # How many different friends have something unread: shown on the button
+        # even while the list is locked (it says how many, not who).
+        from ui.widgets.count_badge import CountBadge
+        self._p2p_friends_badge = CountBadge(corner_of=self._p2p_friends_btn)
 
         sl.addWidget(status_row)
 
@@ -1073,6 +1090,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         runner = getattr(self, "_search_runner", None)
         if runner is not None and getattr(runner, "running", False):
             return True
+        # Pictures that outlived an Add/Edit Save: no dialog holds them any more,
+        # but they are still writing into the cover cache and the library.
+        from ui.dialogs.picture_batch import late_pictures_running
+        if late_pictures_running():
+            return True
         return self._shelved_work_running()
 
     def _has_active_or_pending_dialogs(self) -> bool:
@@ -1092,6 +1114,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_window_minimized_or_hidden(self):
         """Stage 1 cleanup: Immediate light trim on minimize (Linux/Windows) or close to tray.
         Keeps UI widgets, documents, and dialogs intact for 0 ms resume. Starts 2-minute Stage 2 timer."""
+        # An open chat reads what arrives and keeps its notification quiet: with
+        # nobody looking, that would swallow the message.
+        self._close_p2p_friends_panel()
         if hasattr(self, "_stage2_idle_threads_timer"):
             self._stage2_idle_threads_timer.stop()
             self._stage2_idle_threads_timer.start()
@@ -1887,9 +1912,157 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.dialogs.credits_dialog import CreditsDialog
         CreditsDialog(self).exec()
 
+    def _p2p_service(self):
+        """The receive session lives here, not in its panel, so it survives
+        the panel being closed (see ui.p2p_receive_service)."""
+        svc = getattr(self, "_p2p_receive_svc", None)
+        if svc is None:
+            from ui.p2p_receive_service import P2pReceiveService
+            svc = P2pReceiveService(self)
+            svc.offer_arrived.connect(self._on_p2p_offer_arrived)
+            svc.friends = self._p2p_friends_service()   # to hand the token to a friend
+            # What becomes of a chat attachment the person accepted (it is taken
+            # in here; the card in the Friends dialog follows it).
+            svc.attachment_event.connect(svc.friends.on_attachment_event)
+            self._p2p_receive_svc = svc
+            self._p2p_panel_open = False
+        return svc
+
     def _open_p2p_receive_dialog(self):
+        if getattr(self, "_p2p_panel_open", False):
+            return
         from ui.dialogs.p2p_receive_dialog import P2pReceiveDialog
-        P2pReceiveDialog(self).exec()
+        svc = self._p2p_service()
+        self._p2p_panel_open = True
+        try:
+            P2pReceiveDialog(svc, self).exec()
+        finally:
+            self._p2p_panel_open = False
+
+    # ── Friends ──────────────────────────────────────────────────────────
+
+    def _setup_p2p_friends(self):
+        """Friends are looked after from a few seconds after start, so the
+        tokens they send arrive while the person plays (see
+        ui.p2p_friends_service for when the network is really up)."""
+        QTimer.singleShot(8000, self._start_p2p_friends)
+
+    def _p2p_friends_service(self):
+        svc = getattr(self, "_p2p_friends_svc", None)
+        if svc is None:
+            from ui.p2p_friends_service import P2pFriendsService, set_friends_service
+            svc = P2pFriendsService(self)
+            svc.message_received.connect(self._on_friend_message)
+            svc.changed.connect(self._update_friends_button)
+            svc.lock_changed.connect(lambda _locked: self._update_friends_button())
+            svc.receiver_fn = self._p2p_service         # takes an accepted attachment in
+            self._p2p_friends_svc = svc
+            self._p2p_friends_panel = None
+            set_friends_service(svc)
+        return svc
+
+    def _start_p2p_friends(self):
+        try:
+            svc = self._p2p_friends_service()
+            if svc.store.friends:       # nobody to listen for yet: stay quiet
+                svc.start()
+        except Exception as e:
+            logger.debug(f"P2P friends start failed: {e}")
+
+    def _open_p2p_friends_panel(self, friend_id: str = "", *, toggle: bool = True):
+        """Slide the friend list out of the sidebar - or, with *friend_id*, straight
+        onto that friend's chat (the notification's button). The sidebar's button
+        toggles it; *toggle* False only ever opens it. Brings the window up first:
+        the person may be reading it from the tray."""
+        svc = self._p2p_friends_service()
+        panel = getattr(self, "_p2p_friends_panel", None)
+        if panel is not None:
+            if panel.closing:
+                # On its way out: a click on the button is ignored, a request to open
+                # (a notification's, "Manage friends") is asked again once it has gone.
+                if friend_id or not toggle:
+                    QTimer.singleShot(250, lambda: self._open_p2p_friends_panel(
+                        friend_id, toggle=False))
+                return
+            if friend_id:
+                panel.show_friend(friend_id)
+            elif toggle:
+                panel.close_panel()
+            return
+        if friend_id:
+            if self.isMinimized():
+                self.showNormal()
+            elif not self.isVisible():
+                self.show()
+            self.raise_()
+            self.activateWindow()
+        from ui.dialogs.p2p_friends_dialog import P2pFriendsPanel
+        panel = P2pFriendsPanel(svc, self.centralWidget(), self._sidebar, open_friend=friend_id)
+        panel.closed.connect(self._on_p2p_friends_panel_closed)
+        self._p2p_friends_panel = panel
+        panel.open_panel()
+
+    def _on_p2p_friends_panel_closed(self):
+        self._p2p_friends_panel = None
+        self._update_friends_button()
+
+    def _close_p2p_friends_panel(self):
+        """Put the panel away now, without the slide (the window is going away, or
+        its colours are about to change under it)."""
+        panel = getattr(self, "_p2p_friends_panel", None)
+        if panel is not None:
+            panel.close_panel(animated=False)
+
+    def _on_friend_message(self, friend_id: str, message_id: str):
+        """A friend's message arrived and is worth telling the person about (the
+        service has already left out a locked list and a conversation that is
+        open): a notification like any other, with a button that opens it."""
+        svc = self._p2p_friends_service()
+        msg = svc.message(message_id)
+        friend = svc.store.get(friend_id)
+        overlay = getattr(self, "_overlay", None)
+        if msg is not None and friend is not None and overlay is not None:
+            try:
+                overlay.show_friend_message(friend_id, friend.display, svc.preview(msg))
+            except Exception as e:
+                logger.debug(f"Friend message notification failed: {e}")
+        self._update_friends_button()
+
+    def _update_friends_button(self):
+        """The badge on the sidebar button: how many different friends have
+        something unread. Kept while the list is locked."""
+        btn = getattr(self, "_p2p_friends_btn", None)
+        if btn is None:
+            return
+        svc = getattr(self, "_p2p_friends_svc", None)
+        people = svc.unread_friends() if svc is not None else 0
+        badge = getattr(self, "_p2p_friends_badge", None)
+        if badge is not None:
+            badge.set_count(people)
+        tip = t("p2p.friends_button_tooltip")
+        if people:
+            tip += "\n" + t("p2p.friends_button_unread", count=people)
+        if svc is not None and svc.locked:
+            tip += "\n" + t("p2p.friends_button_locked")      # (sealed: nobody is listening)
+        btn.setToolTip(tip)
+
+    def _on_p2p_offer_arrived(self):
+        """A sender used the token while the panel was closed: bring it up."""
+        svc = self._p2p_service()
+        if self._p2p_panel_open or svc.state != "offer":
+            return
+        if QApplication.activeModalWidget() is not None:
+            # Something else is being answered; try again shortly rather
+            # than stacking a dialog on top of it.
+            QTimer.singleShot(2000, self._on_p2p_offer_arrived)
+            return
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        self._open_p2p_receive_dialog()
 
     def _on_sync_batch_progress(self, done: int, total: int, name: str):
         if total <= 0:
@@ -2762,6 +2935,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overlay.dont_show_again.connect(self._on_suppress_overlay)
         self._overlay.exclusive_blocked.connect(self._on_overlay_blocked_by_fullscreen)
         self._overlay.path_changed_expired.connect(self._on_path_changed_expired)
+        self._overlay.friend_silenced.connect(
+            lambda fid: self._p2p_friends_service().set_silenced(fid, True))
 
     def _on_overlay_blocked_by_fullscreen(self, title: str, message: str):
         """Overlay could not show because a game is in exclusive fullscreen.
@@ -2887,6 +3062,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             game_id, _, new_exe_path = context.partition("|")
             self._resolve_overwrite_saves_conflict(
                 game_id, new_exe_path, do_rebase=(action == "path_overwrite_confirm"))
+            return
+        # A friend's message: its notification's button opens THAT friend's page.
+        if action == "open_friend_messages":
+            # One turn of the event loop later: the dialog runs its own, and
+            # started from inside the button's click the notification would stay
+            # on screen until it closed.
+            QTimer.singleShot(0, lambda fid=context: self._open_p2p_friends_panel(fid))
             return
         if action == "add_game":
             self._auto_add_game_from_overlay(context)
@@ -3938,6 +4120,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         _on_theme_changed_inner). Re-entrancy-guarded."""
         if getattr(self, '_rebuilding_pages', False):
             return
+        # The friend panel's colours are set when it is built: put it away rather
+        # than leave it in the old theme over the new one.
+        self._close_p2p_friends_panel()
         self._rebuilding_pages = True
         try:
             self._on_theme_changed_inner(theme)
@@ -4370,6 +4555,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             "backup_archives": t("batch.verify_label"),
             "archive_rebackup": t("batch.backup_label"),
             "settings_integrity": t("batch.verify_settings"),
+            "icon_cache": t("batch.verify_icons"),
         }
         self._verify_batch_notice.update_progress(
             index, max(total, 1), names.get(check_id, check_id))
@@ -4827,7 +5013,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             started = get_monitor().tracked_process_start_time(game_id)
             if started > 0:
                 import time as _t
-                return f" (+{max(0, int(_t.time() - started))}s into the session)"
+                return f" (+{max(0, int(_t.time() - started))}s into the session)"  # i18n-ignore (log text)
         except Exception:
             pass
         return ""
@@ -5603,7 +5789,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 f"unbacked warning, filing temporary instead of skipping")
         if config.get("backup_on_exit", True) and entry.auto_backup_enabled and entry.save_paths:
             logger.info(f"Game exited — checking for exit backup for {entry.name}")
-            self._backup_game(entry.id, force_full=False, notif_gated=True)
+            # exit_backup: the last chance to capture this session, so the
+            # 30 s debounce between backups must not hold it off.
+            self._backup_game(entry.id, force_full=False, notif_gated=True,
+                              exit_backup=True)
         else:
             self._release_idle_documents(force_all=True)
             from ui.helpers import trim_process_memory
@@ -6809,10 +6998,33 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         dlg.background_status_changed.connect(
             lambda status, d=dlg: self._on_add_game_bg_status(d, status))
         dlg.game_added.connect(self._on_game_saved_from_dialog)
+        dlg.pictures_detached.connect(self._on_pictures_detached)
         # Save paths / unticked folders or files / install changed by the edit:
         # the new configuration is backed up now (see on_game_config_changed).
         dlg.config_changed.connect(self.on_game_config_changed)
         dlg.finished.connect(lambda _r, d=dlg: self._on_add_game_dialog_finished(d))
+
+    @Slot(object)
+    def _on_pictures_detached(self, late):
+        """Save did not wait for some pictures: they finish without the dialog (see
+        LatePictures). The dialog is gone by then, so it is here that the person
+        learns if a picture never made it."""
+        late.finished.connect(self._on_late_pictures_finished)
+
+    @Slot(object)
+    def _on_late_pictures_finished(self, late):
+        from ui.helpers import trim_process_memory
+        QTimer.singleShot(250, trim_process_memory)
+        if not late.failed:
+            return
+        msg = t("add_game.images_late_failed", failed=late.failed,
+                total=late.total, name=late.name)
+        self._status_bar.showMessage(msg, 15000)
+        try:
+            if self._tray is not None and not self.isActiveWindow():
+                self._tray.showMessage(t("app.name"), msg, self._tray.icon(), 8000)
+        except Exception:
+            logger.debug("Could not raise a tray notice for pictures", exc_info=True)
 
     def _on_game_saved_from_dialog(self, entry):
         """React immediately if an active game's backup settings or paths are edited while playing."""
@@ -7002,6 +7214,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Accept/reject tear the dialog down for real; without this the
         # Add/Edit dialog (and every pixmap it decoded) stays alive as a
         # hidden child of the main window — one stack of RAM per card opened.
+        # (Pictures still coming at Save do not need it: see _on_pictures_detached.)
         dlg.deleteLater()
         from ui.helpers import trim_process_memory
         QTimer.singleShot(250, trim_process_memory)
@@ -7067,11 +7280,30 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _enqueue_backup(self, game_id: str, force_full: bool = False,
                         silent: bool = False, part_of_batch: bool = False,
                         check_unbacked: bool = False, notif_gated: bool = False,
-                        config_changed: bool = False):
+                        config_changed: bool = False, exit_backup: bool = False):
         if not game_id:
             return
         with self._backup_lock:
             if game_id in self._backup_inflight or game_id in self._backup_queued:
+                if exit_backup:
+                    # Not dropped like any other duplicate request: the one
+                    # already running (the in-game timer, say) started BEFORE
+                    # the game closed and may have missed its last writes.
+                    # Re-run as soon as it finishes (see _finish_backup_job).
+                    if game_id in self._backup_inflight:
+                        self._exit_backup_rerun.add(game_id)
+                    # One that is still only queued has not started, so it
+                    # will see the game as it is now: no re-run needed, but
+                    # it becomes the exit backup — with an exit backup's
+                    # flags, not those of whatever queued it (a manual or
+                    # Backup-all job carries check_unbacked, which would hold
+                    # this very session back as "unbacked" instead of
+                    # writing it).
+                    for _j in self._backup_job_queue:
+                        if _j["game_id"] == game_id:
+                            _j["exit_backup"] = True
+                            _j["notif_gated"] = True
+                            _j["check_unbacked"] = False
                 return
             self._backup_queued.add(game_id)
             if not part_of_batch:
@@ -7103,6 +7335,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 # The backup of a game whose save paths / exclusions / install
                 # just changed — see create_backup's config_changed.
                 "config_changed": bool(config_changed),
+                # The backup taken because the game just closed — the last
+                # chance to capture the session, so create_backup's 30 s
+                # debounce does not apply to it.
+                "exit_backup": bool(exit_backup),
             })
 
     def _pump_backup_queue(self):
@@ -7204,6 +7440,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Identity takes priority when (rarely) both apply at once: it's
         # the older, more fundamental mystery — which game this even is.
         config_changed = bool(job.get("config_changed"))
+        exit_backup = bool(job.get("exit_backup"))
         _note = (t('main.auto_pending_identity') if identity_alts
                 else t('main.auto_pending_review') if notif_pending
                 else t('main.auto_config_change') if config_changed
@@ -7211,26 +7448,39 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         def _do_backup():
             mgr = get_backup_manager()
-            backup, created, regressed_to = mgr.create_backup(
-                game_id, name, save_paths,
-                exe_path=exe_path,
-                note=_note,
-                max_size_mb=max_mb,
-                force=force_full,
-                computed_folder_name=computed,
-                excluded_paths=excluded,
-                pre_confirmation=bool(identity_alts) or notif_pending,
-                identity_alternates=identity_alts,
-                report_regression=True,
-                check_unbacked=check_unbacked,
-                config_changed=config_changed,
-            )
+            backup, created, regressed_to = None, False, None
+            try:
+                backup, created, regressed_to = mgr.create_backup(
+                    game_id, name, save_paths,
+                    exe_path=exe_path,
+                    note=_note,
+                    max_size_mb=max_mb,
+                    force=force_full,
+                    computed_folder_name=computed,
+                    excluded_paths=excluded,
+                    pre_confirmation=bool(identity_alts) or notif_pending,
+                    identity_alternates=identity_alts,
+                    report_regression=True,
+                    check_unbacked=check_unbacked,
+                    config_changed=config_changed,
+                    bypass_debounce=exit_backup,
+                )
+            except Exception:
+                # Still reported, as "nothing was backed up": the result is
+                # what ends the job (_on_backup_done -> _finish_backup_job).
+                # Without it the game stays in _backup_inflight, every later
+                # backup of it is dropped as a duplicate and the exit backup
+                # is parked in _exit_backup_rerun for good.
+                logger.exception("Backup failed for %s", game_id)
             # Its own tag, independent of identity_alts — a game can be
             # BOTH an identity mystery and mid regression/unbacked warning
             # at once, and promote/discard_pre_confirmation_backups need
             # to tell the two apart. See mark_notif_gated.
             if backup and notif_pending:
-                mgr.mark_notif_gated(backup.backup_id)
+                try:
+                    mgr.mark_notif_gated(backup.backup_id)
+                except Exception:
+                    logger.exception("Could not tag the temporary backup of %s", game_id)
             with self._backup_lock:
                 self._backup_results.append(
                     (game_id, backup, silent, created, job.get("batch", False),
@@ -7307,13 +7557,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _backup_game(self, game_id: str, force_full: bool = False, silent: bool = False,
                      check_unbacked: bool = False, notif_gated: bool = False,
-                     config_changed: bool = False):
+                     config_changed: bool = False, exit_backup: bool = False):
         """Enqueue a single-game backup under the adaptive concurrency cap."""
         from core.concurrency import backup_max_inflight
         self._backup_max_inflight = backup_max_inflight()
         self._enqueue_backup(game_id, force_full=force_full, silent=silent,
                              part_of_batch=False, check_unbacked=check_unbacked,
-                             notif_gated=notif_gated, config_changed=config_changed)
+                             notif_gated=notif_gated, config_changed=config_changed,
+                             exit_backup=exit_backup)
         self._pump_backup_queue()
 
     def on_game_config_changed(self, game_id: str, what: str = "") -> None:
@@ -7357,6 +7608,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from core import pending_batch_jobs as _pbj
         with self._backup_lock:
             self._backup_inflight.discard(game_id)
+            rerun_exit = game_id in self._exit_backup_rerun
+            self._exit_backup_rerun.discard(game_id)
+        if rerun_exit:
+            # An exit backup was asked for while another backup of this game
+            # was still running — see _enqueue_backup. Whatever kind of job
+            # that was, including one of a sweep: the flag is already
+            # cleared, so skipping it here would lose the exit backup.
+            QTimer.singleShot(0, lambda gid=game_id: self._backup_game(
+                gid, force_full=False, notif_gated=True, exit_backup=True))
         if batch and self._backup_batch:
             pending = [g for g in (self._backup_batch.get("pending_ids") or [])
                        if g != game_id]
@@ -8538,6 +8798,29 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             get_pin_manager().shutdown()
         except Exception as e:
             logger.debug(f"Pin shutdown failed: {e}")
+        # The receive session owns a libtorrent session and its DHT watch:
+        # close them rather than leave it to interpreter teardown. Files
+        # received but not yet moved are remembered on disk, not lost here.
+        svc = getattr(self, "_p2p_receive_svc", None)
+        if svc is not None:
+            try:
+                svc.shutdown()
+            except Exception as e:
+                logger.debug(f"P2P receive shutdown failed: {e}")
+        friends = getattr(self, "_p2p_friends_svc", None)
+        if friends is not None:
+            try:
+                friends.stop()
+                friends.store.flush()
+            except Exception as e:
+                logger.debug(f"P2P friends shutdown failed: {e}")
+        # Tor (private mode) ends with the application - it is told to follow this process
+        # anyway - this just does not leave it to chance.
+        try:
+            from core.p2p import tor as _tor
+            _tor.shutdown()
+        except Exception as e:
+            logger.debug(f"Tor shutdown failed: {e}")
         # Stop all in-game backup timers
         for gid in list(self._ingame_backup_timers):
             self._stop_ingame_backup_timer(gid)

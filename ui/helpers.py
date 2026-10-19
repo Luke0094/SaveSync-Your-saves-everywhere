@@ -98,7 +98,7 @@ def safe_widget(w) -> bool:
 #: whatever the system decided, and the metrics differ enough to change
 #: every measured width in the interface.
 UI_FONT_STACK = ("Segoe UI", "SF Pro Display", "Inter", "Noto Sans",
-                 "Cantarell", "Ubuntu", "DejaVu Sans")
+                 "Cantarell", "Ubuntu", "DejaVu Sans")  # i18n-ignore (font name)
 _ui_font_family_cache: list = []
 
 
@@ -554,7 +554,7 @@ def z_report(widget) -> str:
     still be underneath a game that holds it too.
     """
     if platform.system() != "Windows":
-        return "not Windows"
+        return "not Windows"  # i18n-ignore (trace text)
     try:
         import ctypes
         from ctypes import wintypes
@@ -1252,13 +1252,21 @@ def display_scale() -> float:
 
 # Design baseline: logical work-area width (Qt DIPs) that matches the
 # validated manual-100% look — typical 4K panel at OS 150% (≈2560 DIP).
-# Ideal auto = availableGeometry.width() / 2560.
+# Ideal auto = availableGeometry / (2560 x 1440), the smaller of the two ratios
+# (see auto_scale_for_area).
 # DIPs already include OS scale on Windows, macOS and Linux (Qt high-DPI),
 # so changing Scale/DPR keeps the same physical chrome size without a
 # second ÷ OS% (that double-count is what pushed 4K@150% to ~133–200%).
 # Callers MUST grow window geometry with ui_scale (fonts alone = compressed).
 # Downscale floor is dynamic; below it, scrolls finish the fit.
 _UI_RES_REF_WIDTH = 2560
+# The height that goes with it (16:9). Growing from the width alone made every
+# ultrawide panel look like a bigger screen than it is: 3440x1440 at OS 100%
+# is an ordinary-density monitor, not 134% of the baseline. A work area is only
+# "larger than the OS scale accounts for" when it is larger both ways.
+_UI_RES_REF_HEIGHT = 1440
+# Share of a screen's height a work area keeps once the taskbar is taken off.
+_UI_WORK_AREA_FRACTION = 0.97
 _UI_SCALE_IDEAL_MIN = 0.50
 _UI_SCALE_IDEAL_MAX = 4.00   # e.g. 8K @ OS 100% ≈ 300%+
 _UI_SCALE_QUALITY_MAX = 4.00
@@ -1559,26 +1567,6 @@ QWidget.setMaximumWidth = _make_tracked_setter(_original_setMaximumWidth, 'max_w
 QWidget.setMaximumHeight = _make_tracked_setter(_original_setMaximumHeight, 'max_height')
 
 
-def windows_os_scale(widget: QWidget | None = None) -> float:
-    """OS display scale (1.0 = 100%, 1.5 = 150%, 2.0 = 200%).
-
-    Prefer ``devicePixelRatio`` (reliable on Windows/macOS/Linux). Informational
-    for tooltips — auto ideal uses DIPs, which already embed this factor.
-    """
-    screen = widget.screen() if widget is not None else None
-    if screen is None:
-        screen = QApplication.primaryScreen()
-    if screen is None:
-        return 1.0
-    try:
-        dpr = float(screen.devicePixelRatio() or 0.0)
-        if dpr >= 0.50:
-            return max(0.50, min(3.0, dpr))
-        return max(0.50, min(3.0, float(screen.logicalDotsPerInch()) / 96.0))
-    except Exception:
-        return 1.0
-
-
 def _scale_screen_of(widget: QWidget | None):
     """The screen *widget*'s scale is measured on, or None for "the primary".
 
@@ -1604,23 +1592,8 @@ def _scale_screen_of(widget: QWidget | None):
     return widget.screen()
 
 
-def _work_area_width_physical(widget: QWidget | None = None) -> float:
-    """Work-area width in physical pixels (DIPs × screen DPR)."""
-    screen = _scale_screen_of(widget)
-    if screen is None:
-        screen = QApplication.primaryScreen()
-    if screen is None:
-        return float(_UI_RES_REF_WIDTH) * windows_os_scale(widget)
-    try:
-        geo = screen.availableGeometry()
-        dpr = float(screen.devicePixelRatio() or 1.0)
-        return max(1.0, float(geo.width()) * dpr)
-    except Exception:
-        return float(_UI_RES_REF_WIDTH)
-
-
-def _work_area_width_dip(widget: QWidget | None = None) -> int:
-    """Work-area width in Qt device-independent pixels (logical).
+def _work_area_dip(widget: QWidget | None = None) -> tuple:
+    """Work-area (width, height) in Qt device-independent pixels (logical).
 
     Already accounts for OS Scale / Retina on Windows, macOS and Linux.
     """
@@ -1628,21 +1601,58 @@ def _work_area_width_dip(widget: QWidget | None = None) -> int:
     if screen is None:
         screen = QApplication.primaryScreen()
     if screen is None:
-        return _UI_RES_REF_WIDTH
+        return _UI_RES_REF_WIDTH, 1400
     try:
-        return max(1, int(screen.availableGeometry().width()))
+        ag = screen.availableGeometry()
+        return max(1, int(ag.width())), max(1, int(ag.height()))
     except Exception:
-        return _UI_RES_REF_WIDTH
+        return _UI_RES_REF_WIDTH, 1400
+
+
+def _work_area_width_dip(widget: QWidget | None = None) -> int:
+    return _work_area_dip(widget)[0]
+
+
+# The smallest work area the full layout is comfortable in, in logical px —
+# below it the automatic scale shrinks the UI just enough to fit.
+_UI_FIT_W = 1100.0
+_UI_FIT_H = 700.0
+
+
+def auto_scale_for_area(width_dip: float, height_dip: float) -> float:
+    """The automatic UI scale for a work area of *width_dip* x *height_dip*
+    Qt DIPs.
+
+    The goal is the SAME text and button size on every screen. The OS display
+    scale has already sized a DIP for each screen's density, so the answer is
+    100% almost everywhere (a 2560x1600 laptop at OS 150% and a 4K monitor at
+    OS 150% both come out at exactly 100%). It only departs from that when the
+    OS scale and the screen disagree:
+
+    - a work area too small for the layout (a 1280x720 logical desktop):
+      shrinks only as far as needed to fit, by whichever of width/height runs
+      out first;
+    - a work area far larger than the OS scale accounts for (4K at OS 100% =
+      3840x2160 DIP): grows proportionally to the 2560x1440 baseline (-> 150%)
+      so controls keep the same physical size — never beyond what fits. It
+      has to be larger in BOTH directions: an ultrawide 3440x1440 is wide but
+      not dense, and stays at 100%.
+    """
+    w, h = float(width_dip), float(height_dip)
+    fit = min(w * 0.96 / _UI_FIT_W, h * 0.96 / _UI_FIT_H)
+    if w >= float(_UI_RES_REF_WIDTH):
+        grow = min(w / float(_UI_RES_REF_WIDTH),
+                   h / (float(_UI_RES_REF_HEIGHT) * _UI_WORK_AREA_FRACTION))
+        return max(1.0, min(grow, fit))
+    return max(0.50, min(1.0, fit))
 
 
 def resolution_scale(widget: QWidget | None = None) -> float:
-    """Chrome scale vs design baseline from **logical** work-area width."""
-    width = float(_work_area_width_dip(widget))
-    return max(0.50, width / float(_UI_RES_REF_WIDTH))
-
+    """Chrome scale from the **logical** work area (see auto_scale_for_area)."""
+    return auto_scale_for_area(*_work_area_dip(widget))
 
 def ui_scale_ideal(widget: QWidget | None = None) -> float:
-    """Auto target: ``logical_work_width / 2560`` (same look as manual 100% on 4K@150%)."""
+    """Auto target: see auto_scale_for_area (100% unless the screen forces otherwise)."""
     ideal = resolution_scale(widget)
     return max(_UI_SCALE_IDEAL_MIN, min(_UI_SCALE_IDEAL_MAX, ideal))
 
@@ -1654,15 +1664,12 @@ def ui_scale_quality_min(widget: QWidget | None = None) -> float:
     ~70%. Below the floor, keep it and use scrollbars instead of crushing glyphs.
     """
     w = float(_work_area_width_dip(widget))
-    if w >= float(_UI_RES_REF_WIDTH):
-        return 0.70
+    if w >= 1280.0:
+        return 0.70    # the automatic scale is never below 100% from here up
     if w <= 640.0:
         return _UI_SCALE_ABS_FLOOR
-    if w <= 1280.0:
-        t = (w - 640.0) / (1280.0 - 640.0)
-        return _UI_SCALE_ABS_FLOOR + t * 0.05
-    t = (w - 1280.0) / (float(_UI_RES_REF_WIDTH) - 1280.0)
-    return 0.55 + t * 0.15
+    t = (w - 640.0) / (1280.0 - 640.0)
+    return _UI_SCALE_ABS_FLOOR + t * 0.05
 
 
 def _read_ui_scale_auto() -> bool:
@@ -1688,10 +1695,10 @@ def _read_ui_scale_pref() -> float:
 def ui_scale(widget: QWidget | None = None) -> float:
     """Logical UI scale for chrome (buttons, paddings, QSS fonts).
 
-    **Auto**: ``logical_work_width / 2560`` then readability clamp — same look
-    as manual 100% on a typical 4K @ OS 150% desktop. DIPs already embed
-    Windows/macOS/Linux scaling, so switching OS % keeps physical size.
-    Examples: 4K@150%→≈100%, 4K@100%→≈150%, FHD@100%→≈75%, 8K@100%→≈300%.
+    **Auto**: see auto_scale_for_area, then readability clamp. DIPs already
+    embed Windows/macOS/Linux scaling, so switching OS % keeps physical size.
+    Examples: 4K@150%→100%, 4K@100%→150%, 2560x1600@150%→100%,
+    FHD@100%→100%, 8K@100%→300%.
     Manual: ``ui_scale_factor`` 50–150%.
 
     Scaling fonts without resizing the window compresses the layout — callers
@@ -2455,7 +2462,7 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
     Forum attachment CDNs (confirmed on a real one) serve AVIF under a .png/.jpg
     URL — QPixmap.loadFromData alone just fails on it, silently, leaving a
     preview thumbnail blank while the same bytes decode fine through PIL.
-    _download_and_set_image (add_game_dialog.py) already has this fallback
+    store_picture (image_cache.py) already has this fallback
     for the full download-and-cache path; the smaller preview-only thumbnail
     loaders (CandidatePreviewDialog, EnrichmentMergeDialog) didn't, which is
     why a candidate could download correctly yet never show a preview.

@@ -247,6 +247,31 @@ def _save_files(entry) -> list:
     return out
 
 
+def _file_sig(path):
+    """What a save file IS right now: (mtime, size, content hash), or None
+    when it cannot be read.
+
+    The mtime alone is not enough to say "the document in memory still
+    matches this file": a restore puts an older copy back with ITS mtime (the
+    kept copy's, or the backup's), which can equal the one the document was
+    loaded under while the contents are entirely different — and the editor
+    then redisplayed the old values. The hash settles it. Past 64 MB the
+    hash is skipped (reading it would cost more than it saves)."""
+    try:
+        st = Path(path).stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        if st.st_size > 64 * 1024 * 1024:
+            return sig
+        import hashlib
+        h = hashlib.blake2b(digest_size=16)
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return sig + (h.hexdigest(),)
+    except OSError:
+        return None
+
+
 class _Row(QFrame, ThemedMixin):
     """A clickable line — a game, a save file, a kept copy."""
 
@@ -568,6 +593,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._save_load_busy = None
         self._save_load_gen = 0
         self._loaded_path = None
+        self._loaded_sig = None     # (mtime, size, content hash) the doc was read from
         self._load_notice = None
         self._hold_watch = QTimer(self)
         self._hold_watch.setInterval(1000)
@@ -879,7 +905,17 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._edit_hint = QLabel("")
         self._edit_hint.setObjectName("form_hint")
         self._edit_hint.setWordWrap(True)
-        col.addWidget(self._edit_hint)
+        # Under Apply, to the right of the hint: how the rows are ordered.
+        # Themed like the group selector, no sheet of its own.
+        hint_row = QHBoxLayout()
+        hint_row.setSpacing(10)
+        hint_row.addWidget(self._edit_hint, 1)
+        self._sort_combo = QComboBox()
+        self._sort_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fill_sort_combo()
+        self._sort_combo.currentIndexChanged.connect(self._apply_sort)
+        hint_row.addWidget(self._sort_combo, 0, Qt.AlignmentFlag.AlignTop)
+        col.addLayout(hint_row)
         # Shown only over a read-only reading (see _on_save_load_finished):
         # an explicit, opt-in offer to try the generic unwrap recipe
         # battery on this same file, in case it does better than whatever
@@ -1018,6 +1054,8 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             # (respect_shelved defaults to True) — that is the point of
             # shelving it in the first place.
             self._abandon_in_flight_save_load()
+            # Edits typed but never applied are not kept for the next visit.
+            self._pending = {}
             # Walking away from the editor stops holding: a loop rewriting a
             # file for a screen nobody is looking at is not something to
             # leave running.
@@ -1180,11 +1218,8 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         """
         if (self._doc is not None and self._loaded_path is not None
                 and self._stack.currentIndex() == self.STEP_EDIT):
-            try:
-                mtime = self._loaded_path.stat().st_mtime_ns
-            except OSError:
-                mtime = 0
-            if mtime != self._loaded_mtime:
+            sig = _file_sig(self._loaded_path)
+            if sig is None or sig != self._loaded_sig:
                 path = self._loaded_path
                 held_snapshot = dict(self._held)
                 armed_snapshot = self._hold_armed
@@ -1290,7 +1325,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._hold_watch.stop()
         self._doc = None
         self._loaded_path = None
-        self._loaded_mtime = 0
+        self._loaded_sig = None
         self._pending.clear()
         self._held.clear()
         self._editors.clear()
@@ -1649,7 +1684,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         if getattr(self, "_loaded_path", None) == Path(target).resolve():
             self._doc = None
             self._loaded_path = None
-            self._loaded_mtime = 0
+            self._loaded_sig = None
         # Stay on the panel: the file as it stood before this restore is now
         # the first row of the list, tagged, one click from undoing it. The
         # save list behind it is read again on the way back.
@@ -1792,17 +1827,22 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # and has not been modified externally, display it immediately without reloading!
         # Skipped for a forced-engine/full-sweep/recipe retry — that fast path
         # would just hand back the same state instead of trying again.
-        try:
-            mtime = resolved_path.stat().st_mtime_ns
-        except OSError:
-            mtime = 0
+        sig = _file_sig(resolved_path)
         if (not forced_engine and not full_sweep and not try_recipes
                 and self._doc is not None
-                and mtime  # a failed stat (locked mid-write) reads as 0 —
-                           # never serve the cache off that, always reload
+                and sig is not None  # unreadable (locked mid-write): always reload
                 and getattr(self, "_loaded_path", None) == resolved_path
-                and getattr(self, "_loaded_mtime", 0) == mtime):
+                and getattr(self, "_loaded_sig", None) == sig):
+            # Same bytes as the document in memory — but anything the person
+            # typed and never applied belongs to the last visit, not this one.
             self._close_load_notice()
+            self._pending = {}
+            self._page = 0
+            self._apply_doc_header(resolved_path)
+            self._field_filter.blockSignals(True)
+            self._field_filter.clear()
+            self._field_filter.blockSignals(False)
+            self._render_page()
             self.show_step(self.STEP_EDIT)
             return
 
@@ -1810,7 +1850,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         if getattr(self, "_loaded_path", None) != resolved_path:
             self._doc = None
             self._loaded_path = None
-            self._loaded_mtime = 0
+            self._loaded_sig = None
             try:
                 from core.save_editor import prune_all
                 prune_all()
@@ -1837,7 +1877,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._page = 0
         self._doc = None
         self._loaded_path = None
-        self._loaded_mtime = 0
+        self._loaded_sig = None
         # A previous shelved load may still be showing its "Loaded" notice —
         # a fresh open starts clean.
         self._close_load_notice()
@@ -2157,7 +2197,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         if err is not None or doc is None:
             self._doc = None
             self._loaded_path = None
-            self._loaded_mtime = 0
+            self._loaded_sig = None
             if notice is not None:
                 notice.hide_cancel()
                 notice.finish(
@@ -2185,10 +2225,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # being non-None here already means a snapshot exists.
         self._doc = doc
         self._loaded_path = path
-        try:
-            self._loaded_mtime = path.stat().st_mtime_ns
-        except OSError:
-            self._loaded_mtime = 0
+        self._loaded_sig = _file_sig(path)
         # A manual pick or full sweep that worked is worth remembering: the
         # next save from this game should not need the same detour. Only
         # when it actually says something auto-detection didn't already
@@ -2206,6 +2243,17 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             notice.finish(t("cheats.loading_done", name=path.name),
                           hide_after_ms=0)
             notice.set_activatable(True)
+        self._apply_doc_header(path, try_recipes)
+        self._field_filter.clear()
+        self._fill_groups()
+        self._render_page()
+        self._reset_idle_save_timer()
+        if not shelved:
+            self.show_step(self.STEP_EDIT)
+
+
+    def _apply_doc_header(self, path: Path, try_recipes: bool = False):
+        """Subtitle, hint and Apply state for the document now on screen."""
         ro = bool(getattr(self._doc, "read_only", False))
         from core.save_editor.recipe_format import RecipeFormat
         is_recipe_doc = isinstance(getattr(self._doc, "_fmt", None), RecipeFormat)
@@ -2231,12 +2279,6 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._save_btn.setEnabled(not ro)
         self._save_btn.setToolTip(
             t("cheats.read_only_hint", engine=self._doc.engine) if ro else "")
-        self._field_filter.clear()
-        self._fill_groups()
-        self._render_page()
-        self._reset_idle_save_timer()
-        if not shelved:
-            self.show_step(self.STEP_EDIT)
 
 
     # ── shelved load: report in the sidebar notice instead of the sheet ────
@@ -2330,7 +2372,48 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                           if q in str(f.value).casefold()]
             else:
                 fields = [f for f in fields if q in f.label.casefold()]
-        return fields
+        return self._sorted_fields(fields)
+
+    def _sorted_fields(self, fields: list) -> list:
+        """*fields* in the order chosen in the sort box (the save's own order
+        by default). Quantity sorts on the value AS IT IS IN THE SAVE, for the
+        same reason the value filter does: an unsaved edit must not move its
+        own row. Values that are not numbers go last, in their own order."""
+        mode = self._sort_combo.currentData() or ""
+        if not mode:
+            return fields
+        if mode.startswith("name"):
+            return sorted(fields, key=lambda f: f.label.casefold(),
+                          reverse=mode.endswith("desc"))
+        numeric, other = [], []
+        for f in fields:
+            v = f.value
+            if isinstance(v, (bool, int, float)):
+                numeric.append((float(v), f))
+            else:
+                other.append(f)
+        numeric.sort(key=lambda p: p[0], reverse=mode.endswith("desc"))
+        return [f for _, f in numeric] + other
+
+    def _fill_sort_combo(self):
+        cur = self._sort_combo.currentData() or ""
+        self._sort_combo.blockSignals(True)
+        self._sort_combo.clear()
+        for key, data in (("cheats.sort_default", ""),
+                          ("cheats.sort_name_asc", "name_asc"),
+                          ("cheats.sort_name_desc", "name_desc"),
+                          ("cheats.sort_qty_desc", "qty_desc"),
+                          ("cheats.sort_qty_asc", "qty_asc")):
+            self._sort_combo.addItem(t(key), data)
+        idx = self._sort_combo.findData(cur)
+        self._sort_combo.setCurrentIndex(max(0, idx))
+        self._sort_combo.setToolTip(t("cheats.sort_tooltip"))
+        self._sort_combo.blockSignals(False)
+
+    def _apply_sort(self):
+        self._page = 0
+        self._render_page()
+        self._reset_idle_save_timer()
 
     def _fill_groups(self):
         """One entry per group the save actually has, in the order it keeps
@@ -2580,6 +2663,11 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # itself still happened, so this is still a real "applied", just
         # named from the doc's own loaded path rather than the copy.
         applied_name = kept.name if kept is not None else self._loaded_path.name
+        # The file just changed on purpose; the document in memory is its new
+        # truth. Without this the next visit saw a different signature and
+        # reloaded, and a restore that brought back the old bytes could look
+        # like "unchanged" to a stale signature.
+        self._loaded_sig = _file_sig(self._loaded_path)
         self._subtitle.setText(t("cheats.applied", name=applied_name))
         running = self._playing()
         # Marks persist across game stop/start; the loop needs Apply first,
@@ -2836,6 +2924,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._subtitle.setText(t("cheats.subtitle"))
         self._search.setPlaceholderText(t("cheats.search_placeholder"))
         self._sync_filter_mode()
+        self._fill_sort_combo()
         self._save_btn.setText(t("cheats.apply"))
         self._kept_lbl.setText(t("cheats.kept_copies"))
         self._restore_lbl.setText(t("cheats.kept_copies"))

@@ -317,7 +317,7 @@ def _already_running_message() -> str:
     Falling back to English on any error keeps a failure here from being
     the reason the user sees nothing at all.
     """
-    fallback = f"{APP_NAME} is already running.\nCheck the system tray."
+    fallback = f"{APP_NAME} is already running.\nCheck the system tray."  # i18n-ignore (source-language fallback)
     try:
         import json as _json
         cfg = USER_DATA_DIR / "config.json"
@@ -404,15 +404,18 @@ def _seed_cursor_size():
             x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
             x11.XDisplayWidth.restype = ctypes.c_int
             x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            x11.XDisplayHeight.restype = ctypes.c_int
+            x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
             screen = x11.XDefaultScreen(ctypes.c_void_p(dpy))
             width = x11.XDisplayWidth(ctypes.c_void_p(dpy), screen)
+            height = x11.XDisplayHeight(ctypes.c_void_p(dpy), screen)
             # An X screen is the whole desk, monitors and all: two 1080p
             # panels side by side report 3840 and would scale the pointer
             # as if it were 4K. ui_scale() works from one screen's work
             # area, so this asks RandR for the same thing.
             monitor = _primary_monitor_rect(x11, dpy, screen)
             if monitor:
-                width = monitor[2]
+                width, height = monitor[2], monitor[3]
         finally:
             x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
             x11.XCloseDisplay(ctypes.c_void_p(dpy))
@@ -434,7 +437,15 @@ def _seed_cursor_size():
         if scale is None:
             # ui_scale()'s auto rule and its readability clamp, without
             # importing Qt to get them.
-            scale = max(0.50, min(4.00, logical / 2560.0))
+            # ui.helpers.auto_scale_for_area's rule: 100% up to the
+            # 2560x1440 baseline, proportional above it in whichever of
+            # width/height is smaller (an ultrawide is wide, not dense). The
+            # work area is not known this early, so the whole monitor's
+            # height stands in for it.
+            grow = logical / 2560.0
+            if height > 0:
+                grow = min(grow, (height / (dpi / 96.0)) / 1440.0)
+            scale = min(4.00, max(1.0, grow))
 
         size = int(round(24 * scale))
         os.environ["XCURSOR_SIZE"] = str(max(16, min(96, size)))
@@ -795,7 +806,7 @@ def main():
 
         def _paint_handler(mode, ctx, message):
             text = str(message)
-            if "QPainter::begin" in text or "Paint device" in text:
+            if "QPainter::begin" in text or "Paint device" in text:  # i18n-ignore (Qt message to match)
                 stack = "".join(_tb.format_stack()[:-1])
                 key = stack[-400:]
                 if key not in _paint_seen:      # one report per call site
