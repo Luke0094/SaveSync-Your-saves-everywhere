@@ -1114,9 +1114,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_window_minimized_or_hidden(self):
         """Stage 1 cleanup: Immediate light trim on minimize (Linux/Windows) or close to tray.
         Keeps UI widgets, documents, and dialogs intact for 0 ms resume. Starts 2-minute Stage 2 timer."""
-        # An open chat reads what arrives and keeps its notification quiet: with
-        # nobody looking, that would swallow the message.
-        self._close_p2p_friends_panel()
         if hasattr(self, "_stage2_idle_threads_timer"):
             self._stage2_idle_threads_timer.stop()
             self._stage2_idle_threads_timer.start()
@@ -1922,7 +1919,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             svc.offer_arrived.connect(self._on_p2p_offer_arrived)
             svc.friends = self._p2p_friends_service()   # to hand the token to a friend
             # What becomes of a chat attachment the person accepted (it is taken
-            # in here; the card in the Friends dialog follows it).
+            # in here; the card in the Friends panel follows it).
             svc.attachment_event.connect(svc.friends.on_attachment_event)
             self._p2p_receive_svc = svc
             self._p2p_panel_open = False
@@ -1953,6 +1950,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             from ui.p2p_friends_service import P2pFriendsService, set_friends_service
             svc = P2pFriendsService(self)
             svc.message_received.connect(self._on_friend_message)
+            svc.group_message.connect(self._on_group_message)
+            svc.group_invite.connect(self._on_group_invite)
+            svc.group_kicked.connect(self._on_group_kicked)
             svc.changed.connect(self._update_friends_button)
             svc.lock_changed.connect(lambda _locked: self._update_friends_button())
             svc.receiver_fn = self._p2p_service         # takes an accepted attachment in
@@ -1969,35 +1969,41 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         except Exception as e:
             logger.debug(f"P2P friends start failed: {e}")
 
-    def _open_p2p_friends_panel(self, friend_id: str = "", *, toggle: bool = True):
-        """Slide the friend list out of the sidebar - or, with *friend_id*, straight
-        onto that friend's chat (the notification's button). The sidebar's button
+    def _open_p2p_friends_panel(self, friend_id: str = "", *, toggle: bool = True, group_id: str = "",
+                                bring_up: bool = False):
+        """Slide the friend list out of the sidebar - or, with *friend_id* (*group_id*), straight
+        onto that friend's (group's) chat (the notification's button). The sidebar's button
         toggles it; *toggle* False only ever opens it. Brings the window up first:
         the person may be reading it from the tray."""
         svc = self._p2p_friends_service()
         panel = getattr(self, "_p2p_friends_panel", None)
-        if panel is not None:
-            if panel.closing:
-                # On its way out: a click on the button is ignored, a request to open
-                # (a notification's, "Manage friends") is asked again once it has gone.
-                if friend_id or not toggle:
-                    QTimer.singleShot(250, lambda: self._open_p2p_friends_panel(
-                        friend_id, toggle=False))
-                return
-            if friend_id:
-                panel.show_friend(friend_id)
-            elif toggle:
-                panel.close_panel()
-            return
-        if friend_id:
+        if friend_id or group_id or bring_up:
+            # (also when the panel is already up: it may be behind other windows, or
+            # the window put away, and the chat switching there would look like nothing)
             if self.isMinimized():
                 self.showNormal()
             elif not self.isVisible():
                 self.show()
             self.raise_()
             self.activateWindow()
+        if panel is not None:
+            if panel.closing:
+                # On its way out: a click on the button is ignored, a request to open
+                # (a notification's, "Manage friends") is asked again once it has gone.
+                if friend_id or group_id or bring_up or not toggle:
+                    QTimer.singleShot(250, lambda: self._open_p2p_friends_panel(
+                        friend_id, toggle=False, group_id=group_id, bring_up=bring_up))
+                return
+            if friend_id:
+                panel.show_friend(friend_id)
+            elif group_id:
+                panel.show_group(group_id)
+            elif toggle and not bring_up:
+                panel.close_panel()
+            return
         from ui.dialogs.p2p_friends_dialog import P2pFriendsPanel
-        panel = P2pFriendsPanel(svc, self.centralWidget(), self._sidebar, open_friend=friend_id)
+        panel = P2pFriendsPanel(svc, self.centralWidget(), self._sidebar, open_friend=friend_id,
+                                open_group=group_id)
         panel.closed.connect(self._on_p2p_friends_panel_closed)
         self._p2p_friends_panel = panel
         panel.open_panel()
@@ -2005,13 +2011,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_p2p_friends_panel_closed(self):
         self._p2p_friends_panel = None
         self._update_friends_button()
-
-    def _close_p2p_friends_panel(self):
-        """Put the panel away now, without the slide (the window is going away, or
-        its colours are about to change under it)."""
-        panel = getattr(self, "_p2p_friends_panel", None)
-        if panel is not None:
-            panel.close_panel(animated=False)
 
     def _on_friend_message(self, friend_id: str, message_id: str):
         """A friend's message arrived and is worth telling the person about (the
@@ -2028,6 +2027,41 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 logger.debug(f"Friend message notification failed: {e}")
         self._update_friends_button()
 
+    def _on_group_message(self, group_id: str, entry_id: str):
+        """A message or an attachment offer arrived in a group and is worth telling the person about
+        (the service has left out a locked list, a group they are looking at and a silenced one)."""
+        svc = self._p2p_friends_service()
+        info = svc.group_preview(group_id, entry_id)
+        overlay = getattr(self, "_overlay", None)
+        if info["group"] and overlay is not None:
+            try:
+                overlay.show_group_message(group_id, info["group"], info["sender"], info["text"])
+            except Exception as e:
+                logger.debug(f"Group message notification failed: {e}")
+        self._update_friends_button()
+
+    def _on_group_invite(self, group_id: str):
+        svc = self._p2p_friends_service()
+        rec = next((r for r in svc.group_invites() if r["gid"] == group_id), None)
+        overlay = getattr(self, "_overlay", None)
+        if rec is not None and overlay is not None:
+            name = svc.member_label(rec["inviter"])
+            try:
+                overlay.show_group_invite(group_id, t("p2p.groups_notice_invite", name=name, group=rec["name"]))
+            except Exception as e:
+                logger.debug(f"Group invitation notification failed: {e}")
+
+    def _on_group_kicked(self, group_id: str):
+        svc = self._p2p_friends_service()
+        g = svc.group(group_id)
+        overlay = getattr(self, "_overlay", None)
+        if g is not None and overlay is not None:
+            try:
+                overlay.show_group_kicked(group_id, t("p2p.groups_notice_kicked", group=g.name))
+            except Exception as e:
+                logger.debug(f"Group removal notification failed: {e}")
+        self._update_friends_button()
+
     def _update_friends_button(self):
         """The badge on the sidebar button: how many different friends have
         something unread. Kept while the list is locked."""
@@ -2036,12 +2070,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         svc = getattr(self, "_p2p_friends_svc", None)
         people = svc.unread_friends() if svc is not None else 0
+        total = svc.unread_total() if svc is not None else 0
         badge = getattr(self, "_p2p_friends_badge", None)
         if badge is not None:
             badge.set_count(people)
         tip = t("p2p.friends_button_tooltip")
         if people:
             tip += "\n" + t("p2p.friends_button_unread", count=people)
+            if total > people:
+                tip += "\n" + t("p2p.friends_button_unread_total", count=total)
         if svc is not None and svc.locked:
             tip += "\n" + t("p2p.friends_button_locked")      # (sealed: nobody is listening)
         btn.setToolTip(tip)
@@ -2937,6 +2974,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overlay.path_changed_expired.connect(self._on_path_changed_expired)
         self._overlay.friend_silenced.connect(
             lambda fid: self._p2p_friends_service().set_silenced(fid, True))
+        self._overlay.group_silenced.connect(
+            lambda gid: self._p2p_friends_service().set_group_silenced(gid, True))
 
     def _on_overlay_blocked_by_fullscreen(self, title: str, message: str):
         """Overlay could not show because a game is in exclusive fullscreen.
@@ -3065,10 +3104,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         # A friend's message: its notification's button opens THAT friend's page.
         if action == "open_friend_messages":
-            # One turn of the event loop later: the dialog runs its own, and
-            # started from inside the button's click the notification would stay
-            # on screen until it closed.
+            # One turn of the event loop later, so that the notification's button has
+            # finished its click (and the notification can go) before the window and
+            # the panel come up.
             QTimer.singleShot(0, lambda fid=context: self._open_p2p_friends_panel(fid))
+            return
+        # A group's message (or its invitation, which has no group yet: the list shows it).
+        if action == "open_group_messages":
+            QTimer.singleShot(0, lambda gid=context: self._open_p2p_friends_panel(
+                group_id=gid, bring_up=not gid, toggle=False))
             return
         if action == "add_game":
             self._auto_add_game_from_overlay(context)
@@ -4120,9 +4164,6 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         _on_theme_changed_inner). Re-entrancy-guarded."""
         if getattr(self, '_rebuilding_pages', False):
             return
-        # The friend panel's colours are set when it is built: put it away rather
-        # than leave it in the old theme over the new one.
-        self._close_p2p_friends_panel()
         self._rebuilding_pages = True
         try:
             self._on_theme_changed_inner(theme)
@@ -4213,6 +4254,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._credits_btn.style().unpolish(self._credits_btn)
         self._credits_btn.style().polish(self._credits_btn)
         self._credits_btn.update()
+        # The friend panel lies beside the sidebar and wears its colours.
+        panel = getattr(self, "_p2p_friends_panel", None)
+        if panel is not None:
+            panel.refresh_styles()
         if self._overlay:
             self._overlay.refresh_styles()
 
@@ -8731,6 +8776,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._sidebar_logo.setText(t("app.name").upper())
         self._sidebar_tagline.setText(t("app.tagline"))
         self._credits_btn.setText(t("credits.title"))
+        self._p2p_friends_btn.setToolTip(t("p2p.friends_button_tooltip"))
+        panel = getattr(self, "_p2p_friends_panel", None)
+        if panel is not None:
+            panel.update_locale()
         # Sidebar status ("Online"/"Offline"/"🎮 <game>") is otherwise only
         # repainted on the next provider/monitor event, so it would stay in
         # the previous language until then — refresh it here explicitly.

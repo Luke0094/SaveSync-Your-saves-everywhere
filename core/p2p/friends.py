@@ -55,6 +55,23 @@ receiver STOPPING an attempt ("k"); like a token it is not worth keeping and
 goes first when the mailbox is crowded. What is refused, and how the arrival is checked
 against the offer, is core.p2p.attachments.
 
+A REQUEST for a token is the other way round: whoever has a save to send asks a friend
+for the token to send it to (an "ask" message: what is to be sent, and how long the
+request is good for). The friend sees a card and presses Accept - nothing is sent before
+- and their SaveSync answers with a token message whose "re" is the request's id, which
+the asker's send window takes up. Either end can call it off with a "cancel" naming the
+request ("withdraw": I no longer want it; "stop": I decline). Like a token it is not worth
+keeping once it has gone out, and it lapses with the token's own ten minutes.
+
+A GROUP CHAT (core.p2p.groups) is made of the same parts. Every member keeps a pairwise
+mailbox with every other member - for one who is not a friend, a "hidden" friend: not in
+the list, and never able to send anything but that group's traffic - and a group message is
+a numbered, acknowledged text to each of them, marked with a "g" that says which group and
+what it is (a message, an invitation, a member added, a kick...). Who may do what is
+decided only by who the message came from, which the pairwise sealing proves: the host's
+word counts for kicks and permissions, an inviter's for who joined, a member's for what
+they said.
+
 Everything that is kept - the identity and the friend list - lives in one file
 (FriendStore), encrypted with the same machine-bound key the app's cloud
 credentials use, and is never part of a config export. Because of that binding
@@ -110,7 +127,24 @@ _MAX_NAME_CHARS = 40
 # Tokens older than this are dropped from the mailbox (they have run out anyway).
 TOKEN_KEEP_SECONDS = 15 * 60
 _SEEN_KEEP = 64
-_KINDS = ("hello", "token", "text", "cancel")
+_KINDS = ("hello", "token", "text", "cancel", "ask")
+# What is not worth keeping once it has gone out - a token, a call-off, a request for a
+# token - goes first when a mailbox is crowded, and is dropped from it when it is old.
+EPHEMERAL_KINDS = ("token", "cancel", "ask")
+# What a request says it is for ("Game - 2026-10-19"): a label, cut to this many bytes.
+ASK_LABEL_BYTES = 64
+# Group chats: what a text's "g" may say (core.p2p.groups is the rest of it).
+GROUP_KINDS = ("m", "fo", "inv", "ok", "no", "ro", "add", "kick", "gr", "ad", "kp", "lim", "lv", "nm")
+MAX_GROUP_MEMBERS = 12          # polling is O(members) for each of them
+MIN_GROUP_MEMBERS = 2
+DEFAULT_GROUP_MEMBERS = 8
+MAX_ROSTER_CHUNK = 3            # members in one "ro" (a slot is 900 bytes)
+MAX_QUOTA = 20                  # how many a member may be allowed to invite
+_GROUP_ID = re.compile(r"^[0-9a-f]{16}$")
+_GROUP_EPOCH = re.compile(r"^[0-9a-f]{6}$")
+# A hidden friend nobody needs any more is kept this long if what I said to them has not
+# been acknowledged (so a "you were taken out" can still reach them), then let go.
+HIDDEN_GRACE = 3 * 24 * 3600
 # A text message: at most this many bytes (UTF-8) - what a slot has room for.
 MAX_TEXT_BYTES = 400
 # How much of a conversation is kept per friend.
@@ -391,6 +425,9 @@ def make_token(token: str, ttl: float, name: str, now: Optional[float] = None,
 
 
 _TEXT_ID = re.compile(r"^[0-9a-f]{1,12}\.[0-9]{1,9}$")
+# What a token or a call-off may answer ("re"): an attachment offer (a numbered text,
+# _TEXT_ID) or a request for a token (the id _new_id makes).
+_REPLY_ID = re.compile(r"^(?:[0-9a-f]{1,12}\.[0-9]{1,9}|[0-9a-f]{16})$")
 CANCEL_KINDS = ("withdraw", "stop")
 # Bidirectional overrides can make a line read differently from what it says.
 _BIDI_CONTROLS = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
@@ -417,9 +454,19 @@ def truncate_bytes(body: str, limit: int) -> str:
     return str(body) if len(raw) <= limit else raw[:limit].decode("utf-8", "ignore")
 
 
+def make_ask(label: str, ttl: float, name: str, now: Optional[float] = None) -> dict:
+    """A request for the friend's token, to send them *label* (what it is, as a
+    name); good for *ttl* more seconds."""
+    from core.p2p import attachments as _a
+    return {"id": _new_id(), "t": "ask", "l": _a.clean_label(label, ASK_LABEL_BYTES, keep_path=True),
+            "ttl": max(0, int(ttl)), "name": _clean_name(name),
+            "at": int(time.time() if now is None else now)}
+
+
 def make_cancel(reply_to: str, kind: str, name: str, now: Optional[float] = None) -> dict:
-    """A friend is told an attachment offer is off: *kind* "withdraw" (I took my
-    offer back, or stopped sending it) or "stop" (I stopped receiving it)."""
+    """A friend is told an attachment offer, or a request for a token, is off: *kind*
+    "withdraw" (I took my offer / request back, or stopped sending it) or "stop" (I
+    stopped receiving it, or declined the request)."""
     return {"id": _new_id(), "t": "cancel", "re": str(reply_to), "k": str(kind),
             "name": _clean_name(name), "at": int(time.time() if now is None else now)}
 
@@ -449,14 +496,87 @@ def file_fallback(info: dict) -> str:
     return truncate_bytes(f"📎 {info['l']}{more} · {_a.human_size(info['s'])}", MAX_TEXT_BYTES)
 
 
+def is_member_id(x) -> bool:
+    """A member of a group is named by their key, as a friend is."""
+    if not isinstance(x, str) or len(x) != 52:
+        return False
+    try:
+        pub_from_id(x)
+        return True
+    except FriendError:
+        return False
+
+
+def clean_group_info(raw) -> Optional[dict]:
+    """What a text's "g" says, as it will be sent or acted on, or None when it is not a
+    usable one: ``{"i": group id, "k": kind, ...}`` with the fields each kind has (see
+    GROUP_KINDS) and nothing else. Names are cleaned like any name."""
+    if not isinstance(raw, dict):
+        return None
+    gid, kind = raw.get("i"), raw.get("k")
+    if not (isinstance(gid, str) and _GROUP_ID.fullmatch(gid)) or kind not in GROUP_KINDS:
+        return None
+
+    def _int(x, lo, hi):
+        return isinstance(x, int) and not isinstance(x, bool) and lo <= x <= hi
+
+    g = {"i": gid, "k": kind}
+    if kind in ("m", "fo"):         # a message, or an attachment offered to the group
+        ep = raw.get("e")
+        if not (_int(raw.get("s"), 1, 10 ** 9) and isinstance(ep, str) and _GROUP_EPOCH.fullmatch(ep)):
+            return None
+        g.update(e=ep, s=raw["s"])
+    elif kind == "inv":
+        name = _clean_name(raw.get("n"))
+        if not (name and is_member_id(raw.get("h")) and _int(raw.get("c"), 1, MAX_GROUP_MEMBERS)
+                and _int(raw.get("mx"), MIN_GROUP_MEMBERS, MAX_GROUP_MEMBERS)):
+            return None
+        g.update(n=name, h=raw["h"], c=raw["c"], mx=raw["mx"], hg=1 if raw.get("hg") else 0)
+    elif kind == "ro":
+        rows, out = raw.get("r"), []
+        if (not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ROSTER_CHUNK
+                or not _int(raw.get("mx"), MIN_GROUP_MEMBERS, MAX_GROUP_MEMBERS)):
+            return None
+        for r in rows:
+            if not (isinstance(r, list) and len(r) == 5 and is_member_id(r[0]) and r[1] in ("h", "a", "m")
+                    and _int(r[2], 0, 1) and _int(r[3], 0, MAX_QUOTA) and _int(r[4], 0, 1)):
+                return None
+            out.append([r[0], r[1], r[2], r[3], r[4]])
+        g["r"], g["mx"] = out, raw["mx"]
+    elif kind in ("add", "kick"):
+        if not is_member_id(raw.get("w")):
+            return None
+        g["w"] = raw["w"]
+    elif kind == "gr":
+        if not (is_member_id(raw.get("w")) and _int(raw.get("q"), 0, MAX_QUOTA)):
+            return None
+        g.update(w=raw["w"], q=raw["q"])
+    elif kind in ("ad", "kp"):      # made an administrator / allowed to take members out (1), or not any more (0)
+        if not (is_member_id(raw.get("w")) and _int(raw.get("a"), 0, 1)):
+            return None
+        g.update(w=raw["w"], a=raw["a"])
+    elif kind == "lim":             # the most the group holds, raised
+        if not _int(raw.get("n"), MIN_GROUP_MEMBERS, MAX_GROUP_MEMBERS):
+            return None
+        g["n"] = raw["n"]
+    elif kind == "nm":
+        name = _clean_name(raw.get("n"))
+        if not name:
+            return None
+        g["n"] = name
+    return g
+
+
 def make_text(epoch: str, n: int, body: str, now: Optional[float] = None,
-              file: Optional[dict] = None) -> dict:
+              file: Optional[dict] = None, group: Optional[dict] = None) -> dict:
     """Text message number *n* of the numbering *epoch* (its id says both). With
     *file* it is an attachment offer: the text is what an older version shows."""
     msg = {"id": f"{epoch}.{n}", "t": "text", "n": int(n), "b": body,
            "at": int(time.time() if now is None else now)}
     if file is not None:
         msg["f"] = {"l": file["l"], "c": file["c"], "s": file["s"]}
+    if group is not None:
+        msg["g"] = group
     return msg
 
 
@@ -478,7 +598,7 @@ def pack_slot(msgs: list, ack: Optional[dict] = None) -> bytes:
         out = payload(msgs, ack)
         if len(out) <= MAX_SLOT_PLAIN:
             return out
-        victim = next((i for i, m in enumerate(msgs) if m.get("t") in ("token", "cancel")), None)
+        victim = next((i for i, m in enumerate(msgs) if m.get("t") in EPHEMERAL_KINDS), None)
         if victim is None:
             victim = next((i for i, m in enumerate(msgs) if m.get("t") == "hello"), None)
         if victim is None:
@@ -528,13 +648,22 @@ def parse_slot(plain: bytes) -> tuple:
             ttl = m.get("ttl")
             item["token"] = m["token"]
             item["ttl"] = int(ttl) if isinstance(ttl, (int, float)) and ttl >= 0 else 0
-            if isinstance(m.get("re"), str) and _TEXT_ID.fullmatch(m["re"]):
-                item["re"] = m["re"]            # the attachment offer this answers
+            if isinstance(m.get("re"), str) and _REPLY_ID.fullmatch(m["re"]):
+                item["re"] = m["re"]            # the offer / request this answers
         elif kind == "cancel":
-            if (not isinstance(m.get("re"), str) or not _TEXT_ID.fullmatch(m["re"])
+            if (not isinstance(m.get("re"), str) or not _REPLY_ID.fullmatch(m["re"])
                     or m.get("k") not in CANCEL_KINDS):
                 continue
             item["re"], item["k"] = m["re"], m["k"]
+        elif kind == "ask":
+            from core.p2p import attachments as _a
+            label = (_a.clean_label(m.get("l"), ASK_LABEL_BYTES, keep_path=True)
+                     if isinstance(m.get("l"), str) else "")
+            if not label:
+                continue
+            ttl = m.get("ttl")
+            item["l"] = label
+            item["ttl"] = int(ttl) if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0 else 0
         elif kind == "text":
             n, body = m.get("n"), m.get("b")
             if (not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 10 ** 9
@@ -546,6 +675,11 @@ def parse_slot(plain: bytes) -> tuple:
             if info is not None:
                 item["f"] = info
                 body = body or file_fallback(info)
+            if "g" in m:
+                group = clean_group_info(m["g"])
+                if group is None or (info is not None) != (group["k"] == "fo"):
+                    continue            # (a malformed group text: left out, the gap shows)
+                item["g"] = group
             if not body:
                 continue
             item["n"], item["b"] = n, body
@@ -576,6 +710,9 @@ class Friend:
     # file - it used to be a "friend:<their key>" line in config.json, which spelled
     # out who the friends are to anything that read the settings.
     silenced: bool = False
+    # Somebody I only know through a group: not in the list, and the only thing they can
+    # send me is that group's traffic (see FriendStore.ensure_peer).
+    hidden: bool = False
 
     @property
     def id(self) -> str:
@@ -658,7 +795,8 @@ def export_link(store: "FriendStore", password: str) -> bytes:
     if len(password or "") < MIN_LINK_PASSWORD:
         raise FriendError("password too short")
     doc = {"v": 1, "identity": _b32(store.priv),
-           "friends": [_friend_to_dict(f, local=False) for f in store.friends]}
+           "friends": [_friend_to_dict(f, local=False) for f in store.friends],
+           **_groups_to_doc(store, local=False)}
     salt = os.urandom(16)
     sealed = _secret.seal_with(_scrypt(password, salt), json.dumps(doc).encode("utf-8"),
                                b"friends link")
@@ -704,7 +842,8 @@ def _friend_to_dict(f: "Friend", local: bool = True) -> dict:
     return {"id": f.id, "alias": f.alias, "name": f.name, "added": f.added,
             "last_seen": f.last_seen, "seen": f.seen[-_SEEN_KEEP:],
             "chat": chat, "tx": {"e": f.tx_epoch, "n": f.tx_next},
-            "outbox": f.outbox, "rx": {"e": f.rx_epoch, "n": f.rx_n}, "sl": bool(f.silenced)}
+            "outbox": f.outbox, "rx": {"e": f.rx_epoch, "n": f.rx_n}, "sl": bool(f.silenced),
+            "hid": 1 if f.hidden else 0}
 
 
 def _num(x, default=0):
@@ -764,6 +903,11 @@ def _friend_from_dict(d: dict) -> "Friend":
             info = clean_file_info(o.get("f")) if "f" in o else None
             if info is not None:
                 wire["f"] = info
+            if "g" in o:
+                group = clean_group_info(o["g"])
+                if group is None:
+                    continue
+                wire["g"] = group
             outbox.append(wire)
     tx, rx = d.get("tx") or {}, d.get("rx") or {}
     return Friend(
@@ -775,7 +919,31 @@ def _friend_from_dict(d: dict) -> "Friend":
         outbox=outbox,
         rx_epoch=str(rx.get("e") or "") if isinstance(rx, dict) else "",
         rx_n=max(0, int(_num(rx.get("n")))) if isinstance(rx, dict) else 0,
-        silenced=bool(d.get("sl")))
+        silenced=bool(d.get("sl")), hidden=bool(d.get("hid")))
+
+
+def _groups_to_doc(store: "FriendStore", local: bool = True) -> dict:
+    """The groups as they are kept. Not *local* (a link file for another PC): without what belongs
+    to this PC only - where the files of an attachment are, and where one was put."""
+    from core.p2p import groups as _g
+    groups = [_g.group_to_dict(g) for g in store.groups]
+    if not local:
+        for d in groups:
+            d["log"] = [{k: v for k, v in e.items() if k not in _LOCAL_FILE_KEYS} for e in d["log"]]
+    return {"groups": groups, "group_invites": store.group_invites, "group_outq": store.group_outq}
+
+
+def _groups_from_doc(doc: dict) -> tuple:
+    """(groups, invitations, queue) from a stored document; what is not well formed is left out
+    (older files have none)."""
+    from core.p2p import groups as _g
+    groups = [g for g in (_g.group_from_dict(d) for d in (doc.get("groups") or [])[:_g.MAX_GROUPS])
+              if g is not None]
+    invites = [r for r in (_g.invite_from_dict(d) for d in (doc.get("group_invites") or [])[:_g.MAX_INVITES_IN])
+               if r is not None]
+    queue = [x for x in (_g.outq_item_from_dict(d) for d in (doc.get("group_outq") or [])[:2000])
+             if x is not None]
+    return groups, invites, queue
 
 
 def default_path() -> Path:
@@ -830,6 +998,12 @@ class FriendStore:
         self._key_fn = key_fn if key_fn is not None else _default_key
         self._priv: Optional[bytes] = None
         self.friends: list = []
+        # Group chats (core.p2p.groups): the groups, the invitations waiting for my answer, and
+        # the group messages waiting for room in somebody's stream.
+        self.groups: list = []
+        self.group_invites: list = []
+        self.group_outq: list = []
+        self._unused_since: dict = {}
         self.lock: Optional[dict] = None        # see new_lock; None = no lock password
         self._dek: Optional[bytes] = None       # the key the file is sealed under (with a lock password)
         self._sealed = False
@@ -843,6 +1017,19 @@ class FriendStore:
         """The list is closed: its file is there, protected by the lock password,
         and nothing of it is in memory."""
         return self._sealed
+
+    def bind_key(self, fid: str) -> Optional[bytes]:
+        """The key that binds a transfer token to this friendship - the same one on both
+        sides (it comes from the secret the two keys give, under a label of its own) and
+        known to nobody else. None for a friend that is not in the list or while it is
+        locked. See core.p2p.transfer (_TOKEN_BOUND_FLAG)."""
+        f = None if self._sealed else self.get(fid)
+        if f is None:
+            return None
+        try:
+            return _secret.derive(shared_secret(self.priv, f.pub), b"friends offer binding", 32)
+        except FriendError:
+            return None
 
     @property
     def priv(self) -> bytes:
@@ -915,6 +1102,7 @@ class FriendStore:
             if len(priv) != 32:
                 raise ValueError("identity")
             friends = [_friend_from_dict(d) for d in doc.get("friends", [])]
+            gstate = _groups_from_doc(doc)
         except Exception:
             logger.warning("P2P friends: the sealed friend list could not be read", exc_info=True)
             self._set_aside("unreadable")
@@ -922,6 +1110,7 @@ class FriendStore:
             self.reset_reason = "unreadable"
             return True
         self._priv, self.friends, self._dek, self._sealed = priv, friends, dek, False
+        self.groups, self.group_invites, self.group_outq = gstate
         self.dirty = False
         return True
 
@@ -941,6 +1130,7 @@ class FriendStore:
             if self.dirty:
                 raise FriendError("could not save the friend list")
         self._priv, self.friends, self._dek, self._sealed = None, [], None, True
+        self.groups, self.group_invites, self.group_outq, self._unused_since = [], [], [], {}
         self.dirty = False
 
     def set_silenced(self, fid: str, on: bool = True) -> None:
@@ -958,8 +1148,11 @@ class FriendStore:
             raise FriendError("the friend list is locked")
         priv = _unb32(doc["identity"])
         friends = [_friend_from_dict(d) for d in doc.get("friends", [])]
+        gstate = _groups_from_doc(doc)
         self._set_aside("replaced")
         self._priv, self.friends = priv, friends
+        self.groups, self.group_invites, self.group_outq = gstate
+        self._unused_since = {}
         self.dirty = True
         self.save()
 
@@ -971,6 +1164,7 @@ class FriendStore:
             raise FriendError("the friend list is locked")
         self._set_aside("retired")
         self._priv, self.friends, self.lock, self._dek = None, [], None, None
+        self.groups, self.group_invites, self.group_outq, self._unused_since = [], [], [], {}
 
     def wipe(self) -> tuple:
         """Delete the friend list for good - the one thing to do when the lock
@@ -1006,6 +1200,7 @@ class FriendStore:
             except OSError:
                 failed.append(p.name)
         self._priv, self.friends, self.lock, self._dek = None, [], None, None
+        self.groups, self.group_invites, self.group_outq, self._unused_since = [], [], [], {}
         self._sealed = False
         self.dirty = False
         self.reset_reason = ""
@@ -1027,19 +1222,69 @@ class FriendStore:
         pub = decode_code(code)
         if pub == self.pub:
             raise FriendError("that is your own code")
-        if self.get(friend_id(pub)) is not None:
+        known = self.get(friend_id(pub))
+        if known is not None and not known.hidden:
             raise FriendError("already a friend")
         shared_secret(self.priv, pub)       # refuses a key that cannot be used
+        if known is not None:
+            # Somebody I already share a group with: now in the list, with the stream (and its
+            # numbering) they already had.
+            known.hidden, known.alias, known.added = False, _clean_name(alias), time.time()
+            self.dirty = True
+            self.save()
+            return known
         f = Friend(pub=pub, alias=_clean_name(alias), added=time.time())
         self.friends.append(f)
         self.dirty = True
         self.save()
         return f
 
+    def _in_a_group(self, fid: str) -> bool:
+        return any(g.state not in ("kicked", "failed") and fid != g.me and fid in g.members for g in self.groups)
+
     def remove(self, fid: str) -> None:
-        self.friends = [f for f in self.friends if f.id != fid]
+        """Take a friend out of the list. If they are in one of my groups they stay as a hidden
+        friend - the conversation with them is gone, the group's traffic goes on."""
+        f = self.get(fid)
+        self.group_invites = [r for r in self.group_invites if r["inviter"] != fid]
+        if f is not None and not f.hidden and self._in_a_group(fid):
+            f.hidden, f.alias, f.chat = True, "", []
+            f.outbox = [o for o in f.outbox if "g" in o]
+        else:
+            self.friends = [x for x in self.friends if x.id != fid]
         self.dirty = True
         self.save()
+
+    def ensure_peer(self, pub: bytes) -> "Friend":
+        """The stream with somebody a group needs: the friend if they are one, else a hidden
+        friend (made now). FriendError for a key that cannot be used."""
+        known = self.get(friend_id(pub))
+        if known is not None:
+            return known
+        shared_secret(self.priv, pub)
+        f = Friend(pub=pub, added=time.time(), hidden=True)
+        self.friends.append(f)
+        self.dirty = True
+        return f
+
+    def drop_unused_peers(self, keep, now: Optional[float] = None) -> list:
+        """Let go of the hidden friends nobody needs (not in *keep*): at once, or - if what I
+        said to them has not been acknowledged - after HIDDEN_GRACE. Returns their ids."""
+        now = time.time() if now is None else now
+        keep, gone = set(keep), []
+        for f in self.friends:
+            if not f.hidden or f.id in keep:
+                self._unused_since.pop(f.id, None)
+                continue
+            if f.outbox and now - self._unused_since.setdefault(f.id, now) < HIDDEN_GRACE:
+                continue
+            gone.append(f.id)
+        if gone:
+            self.friends = [f for f in self.friends if f.id not in gone]
+            for fid in gone:
+                self._unused_since.pop(fid, None)
+            self.dirty = True
+        return gone
 
     def set_alias(self, fid: str, alias: str) -> None:
         f = self.get(fid)
@@ -1072,7 +1317,8 @@ class FriendStore:
         self.dirty = True
 
     def queue_text(self, fid: str, body: str, now: Optional[float] = None, *,
-                   file: Optional[dict] = None, paths: Optional[list] = None) -> dict:
+                   file: Optional[dict] = None, paths: Optional[list] = None,
+                   group: Optional[dict] = None) -> dict:
         """Number a text for the friend and keep it (outbox and conversation)
         until they acknowledge it. Returns the message as it goes on the wire.
         FriendError when empty or too long. Whether it FITS the mailbox is the
@@ -1080,12 +1326,30 @@ class FriendStore:
 
         With *file* (see clean_file_info) it is an attachment OFFER instead:
         *paths* is ``[(path, relative path, size)]`` of the files on this PC,
-        kept here (never sent) for when the friend accepts."""
+        kept here (never sent) for when the friend accepts.
+
+        With *group* (see clean_group_info) it is a group's traffic: numbered and acknowledged
+        like any text, but not part of the conversation (no entry)."""
         f = self.get(fid)
         if f is None:
             raise FriendError("not a friend")
         info = None
-        if file is not None:
+        if group is not None:
+            group = clean_group_info(group)
+            if group is None or (file is not None) != (group["k"] == "fo"):
+                raise FriendError("not a group message")
+            if file is not None:
+                info = clean_file_info(file)
+                if info is None:
+                    raise FriendError("not an attachment")
+                body = file_fallback(info)
+            else:
+                body = clean_text(body)
+                if not body or text_bytes(body) > MAX_TEXT_BYTES:
+                    raise FriendError("message too long" if body else "empty message")
+        elif f.hidden:
+            raise FriendError("not a friend")
+        elif file is not None:
             info = clean_file_info(file)
             if info is None:
                 raise FriendError("not an attachment")
@@ -1099,9 +1363,13 @@ class FriendStore:
         if not f.tx_epoch:
             f.tx_epoch, f.tx_next = os.urandom(3).hex(), 1
         now = time.time() if now is None else now
-        wire = make_text(f.tx_epoch, f.tx_next, body, now, file=info)
+        wire = make_text(f.tx_epoch, f.tx_next, body, now, file=info, group=group)
         f.tx_next += 1
         f.outbox.append(wire)
+        if group is not None:
+            self.dirty = True
+            self.save()
+            return wire
         entry = {"id": wire["id"], "dir": "out", "kind": "file" if info else "text", "b": body,
                  "ts": now, "n": wire["n"], "read": True, "state": "pending", "missed": 0}
         if info:
@@ -1125,11 +1393,22 @@ class FriendStore:
         if n <= f.rx_n:
             return None
         now = time.time() if now is None else now
+        group = msg.get("g")
+        if f.hidden:
+            # Somebody I only know through a group: the group's traffic, and nothing else.
+            f.rx_n = n
+            self.dirty = True
+            if group is None:
+                return None
+            return self._group_item(msg, group, now)
         missed = n - f.rx_n - 1
         if missed > 0:
             self._chat_add(f, {"id": f"gap-{epoch}.{n}", "dir": "sys", "kind": "gap", "b": "",
                                "ts": now, "n": n, "read": True, "state": "", "missed": missed})
         f.rx_n = n
+        if group is not None:
+            self.dirty = True
+            return self._group_item(msg, group, now)
         entry = {"id": msg["id"], "dir": "in", "kind": "text", "b": msg["b"], "ts": now,
                  "n": n, "read": bool(read), "state": "", "missed": 0}
         info = msg.get("f")
@@ -1144,12 +1423,47 @@ class FriendStore:
         self._chat_add(f, entry)
         return entry
 
+    @staticmethod
+    def _group_item(msg: dict, group: dict, now: float) -> dict:
+        """What a group's message is handed up as (the group's own book acts on it)."""
+        item = {"id": msg["id"], "kind": "group", "g": group, "b": msg["b"], "ts": now, "n": msg["n"]}
+        if msg.get("f"):
+            item["f"] = msg["f"]
+        return item
+
     # attachments ---------------------------------------------------------
+    # An attachment is a card in a direct conversation, or - one per member it was offered
+    # to - in a group's log (core.p2p.groups); either way it is told apart by the friend it
+    # is with and the id of the offer in THEIR stream, so the same calls serve both.
+    def _group_file(self, fid: str, mid: str) -> Optional[dict]:
+        for g in self.groups:
+            for e in g.log:
+                if e["kind"] == "file" and e.get("w") == mid and fid in (e.get("from"), e.get("to")):
+                    return e
+        return None
+
+    def file_entries(self, fid: Optional[str] = None) -> list:
+        """``[(friend id, offer id, entry)]`` of every attachment - direct or a group's - with
+        *fid* (or with anybody)."""
+        out = []
+        for f in self.friends:
+            if fid is not None and f.id != fid:
+                continue
+            out += [(f.id, e["id"], e) for e in f.chat if e["kind"] == "file"]
+        for g in self.groups:
+            for e in g.log:
+                if e["kind"] != "file" or not e.get("w"):
+                    continue
+                who = e.get("from") or e.get("to")
+                if fid is None or who == fid:
+                    out.append((who, e["w"], e))
+        return out
+
     def file_entry(self, fid: str, mid: str) -> Optional[dict]:
-        """The conversation entry (live: change it through set_file_state) of
-        an attachment offer, or None."""
+        """The entry (live: change it through set_file_state) of an attachment offer, or None."""
         f = self.get(fid)
-        return next((e for e in f.chat if e["id"] == mid and e["kind"] == "file"), None) if f else None
+        found = next((e for e in f.chat if e["id"] == mid and e["kind"] == "file"), None) if f else None
+        return found if found is not None else self._group_file(fid, mid)
 
     def set_file_state(self, fid: str, mid: str, state: str, why: str = "", **extra) -> bool:
         """Move an attachment on to *state* (one of FILE_STATES). *extra* may
@@ -1173,12 +1487,10 @@ class FriendStore:
         from core.p2p import attachments as _a
         now = time.time() if now is None else now
         done = []
-        for f in self.friends:
-            for e in f.chat:
-                if (e["kind"] == "file" and e.get("fs") == "offered"
-                        and now - e["ts"] > _a.OFFER_SECONDS):
-                    e["fs"], e["fw"], e["fp"] = "expired", "", []
-                    done.append(e["id"])
+        for _who, _mid, e in self.file_entries():
+            if e.get("fs") == "offered" and now - e["ts"] > _a.OFFER_SECONDS:
+                e["fs"], e["fw"], e["fp"] = "expired", "", []
+                done.append(e["id"])
         if done:
             self.dirty = True
         return done
@@ -1239,7 +1551,7 @@ class FriendStore:
         included. The numbering carries on, so nothing is mistaken for old."""
         f = self.get(fid)
         if f is not None:
-            f.chat, f.outbox = [], []
+            f.chat, f.outbox = [], [o for o in f.outbox if "g" in o]
             self.dirty = True
             self.save()
 
@@ -1292,6 +1604,7 @@ class FriendStore:
                 raise ValueError("identity")
             friends = [_friend_from_dict(d) for d in doc.get("friends", [])]
             self._priv, self.friends = priv, friends
+            self.groups, self.group_invites, self.group_outq = _groups_from_doc(doc)
         except Exception:
             # Unreadable (another login, a damaged file): keep it aside rather
             # than overwrite it, and start with a new identity.
@@ -1308,7 +1621,8 @@ class FriendStore:
             return              # sealed: the file is not ours to touch; no identity: nothing to keep
         doc = {"v": 1,
                "identity": base64.b32encode(self._priv).decode("ascii").rstrip("="),
-               "friends": [_friend_to_dict(f) for f in self.friends]}
+               "friends": [_friend_to_dict(f) for f in self.friends],
+               **_groups_to_doc(self)}
         raw = json.dumps(doc).encode("utf-8")
         try:
             blob = self._encode_password(raw) if self.lock is not None else self._encode(raw)

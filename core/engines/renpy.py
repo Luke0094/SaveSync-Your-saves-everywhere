@@ -39,17 +39,17 @@ class RenpyError(Exception):
 # The mark the pickle stack uses to remember where a run of items began.
 _MARK = object()
 # Keys whose value names the record holding them, so a repeated field can be
-# told apart: the reward of Quest[intro_wolf] rather than the fourth "money".
+# told apart: the reward of Task[first] rather than the fourth "money".
 _IDENTIFIERS = ("objectname", "name", "id", "label", "title")
 # Ren'Py's undo buffer. It is a copy of past states, not the state itself:
 # editing it changes nothing a player would see, and it is nearly half of
 # everything in the file.
 _ROLLBACK = "RollbackLog"
 # Ren'Py's own container types. Naming them in a path adds a word to every
-# step and tells nobody anything: "kermit_perks.RevertableDict.description"
-# is the same address as "kermit_perks.description", only longer. Classes
+# step and tells nobody anything: "perks.RevertableDict.description"
+# is the same address as "perks.description", only longer. Classes
 # the GAME defined are kept, because those do identify what a value belongs
-# to — Quest[intro_wolf] is worth saying.
+# to — Task[first] is worth saying.
 _PLUMBING = frozenset({
     "RevertableDict", "RevertableList", "RevertableSet", "RevertableObject",
     "dict", "list", "set", "tuple", "defaultdict", "OrderedDict",
@@ -68,13 +68,36 @@ class _Node:
         self.span = span
 
 
-def _describe(node, trail, out, seen=None):
-    """Give every scalar under *node* the path that identifies it."""
+def _label(trail) -> str:
+    """The name a value or object at *trail* is listed under (see _describe)."""
+    parts = [str(t) for t in trail]
+    if parts and parts[0].isdigit():
+        parts = parts[1:]
+    return ".".join(parts)
+
+
+def _describe(node, trail, out, seen=None, where=None, aliases=None):
+    """Give every scalar under *node* the path that identifies it.
+
+    A pickle writes an object once and refers back to it afterwards, so an
+    object kept in two places is listed under whichever came first. *where*
+    remembers that first place, and *aliases* collects every later mention as
+    ``(trail it was mentioned at, trail it was listed at)``: the one thing that
+    says two places in the save hold the same object.
+    """
     if seen is None:
         seen = set()
-    if not isinstance(node, _Node) or id(node) in seen:
+    if not isinstance(node, _Node):
+        return
+    if id(node) in seen:
+        if aliases is not None and where is not None and node.kind != "scalar":
+            first = where.get(id(node))
+            if first is not None:
+                aliases.append((trail, first))
         return
     seen.add(id(node))
+    if where is not None and node.kind != "scalar":
+        where[id(node)] = trail
     if node.kind == "scalar":
         key = trail[-1] if trail else ""
         if node.cls and key and not str(key).startswith("_"):
@@ -110,10 +133,10 @@ def _describe(node, trail, out, seen=None):
         return
     for key, child in pairs:
         step = f"{here}.{key}" if here else str(key)
-        _describe(child, trail + (step,), out, seen)
+        _describe(child, trail + (step,), out, seen, where, aliases)
     for i, child in enumerate(loose):
         step = f"{here}[{i}]" if here else str(i)
-        _describe(child, trail + (step,), out, seen)
+        _describe(child, trail + (step,), out, seen, where, aliases)
 
 
 # A value is offered when a name is followed straight away by a scalar — the
@@ -160,6 +183,7 @@ class RenpySave:
         self._entries = []       # (name, bytes) in the order the zip had them
         self._log = b""
         self._values = []        # dicts: name, kind, value, start, end
+        self._aliases_raw = []   # (trail, trail): see aliases()
         self._signed = False
 
     # ── reading ──────────────────────────────────────────────────────────────
@@ -175,13 +199,17 @@ class RenpySave:
             raise RenpyError("not a zip archive") from e
         self._signed = any(n == "signatures" for n, _ in self._entries)
         self._log = dict(self._entries)["log"]
-        self._values = self._scan(self._log)
+        self._aliases_raw = []
+        self._values = self._scan(self._log, self._aliases_raw)
         if not self._values:
             raise RenpyError("no editable values found in the save")
 
     @staticmethod
-    def _scan(log: bytes) -> list:
+    def _scan(log: bytes, aliases: list = None) -> list:
         """Every scalar in the pickle, with the path that identifies it.
+
+        *aliases*, when given, is filled with the places an object is mentioned
+        again after the one it is listed under (see _describe).
 
         The stream is walked by simulating the pickle STACK — pickletools says
         what each opcode takes and leaves — so the container every value sits
@@ -316,12 +344,30 @@ class RenpySave:
                     stack.append(_Node("other"))
 
         out = []
+        where = {} if aliases is not None else None
         for root in stack:
-            _describe(root, (), out)
+            _describe(root, (), out, None, where, aliases)
         return out
 
 
     # ── the values ───────────────────────────────────────────────────────────
+
+    def aliases(self) -> list:
+        """``(where an object is mentioned again, where it is listed)`` as the
+        names the values carry, for objects kept in more than one place.
+
+        Only for working out which values belong to the same thing; it is not
+        a list of anything that can be edited."""
+        out = []
+        for trail, first in self._aliases_raw:
+            a, b = _label(trail), _label(first)
+            if not a or not b or a == b:
+                continue
+            # Ren'Py talking to itself, as in _describe: never a value's name.
+            if any(p.startswith("_") or "._" in p for p in (a, b)):
+                continue
+            out.append((a, b))
+        return out
 
     def values(self) -> list:
         """(index, name, kind, value) for everything that can be edited."""

@@ -84,9 +84,10 @@ def _display_sync_status(entry, playing: bool = False) -> str:
 
     *playing* wins over everything. While a game is running the sync status
     is not actionable — a sync cannot run against saves the game has open,
-    and mark_played() flips a synced game to "pending" the moment it starts,
-    so the card sat there reading "Sync in attesa" for the whole session
-    about work that was deliberately not being done. It goes back to the
+    and mark_played() flips a synced game to "pending" the moment it starts
+    when its saves have changed since the last sync (and again when it
+    exits), so the card sat there reading "Sync in attesa" for the whole
+    session about work that was deliberately not being done. It goes back to the
     real state the moment the game exits, which is also when the sync it was
     talking about actually happens.
     Filters and sorting do NOT pass this: "playing" is a thing the card

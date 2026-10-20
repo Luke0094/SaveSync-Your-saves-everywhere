@@ -1622,8 +1622,8 @@ class _CommonRootSaveHandler:
         if event.is_directory:
             return
         # Fast pre-filter: at least one word from the game name must appear
-        # somewhere in the file path (e.g. "Modification App" → "modification"
-        # or "app" must be in the path)
+        # somewhere in the file path (e.g. "Example Title" → "example"
+        # or "title" must be in the path)
         if self._game_name_parts:
             path_lower = event.src_path.lower()
             if not any(part in path_lower for part in self._game_name_parts):

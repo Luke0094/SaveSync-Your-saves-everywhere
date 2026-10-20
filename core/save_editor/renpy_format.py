@@ -92,3 +92,9 @@ class RenpyFormat(_Format):
 
     def set_field(self, path: tuple, value) -> None:
         self._save.set_value(path[0], value)
+
+    def aliases(self) -> list:
+        """Where the same object is kept in more than one place, so values that
+        belong to one thing can be told apart from values that merely share
+        its name (see core.save_editor.links)."""
+        return self._save.aliases()

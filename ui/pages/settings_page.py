@@ -7,22 +7,83 @@ import os
 
 logger = logging.getLogger(__name__)
 from pathlib import Path
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QScrollArea, QLineEdit, QCheckBox,
     QSpinBox, QPlainTextEdit, QGroupBox, QFormLayout,
     QListWidget, QListWidgetItem, QMenu, QSlider, QSizePolicy,
+    QButtonGroup,
 )
 from PySide6.QtGui import QColor
 
 from i18n import t, get_engine
 from core.config_manager import get_config
+from core.p2p.proxy import CHECK_CODES as _P2P_PROXY_CODES      # (what the Test button can answer)
 from core.startup import set_launch_on_startup, get_launch_on_startup
 from ui.styles.theme import get_theme_manager, palette, theme_display_name, THEMES
 from ui.helpers import PageScrollMixin, scaled, lock_min_size
 from ui.modal_helpers import information_window_modal, warning_window_modal
 from ui.widgets.hotkey_edit import HotkeyEdit
+
+
+class _SegmentedChoice(QWidget):
+    """A row of buttons of which one is always chosen: a setting with a few exclusive
+    values (the P2P connection) shown as what it is, instead of one checkbox per value
+    with the others greyed out. *options*: [(key, label)]."""
+    changed = Signal(str)
+
+    def __init__(self, options, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._keys = [k for k, _label in options]
+        self._buttons = {}
+        for i, (key, label) in enumerate(options):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._group.addButton(b, i)
+            b.clicked.connect(lambda _=False, k=key: self._chosen(k))
+            lay.addWidget(b, 1)
+            self._buttons[key] = b
+        self._buttons[self._keys[0]].setChecked(True)
+        self.restyle()
+
+    def mode(self) -> str:
+        return next((k for k, b in self._buttons.items() if b.isChecked()), self._keys[0])
+
+    def set_mode(self, key: str) -> None:
+        """Choose *key* (without saying so: this is for showing what is saved)."""
+        self._buttons.get(key, self._buttons[self._keys[0]]).setChecked(True)
+
+    def set_texts(self, labels: dict, tips: dict) -> None:
+        for key, b in self._buttons.items():
+            b.setText(labels.get(key, b.text()))
+            b.setToolTip(tips.get(key, ""))
+
+    def _chosen(self, key: str) -> None:
+        self.changed.emit(key)
+
+    def restyle(self) -> None:
+        """The buttons in the theme's colours (called again when the theme changes)."""
+        r, n = scaled(8, self), len(self._keys)
+        for i, key in enumerate(self._keys):
+            left = r if i == 0 else 0
+            right = r if i == n - 1 else 0
+            self._buttons[key].setStyleSheet(
+                f"QPushButton {{ padding: {scaled(7, self)}px {scaled(14, self)}px; "
+                f"font-weight: 600; color: {palette('text')}; background: {palette('bg_elevated')}; "
+                f"border: 1px solid {palette('border')}; "
+                f"border-top-left-radius: {left}px; border-bottom-left-radius: {left}px; "
+                f"border-top-right-radius: {right}px; border-bottom-right-radius: {right}px; }}"
+                f"QPushButton:hover {{ border-color: {palette('border_hover')}; }}"
+                f"QPushButton:checked {{ color: {palette('accent_text')}; background: {palette('accent')}; "
+                f"border-color: {palette('accent')}; }}")
 
 
 # The P2P port box shows "Auto" at this value, one below the smallest real
@@ -101,9 +162,6 @@ class WrappedCheckBox(QWidget):
         return super().blockSignals(b)
 
 
-_P2P_PROXY_CODES = ("ok", "unreachable", "timeout", "not_socks5", "auth_required", "auth_failed", "no_udp")
-
-
 class SettingsPage(PageScrollMixin, QWidget):
     hotkey_changed = Signal(str, str)   # old, new
     # Config replaced wholesale (reset / import / snapshot restore): the
@@ -141,9 +199,26 @@ class SettingsPage(PageScrollMixin, QWidget):
         root.setContentsMargins(scaled(20, self, min_px=14), scaled(16, self, min_px=10), scaled(20, self, min_px=14), 0)
         root.setSpacing(0)
 
+        # The title, and at its right a way to go straight to a section: this page is long.
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(scaled(12, self))
         self._header = QLabel(t("settings.title"))
         self._header.setObjectName("page_header")
-        root.addWidget(self._header)
+        head_row.addWidget(self._header, 1)
+        self._jump_combo = QComboBox()
+        self._jump_combo.setMaxVisibleItems(14)
+        self._jump_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._jump_combo.setMinimumContentsLength(18)
+        self._jump_combo.setToolTip(t("settings.jump_tooltip"))
+        self._jump_combo.addItem(t("settings.jump_to"))
+        self._jump_combo.setEnabled(False)          # (until the sections are built)
+        self._jump_combo.activated.connect(self._jump_to_section)
+        self._jump_targets = []
+        self._jump_anim = None
+        head_row.addWidget(self._jump_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(head_row)
         root.addSpacing(scaled(10, self, min_px=6))
 
         scroll = QScrollArea()
@@ -270,6 +345,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             (grp, key) for grp, key in self._section_results if key
         ]
         self._built = True
+        self._refresh_jump_combo()
         # Wire every change signal, relock the chrome, sync the scale
         # controls, then load the saved config (which needs all widgets).
         self._connect_change_signals()
@@ -301,6 +377,54 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._deferred_busy.pump()
         self._stop_deferred_busy()
 
+    # ── Jumping to a section ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _section_menu_text(title: str) -> str:
+        """A section's title as the list shows it: the boxes say APPEARANCE or
+        BACKUP POLICY, a menu reads better as "Appearance" and "Backup policy" (a name with
+        a digit, P2P, stays as it is)."""
+        title = (title or "").strip()
+        if title and title == title.upper() and not any(c.isdigit() for c in title):
+            return title.capitalize()
+        return title
+
+    def _refresh_jump_combo(self) -> None:
+        """List the sections that are built, in the order they are on the page (called when
+        the build is done and whenever the language changes the titles)."""
+        combo = self._jump_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(t("settings.jump_to"))
+        self._jump_targets = []
+        for w in getattr(self, "_groups", []):
+            if isinstance(w, QGroupBox) and w.title().strip():
+                combo.addItem(self._section_menu_text(w.title()))
+                self._jump_targets.append(w)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        combo.setEnabled(bool(self._jump_targets) and getattr(self, "_built", False))
+
+    def _jump_to_section(self, index: int) -> None:
+        """Scroll the page to the section chosen (the list goes back to its prompt: it
+        is a way to get somewhere, not a setting)."""
+        combo = self._jump_combo
+        grp = self._jump_targets[index - 1] if 1 <= index <= len(self._jump_targets) else None
+        combo.setCurrentIndex(0)
+        if grp is None or not getattr(self, "_built", False):
+            return
+        bar = self._scroll.verticalScrollBar()
+        target = max(0, min(bar.maximum(), grp.y() - scaled(4, self)))
+        if self._jump_anim is not None:
+            self._jump_anim.stop()
+        anim = QPropertyAnimation(bar, b"value", self)
+        anim.setDuration(220)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(bar.value())
+        anim.setEndValue(target)
+        anim.start()
+        self._jump_anim = anim
+
     def _stop_deferred_busy(self):
         busy = getattr(self, "_deferred_busy", None)
         if busy is not None:
@@ -331,6 +455,8 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._section_jobs_gen += 1  # kill a running pump
         self._stop_deferred_busy()
         self._built = False
+        self._jump_combo.setEnabled(False)
+        self._jump_targets = []
         self._loading = True
         self._dirty = False
         while self._scroll_layout.count():
@@ -645,6 +771,18 @@ class SettingsPage(PageScrollMixin, QWidget):
         p2p_grp = _group(t("settings.section_p2p_retention"))
         p2p_form = QFormLayout(p2p_grp)
         p2p_form.setSpacing(14)
+        self._p2p_caps = []
+
+        def caption(key):
+            """A small heading that sets a block of this long section apart."""
+            lbl = QLabel(t(key).upper())
+            lbl.setObjectName("p2p_caption")
+            lbl.setStyleSheet(f"color:{palette('text_secondary')};font-weight:700;"
+                              f"font-size:{scaled(11, self)}px;letter-spacing:1px;padding-top:{scaled(6, self)}px;")
+            self._p2p_caps.append((key, lbl))
+            return lbl
+
+        p2p_form.addRow(caption("settings.p2p_group_saves"))
         self._p2p_max_spin = QSpinBox()
         self._p2p_max_spin.setRange(1, 50)
         self._p2p_max_spin.setToolTip(t("settings.p2p_max_per_game_tooltip"))
@@ -679,6 +817,43 @@ class SettingsPage(PageScrollMixin, QWidget):
         p2p_form.addRow(self._p2p_files_dir_lbl, dir_row)
         self._set_p2p_files_dir("")
 
+
+        # How this PC reaches the other one - one choice, and only what belongs to it on show.
+        # The three used to be a checkbox each (the others greyed out when one was on); they
+        # are still the same three settings in the config (p2p_proxy, p2p_tor), but only one
+        # can be chosen, which is what they always meant. A proxy and Tor are two ways of one
+        # thing, Tor wins over TLS and over a proxy, and a proxy over TLS.
+        p2p_form.addRow(caption("settings.p2p_group_connection"))
+        self._p2p_mode = _SegmentedChoice([
+            ("direct", t("settings.p2p_mode_direct")),
+            ("proxy", t("settings.p2p_mode_proxy")),
+            ("tor", t("settings.p2p_mode_tor"))])
+        self._p2p_mode_tips = lambda: {"direct": t("settings.p2p_mode_direct_tip"),
+                                       "proxy": t("settings.p2p_proxy_tooltip"),
+                                       "tor": t("settings.p2p_tor_tooltip")}
+        self._p2p_mode.set_texts({}, self._p2p_mode_tips())
+        p2p_form.addRow(self._p2p_mode)
+        # (a plain box with one page showing, not a QStackedWidget: that is as tall as its
+        # tallest page whichever one is on show, which left a gap under the shorter two)
+        self._p2p_mode_stack = QWidget()
+        stack_lay = QVBoxLayout(self._p2p_mode_stack)
+        stack_lay.setContentsMargins(0, 0, 0, 0)
+        stack_lay.setSpacing(0)
+
+        def page(order):
+            w = QWidget()
+            form = QFormLayout(w)
+            form.setContentsMargins(0, 4, 0, 0)
+            form.setSpacing(14)
+            stack_lay.addWidget(w)
+            return form
+
+        # Direct: the other PC connects straight to this one - the fastest way.
+        direct_form = page(0)
+        self._p2p_direct_note_lbl = QLabel(t("settings.p2p_mode_direct_note"))
+        self._p2p_direct_note_lbl.setWordWrap(True)
+        self._p2p_direct_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        direct_form.addRow(self._p2p_direct_note_lbl)
         # The port transfers listen on ("Auto" = a free one each time) and
         # whether the router is asked to open it by itself (UPnP / NAT-PMP).
         # Read when a transfer starts, so a change applies to the next one.
@@ -697,44 +872,26 @@ class SettingsPage(PageScrollMixin, QWidget):
         port_lay.addStretch(1)
         self._p2p_port_lbl = QLabel(t("settings.p2p_port"))
         self._p2p_port_lbl.setToolTip(t("settings.p2p_port_tooltip"))
-        p2p_form.addRow(self._p2p_port_lbl, port_row)
+        direct_form.addRow(self._p2p_port_lbl, port_row)
         self._set_p2p_port(0)
 
         # TLS instead of BitTorrent's own encryption for the transfers this PC sends
         # (and a socket for it when receiving): see core.p2p.tls. Not with the proxy.
         self._p2p_tls_cb = QCheckBox(t("settings.p2p_tls"))
         self._p2p_tls_cb.setToolTip(t("settings.p2p_tls_tooltip"))
-        p2p_form.addRow(self._p2p_tls_cb)
+        direct_form.addRow(self._p2p_tls_cb)
         self._p2p_tls_note_lbl = QLabel(t("settings.p2p_tls_note"))
         self._p2p_tls_note_lbl.setWordWrap(True)
         self._p2p_tls_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
-        p2p_form.addRow(self._p2p_tls_note_lbl)
+        direct_form.addRow(self._p2p_tls_note_lbl)
 
-        # Private mode: transfers and friends go through Tor, which travels with the
-        # application (core.p2p.tor); the DHT is not used at all. Not with the proxy
-        # (two ways of hiding the address) nor TLS (Tor is encrypted end to end).
-        self._p2p_tor_cb = QCheckBox(t("settings.p2p_tor"))
-        self._p2p_tor_cb.setToolTip(t("settings.p2p_tor_tooltip"))
-        p2p_form.addRow(self._p2p_tor_cb)
-        self._p2p_tor_note_lbl = QLabel(t("settings.p2p_tor_note"))
-        self._p2p_tor_note_lbl.setWordWrap(True)
-        self._p2p_tor_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
-        p2p_form.addRow(self._p2p_tor_note_lbl)
-        self._p2p_tor_status_lbl = QLabel("")
-        self._p2p_tor_status_lbl.setWordWrap(True)
-        p2p_form.addRow(self._p2p_tor_status_lbl)
-        self._p2p_tor_timer = QTimer(self)
-        self._p2p_tor_timer.setInterval(1000)
-        self._p2p_tor_timer.timeout.connect(self._p2p_tor_refresh)
-        self._p2p_tor_timer.start()
 
+        # Through a SOCKS5 proxy (many VPN services offer one).
+        proxy_form = page(1)
         # Hiding this PC's address: every P2P connection (friends and transfers)
         # goes through a SOCKS5 proxy, or none goes at all (core.p2p.proxy). The
         # login is kept apart from config.json, encrypted for this PC.
         self._p2p_proxy_code = ""
-        self._p2p_proxy_cb = QCheckBox(t("settings.p2p_proxy"))
-        self._p2p_proxy_cb.setToolTip(t("settings.p2p_proxy_tooltip"))
-        p2p_form.addRow(self._p2p_proxy_cb)
         proxy_row = QWidget()
         proxy_lay = QHBoxLayout(proxy_row)
         proxy_lay.setContentsMargins(0, 0, 0, 0)
@@ -747,7 +904,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_proxy_port_spin.setValue(1080)
         proxy_lay.addWidget(self._p2p_proxy_port_spin)
         self._p2p_proxy_lbl = QLabel(t("settings.p2p_proxy_server"))
-        p2p_form.addRow(self._p2p_proxy_lbl, proxy_row)
+        proxy_form.addRow(self._p2p_proxy_lbl, proxy_row)
         login_row = QWidget()
         login_lay = QHBoxLayout(login_row)
         login_lay.setContentsMargins(0, 0, 0, 0)
@@ -761,7 +918,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_proxy_pw_edit.setPlaceholderText(t("settings.p2p_proxy_password_ph"))
         login_lay.addWidget(self._p2p_proxy_pw_edit, 1)
         self._p2p_proxy_login_lbl = QLabel(t("settings.p2p_proxy_login"))
-        p2p_form.addRow(self._p2p_proxy_login_lbl, login_row)
+        proxy_form.addRow(self._p2p_proxy_login_lbl, login_row)
+        # (off by default: behind a proxy that cannot look up names, P2P waits rather than ask this PC's DNS)
+        self._p2p_proxy_dns_cb = QCheckBox(t("settings.p2p_proxy_local_dns"))
+        self._p2p_proxy_dns_cb.setToolTip(t("settings.p2p_proxy_local_dns_tooltip"))
+        proxy_form.addRow(self._p2p_proxy_dns_cb)
         test_row = QWidget()
         test_lay = QHBoxLayout(test_row)
         test_lay.setContentsMargins(0, 0, 0, 0)
@@ -771,20 +932,43 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_proxy_status_lbl = QLabel("")
         self._p2p_proxy_status_lbl.setWordWrap(True)
         test_lay.addWidget(self._p2p_proxy_status_lbl, 1)
-        p2p_form.addRow(test_row)
+        proxy_form.addRow(test_row)
         self._p2p_proxy_note_lbl = QLabel(t("settings.p2p_proxy_note"))
         self._p2p_proxy_note_lbl.setWordWrap(True)
         self._p2p_proxy_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
-        p2p_form.addRow(self._p2p_proxy_note_lbl)
-        self._p2p_proxy_cb.toggled.connect(self._p2p_proxy_sync)
-        self._p2p_tor_cb.toggled.connect(self._p2p_proxy_sync)
+        proxy_form.addRow(self._p2p_proxy_note_lbl)
         self._p2p_proxy_host_edit.textChanged.connect(self._p2p_proxy_sync)
         self._p2p_proxy_port_spin.valueChanged.connect(self._p2p_proxy_sync)
+
+
+        # Through Tor, which travels with the application.
+        tor_form = page(2)
+        # Private mode: transfers and friends go through Tor, which travels with the
+        # application (core.p2p.tor); the DHT is not used at all. Not with the proxy
+        # (two ways of hiding the address) nor TLS (Tor is encrypted end to end).
+        self._p2p_tor_note_lbl = QLabel(t("settings.p2p_tor_note"))
+        self._p2p_tor_note_lbl.setWordWrap(True)
+        self._p2p_tor_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        tor_form.addRow(self._p2p_tor_note_lbl)
+        self._p2p_tor_status_lbl = QLabel("")
+        self._p2p_tor_status_lbl.setWordWrap(True)
+        tor_form.addRow(self._p2p_tor_status_lbl)
+        self._p2p_tor_timer = QTimer(self)
+        self._p2p_tor_timer.setInterval(1000)
+        self._p2p_tor_timer.timeout.connect(self._p2p_tor_refresh)
+        self._p2p_tor_timer.start()
+
+
+        p2p_form.addRow(self._p2p_mode_stack)
+        self._p2p_mode.changed.connect(self._on_p2p_mode_changed)
         self.p2p_proxy_checked.connect(self._on_p2p_proxy_checked)
+        self._p2p_mode_pages = [stack_lay.itemAt(i).widget() for i in range(3)]
+        self._show_p2p_mode("direct")
         self._p2p_proxy_sync()
 
+        p2p_form.addRow(caption("settings.p2p_group_friends"))
         # Friends: whether SaveSync keeps listening for the tokens friends send
-        # (otherwise only while the Friends or Receive window is open).
+        # (otherwise only while the Friends panel or the Receive window is open).
         self._p2p_friends_online_cb = QCheckBox(t("settings.p2p_friends_online"))
         self._p2p_friends_online_cb.setToolTip(t("settings.p2p_friends_online_tooltip"))
         self._p2p_friends_online_cb.setChecked(True)
@@ -798,7 +982,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         p2p_form.addRow(self._p2p_media_cb)
 
         # How long the friend list may sit unused before it locks itself (when a
-        # lock password is set in the Friends window; 0 = only the Lock button).
+        # lock password is set in the Friends panel; 0 = only the Lock button).
         self._p2p_autolock_spin = QSpinBox()
         self._p2p_autolock_spin.setRange(0, 1440)
         self._p2p_autolock_spin.setSpecialValueText(t("settings.p2p_autolock_never"))
@@ -810,7 +994,7 @@ class SettingsPage(PageScrollMixin, QWidget):
 
         # The way back in when the lock password is forgotten: delete the list and
         # start again. It is HERE, on a page that is never locked, because the
-        # Friends window may be (the lock screen has the same button).
+        # Friends panel may be (the lock screen has the same button).
         self._p2p_lock_wired = False
         reset_row = QWidget()
         reset_lay = QHBoxLayout(reset_row)
@@ -865,23 +1049,43 @@ class SettingsPage(PageScrollMixin, QWidget):
             except Exception:
                 logger.debug("Settings: refreshing the silenced list failed", exc_info=True)
 
+    def _p2p_mode_value(self) -> str:
+        """The connection chosen: "direct", "proxy" or "tor"."""
+        return self._p2p_mode.mode()
+
+    def _set_p2p_mode(self, mode: str) -> None:
+        """Show *mode* as the chosen one (what is saved: not a change, so nothing is marked)."""
+        self._p2p_mode.set_mode(mode)
+        self._show_p2p_mode(self._p2p_mode.mode())
+        self._p2p_proxy_sync()
+
+    def _show_p2p_mode(self, mode: str) -> None:
+        """Only the chosen connection's settings are on show, and the box is as high as
+        they are - not as the tallest of the three."""
+        index = {"direct": 0, "proxy": 1, "tor": 2}.get(mode, 0)
+        for i, w in enumerate(self._p2p_mode_pages):
+            w.setVisible(i == index)
+
+    def _on_p2p_mode_changed(self, mode: str) -> None:
+        self._show_p2p_mode(mode)
+        self._p2p_proxy_sync()
+        self._mark_dirty()
+
+    @staticmethod
+    def _p2p_mode_from_config(config) -> str:
+        """The connection a saved config stands for. Both flags can be set (an old config):
+        Tor is what runs then - it wins over the proxy (core.p2p.transfer.tor_enabled)."""
+        if config.get("p2p_tor", False):
+            return "tor"
+        return "proxy" if config.get("p2p_proxy", False) else "direct"
+
     def _p2p_proxy_sync(self, *_args) -> None:
-        """The proxy's boxes are for use only while it is switched on - and say
-        so when it is on but not filled in (P2P is then paused, not direct)."""
+        """The proxy's boxes are for use only while it is the chosen connection - and say
+        so when it is chosen but not filled in (P2P is then paused, not direct)."""
         from core.p2p import proxy as _px
-        tor = self._p2p_tor_cb.isChecked()
-        on = self._p2p_proxy_cb.isChecked() and not tor
-        # (TLS needs sockets that listen, which a proxy forbids: the proxy wins, and
-        # the box says so rather than leaving it to be found out. Private mode (Tor)
-        # is end to end already and has no listening socket either, so it wins over
-        # both - and a proxy and Tor are two ways of one thing, so one at a time.)
-        self._p2p_tls_cb.setEnabled(not on and not tor)
-        self._p2p_tls_note_lbl.setText(t("settings.p2p_tls_note_tor") if tor
-                                       else t("settings.p2p_tls_note_proxy") if on else t("settings.p2p_tls_note"))
-        self._p2p_proxy_cb.setEnabled(not tor)
-        self._p2p_tor_cb.setEnabled(not self._p2p_proxy_cb.isChecked() or tor)
+        on = self._p2p_mode.mode() == "proxy"
         for w in (self._p2p_proxy_host_edit, self._p2p_proxy_port_spin, self._p2p_proxy_user_edit,
-                  self._p2p_proxy_pw_edit, self._p2p_proxy_test_btn):
+                  self._p2p_proxy_pw_edit, self._p2p_proxy_dns_cb, self._p2p_proxy_test_btn):
             w.setEnabled(on)
         self._p2p_tor_refresh()
         filled = (_px.valid_host(self._p2p_proxy_host_edit.text())
@@ -895,7 +1099,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         """What to say under the private-mode box: whether the Tor program is in this
         installation, and - once it is switched on and saved - how Tor is doing."""
         from core.p2p import tor as _tor
-        if not self._p2p_tor_cb.isChecked():
+        if self._p2p_mode.mode() != "tor":
             text, color = "", palette("text_secondary")
         elif not _tor.service().available():
             text, color = "✗ " + t("settings.p2p_tor_missing"), palette("error")
@@ -921,6 +1125,8 @@ class SettingsPage(PageScrollMixin, QWidget):
             text, color = t("settings.p2p_proxy_testing"), palette("text_secondary")
         elif code == "ok":
             text, color = "✓ " + t("settings.p2p_proxy_test_ok"), palette("success")
+        elif code == "dns_local":           # (works, but this PC's DNS looks up the DHT's starting server)
+            text, color = "⚠ " + t("settings.p2p_proxy_test_dns_local"), palette("warning")
         elif code == "not_set":
             text, color = "✗ " + t("settings.p2p_proxy_not_set"), palette("error")
         else:
@@ -938,12 +1144,13 @@ class SettingsPage(PageScrollMixin, QWidget):
             return
         px = _px.Proxy(host, port, self._p2p_proxy_user_edit.text().strip(),
                        self._p2p_proxy_pw_edit.text())
+        local_dns = self._p2p_proxy_dns_cb.isChecked()
         self._p2p_proxy_test_btn.setEnabled(False)
         self._p2p_proxy_set_status("testing")
 
         def work():
             try:
-                code = _px.check(px)
+                code = _px.check(px, allow_local=local_dns)
             except Exception:
                 code = "unreachable"
             try:
@@ -955,7 +1162,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         threading.Thread(target=work, name="p2p-proxy-test", daemon=True).start()
 
     def _on_p2p_proxy_checked(self, code: str) -> None:
-        self._p2p_proxy_test_btn.setEnabled(self._p2p_proxy_cb.isChecked() and not self._p2p_tor_cb.isChecked())
+        self._p2p_proxy_test_btn.setEnabled(self._p2p_mode.mode() == "proxy")
         self._p2p_proxy_set_status(code if code in _P2P_PROXY_CODES else "unreachable")
 
     def _set_p2p_port(self, port) -> None:
@@ -1499,12 +1706,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_port_spin.valueChanged.connect(self._mark_dirty)
         self._p2p_upnp_cb.stateChanged.connect(self._mark_dirty)
         self._p2p_tls_cb.stateChanged.connect(self._mark_dirty)
-        self._p2p_tor_cb.stateChanged.connect(self._mark_dirty)
-        self._p2p_proxy_cb.stateChanged.connect(self._mark_dirty)
         self._p2p_proxy_host_edit.textChanged.connect(self._mark_dirty)
         self._p2p_proxy_port_spin.valueChanged.connect(self._mark_dirty)
         self._p2p_proxy_user_edit.textChanged.connect(self._mark_dirty)
         self._p2p_proxy_pw_edit.textChanged.connect(self._mark_dirty)
+        self._p2p_proxy_dns_cb.stateChanged.connect(self._mark_dirty)
         self._p2p_friends_online_cb.stateChanged.connect(self._mark_dirty)
         self._p2p_media_cb.stateChanged.connect(self._mark_dirty)
         self._p2p_autolock_spin.valueChanged.connect(self._mark_dirty)
@@ -1549,6 +1755,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         "sync":              "settings.suppression_sync_notif",
         "regression":        "settings.suppression_regression_notif",
         "friend_message":    "settings.suppression_friend_notif",
+        "group_message":     "settings.suppression_group_notif",
     }
 
     def _game_label(self, game_id: str) -> str:
@@ -1566,6 +1773,8 @@ class SettingsPage(PageScrollMixin, QWidget):
             return game_id[len("folder:"):]
         if game_id.startswith("friend:"):       # a friend whose messages were silenced
             return self._friend_label(game_id[len("friend:"):])
+        if game_id.startswith("group:"):        # a group whose messages were silenced
+            return self._group_label(game_id[len("group:"):])
         entry = get_library().get_by_id(game_id)
         if entry is not None and entry.name:
             return entry.name
@@ -1577,6 +1786,18 @@ class SettingsPage(PageScrollMixin, QWidget):
         except Exception:
             logger.debug("Backup index unavailable for label lookup", exc_info=True)
         return t("settings.removed_game", id=game_id[:8])
+
+    @staticmethod
+    def _group_label(group_id: str) -> str:
+        """A name for a group whose notifications were silenced (none while the friend list is
+        locked - the names of groups are not shown then either)."""
+        try:
+            from ui.p2p_friends_service import get_friends_service
+            svc = get_friends_service()
+            g = svc.group(group_id) if svc is not None else None
+            return t("settings.suppression_group_name", name=g.name if g is not None else group_id[:8])
+        except Exception:
+            return t("settings.suppression_group_name", name=group_id[:8])
 
     @staticmethod
     def _friend_label(friend_id: str) -> str:
@@ -1691,6 +1912,8 @@ class SettingsPage(PageScrollMixin, QWidget):
             svc = get_friends_service()
             for f in (svc.silenced_friends() if svc is not None else []):
                 notif_suppress[f"friend:{f.id}"] = ["friend_message"]
+            for g in ([x for x in svc.groups() if x.silenced] if svc is not None else []):
+                notif_suppress[f"group:{g.id}"] = ["group_message"]
         except Exception:
             logger.debug("Settings: listing the silenced friends failed", exc_info=True)
         cloud_no_local: list    = config.get("suppressed_cloud_no_local", [])
@@ -1749,6 +1972,13 @@ class SettingsPage(PageScrollMixin, QWidget):
             svc = get_friends_service()
             if svc is not None:
                 svc.set_silenced(game_id[len("friend:"):], False)
+            self._load_suppression_list()
+            return
+        if game_id.startswith("group:"):        # a silenced group: the same
+            from ui.p2p_friends_service import get_friends_service
+            svc = get_friends_service()
+            if svc is not None:
+                svc.set_group_silenced(game_id[len("group:"):], False)
             self._load_suppression_list()
             return
 
@@ -1850,10 +2080,11 @@ class SettingsPage(PageScrollMixin, QWidget):
             "p2p_port": self._p2p_port_value(),
             "p2p_upnp": self._p2p_upnp_cb.isChecked(),
             "p2p_tls": self._p2p_tls_cb.isChecked(),
-            "p2p_tor": self._p2p_tor_cb.isChecked(),
-            "p2p_proxy": self._p2p_proxy_cb.isChecked(),
+            "p2p_tor": self._p2p_mode.mode() == "tor",
+            "p2p_proxy": self._p2p_mode.mode() == "proxy",
             "p2p_proxy_host": self._p2p_proxy_host_edit.text().strip(),
             "p2p_proxy_port": self._p2p_proxy_port_spin.value(),
+            "p2p_proxy_local_dns": self._p2p_proxy_dns_cb.isChecked(),
             "p2p_proxy_user": self._p2p_proxy_user_edit.text().strip(),
             "p2p_proxy_password": self._p2p_proxy_pw_edit.text(),
             "p2p_friends_online": self._p2p_friends_online_cb.isChecked(),
@@ -1938,13 +2169,13 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._set_p2p_port(config.get("p2p_port", 0))
         self._p2p_upnp_cb.setChecked(bool(config.get("p2p_upnp", True)))
         self._p2p_tls_cb.setChecked(bool(config.get("p2p_tls", False)))
-        self._p2p_tor_cb.setChecked(bool(config.get("p2p_tor", False)))
-        self._p2p_proxy_cb.setChecked(bool(config.get("p2p_proxy", False)))
+        self._set_p2p_mode(self._p2p_mode_from_config(config))
         self._p2p_proxy_host_edit.setText(str(config.get("p2p_proxy_host", "") or ""))
         try:
             self._p2p_proxy_port_spin.setValue(int(config.get("p2p_proxy_port", 1080)))
         except (TypeError, ValueError):
             self._p2p_proxy_port_spin.setValue(1080)
+        self._p2p_proxy_dns_cb.setChecked(bool(config.get("p2p_proxy_local_dns", False)))
         from core.p2p import proxy as _px
         _user, _pw = _px.load_credentials()
         self._p2p_proxy_user_edit.setText(_user)
@@ -2083,10 +2314,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("p2p_port",               self._p2p_port_value())
         config.set("p2p_upnp",               self._p2p_upnp_cb.isChecked())
         config.set("p2p_tls",                self._p2p_tls_cb.isChecked())
-        config.set("p2p_tor",                self._p2p_tor_cb.isChecked())
-        config.set("p2p_proxy",              self._p2p_proxy_cb.isChecked())
+        config.set("p2p_tor",                self._p2p_mode.mode() == "tor")
+        config.set("p2p_proxy",              self._p2p_mode.mode() == "proxy")
         config.set("p2p_proxy_host",         self._p2p_proxy_host_edit.text().strip())
         config.set("p2p_proxy_port",         self._p2p_proxy_port_spin.value())
+        config.set("p2p_proxy_local_dns",    self._p2p_proxy_dns_cb.isChecked())
         from core.p2p import proxy as _px
         _user, _pw = self._p2p_proxy_user_edit.text().strip(), self._p2p_proxy_pw_edit.text()
         if not _px.save_credentials(_user, _pw) and (_user or _pw):
@@ -2703,7 +2935,13 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._saved_lbl.setStyleSheet(f"color: {palette('success')};")
         self._p2p_proxy_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
         self._p2p_tls_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._p2p_tor_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._p2p_direct_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
         self._p2p_lockstate_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._p2p_mode.restyle()
+        for _key, _lbl in self._p2p_caps:
+            _lbl.setStyleSheet(f"color:{palette('text_secondary')};font-weight:700;"
+                               f"font-size:{scaled(11, self)}px;letter-spacing:1px;padding-top:{scaled(6, self)}px;")
         self._p2p_proxy_set_status(self._p2p_proxy_code)
         if not self._hotkey_edit._capturing:
             self._hotkey_edit._set_idle_style()
@@ -2722,6 +2960,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             self._locale_pending = True
             return
         self._header.setText(t("settings.title"))
+        self._jump_combo.setToolTip(t("settings.jump_tooltip"))
         for grp, key in self._group_title_keys:
             grp.setTitle(t(key))
         self._lang_lbl.setText(t("settings.language"))
@@ -2756,6 +2995,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._auto_scan_cb.setToolTip(t("settings.auto_scan_on_exit_tooltip"))
         self._updates_cb.setText(t("settings.check_for_updates"))
         self._updates_cb.setToolTip(t("settings.check_for_updates_tooltip"))
+        self._self_checks_cb.setText(t("settings.self_checks"))
+        self._self_checks_cb.setToolTip(t("settings.self_checks_tooltip"))
+        self._self_checks_freq_lbl.setText(t("settings.self_checks_frequency"))
+        self._self_checks_freq_spin.setSuffix(f" {t('settings.days_suffix')}")
+        self._self_checks_freq_spin.setToolTip(t("settings.self_checks_frequency_tooltip"))
         self._lang_combo.setToolTip(t("settings.language_tooltip"))
         self._theme_combo.setToolTip(t("settings.theme_tooltip"))
         self._ui_scale_slider.setToolTip(t("settings.ui_scale_tooltip"))
@@ -2801,20 +3045,24 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._p2p_upnp_cb.setToolTip(t("settings.p2p_upnp_tooltip"))
         self._p2p_tls_cb.setText(t("settings.p2p_tls"))
         self._p2p_tls_cb.setToolTip(t("settings.p2p_tls_tooltip"))
-        self._p2p_tor_cb.setText(t("settings.p2p_tor"))
-        self._p2p_tor_cb.setToolTip(t("settings.p2p_tor_tooltip"))
+        self._p2p_tls_note_lbl.setText(t("settings.p2p_tls_note"))
         self._p2p_tor_note_lbl.setText(t("settings.p2p_tor_note"))
-        self._p2p_proxy_cb.setText(t("settings.p2p_proxy"))
-        self._p2p_proxy_cb.setToolTip(t("settings.p2p_proxy_tooltip"))
+        self._p2p_direct_note_lbl.setText(t("settings.p2p_mode_direct_note"))
+        self._p2p_mode.set_texts({"direct": t("settings.p2p_mode_direct"), "proxy": t("settings.p2p_mode_proxy"),
+                                  "tor": t("settings.p2p_mode_tor")}, self._p2p_mode_tips())
+        for _key, _lbl in self._p2p_caps:
+            _lbl.setText(t(_key).upper())
         self._p2p_proxy_lbl.setText(t("settings.p2p_proxy_server"))
         self._p2p_proxy_host_edit.setPlaceholderText(t("settings.p2p_proxy_host_ph"))
         self._p2p_proxy_login_lbl.setText(t("settings.p2p_proxy_login"))
         self._p2p_proxy_user_edit.setPlaceholderText(t("settings.p2p_proxy_user_ph"))
         self._p2p_proxy_pw_edit.setPlaceholderText(t("settings.p2p_proxy_password_ph"))
         self._p2p_proxy_test_btn.setText(t("settings.p2p_proxy_test"))
+        self._p2p_proxy_dns_cb.setText(t("settings.p2p_proxy_local_dns"))
+        self._p2p_proxy_dns_cb.setToolTip(t("settings.p2p_proxy_local_dns_tooltip"))
         self._p2p_proxy_note_lbl.setText(t("settings.p2p_proxy_note"))
         self._p2p_proxy_set_status(self._p2p_proxy_code)
-        self._p2p_proxy_sync()          # (the TLS note follows the proxy's state)
+        self._p2p_proxy_sync()
         self._p2p_friends_online_cb.setText(t("settings.p2p_friends_online"))
         self._p2p_friends_online_cb.setToolTip(t("settings.p2p_friends_online_tooltip"))
         self._p2p_media_cb.setText(t("settings.p2p_friends_media"))
@@ -2878,6 +3126,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._save_btn.setText(t("settings.save"))
         self._cancel_btn.setText(t("common.cancel"))
         self._hotkey_edit.update_locale()
+        self._refresh_jump_combo()      # (every group has its new title by now)
         # Re-fill both preference lists so their placeholder rows ("no game
         # preferences saved", "no excluded paths") and the per-item
         # suppression-kind labels pick up the new locale.

@@ -100,6 +100,17 @@ class PathRow(QFrame):
         self.setObjectName("path_row")
         self._build()
 
+    def set_note(self, text: str, kind: str = "muted") -> None:
+        """A line under the row saying what Save will do with this folder ("" for none).
+        *kind* "accent": something will be done to it; "muted": nothing will."""
+        from ui.styles.theme import palette
+        lbl = self._note_lbl
+        lbl.setText(text)
+        lbl.setToolTip(text)
+        lbl.setVisible(bool(text))
+        color = palette("accent") if kind == "accent" else palette("text_secondary")
+        lbl.setStyleSheet(f"color:{color};font-size:{scaled(11, self)}px;")
+
     def set_excluded_subdirs(self, excluded: set):
         """Set child paths whose files should be excluded from size calculation."""
         self._excluded_subdirs = excluded
@@ -242,6 +253,14 @@ class PathRow(QFrame):
         # Floor so checkbox + truncated path + size + open/✕ stay reachable.
         self.setMinimumWidth(scaled(280, self, min_px=240))
         outer.addLayout(row)
+
+        # What Save will do with this folder (a version was switched to; see
+        # set_note) - hidden until there is something to say.
+        self._note_lbl = QLabel("")
+        self._note_lbl.setObjectName("path_row_note")
+        self._note_lbl.setWordWrap(True)
+        self._note_lbl.setVisible(False)
+        outer.addWidget(self._note_lbl)
 
         # File browser (collapsible) — shows individual files for exclusion
         from ui.widgets.file_list_widget import FileListWidget

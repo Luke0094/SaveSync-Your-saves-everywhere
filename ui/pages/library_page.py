@@ -24,7 +24,7 @@ from ui.widgets.library_folders import FolderTree, MenuCombo, _clean_tag_display
 from ui.widgets.game_items import GameCard, GameRow, _display_sync_status, library_card_size
 from ui.widgets.page_size import (
     PageSizeCombo, SCOPE_LIBRARY, guarded_render, page_size)
-from ui.widgets.search_inputs import ClearableLineEdit
+from ui.widgets.search_inputs import ClearableLineEdit, SEARCH_DEBOUNCE_MS
 
 _SORT_NATURAL_DIRECTION = {
     "date_added":  "desc",
@@ -341,7 +341,7 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         # grid rebuilds on every keystroke while typing.
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(320)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
         self._search_timer.timeout.connect(self._apply_search_filter)
         self._search.textChanged.connect(self._on_search_text_changed)
         # Mode change is a deliberate click — apply at once, no debounce.

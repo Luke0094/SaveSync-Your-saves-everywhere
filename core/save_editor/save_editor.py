@@ -219,6 +219,10 @@ class SaveDocument:
     # The values as they stand in the file, for the formats whose bytes
     # cannot be compared — see dirty_against_disk.
     _baseline: tuple = ()
+    # What a registry key exports as right after this document wrote it, for
+    # changed_on_disk. Empty everywhere else: for a file, _original already is
+    # exactly what sits on disk.
+    _disk: bytes = b""
 
     def set_value(self, path: tuple, value) -> None:
         if self.read_only:
@@ -249,6 +253,39 @@ class SaveDocument:
 
     def _value_snapshot(self) -> tuple:
         return tuple((f.path, f.value) for f in self._fmt.fields())
+
+    def changed_on_disk(self) -> bool:
+        """Whether something else has rewritten the save since this document
+        read it, or last wrote it.
+
+        The document is a picture of the file taken at open, and save() writes
+        that picture back with the edits on top. If the game wrote the file in
+        between, an autosave is enough, everything it wrote is gone from the
+        picture and would be overwritten. Ren'Py makes it worse: it renames
+        ``auto-1`` to ``auto-2`` on every autosave, so the same path can now
+        hold a different save altogether.
+
+        Compared by bytes, not by timestamp: _original is exactly what was
+        parsed, so a write landing between reading the file and noting its
+        mtime cannot slip through. A save that exists but cannot be read right
+        now (locked, no permission) counts as changed, since writing over what
+        cannot be seen is the thing to avoid. A file that is simply GONE does
+        not: nothing is there to overwrite, and save() writes it regardless
+        (see backup_original) because the edit is fully known in memory.
+        """
+        try:
+            if self._registry:
+                from core.registry_saves import export_registry_key
+                now = export_registry_key(self._registry)
+            else:
+                now = self.path.read_bytes()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if not now:
+            return True
+        return now != (self._disk or self._original)
 
     def save(self) -> Path:
         """Write the edits back, keeping the original first.
@@ -301,12 +338,13 @@ class SaveDocument:
                 "cheats.err_read_only")
         data = self._fmt.dump()
         if self._registry:
-            from core.registry_saves import import_registry_tree
+            from core.registry_saves import export_registry_key, import_registry_tree
             if not import_registry_tree(self._registry, data):
                 raise SaveEditorError(
                     "the changes could not be written back to the registry")
             self._original = data
             self._baseline = self._value_snapshot()
+            self._disk = export_registry_key(self._registry) or b""
             return
         tmp = self.path.with_suffix(self.path.suffix + ".savesync-tmp")
         tmp.write_bytes(data)
@@ -1053,7 +1091,11 @@ def backup_original(path, contents: bytes = None, kind: str = KIND_EDIT) -> Path
 
 
 def copy_policy() -> tuple:
-    """How many copies to keep of one save, and for how many days."""
+    """How many copies to keep of one save, and for how many days.
+
+    Both numbers apply to each KIND of copy on its own (see prune_backups): a
+    save keeps that many copies taken before an edit AND that many taken before
+    a restore."""
     try:
         from core.config_manager import get_config
         cfg = get_config()
@@ -1067,9 +1109,15 @@ def copy_policy() -> tuple:
 def prune_backups(path) -> int:
     """Apply both rules to the copies kept of *path*; returns how many went.
 
-    The newest copy is never dropped, whatever its age. Age alone could
-    otherwise clear the lot — leaving an edit with nothing to undo it with,
-    which is the one thing these copies exist to prevent.
+    Each KIND of copy (backup_kind) has its own list with the same two rules:
+    the copies taken before an edit, and the copies taken before a restore.
+    They used to share one, so a few restores pushed every "before edit" copy
+    out — the ones that undo the edit itself. With the default of 3 a save now
+    keeps up to 3 + 3.
+
+    The newest copy of a kind is never dropped, whatever its age. Age alone
+    could otherwise clear the lot — leaving an edit with nothing to undo it
+    with, which is the one thing these copies exist to prevent.
 
     A copy's age is counted from when it was PUT ASIDE (backup_taken_at), not
     from its modification time: copy2 gives the copy the original's, so a save
@@ -1081,23 +1129,29 @@ def prune_backups(path) -> int:
     keep, days = copy_policy()
     p = Path(path)
     try:
-        # list_backups is already newest-kept first; reversed = oldest first.
-        kept = [f for f, _ in reversed(list_backups(p))]
+        # list_backups is newest-kept first; a kind's list reversed is oldest first.
+        by_kind = {}
+        for f, _ in list_backups(p):
+            by_kind.setdefault(backup_kind(f), []).append(f)
     except OSError:
         return 0
     cutoff = datetime.now() - timedelta(days=days)
     gone = 0
-    # Oldest first, and never the last one standing.
-    for old in kept[:-1]:
-        too_many = len(kept) - gone > keep
-        too_old = backup_taken_at(old) < cutoff
-        if not (too_many or too_old):
-            continue
-        try:
-            old.unlink()
-            gone += 1
-        except OSError:
-            pass
+    for newest_first in by_kind.values():
+        kept = newest_first[::-1]
+        dropped = 0
+        # Oldest first, and never the last one standing.
+        for old in kept[:-1]:
+            too_many = len(kept) - dropped > keep
+            too_old = backup_taken_at(old) < cutoff
+            if not (too_many or too_old):
+                continue
+            try:
+                old.unlink()
+                dropped += 1
+            except OSError:
+                pass
+        gone += dropped
     if gone:
         logger.info(f"Dropped {gone} old copies of {p.name} "
                     f"(keeping {keep}, for {days} days)")
@@ -1211,7 +1265,10 @@ def restore_backup(backup, target) -> None:
     gone. Now it survives as its own entry in the same list the restore
     panel already shows, tagged KIND_PRE_RESTORE so it reads as what it
     is — one restore point, backup or pre-restoration, no second
-    mechanism. backup_original's own dedup means this is a no-op
+    mechanism. It is listed with the others but counted apart from them:
+    prune_backups keeps the same number of each kind, so restoring never
+    costs a "before edit" copy its place. backup_original's own dedup means
+    this is a no-op
     disk-wise on a restore that changes nothing (e.g. restoring the copy
     already matching what's on disk).
 

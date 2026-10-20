@@ -19,9 +19,61 @@ involved at all.
 
 ---
 
+## Contents
+
+**New here? Start with what you want to do:**
+
+| I want to… | Go to |
+|---|---|
+| Keep my saves safe: backups, cloud, restore | [Backups & sync](#backups--sync) · [Sync providers](#sync-providers) · [Conflict resolution](#conflict-resolution) |
+| Send a save, a file or a folder to a friend | [P2P save transfer](#p2p-save-transfer) → [Sending](#sending) · [Receiving](#receiving) · [Friends](#friends) |
+| Chat with several friends at once | [Group chats](#group-chats) |
+| Hide my address when I send | [Hiding your address](#hiding-your-address) · [Private mode (Tor)](#private-mode-tor) |
+| Change what is inside a save | [Save editor](#save-editor) |
+| Know how a folder is decided to be a save | [Save detection](#save-detection) |
+| Install it, or build it myself | [Installation](#installation) |
+| Change a setting | [Settings reference](#settings-reference) · [Configuration](#configuration) |
+| Read how it works inside | [Architecture](#architecture) · [How the P2P transfer works](#how-it-works) · [Privacy: what the network sees](#privacy-what-the-network-sees) |
+| Fix something | [If it doesn't connect](#if-it-doesnt-connect) · [Data-integrity checks](#data-integrity-checks) · [Offline repair](#offline-repair) · [Diagnostics](#diagnostics) |
+
+**Every section:**
+
+| Section | What's in it |
+|---|---|
+| [Features](#features) | [Detection & tracking](#detection--tracking) · [Backups & sync](#backups--sync) · [Library](#library) · [Experience](#experience) |
+| [Installation](#installation) | From source, offline, building the Windows .exe and the Linux AppImage, Linux and macOS, dependencies |
+| [Architecture](#architecture) | The project layout |
+| [Sync providers](#sync-providers) | Google Drive, OneDrive, Dropbox, WebDAV, rclone and a local folder - and how to add one |
+| [Conflict resolution](#conflict-resolution) | What happens when the cloud and this PC disagree |
+| [P2P save transfer](#p2p-save-transfer) | Sending, receiving, settings, friends, group chats, speed, TLS, hiding your address, how it works, privacy |
+| [Save detection](#save-detection) | How candidate folders are scored |
+| [Save editor](#save-editor) | Editing the values inside a save, and the formats it understands |
+| [Hotkeys](#hotkeys) | The global shortcuts |
+| [Configuration](#configuration) | Adaptive limits, the settings reference, export, integrity checks, offline repair, diagnostics |
+| [License](#license) | PolyForm Noncommercial 1.0.0 |
+
+> Long sections open with the short version and keep the detail in **collapsible blocks**: click a block's title to open it.
+
+---
+
 ## Features
 
+Four groups. Each one lists what it covers; open it for the details.
+
+| Group | What it covers |
+|---|---|
+| [Detection & tracking](#detection--tracking) | Spotting running games, finding their save folders, playtime, several exe-path versions per game |
+| [Backups & sync](#backups--sync) | Versioned backups, integrity checks, cloud providers, conflicts, restore, P2P transfer |
+| [Library](#library) | Cards and lists, search and tags, web metadata and pictures, the context menu |
+| [Experience](#experience) | The overlay, the save editor, pinned notes, hotkeys, language and theme, the tray |
+
 ### Detection & tracking
+
+**In this group:** Auto-detection of running games · Cheap process-exit watchdog · Heuristic save-folder detection · Real-time filesystem watcher · Unknown-game queue · Proton/Wine on Linux · Launcher URL support · Playtime tracking · Multiple exe-path versions per game
+
+<details>
+<summary><strong>Show all 9 features</strong></summary>
+
 - **Auto-detection of running games** via process monitoring, with a cached
   process snapshot (per-process verdicts memoized across polls) and gentler
   polling while a game session is active — near-zero background cost during
@@ -70,12 +122,26 @@ involved at all.
   saves yet, replacing the executable brings the saves across (copied, the
   originals stay put) — or offers the latest backup when the old version's
   folder is gone. Switching between tracked versions does the same into an
-  empty folder, does nothing when the saves are identical (compared by hash),
-  and asks before overwriting when they differ (a mirror — the replaced set is
-  copied aside first); adding a version beside the current one seeds its empty
-  folder
+  empty folder, does nothing when the target already holds every save of the
+  version you leave (compared by hash), and when it has different saves of its
+  own it asks **as soon as you pick the version** (Overwrite = **Merge saves**:
+  every save of the version you leave is brought across, same-named files are
+  replaced after a copy of them is set aside, and nothing else is removed, so a
+  game's own config can never take the real saves with it). The folders under
+  *Your save folders* say what Save will do with each - copied, merged, kept - and
+  the copy itself happens on Save, so Cancel leaves everything as it was; an
+  unticked folder is never carried. Adding a version beside the current one seeds
+  its empty folder
+
+</details>
 
 ### Backups & sync
+
+**In this group:** Versioned local backups · Mtime preflight · Adaptive batch queues · Pre-restore safety backups · Verified on arrival · Duplicates view · Integrity checks · Interference alerts · Periodic in-game backups · Provisional backups · Multi-provider cloud sync · Renames and edited notes reach the provider · Conflict resolution · Quick restore from the overlay · Direct P2P transfer
+
+<details>
+<summary><strong>Show all 15 features</strong></summary>
+
 - **Versioned local backups** with retention (max count, days, minimum kept,
   size cap) and content-dedup (unchanged saves are skipped)
 - **Mtime preflight** — Backup All / Sync skip games whose saves clearly have
@@ -138,7 +204,15 @@ involved at all.
   transfer (see
   [P2P save transfer](#p2p-save-transfer))
 
+</details>
+
 ### Library
+
+**In this group:** Card and list views · Paged lists · Smart tag merging · Web metadata search · More pictures · Languages · Per-game context menu
+
+<details>
+<summary><strong>Show all 7 features</strong></summary>
+
 - **Card and list views** with search (by title or developer), folder tree with
   colors, star ratings from reviews, and three-state filters (include /
   exclude) for tags, engine and languages, picked from one dropdown that
@@ -174,12 +248,23 @@ involved at all.
   source's languages as one chip with the count; the add/edit panel shows the
   result beside the version — English when the game has it, with the full list
   one per line on hover. Clicking it lists them with a bin on each (shown on
-  hover), for the ones a regional store offers and your copy lacks (kept on
-  Save only)
+  hover), for the ones a regional store offers and your copy lacks, and an **Add a
+  language…** row at the bottom: pick one from the list (the ones the sources name, and every
+  language any of your games lists) or type your own - a language no source knows. A game with
+  none shows an **Add language** chip that opens the same menu. Kept on Save only; the library's
+  language filter lists what you add
 - **Per-game context menu** — backup, restore, sync, open save folder, edit,
   web search, remove
 
+</details>
+
 ### Experience
+
+**In this group:** In-game overlay · Save editor · Pinned notes and images · Global hotkeys · Live language switching · Dark / Light theme · Secure credential storage · System tray
+
+<details>
+<summary><strong>Show all 8 features</strong></summary>
+
 - **In-game overlay** — frameless always-on-top card with fade animations,
   notification carousel, cloud-save prompts, running game with engine label,
   and exclusive-fullscreen protection (never breaks a game's display mode)
@@ -201,9 +286,23 @@ involved at all.
 - **System tray** integration, minimize-to-tray, single-instance lock with
   second-launch focus, animated bootloader splash
 
+</details>
+
 ---
 
 ## Installation
+
+Run it from source, or build an executable. Each part below is its own block:
+
+| Part | What it covers |
+|---|---|
+| [From source](#from-source) | Run it from the repository (Python 3.10+) |
+| [Offline installation](#offline-installation) | Install on a machine without internet access |
+| [Building the Windows executable](#building-the-windows-executable) | Build the .exe with PyInstaller |
+| [Building the Linux AppImage](#building-the-linux-appimage) | Build the AppImage |
+| [Linux and macOS](#linux-and-macos) | Running it on those systems |
+| [What Linux needs installed](#what-linux-needs-installed) | The three packages that decide whether it looks right |
+| [Dependencies](#dependencies) | Every package and what it is for |
 
 ### From source
 
@@ -220,6 +319,10 @@ python main.py
 
 To install on a machine without internet access (or to keep a local copy
 of every dependency in case a package ever disappears from PyPI):
+
+<details>
+<summary><strong>Offline installation steps</strong></summary>
+
 
 ```bat
 :: Windows
@@ -238,7 +341,13 @@ The `offline_deps\` folder contains wheels for the **same OS and Python
 version** it was generated on — regenerate it when either changes. It is
 git-ignored (hundreds of MB); carry it alongside the project folder.
 
+</details>
+
 ### Building the Windows executable
+
+<details>
+<summary><strong>Build the Windows .exe</strong></summary>
+
 
 ```bash
 pip install pyinstaller
@@ -255,7 +364,13 @@ Output: `dist/SaveSync-<version>-win-<arch>.exe` (e.g.
 Always pass `--clean` — the spec injects custom Tcl into the splash and stale
 build caches would ship the old version.
 
+</details>
+
 ### Building the Linux AppImage
+
+<details>
+<summary><strong>Build the Linux AppImage</strong></summary>
+
 
 ```bash
 pip install pyinstaller
@@ -281,6 +396,8 @@ binaries between platforms (e.g. numba's bundled LLVM), is why the two
 outputs aren't a fair byte-for-byte comparison even when both carry the same
 dependencies.
 
+</details>
+
 ### Linux and macOS
 
 The application itself is portable: nothing imports a Windows module at
@@ -289,6 +406,10 @@ module level, the data directory follows XDG (`$XDG_DATA_HOME/SaveSync`,
 `flock` where there is no named mutex, launch-at-login writes an XDG
 `.desktop` or a LaunchAgent, folders open through `xdg-open` / `open`, and
 the global hotkey goes through pynput rather than a Windows hook.
+
+<details>
+<summary><strong>Linux and macOS in detail</strong></summary>
+
 
 Two things are Windows-only **by nature**, and degrade rather than fail:
 
@@ -321,6 +442,8 @@ and `~/.local/share/Steam`, and the user directories inside every Wine and
 Proton prefix it can find — plain `~/.wine`, `$WINEPREFIX`, Bottles,
 Heroic, Lutris.
 
+</details>
+
 ### What Linux needs installed
 
 Three packages decide whether SaveSync looks right, and none of them is a
@@ -336,6 +459,10 @@ have to be there.
 | `xdg-utils` | every "open folder" button does nothing (SaveSync falls back to `gio`, `kde-open` or `exo-open` when one of those is present) |
 
 ### Dependencies
+
+<details>
+<summary><strong>The dependency table</strong></summary>
+
 
 | Package | Purpose |
 |---------|---------|
@@ -354,9 +481,17 @@ have to be there.
 | lz4 | Wolf RPG's LZ4-compressed save variant |
 | numpy | Vectorised key search for that same variant |
 
+</details>
+
 ---
 
 ## Architecture
+
+For contributors: where the code lives.
+
+<details>
+<summary><strong>Project layout</strong></summary>
+
 
 ```
 savesync/
@@ -460,6 +595,7 @@ savesync/
 │   │   ├── secret.py              # Keys and sealing derived from a token or a friendship
 │   │   ├── friends.py             # Friend codes, per-direction mailboxes, the encrypted friend file
 │   │   ├── friend_net.py          # DHT session that reads/writes the friends' mailboxes
+│   │   ├── groups.py              # Group chats: members, roles, invitations, the queue - over the same pairwise mailboxes
 │   │   ├── tls.py                 # Optional TLS for transfers: the certificate authority derived from the token
 │   │   └── paths.py               # Folder received files are downloaded into (Settings)
 │   ├── resolvers.py               # Launcher URLs, executable resolution
@@ -527,6 +663,8 @@ dialog respectively; they are summarised rather than listed because their
 contents are exactly what their names say and the list would be longer than
 the rest of the tree put together.
 
+</details>
+
 ---
 
 ## Sync providers
@@ -560,6 +698,10 @@ Every decision is asked through the overlay notification, with the alternatives
 under the primary button's `▾` — never through a modal that could open behind a
 fullscreen game.
 
+<details>
+<summary><strong>The decision table and what each option does</strong></summary>
+
+
 | Condition | Result |
 |-----------|--------|
 | Only local modified since last sync | Auto-upload |
@@ -587,6 +729,8 @@ sync, another tool) is reported separately: it isn't a conflict, so the prompt
 offers to restore the newest backup, or to back up the current state from the dropdown.
 Closing it unanswered leaves the game on temporary backups until you choose.
 
+</details>
+
 ---
 
 ## P2P save transfer
@@ -604,10 +748,28 @@ There are two things you can send, and they end up in different places:
 | **A backup** — ➡️ on a row of the Backups page | In the receiver's **Backups** page, as an archive with a `📥 P2P` badge, ready to restore | Yes, like any other backup, including the retention below |
 | **A file or folder** — **Send a file…** in the Receive panel | Straight into a folder the receiver picks in Settings | No. Never in Backups, never listed, never deleted by SaveSync |
 
+**In this section:**
+
+| Part | What it covers |
+|---|---|
+| [Sending](#sending) | Give the receiver's token, pick what to send |
+| [Receiving](#receiving) | Get a token, accept an offer, where the files go |
+| [Settings](#settings) | The P2P settings and what each one does |
+| [Friends](#friends) | Add people by code, chat, hand over tokens, send files, lock the list, link another PC |
+| [Group chats](#group-chats) | Chat with several friends: roles, invitations, taking people out, attachments, what it does not promise |
+| [If it doesn't connect](#if-it-doesnt-connect) | Why two PCs fail to meet |
+| [Speed](#speed) | What decides the speed of a transfer |
+| [TLS (optional)](#tls-optional) | Swapping BitTorrent's own encryption for TLS |
+| [Hiding your address](#hiding-your-address) | Going through a SOCKS5 proxy |
+| [Private mode (Tor)](#private-mode-tor) | Going through Tor, so nobody sees your address |
+| [How it works](#how-it-works) | The mailbox, the meeting point, the connection |
+| [Privacy: what the network sees](#privacy-what-the-network-sees) | What stays hidden and what does not |
+
 ### Sending
 
 1. The receiver opens 📥 (bottom left of the sidebar) and gives you the token
-   it shows — pasted, or sent to you in one click if you are friends (see
+   it shows — pasted, sent to you in one click if you are friends, or, if you are
+   friends, **asked for from the send window itself** with 👥 (see
    [Friends](#friends)).
 2. Pick what to send:
    - **A backup:** click ➡️ on it in the Backups page.
@@ -636,6 +798,10 @@ Open 📥 to get a one-time token and give it to whoever is sending. When they
 send, the panel shows who and what — for a backup the game, its folder and the
 file (`"<name> wants to send you save.zip"`), for files the folder and how many
 — and **nothing downloads until you accept**. You can also decline.
+
+<details>
+<summary><strong>Receiving in detail</strong></summary>
+
 
 - A token works **once**, and a used one is no longer shown or copyable.
 - A token is good for **10 minutes from the moment it was made**; the panel
@@ -681,22 +847,25 @@ path, a 📁 button that opens it, and two buttons under it:
 That note lives in memory only. SaveSync keeps no list of received files and
 never deletes them.
 
+</details>
+
 ### Settings
 
 | Setting | Where | Default | What it does |
 |---|---|---|---|
 | `p2p_username` | Behaviour → *P2P display name* | empty | The name the receiver sees in your offer |
-| `p2p_max_per_game` | P2P received saves → *Archives to keep per game* | 3 | Received **saves** beyond this are pruned, oldest first |
-| `p2p_retention_days` | P2P received saves → *Delete after* | 7 | Received **saves** older than this are pruned (the newest is always kept) |
-| `p2p_files_dir` | P2P received saves → *Folder for received files* | empty = `<SaveSync data>/p2p_files` | Where files and folders sent by hand are downloaded. *Browse…* picks one, *Default* goes back |
-| `p2p_port` | P2P received saves → *Connection port* | 0 (*Auto*) | The port used to send and receive. Auto picks a free one each time; otherwise 1024–65535 |
-| `p2p_upnp` | P2P received saves → *UPnP* | on | Asks the router to open that port by itself (UPnP / NAT-PMP) |
-| `p2p_friends_online` | P2P received saves → *Check friends for tokens in the background* | on | Keeps SaveSync listening for the tokens friends send while it runs; off = only while the Friends panel or the Receive window is open |
-| `p2p_friends_autolock_minutes` | P2P received saves → *Lock friends after* | 10 | Minutes the friend list may sit unused before it locks itself (0 = never); only applies when a lock password is set |
-| `p2p_friends_media` | P2P received saves → *Play pictures and videos from friends inside the chat* | on | Whether **Show picture**, **Play video** and **Watch while downloading** exist on a received attachment. Off = SaveSync never reads a file somebody else made, in any way |
-| `p2p_tls` | P2P received saves → *Use TLS for transfers* | off | Sends over TLS instead of BitTorrent's RC4, with no fallback; needs a reachable port, and is not used while the proxy is on; see [TLS](#tls-optional) |
-| `p2p_proxy`, `p2p_proxy_host`, `p2p_proxy_port` | P2P received saves → *Hide my address behind a SOCKS5 proxy* | off | Sends every P2P connection (friends and transfers) through that proxy, or none at all; see [Hiding your address](#hiding-your-address). The proxy's login is kept encrypted on this PC, not in `config.json` |
-| `p2p_tor` | P2P received saves → *Private mode: hide this PC's address with Tor* | off | Friends and transfers go through Tor (the program comes with SaveSync) and the DHT is not used at all; both ends need it. Not with the proxy or TLS; see [Private mode](#private-mode-tor) |
+| `p2p_max_per_game` | P2P → Received saves → *Archives to keep per game* | 3 | Received **saves** beyond this are pruned, oldest first |
+| `p2p_retention_days` | P2P → Received saves → *Delete after* | 7 | Received **saves** older than this are pruned (the newest is always kept) |
+| `p2p_files_dir` | P2P → Received saves → *Folder for received files* | empty = `<SaveSync data>/p2p_files` | Where files and folders sent by hand are downloaded. *Browse…* picks one, *Default* goes back |
+| `p2p_port` | P2P → Connection → Direct → *Connection port* | 0 (*Auto*) | The port used to send and receive. Auto picks a free one each time; otherwise 1024–65535 |
+| `p2p_upnp` | P2P → Connection → Direct → *UPnP* | on | Asks the router to open that port by itself (UPnP / NAT-PMP) |
+| `p2p_friends_online` | P2P → Friends → *Check friends for tokens in the background* | on | Keeps SaveSync listening for the tokens friends send while it runs; off = only while the Friends panel or the Receive window is open |
+| `p2p_friends_autolock_minutes` | P2P → Friends → *Lock friends page after* | 10 | Minutes the friend list may sit unused before it locks itself (0 = never); only applies when a lock password is set |
+| `p2p_friends_media` | P2P → Friends → *Play pictures and videos from friends inside the chat* | on | Whether **Show picture**, **Play video** and **Watch while downloading** exist on a received attachment. Off = SaveSync never reads a file somebody else made, in any way |
+| `p2p_tls` | P2P → Connection → Direct → *Use TLS for transfers* | off | Sends over TLS instead of BitTorrent's RC4, with no fallback; needs a reachable port, and is not used while the proxy is on; see [TLS](#tls-optional) |
+| `p2p_proxy`, `p2p_proxy_host`, `p2p_proxy_port` | P2P → Connection → *SOCKS5 proxy* | off (the chosen connection is *Direct*) | Sends every P2P connection (friends and transfers) through that proxy, or none at all; see [Hiding your address](#hiding-your-address). The proxy's login is kept encrypted on this PC, not in `config.json` |
+| `p2p_proxy_local_dns` | P2P → Connection → *If the proxy cannot look up names, let this PC's DNS do it* | off | Behind a proxy that carries UDP but not a name lookup: off = P2P waits (nothing is looked up on this PC); on = this PC's DNS looks up the DHT's starting server's name, and so learns you use P2P |
+| `p2p_tor` | P2P → Connection → *Tor (private)* | off | Friends and transfers go through Tor (the program comes with SaveSync) and the DHT is not used at all; both ends need it. One connection at a time (Tor wins if a config has both set), and not with TLS; see [Private mode](#private-mode-tor) |
 
 The port and UPnP apply from the next transfer; a session that's already open
 keeps what it started with. The proxy applies at once to the friends' chat and to
@@ -716,8 +885,17 @@ Instead of pasting a token into another app, add the people you send things to
 as friends: write to each other (with a little formatting), offer each other
 files, and hand each other tokens in a click. 👥 in the sidebar, right after 📥,
 slides the list out of the sidebar, over the page beside it (click 👥 again, ✕ or
-press Esc to put it away; it also goes when the window is minimized or put away to
-the tray, so that nothing arrives unnoticed into a chat nobody is looking at).
+press Esc to put it away). It stays up when the window is minimized, put away to the
+tray, or another program (a game, say) has the focus; the chat is then not being
+read, so a new message is announced like any other and stays unread until you are
+back. Switching the theme or the language changes it in place: a draft and the
+picture you opened stay as they were.
+
+**Covers:** Your friend code · Handing over a token · Asking a friend for a token · Messages · Formatting and links · Attachments · Announcing · Nothing lost · Badges · Stopping a transfer · A token's time · Staying reachable · Removing · Locking the list · Forgot the lock password? · Another PC
+
+<details>
+<summary><strong>Friends in detail</strong></summary>
+
 
 - **Your friend code** is a 56-character string that identifies you to your
   friends; the Friends panel shows it with a **Copy** button. Give it to a
@@ -725,11 +903,47 @@ the tray, so that nothing arrives unnoticed into a chat nobody is looking at).
   add the other**: until they do, the entry reads *waiting for them to add you*,
   and it turns *connected* as soon as something of theirs is seen. Your name
   for friends is the P2P display name in Settings.
+- **Who is there.** A **green** dot on each friend (and under their name in the chat, with the
+  word *online*) means their SaveSync has been heard from lately; **red** means it has not
+  (the tooltip says when they were last seen). While SaveSync runs it writes each friend's mailbox
+  again every 3 minutes whether or not anything changed, and a friend who has not been seen to
+  write for 7 minutes (two beats missed) is shown as gone - so closing SaveSync turns the dot red
+  within a few minutes, not at once, and a friend on a version before this one (which writes every
+  45 minutes) reads red most of the time. In private mode (Tor) the dot is the live link itself.
+  Nothing is shown as online while your own network is not running, is blocked, or cannot reach the
+  DHT, and never while the list is locked. The same dot is on the friends in the Receive and Send
+  menus. People you only know through a group get no dot and no extra writes.
 - **Handing over a token.** In the Receive panel, **👥 Friends** on the right of
   *Copy* lists your friends; pick one and the token goes to them directly. It
-  arrives as a message (see below) with a countdown. **Click it, pick what to
-  send, and the transfer starts** — nothing to paste. For a backup, the send
+  arrives as a card in that friend's chat, with a countdown. **Press *Send…* on it,
+  pick what to send, and the transfer starts** — nothing to paste. For a backup, the send
   dialog (➡️ on a backup) offers the tokens friends have sent in a drop-down.
+- **Asking a friend for a token.** The other way round: in the send window (➡️ on a
+  backup, or **Send a file…**), **👥** next to the token box lists your friends;
+  pick one and they get a *request* in their chat — "Alice wants to send you
+  Game — 2026-10-19" — with **Accept** and **Decline**. Nothing is sent before
+  they press Accept. Accept makes a new token for that request and hands it to you; it
+  fills in your send window, where the send starts at once, with no further click; they then accept the incoming save in their Receive panel as usual. They get the
+  request while their SaveSync is listening (*Check friends for tokens in the background* is on
+  by default; with it off, only while their Friends panel or Receive window is open) and the
+  list is not locked. The
+  usual rules hold: the token is good for 10 minutes from when it was made, for the
+  first contact only, and the request itself lapses after 10 minutes too. The token is
+  made *for that friend*: it is tied to your friendship by a key only the two of you have,
+  so someone who gets hold of the token - or a friend who passes it on - can neither find
+  the transfer nor read it nor answer it, and a request never gets a token that was
+  already out. (If a token they gave another friend is still waiting for them, Accept says
+  so rather than take it away.) A token you copy from the Receive panel, or hand over with
+  *Send to friend*, is not tied like that: it is a secret that whoever holds it can use
+  once. You can ask a friend once a minute; they
+  turn away what comes faster, with a little allowance for how often they look, so at
+  worst about one and a half a minute gets through. Closing the
+  send window takes a request back (their card goes); Decline, a request that is not
+  answered, and a friend who is busy receiving something else are each told in the
+  window. Only the name shown on the request (what you are sending, cut to 64
+  bytes) is shown to them. Both of you need this version: an older one ignores
+  requests, and the window then says there was no answer. One request per friend
+  is live at a time; a newer one replaces the last.
 - **Messages.** Click a friend to open their chat and write in
   the box under it: Enter sends, Shift+Enter starts a new line. (The **⋯** on a
   friend's row renames or removes them.) A message is up
@@ -846,7 +1060,8 @@ the tray, so that nothing arrives unnoticed into a chat nobody is looking at).
   something unread (two messages from one friend count once). In the Friends
   panel each friend has a badge with the exact number of unread messages (texts,
   attachment offers and tokens alike); opening their conversation reads them and the badges come
-  down. A token card says whether the token is usable (with its countdown), used,
+  down. The button's tooltip also gives the total number of unread messages. A token card says
+  whether the token is usable (with its countdown), used,
   replaced by a newer one, or expired.
 - **Stopping a transfer.** Either end can call one off at any time, and the other
   end is told. **Receiving:** *Cancel* on the card (or *Cancel transfer* in the
@@ -900,7 +1115,8 @@ the tray, so that nothing arrives unnoticed into a chat nobody is looking at).
   elsewhere. With one, **nothing on this PC can open the file without the password**,
   and the file does not need this PC's key at all.
   The list is closed when SaveSync starts, after the minutes you choose without
-  using it (*Lock friends after*, Settings, 10 by default, *Never* = only the button)
+  using it (*Lock friends page after*, Settings, 10 by default, *Never* = only the button;
+  a Friends panel left open and not touched does not count as using it)
   and whenever you press **🔒 Lock**. Closing it saves it, stops the friends'
   network, and forgets the key and everything decrypted (the friends, the
   conversations, your identity, the mailbox keys): the program holds nothing it
@@ -939,6 +1155,84 @@ the tray, so that nothing arrives unnoticed into a chat nobody is looking at).
   writing the file SaveSync offers to remove the friends from this PC. What an
   import or a removal replaces is kept next to the file. Anyone holding the file
   *and* the password can read your friends and write as you: keep both safe.
+
+</details>
+
+### Group chats
+
+A group is a chat for several of you, kept **between the members themselves**: there is no server, no
+group key to leak and no place the conversation lives, so it goes on when someone - even the person who made it -
+is away. Open 👥, press **New group**, give it a name and say how many people it can hold, then invite your
+friends from the group's **Members** page. Messages are text (up to 270 bytes) and attachments, sealed end to
+end the same way a direct message is.
+
+**Covers:** Making one, and raising its limit · Inviting, and letting others invite · Roles: host, administrator, member · Taking people out, and who may · Closing the group · When the host goes · Who sees what · Attachments · What is not promised · Limits
+
+<details>
+<summary><strong>Group chats in detail</strong></summary>
+
+- **Making one.** *New group* asks for a name and the **most people it can hold** (2 to 12, you included -
+  8 by default). Every member talks to every other member directly, so a bigger group costs everybody more;
+  the host can **raise** the limit later (*Members* → **Raise limit…**, up to 12) and never lower it, and every
+  member is told. Your friends are asked from the group's *Members* page (**Invite…**); they see an invitation in their list (and a
+  notification) and **Accept** or **Decline**. An invitation lapses after a day. Accepting shows your
+  name and friend key to every member of the group, and theirs to you - that is how a group works.
+- **Letting others invite.** The host (and administrators) can allow an ordinary member to invite their own
+  friends: tick **Can invite** on that member and choose how many people **in all** they may ask. The member
+  asks one of *their* friends; when that friend accepts, the member tells them who is in the group and tells
+  the others who joined. Somebody asked back after they left is the same person, not another one of the number.
+  What is waiting for an answer counts against the number until it is answered.
+- **Roles.** The **host** made the group and can do everything: take anybody out, rename the group, allow members
+  to invite and how many, make administrators (and take that away), and close the group. An **administrator**
+  - made so by the host with the **Administrator** box - can do what the host can **against ordinary members**:
+  take them out, allow them to invite, rename the group, and invite without any number. They cannot do it to
+  the host, who cannot be touched, nor to another administrator: only the host removes an administrator. The host
+  or an administrator can also tick **Can take out members** on an ordinary member, which lets that member take
+  out the ordinary members **below** them - never an administrator, the host, or anybody else who holds that right
+  (so power only ever goes down: host, administrators, those allowed to, everybody else) - and take it back at any
+  time. An ordinary **member** can write, offer files, and leave. A member who is taken out, or who is made an
+  administrator, loses the single rights they were given.
+- **Taking people out, and closing the group.** **Take out** removes a member: they are told, they lose what they
+  were allowed, and only the host or an administrator can ask them back (an invitation from anyone else is
+  refused). Who may take whom out is decided by each member for themselves from who sent it, so a claim from
+  somebody who may not is ignored. Because there is no one place a group lives, **there is no "delete for
+  everybody"**: the only way to end one is to take everybody out, which the host's **Close group** button does in
+  one go - each member is told and the group is removed from the host's PC. A member who was away when it was
+  closed is told as soon as they are back.
+- **When the host goes.** Nothing in a group needs the host to be there: the others keep talking, administrators keep
+  their powers, and members keep the right to invite they were given. What goes with the host is the host's own
+  power - nobody can appoint administrators any more - and a group with no administrator is simply
+  not run by anyone: nobody can take people out or allow them to invite.
+- **Who sees what.** Every message is sealed separately for each other member, with the key the two of you share -
+  exactly like a direct message - so only the members can read it, and what the DHT stores for a mailbox looks like
+  any other. A member you are not friends with is a **hidden friend**: never in your friend list, only able to send
+  you this group's traffic (and the answer to a file you offered them), shown with the start of their key next to
+  their own name, because a name is only what its owner says. **Every member can see every member's name and key**,
+  whoever invited them. In the DHT, the nodes that keep a mailbox see an address write and an address read it, as
+  with a friend - for every pair of members; in private mode (Tor) every member is one more onion link.
+- **Attachments.** The **+** (or dropping files on the chat) offers a file or folder to the group: nothing moves
+  until a member presses **Accept**, and then the files go from the PC that offered them to that member alone, over
+  the usual sealed transfer, one member at a time - so **everybody who accepts connects to the PC that offered, and
+  both see each other's network address**, as friends do (you are asked once, when you offer). You see one card
+  with a line for every member (offered, sending 45%, sent, taken back, not taken in time) and can **Take back**
+  what is still open. Pictures and videos are not shown inside a group's chat: open the received file from its
+  folder (*Show in folder*). Programs and scripts are never sent or taken, as in a direct chat.
+- **What is not promised.** A member who joins takes their inviter's word for who is in the group (everyone else
+  then speaks for themselves): an inviter who lies can show a newcomer the wrong members. An inviter who lies
+  selectively can let in one person more than their number to some of the members, each of whom counts for
+  themselves. There is no history: a newcomer sees only what is said after they joined. A name is not proof of
+  anyone. Nothing here has been tried over a live DHT or Tor - it was tested over simulated mailboxes.
+- **If somebody is away.** What you say waits for them and goes when they are back. When more than twenty
+  messages are waiting for somebody who has been away that long, the oldest chat is dropped from the queue, but never a message that changes the group (a
+  join, a removal, a permission): the log shows a ✗ for that member and they get a note that some did not reach
+  them. Each of your messages shows how many of the others have it (✓✓ 3/3); hover for who. A group's messages
+  go out one or two at a time per member, so a direct message to a friend can briefly say the mailbox is full
+  while a group message waits to be acknowledged.
+- **Limits.** At most 12 members (chosen per group, raised by the host later), 20 groups, 20 invitations waiting for an answer, texts up to
+  270 bytes. "Don't show again" on a group's notification (or the ⋯ menu) silences that group only; it is listed in
+  Settings and counted by the badge all the same. Locking the friend list closes the groups with it.
+
+</details>
 
 ### If it doesn't connect
 
@@ -994,6 +1288,10 @@ A transfer is meant to use all of your line. What decides that, measured on this
 secret info-hash, see *Privacy* below) for TLS - an authenticated modern cipher -
 through libtorrent's "SSL torrents". Nothing is copied; the files stay links.
 
+<details>
+<summary><strong>TLS in detail</strong></summary>
+
+
 - **A transfer is TLS or it does not happen.** Every connection is TLS and each
   side must show a certificate signed by that transfer's own authority; a peer that
   is not speaking TLS is refused. There is no fallback to the other kind. The
@@ -1032,14 +1330,21 @@ through libtorrent's "SSL torrents". Nothing is copied; the files stay links.
 - **Who sees what:** the SNI of a TLS connection is the torrent's info-hash in the
   clear - random to anyone else, and useless without a certificate.
 
+</details>
+
 ### Hiding your address
 
 Peer to peer cannot hide an address by itself: the friend on the other end
-connects to your PC, and the DHT nodes that keep the mailboxes see who asks them.
+connects to your PC (for a transfer; chat only goes through the DHT), and the DHT nodes
+that keep the mailboxes see who asks them.
 The only way out is to let something else be seen instead - a **SOCKS5 proxy**
-(many VPN services offer one). In Settings, switch on *Hide my address behind a
-SOCKS5 proxy*, give its address and port (and a login if it wants one) and press
+(many VPN services offer one). In Settings, under *P2P → Connection*, choose
+*SOCKS5 proxy*, give its address and port (and a login if it wants one) and press
 **Test**.
+
+<details>
+<summary><strong>The proxy in detail</strong></summary>
+
 
 - **Through it, or not at all.** Every P2P packet and connection - the DHT, the
   mailboxes, the transfers, both ways - goes through the proxy. If it is down,
@@ -1059,23 +1364,49 @@ SOCKS5 proxy*, give its address and port (and a login if it wants one) and press
 - **The login** is kept in `p2p_proxy.dat`, encrypted for this PC - not in
   `config.json`, and never in a config export.
 - **What it does not hide:** the proxy's operator (and the line up to it) still
-  knows your PC and sees that you use P2P, when and how much. The name of the
-  DHT's starting server is looked up by your PC's own DNS, not through the proxy.
+  knows your PC and sees that you use P2P, when and how much. The DHT's starting
+  servers are looked up **through the proxy** too - over its UDP, by a public DNS server that sees
+  the proxy's address - and libtorrent is given addresses only: left to itself it asks *this PC's*
+  DNS for the name whatever the proxy settings say (checked: a name that exists nowhere fails on
+  this PC's resolver and the proxy is never asked), which tells that DNS server you run P2P. The only
+  name still looked up on this PC is the proxy's own address, if you typed it as a name. **Test** also
+  checks that the proxy carries such a lookup; one that carries UDP but not that cannot be used for
+  P2P - nothing is looked up locally instead - unless you tick **If the proxy cannot look up names, let this
+  PC's DNS do it** (off by default): then only that one name goes to this PC's DNS, which learns you use P2P.
+  A passing glitch does not send it there: the lookup is tried twice first (once, for a proxy that has just
+  failed a whole round), and a public DNS server that answers with an error is passed over for the next.
+  Switching the option restarts the friends' network (and drops a waiting token, as any change of the proxy
+  does). Without it, a friends' network that started before the proxy could carry the lookup looks again
+  every minute and starts its DHT by itself when it can.
 - **Why not I2P.** I2P was designed and tried (libtorrent left exactly as it is,
   talking only to 127.0.0.1, small bridges carrying its connections over I2P
   streams: a transfer, cancel and all, worked against a pretend router) but dropped: its
   router needs 10-20 minutes before it is usable the first time, and offline messages
   would need roughly 20-50 PCs of SaveSync users on I2P. Tor is what private mode
   uses instead.
+- **Why not Hyphanet (Freenet).** Asked for, and not offered, because it cannot be
+  built in small. It is a Java node (a recent build needs Java 17; the download page still
+  says 9) with a datastore of its own, which a program talks to over its FCP protocol by
+  inserting and fetching content-addressed blocks - not a connection two PCs can run
+  BitTorrent over, so it would replace the transfer rather than carry it, and would have to
+  be installed beside SaveSync (the Tor copy in `vendor/tor` is about 20 MB for both
+  platforms). Hiding an address always costs at least one hop; the fast one is the proxy
+  above, and Tor is the private one.
+
+</details>
 
 ### Private mode (Tor)
 
 A proxy puts somebody else's address where yours was, and needs one. **Private mode**
-(Settings, *Private mode: hide this PC's address with Tor*) needs nothing: SaveSync carries
+(Settings, *P2P → Connection → Tor (private)*) needs nothing: SaveSync carries
 a copy of Tor (the Tor Project's own program, kept in `vendor/tor`, fetched and checked by
 `tools/fetch_tor.py`), starts it when it is first needed and ends it with the application.
 The two PCs meet inside Tor, at *onion addresses*, and neither ever sees the other's
 address - nor do the relays, nor the DHT, which is not used at all while this is on.
+
+<details>
+<summary><strong>Private mode in detail</strong></summary>
+
 
 - **Transfers.** The receiver's token says it is a private one (it is one byte longer) and
   leads to an onion address that both sides work out from it; the receiver waits there, the
@@ -1142,7 +1473,15 @@ address - nor do the relays, nor the DHT, which is not used at all while this is
   test server that greets is not). And a circuit takes 3-60 seconds to set up, so libtorrent's
   handshake timeout is raised from 10 s to two minutes.
 
+</details>
+
 ### How it works
+
+**Covers:** The mailbox · The meeting point · Friends · The token's time · Tokens made for a friend · Asking for a token · Stopping, and watching meanwhile · Chat formatting and attachments · The connection
+
+<details>
+<summary><strong>How the transfer works, in detail</strong></summary>
+
 
 **The mailbox.** The receiver's token is 15 random bytes (shown in base32);
 hashing it gives the seed for a keypair generated fresh for that transfer. The
@@ -1183,8 +1522,8 @@ when a period begins, and a message seen twice is taken once. What the mailbox h
 (ChaCha20-Poly1305), is a "hello" with the sender's name, the tokens sent in the
 last few minutes, the texts the friend has not acknowledged yet and the sender's
 own acknowledgement of theirs, at most about 900 bytes; each message has an id and
-is taken once, and the sender writes it again every 45 minutes so it does not
-expire from the DHT. A text carries a number inside a random "numbering" of its
+is taken once, and the sender writes it again every 3 minutes (45 for somebody only known through a
+group) so it does not expire from the DHT - and so that the friend can tell it is there. A text carries a number inside a random "numbering" of its
 own (an epoch, made with the first one): the friend answers with "I have up to n
 of that epoch", the sender drops what is covered and marks it delivered, and a
 skipped number shows up as a gap rather than going unnoticed. A text is never
@@ -1208,10 +1547,51 @@ offer comes, the person cancels, or five minutes pass without a renewal. After t
 offer is accepted nothing has a clock — not the download, not the seeding, not
 the connection.
 
+**Tokens made for a friend.** A token has one flag byte (the one private mode already used),
+and a token made for a friend - the answer to a request, or to an attachment offer - sets a second
+bit in it. Its seed is not just the hash of the token but that mixed with a key derived from the
+secret the two friends' identity keys give (`FriendStore.bind_key`, the same on both sides, and
+under a label of its own). Everything a transfer is made from comes from that one seed - the DHT
+mailbox and the key it is signed with, the key the offer, the "hold" and the "cancel" are sealed
+under, the rendezvous hash, the TLS authority, the onion address - so a holder of the token alone
+derives none of them: it is not their token. The send entry points refuse a bound token that
+comes without its key rather than send to the wrong mailbox, and the key is read on the GUI thread
+before the sending work starts. Verified at the level of the derivation and the services, not
+over a live DHT or Tor.
+
+**Group chats.** A group is no new kind of channel: a group message is a numbered, acknowledged text with a
+`g` field - the group, what it is (a message, an offered attachment, an invitation, the roster, a member added,
+taken out, allowed, made an administrator, renamed, left) and a few validated fields - sent to each member over the
+pair's own sealed mailbox, so what it adds to a direct conversation is only the rules. **Who may do what is decided by
+who a message came from**, which the pairwise sealing proves: the host's or an administrator's word counts for
+taking out, renaming and allowing (an administrator's not against the host or another administrator; one allowed
+to take members out only against ordinary members who are not themselves allowed to), the host's alone for
+making administrators and for raising the limit, an inviter's for who joined (within the number they were given, counted by
+each member for themselves), anyone's for what they say; a message that claims more is ignored. There is no group
+key, so a removal means "stop sending to them and refuse them" rather than a re-key. The members a group needs
+and you are not friends with are **hidden friends** in the friend file: they get a stream like any friend, but
+every other kind of message from them (a text of their own, a request) is dropped, and a token only as the
+answer to an attachment offered them. Streams are separate, so a message can arrive before the roster or the "add"
+that explains it: it is held (30 per group, a day) and acted on when they come, never lost, since the stream has
+already counted it as received. Group traffic waits in a queue of its own and goes into a pair's stream one or two at
+a time, so that somebody away does not fill it; chat that waits too long is dropped (and noted), what changes the
+group never. Each message carries its sender's own number for the group, so a gap is told. A group attachment
+reuses the direct one's offer, accept and send, one per member, keyed by the id of the offer in that member's stream.
+
+**Asking for a token.** A request is a small "ask" message — a label for what is to be sent
+(cut to 64 bytes) and the seconds it is good for, at most the token's ten minutes — kept
+in the mailbox like a token and dropped before any text when it is crowded. The friend's
+answer is an ordinary token message whose "re" is the request's id (the same field that
+answers an attachment offer), so what the asker's send window takes up is a token that
+passed the same checks as any other; a token for a request that was declined or taken
+back is just an ordinary token. A request that does not fit the friend's mailbox next to
+the texts waiting there is refused, never squeezed in. An older SaveSync skips the
+unknown message, so there the request goes unanswered.
+
 **Stopping, and watching meanwhile.** A *cancel* between friends is a small
-message naming the offer and saying who stops (*withdraw*: the sender took it
-back; *stop*: the receiver stopped an attempt) — dropped before any text when the
-mailbox is crowded, like a token. For a send in progress the sender also writes a
+message naming the offer (or the request for a token) and saying who stops (*withdraw*: the
+sender took it back; *stop*: the receiver stopped an attempt, or declined the request) —
+dropped before any text when the mailbox is crowded, like a token. For a send in progress the sender also writes a
 sealed `{"cancel": 1}` into the token's mailbox and keeps its session alive a few
 seconds so that it is stored; the receiving session looks at that mailbox every
 five seconds while it downloads. Stopping a download removes the torrent, waits
@@ -1255,7 +1635,15 @@ and an existing file can't be hit by accident. A download counts as finished
 only once the torrent has been released and the files are closed; until then the
 last bytes may still be on their way to the disk.
 
+</details>
+
 ### Privacy: what the network sees
+
+**Covers:** Hidden · Not hidden · The token is the secret · Friends · Formatting, links, attachments · The cipher is BitTorrent's · TLS is the stronger, optional choice
+
+<details>
+<summary><strong>What stays hidden, what does not, and the trade-offs</strong></summary>
+
 
 - **Hidden:** the offer (who sends, what, how big, the magnet link), the
   torrent's info-hash, the file names and the contents. The public network sees
@@ -1263,7 +1651,10 @@ last bytes may still be on their way to the disk.
   that means nothing to anyone else. No tracker is contacted.
 - **Not hidden:** that two IP addresses met at that hash and then exchanged
   traffic — as in any peer-to-peer connection — and that they use the BitTorrent
-  network. A SOCKS5 proxy puts its address there instead of yours; see
+  network. Every packet to the DHT carries the sender's address, sealed contents or
+  not, so the nodes that keep the mailboxes see it, as one more DHT node. Chat alone
+  never connects the two PCs (messages only go through those mailboxes): your friend
+  sees your address only while a transfer connects. A SOCKS5 proxy puts its address there instead of yours; see
   [Hiding your address](#hiding-your-address). **Private mode** hides it from the
   other side and from the DHT alike, which it does not use; see
   [Private mode](#private-mode-tor).
@@ -1326,13 +1717,15 @@ use), `core/p2p/attachments.py` (what an attachment may be, and the checks on it
 arrival), `ui/dialogs/p2p_link_dialog.py` (the "open this link?" question),
 `ui/widgets/safe_image.py` (the one place a picture is decoded),
 `ui/widgets/safe_video.py` (the one place a video is played),
-`ui/widgets/stream_device.py` (what lets it read a file that is still arriving), `ui/p2p_friends_service.py` (the friend list, received
+`ui/widgets/stream_device.py` (what lets it read a file that is still arriving), `ui/p2p_friends_service.py` (the friend list, groups, received
 tokens and their countdowns), `ui/dialogs/p2p_friends_dialog.py` (the Friends
 panel that slides out of the sidebar), `ui/dialogs/p2p_friends_reset.py` (the question before the friend list is deleted), `ui/dialogs/p2p_send_flow.py` (pick, confirm, send), `core/p2p/paths.py`
 (where received files go), `ui/p2p_receive_service.py` (keeps the receive session alive with the panel
 closed, files the archive, does the move), `ui/dialogs/p2p_send_dialog.py`,
 `ui/dialogs/p2p_send_confirm_dialog.py` (the list of files to send),
 `ui/dialogs/p2p_receive_dialog.py`.
+
+</details>
 
 ---
 
@@ -1947,6 +2340,17 @@ Settings live in `%APPDATA%/SaveSync/config.json` (Linux/macOS:
 you tune is in **Settings**; a few behaviours scale automatically from the
 machine so capable PCs are not artificially slowed and weaker ones stay usable.
 
+**In this section:**
+
+| Part | What it covers |
+|---|---|
+| [How adaptive limits work](#how-adaptive-limits-work) | How the machine is sized up and what scales with it |
+| [Settings reference](#settings-reference) | Every setting, its default and what it does |
+| [Config export & history](#config-export--history) | Exporting and importing settings, and the history |
+| [Data-integrity checks](#data-integrity-checks) | The checks that run on a schedule and on demand |
+| [Offline repair](#offline-repair) | The one tool that can rewrite an archive index |
+| [Diagnostics](#diagnostics) | Tracing child processes and windows |
+
 ### How adaptive limits work
 
 At runtime SaveSync classifies the host into a coarse tier from **logical CPU
@@ -1955,6 +2359,10 @@ That tier is **cached ~45 s** so a brief free-RAM dip (game launch, antivirus)
 does not flip library chunking / verify pacing on and off. **Currently
 available RAM** is still read live for Backup All / Sync All: under ~1.5 GB
 free, those queues drop to one job so they do not fight the game for memory.
+
+<details>
+<summary><strong>How the tiers and limits work</strong></summary>
+
 
 **Cores are not the whole story, in either direction.**
 
@@ -2053,6 +2461,8 @@ Other automatic I/O habits worth knowing:
 - **Page-size crash guard** for oversized custom page sizes uses a tiny sidecar
   file (`page_size_render_guard.json`), not a full rewrite of `config.json`
 
+</details>
+
 ### Settings reference
 
 | Setting | Default | Description |
@@ -2091,7 +2501,7 @@ Other automatic I/O habits worth knowing:
 | `check_for_updates` | true | Look for a newer release (`update_check_interval_sec`, 0 = at startup only) |
 | `extra_watch_paths` | [] | Additional folders the filesystem watcher should keep an eye on |
 | `theme` / `language` | `dark` / `en` | Appearance and tool language |
-| `p2p_username`, `p2p_max_per_game`, `p2p_retention_days`, `p2p_files_dir`, `p2p_port`, `p2p_upnp`, `p2p_friends_online`, `p2p_friends_autolock_minutes`, `p2p_proxy`, `p2p_proxy_host`, `p2p_proxy_port` | see the P2P section | P2P display name, how many received saves to keep and for how long, the folder files sent by hand are downloaded into, the connection port and UPnP, whether friends are checked in the background, and the optional SOCKS5 proxy — described under *Settings* in [P2P save transfer](#p2p-save-transfer) |
+| `p2p_username`, `p2p_max_per_game`, `p2p_retention_days`, `p2p_files_dir`, `p2p_port`, `p2p_upnp`, `p2p_friends_online`, `p2p_friends_autolock_minutes`, `p2p_proxy`, `p2p_proxy_host`, `p2p_proxy_port`, `p2p_proxy_local_dns` | see the P2P section | P2P display name, how many received saves to keep and for how long, the folder files sent by hand are downloaded into, the connection port and UPnP, whether friends are checked in the background, and the optional SOCKS5 proxy — described under *Settings* in [P2P save transfer](#p2p-save-transfer) |
 | `ui_scale_auto` / `ui_scale_factor` | true / 1.0 | Follow the screen's DPI, or pin a factor by hand |
 
 Everything else in `config.json` is remembered state rather than a

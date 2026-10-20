@@ -127,6 +127,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # "Don't show again" on a friend's message (the friend's id): the friend is silenced
     # in the sealed friend file, not in config.json - which would list the friends.
     friend_silenced = Signal(str)
+    # The same for a group's messages (the group's id): silenced in the sealed friend file too.
+    group_silenced = Signal(str)
     # Provider restore-list fetch completed (payload: entries, game_id,
     # local_ids, seq). Emitted FROM THE WORKER THREAD — a queued signal is
     # the only safe hop back to the GUI thread; the old QTimer.singleShot
@@ -2269,7 +2271,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # Per-game suppress link when this notif carries an identity
         if game_id and notif_type:
             self._set_suppress_link(
-                "dont_show_friend" if game_id.startswith("friend:") else "dont_show_ingame",
+                "dont_show_friend" if game_id.startswith("friend:")
+                else "dont_show_group" if game_id.startswith("group:") else "dont_show_ingame",
                 lambda _checked=False, gid=game_id, nt=notif_type:
                     self._suppress_ingame_notif(gid, nt))
         else:
@@ -2340,6 +2343,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if game_id.startswith("friend:"):
             self.friend_silenced.emit(game_id[len("friend:"):])
             logger.info("Silenced a friend's message notifications")
+        elif game_id.startswith("group:"):
+            self.group_silenced.emit(game_id[len("group:"):])
+            logger.info("Silenced a group's message notifications")
         else:
             from core.config_manager import get_config
             config = get_config()
@@ -2477,6 +2483,28 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             "👥", t("p2p.friends_notice_title"), msg, _FRIEND_AUTO_HIDE_MS,
             game_id=f"friend:{friend_id}", notif_type="friend_message",
             action=(t("p2p.friends_notice_open"), "open_friend_messages", friend_id))
+
+    def show_group_message(self, group_id: str, group: str, sender: str, preview: str) -> None:
+        """A message (or an attachment offer) arrived in a group: which group, who said it and a line
+        of it, a button that opens the group, and a "don't show again" that silences THIS group."""
+        msg = (f"<b>{html.escape(group)}</b> · {html.escape(sender)} — "
+               f"<span style='color:{palette('text_secondary')};'>{html.escape(preview)}</span>")
+        self._push_notification(
+            "👥", t("p2p.groups_notice_title"), msg, _FRIEND_AUTO_HIDE_MS,
+            game_id=f"group:{group_id}", notif_type="group_message",
+            action=(t("p2p.groups_notice_open"), "open_group_messages", group_id))
+
+    def show_group_invite(self, group_id: str, text: str) -> None:
+        """Somebody asked the person into a group: the button opens the list, where the invitation waits."""
+        msg = html.escape(text)
+        self._push_notification(
+            "👥", t("p2p.groups_notice_invite_title"), msg, _FRIEND_AUTO_HIDE_MS,
+            action=(t("p2p.groups_notice_invite_open"), "open_group_messages", ""))
+
+    def show_group_kicked(self, group_id: str, text: str) -> None:
+        self._push_notification(
+            "👥", t("p2p.groups_notice_title"), html.escape(text), _FRIEND_AUTO_HIDE_MS,
+            action=(t("p2p.groups_notice_open"), "open_group_messages", group_id))
 
     def show_sync_done(self, game_name: str, game_id: str = ""):
         """Queue a sync-result notification. Multiple results stack in the carousel.

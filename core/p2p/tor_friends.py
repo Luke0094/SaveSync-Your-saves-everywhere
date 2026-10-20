@@ -25,7 +25,6 @@ The part that stays the same is everything above the transport: FriendNet's send
 (text_room / send_text / send_file / send_token / send_cancel), the events it gives
 back, the acknowledgements. Only where a slot goes - and where one comes from - is new.
 """
-import json
 import logging
 import time
 from typing import Callable, Optional
@@ -107,6 +106,11 @@ class TorFriendNet(_fn.FriendNet):
                 "online": sum(1 for s in self._states.values() if s.connected),
                 "links": len(self._states)}
 
+    def online(self, fid: str, now: Optional[float] = None) -> bool:
+        """Is the friend there now? In private mode that is a live stream to them, not a guess."""
+        st = self._states.get(fid)
+        return bool(st is not None and st.connected and not self.error)
+
     def _make_state(self, link: "_fn._Link", svc) -> _State:
         mb = link.mb
         mine, mine_key = _tor.identity_from_seed(mb.onion_seed(True))
@@ -122,6 +126,7 @@ class TorFriendNet(_fn.FriendNet):
         """Do what is due; return events (the same kinds FriendNet gives)."""
         now = time.time() if now is None else now
         self.sync(now)
+        self.feed_groups(now)
         events: list = []
         if not self._links:
             self._close_states()
@@ -174,7 +179,7 @@ class TorFriendNet(_fn.FriendNet):
         if not went:
             return
         st.last_plain, st.next_keepalive = plain, now + KEEPALIVE_SECONDS
-        ids = [m["id"] for m in json.loads(plain.decode("utf-8"))["m"]]
+        ids = [m["id"] for m in _f.unpack_slot(plain)]      # (as the friend will read it)
         settled = [i for i in ids if i in link.pending_tokens]
         if settled:
             link.pending_tokens.difference_update(settled)
@@ -189,7 +194,7 @@ class TorFriendNet(_fn.FriendNet):
         not acknowledged, and my acknowledgement of theirs."""
         if st.hello is None or now - st.hello_at >= KEEPALIVE_SECONDS:
             st.hello, st.hello_at = _f.make_hello(self._name_fn(), now), now
-        keep = [m for m in link.out_msgs if m["t"] in ("token", "cancel")
+        keep = [m for m in link.out_msgs if m["t"] in _f.EPHEMERAL_KINDS
                 and now - m["at"] <= _f.TOKEN_KEEP_SECONDS]
         link.out_msgs = [st.hello] + keep
         f = self.store.get(link.fid)

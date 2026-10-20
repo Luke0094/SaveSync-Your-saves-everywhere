@@ -183,6 +183,13 @@ class P2pReceiveService(QObject):
         self._proxy_sig = None
         # Private mode: (friend id, reply_to) of tokens waiting for the onion address to be up.
         self._token_waiting: list = []
+        # The friends the token of this session has been handed to (send_token_to_friend).
+        # A token is a secret that whoever holds it can use, once: it must not go to a second
+        # friend while the first may still be using it (see answer_request).
+        self._issued_to: set = set()
+        # The friend this session's token was made for, if it was (new_session's bind_fid):
+        # only that friend's SaveSync can use it, see core.p2p.transfer.
+        self._bound_to = ""
         # Set by the main window: the friends service, so the panel can hand the
         # token straight to a friend (None when friends are not in use).
         self.friends = None
@@ -281,6 +288,9 @@ class P2pReceiveService(QObject):
         *reply_to* is the attachment offer the token accepts, if it does."""
         if self.friends is None or self.session is None or self.state != WAITING:
             return
+        if self._bound_to and fid != self._bound_to:
+            return                      # (made for another friend: it would be of no use to this one)
+        self._issued_to.add(fid)
         if self.session.private and not self._reachable():
             # Private mode: a token is of no use until the onion address it leads to can be
             # found, and a friend who tries before that is told "not found" and may not try
@@ -310,9 +320,9 @@ class P2pReceiveService(QObject):
 
     def start_attachment(self, fid: str, mid: str, count: int, size: int) -> None:
         """The person accepted an attachment in the chat: make a fresh token for
-        it, remember what is expected, and answer the friend with that token.
-        The offer that comes back is taken by itself only if it is exactly this
-        one (see _take_expected). P2pError says why not."""
+        it - made for that friend, see new_session - remember what is expected, and
+        answer the friend with that token. The offer that comes back is taken by itself
+        only if it is exactly this one (see _take_expected). P2pError says why not."""
         from core.p2p import attachments as _a
         from core.p2p.paths import files_dir
         from core.p2p.transfer import P2pError
@@ -322,12 +332,35 @@ class P2pReceiveService(QObject):
             raise P2pError("busy")
         if not _a.free_space_ok(files_dir(), size):
             raise P2pError("space")
-        self.new_session()                  # (a token that was waiting is replaced)
+        self.new_session(bind_fid=fid)      # (a token that was waiting is replaced; this one is made for the friend)
         if self.session is None:
             raise P2pError(self.error or "no session")
         self.expected = {"fid": fid, "mid": mid, "count": int(count), "size": int(size)}
         self.session.name_filter = lambda rels, sizes: _a.check_incoming(rels, sizes, count, size)
         self.send_token_to_friend(fid, reply_to=mid)
+
+    def answer_request(self, fid: str, rid: str) -> None:
+        """A friend asked for a token (to send me a save) and the person accepted: make a
+        new token for that request and hand it to them, with the time it has left. It is
+        never one that was already out: a token is a secret that whoever holds it can use,
+        once, so each is made for one friend. The offer that comes back waits for the
+        person, as any other. P2pError says why not: "busy" - something is being received,
+        or a transfer asked for from a chat card is waiting for its own token, which a new
+        session would replace - or "token_out": the token of this session was given to
+        another friend, who has not used it yet and would lose it."""
+        from core.p2p.transfer import P2pError
+        if self.friends is None:
+            raise P2pError("unavailable")
+        if (self.state in (OFFER, DOWNLOADING) or self.importing or self.moving
+                or self._cancelling or self.expected is not None):
+            raise P2pError("busy")
+        if (self.state == WAITING and self.session is not None and not self.session.lapsed
+                and self._issued_to - {fid}):
+            raise P2pError("token_out")
+        self.new_session(bind_fid=fid)
+        if self.session is None or self.state != WAITING:
+            raise P2pError(self.error or "no session")
+        self.send_token_to_friend(fid, reply_to=rid)
 
     def cancel_attachment(self, mid: str) -> None:
         """Call the attachment *mid* off: give up waiting for the friend to send
@@ -510,16 +543,31 @@ class P2pReceiveService(QObject):
 
     # ── Session lifecycle ────────────────────────────────────────────────
 
-    def new_session(self) -> None:
+    @property
+    def bound_to(self) -> str:
+        """The id of the friend the token on show was made for ("" if for nobody in
+        particular)."""
+        return self._bound_to if self.session is not None else ""
+
+    def new_session(self, bind_fid: str = "") -> None:
         """Fresh token, fresh session — first open, "New token", or after a
-        decline (a token is meant to work once)."""
+        decline (a token is meant to work once). *bind_fid*: the token is made for that
+        friend - it is useless without the key only the two of them have - and P2pError
+        "locked" if that key is not to be had (the session that waits is left as it is)."""
+        bind_key = None
+        if bind_fid:
+            bind_key = self.friends.bind_key(bind_fid) if self.friends is not None else None
+            if not bind_key:
+                from core.p2p.transfer import P2pError
+                raise P2pError("locked")
         self._drop_session()
         self.token_renewed = False
         self.token_renewed_proxy = False
         try:
             from core.p2p.transfer import ReceiveSession
             sig = _current_proxy_signature()
-            self.session = ReceiveSession()
+            self.session = ReceiveSession(bind_key=bind_key) if bind_key else ReceiveSession()
+            self._bound_to = bind_fid
             self._proxy_sig = sig
         except Exception as e:
             logger.warning(f"P2P receive: could not start a session: {e}")
@@ -548,6 +596,8 @@ class P2pReceiveService(QObject):
     def _drop_session(self) -> None:
         self._timer.stop()
         self._token_waiting = []
+        self._issued_to = set()
+        self._bound_to = ""
         if self.expected is not None:
             self._clear_expected("cancelled")
         if self.session is not None:
@@ -873,12 +923,17 @@ class P2pReceiveService(QObject):
 
         def _work():
             moved, failed, new_rels = 0, [], []
+            from core.p2p import attachments as _a
             for rel in rels:
                 src = src_dir / rel
                 try:
                     target = _unique_target(dest / rel)
                     target.parent.mkdir(parents=True, exist_ok=True)
+                    marked = _a.has_internet_mark(src)
                     shutil.move(str(src), str(target))
+                    if marked and not _a.has_internet_mark(target):
+                        # (across drives a move is a copy, and a copy does not take the mark with it)
+                        _a.mark_from_internet(target)
                     moved += 1
                     new_rels.append(target.relative_to(dest).as_posix())
                 except OSError as e:

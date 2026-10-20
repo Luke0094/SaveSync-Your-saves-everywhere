@@ -26,6 +26,14 @@ What keeps it between the two of them (see core.p2p.secret for the keys):
 - BitTorrent's protocol encryption is mandatory in both directions (RC4 only;
   a plain peer is refused). Its key mixes the info-hash, so a stranger who
   does not know it can neither join the swarm nor read the traffic.
+A token made FOR A FRIEND (a request they accepted, an attachment they offered) is bound
+to that friendship: it carries one more flag (the same byte as the private-mode flag), and
+the seed everything above comes from is the token's own mixed with a key only the two
+friends have (core.p2p.friends, FriendStore.bind_key). So whoever merely holds the token -
+it leaked, or the friend passed it on without the key - cannot find the mailbox, write an
+offer, read one, or reach the rendezvous: it is not their token, whatever it says. A token
+pasted by hand or handed over with "send to friend" is not bound: it is what it always was,
+a secret that whoever holds it can use once.
 The token's ten minutes are for FIRST CONTACT only - the sender reaching the
 receiver's mailbox - and say nothing about how long a transfer takes or how big
 it is. A large offer can need a long time to be prepared (every piece of it is
@@ -156,6 +164,10 @@ _TOKEN_BYTES = _TOKEN_RANDOM + _TOKEN_STAMP
 # token gives, and never the DHT), and must not use the DHT for a token that is not
 # one - its address would be shown to it.
 _TOKEN_PRIVATE_FLAG = b"\x01"
+# ...and a token made for one friend has the byte too, with this bit (both: 3). Its seed
+# needs that friend's key (see _seed_of); the send entry points refuse it without one.
+_TOKEN_BOUND_FLAG = b"\x02"
+_TOKEN_FLAGS = (1, 2, 3)
 _TOKEN_EPOCH = 1767225600           # 2026-01-01T00:00:00Z
 TOKEN_TTL_SECONDS = 10 * 60
 # The sender only turns a token away when it is clearly out of date: the clocks
@@ -201,6 +213,11 @@ class P2pTorError(P2pError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class P2pBoundError(P2pError):
+    """A token made for one friend, and no key of theirs to use it with: nothing is
+    started - never an offer to the wrong mailbox."""
 
 
 class P2pRefused(P2pError):
@@ -287,18 +304,38 @@ def _expanded_keys(seed32: bytes) -> tuple:
     return _secret.signing_keys(seed32)
 
 
-def generate_token(now: Optional[float] = None, private: bool = False) -> tuple:
+def generate_token(now: Optional[float] = None, private: bool = False,
+                   bind_key: Optional[bytes] = None) -> tuple:
     """(token_str, seed32) for a fresh, single-use transfer address.
     token_str is what gets handed to the other side; seed32 is what THIS
     side keeps to derive its own keys from. It is good for
     TOKEN_TTL_SECONDS from *now* (see token_created_at). *private*: for private
-    mode (Tor), see _TOKEN_PRIVATE_FLAG."""
+    mode (Tor), see _TOKEN_PRIVATE_FLAG. *bind_key*: made for one friend, whose key
+    this is (see _TOKEN_BOUND_FLAG)."""
     stamp = max(0, int((time.time() if now is None else now) - _TOKEN_EPOCH))
     token_bytes = os.urandom(_TOKEN_RANDOM) + stamp.to_bytes(_TOKEN_STAMP, "big")
-    if private:
-        token_bytes += _TOKEN_PRIVATE_FLAG
+    flags = (1 if private else 0) | (2 if bind_key else 0)
+    if flags:
+        token_bytes += bytes([flags])
     token_str = b32encode(token_bytes).decode("ascii").rstrip("=")
-    return token_str, hashlib.sha256(token_bytes).digest()
+    return token_str, _seed_of(token_bytes, bind_key)
+
+
+def _flags(token_bytes: bytes) -> int:
+    return token_bytes[_TOKEN_BYTES] if len(token_bytes) > _TOKEN_BYTES else 0
+
+
+def _seed_of(token_bytes: bytes, bind_key: Optional[bytes]) -> bytes:
+    """The seed every key of a transfer comes from - the one place it is made, for both
+    ends. A plain or private token: the hash of the token, as it has always been. One made
+    for a friend: that, mixed with the friend's key, so that the token alone is of no use.
+    P2pBoundError for a bound token without the key."""
+    seed = hashlib.sha256(token_bytes).digest()
+    if not _flags(token_bytes) & 2:
+        return seed
+    if not bind_key:
+        raise P2pBoundError("this token was made for one friend")
+    return _secret.derive(seed + bytes(bind_key), b"bound seed", 32)
 
 
 def _token_bytes(token_str: str) -> bytes:
@@ -310,14 +347,20 @@ def _token_bytes(token_str: str) -> bytes:
         raise P2pError("that token is not valid") from e
     if len(token_bytes) not in (_TOKEN_BYTES, _TOKEN_BYTES + 1):
         raise P2pError("that token is not valid")
-    if len(token_bytes) > _TOKEN_BYTES and token_bytes[_TOKEN_BYTES:] != _TOKEN_PRIVATE_FLAG:
+    if len(token_bytes) > _TOKEN_BYTES and token_bytes[_TOKEN_BYTES] not in _TOKEN_FLAGS:
         raise P2pError("that token is not valid")
     return token_bytes
 
 
 def token_is_private(token_str: str) -> bool:
     """Is this a private-mode (Tor) token? P2pError if it is not a token."""
-    return len(_token_bytes(token_str)) > _TOKEN_BYTES
+    return bool(_flags(_token_bytes(token_str)) & 1)
+
+
+def token_is_bound(token_str: str) -> bool:
+    """Was this token made for one friend (it cannot be used without that friend's
+    key)? P2pError if it is not a token."""
+    return bool(_flags(_token_bytes(token_str)) & 2)
 
 
 def token_created_at(token_str: str) -> float:
@@ -338,6 +381,15 @@ def seed_from_token(token_str: str, *, check_age: bool = True) -> bytes:
         if age > TOKEN_TTL_SECONDS + _TOKEN_SKEW_SECONDS:
             raise P2pTokenExpired("that token has expired")
     return hashlib.sha256(token_bytes).digest()
+
+
+def session_seed(token_str: str, bind_key: Optional[bytes] = None, *, check_age: bool = True) -> bytes:
+    """The seed a transfer under this token is made from (seed_from_token only says the
+    token is one, and not run out - for a token made for a friend its answer is not the
+    seed to use). *bind_key* is the key of the friend it was made for; a plain token
+    ignores it. P2pBoundError for a bound token without one."""
+    seed_from_token(token_str, check_age=check_age)
+    return _seed_of(_token_bytes(token_str), bind_key)
 
 def net_settings() -> dict:
     """Listening port and router port-mapping, from Settings (P2P section).
@@ -496,6 +548,22 @@ def _tor_role_settings(role: str) -> dict:
     return {"enable_outgoing_tcp": False} if role == "receive" else {"enable_incoming_tcp": False}
 
 
+# The DHT's starting servers, as libtorrent has them unless a test says otherwise.
+_DHT_BOOTSTRAP = ""
+# Behind a proxy a session's DHT is switched on once its starting servers have been looked up over the
+# proxy (see _start_dht_behind_proxy): a put made before is lost. session id -> the event that says so.
+_PROXY_DHT_READY: dict = {}
+# ... and what each of them was given: session id -> {"names": the starting servers by name, "nodes": the
+# addresses found ("" - none), "busy": a try is under way, "wait": the longest the first start can take}.
+_PROXY_DHT_INFO: dict = {}
+_PROXY_READY_LOCK = threading.Lock()        # (sessions are made on the GUI thread and on the sending threads)
+_BOOTSTRAP_TRIES = 4
+# With this PC's DNS to fall back on (Settings), fewer: the fallback is the cheaper way out, and each try of
+# a proxy that carries no lookups costs a whole timeout. (And a proxy that has just failed a whole round: one.)
+_LOCAL_DNS_TRIES = 2
+_BOOTSTRAP_RETRY_SECONDS = 5.0
+
+
 def _new_session(tls: bool = False, role: str = ""):
     """A libtorrent session. *tls*: with an SSL socket beside each one that listens
     (the receiver of a TLS transfer is reached there; see core.p2p.tls). *role*
@@ -508,11 +576,88 @@ def _new_session(tls: bool = False, role: str = ""):
         if not _tls.available(lt):
             raise P2pError("TLS is switched on in Settings, but this libtorrent cannot do it")
         settings["listen_interfaces"] = _tls.with_ssl_sockets(settings["listen_interfaces"])
+    behind_proxy = bool(settings.get("force_proxy"))
+    names = _DHT_BOOTSTRAP or lt.default_settings().get("dht_bootstrap_nodes", "")
+    if behind_proxy:
+        # (no name for libtorrent to look up on this PC: the addresses come from the thread below)
+        settings["dht_bootstrap_nodes"] = ""
     ses = lt.session(settings)
-    if settings.get("force_proxy"):
-        threading.Thread(target=_restart_dht_later, args=(ses,),
+    if behind_proxy:
+        ready = threading.Event()
+        try:
+            px = _proxy.configured()
+        except _proxy.ProxyError:
+            px = None
+        count = len([e for e in names.split(",") if e.strip()])
+        wait = (_bootstrap_tries(px) * (_BOOTSTRAP_RETRY_SECONDS + _proxy.lookup_budget(count))
+                + _PROXY_DHT_RESTART_SECONDS + 2.0)
+        with _PROXY_READY_LOCK:
+            for key in [k for k, ev in _PROXY_DHT_READY.items() if ev.is_set()][:-8]:
+                _PROXY_DHT_READY.pop(key, None)
+                _PROXY_DHT_INFO.pop(key, None)
+            _PROXY_DHT_READY[id(ses)] = ready
+            _PROXY_DHT_INFO[id(ses)] = {"names": names, "nodes": "", "busy": True, "wait": wait}
+        threading.Thread(target=_start_dht_behind_proxy, args=(ses, px, names, ready),
                          name="p2p-proxy-dht", daemon=True).start()
     return ses
+
+
+def proxy_dht_ready(ses):
+    """The event that says a session started behind a proxy has its DHT up (see _start_dht_behind_proxy),
+    or None for a session that is not waiting for one."""
+    with _PROXY_READY_LOCK:
+        return _PROXY_DHT_READY.get(id(ses))
+
+
+def proxy_dht_state(ses) -> str:
+    """"" for a session that is not behind a proxy, "starting" until its DHT has been started (see
+    _start_dht_behind_proxy), "busy" while the starting servers are looked for again, "ok" once the DHT
+    has some, "none" if it runs without any - the proxy would not carry the lookup (retry_proxy_dht)."""
+    with _PROXY_READY_LOCK:
+        info, ready = _PROXY_DHT_INFO.get(id(ses)), _PROXY_DHT_READY.get(id(ses))
+        if info is None or ready is None:
+            return ""
+        if not ready.is_set():
+            return "starting"
+        return "busy" if info["busy"] else ("ok" if info["nodes"] else "none")
+
+
+def retry_proxy_dht(ses) -> bool:
+    """A session whose DHT was started with no starting servers (proxy_dht_state "none") looks for them
+    again, on a thread of its own that ends with the try; the DHT is started over when they are found. For
+    a session that lives on (the friends'): a transfer's is made new each time. False when it is not one
+    that needs it, or a try is under way already."""
+    with _PROXY_READY_LOCK:
+        info = _PROXY_DHT_INFO.get(id(ses))
+        ready = _PROXY_DHT_READY.get(id(ses))
+        if info is None or ready is None or not ready.is_set() or info["busy"] or info["nodes"]:
+            return False
+        info["busy"] = True
+    try:
+        px = _proxy.configured()
+    except _proxy.ProxyError:
+        px = None
+    threading.Thread(target=_retry_dht_behind_proxy, args=(ses, px, info),
+                     name="p2p-proxy-dht-again", daemon=True).start()
+    return True
+
+
+def _retry_dht_behind_proxy(ses, px, info: dict) -> None:
+    nodes = ""
+    try:
+        if px is not None:
+            nodes = _proxy.bootstrap_nodes(px, info["names"])
+        if nodes:
+            ses.apply_settings({"enable_dht": False})
+            ses.apply_settings({"dht_bootstrap_nodes": nodes, "enable_dht": True})
+            logger.info("P2P: the proxy carries the lookup of the DHT's starting servers now; the DHT is started")
+    except Exception:
+        nodes = ""
+        logger.debug("P2P: starting the DHT behind the proxy again failed", exc_info=True)
+    finally:
+        with _PROXY_READY_LOCK:
+            info["nodes"] = nodes or info["nodes"]
+            info["busy"] = False
 
 
 def _wait_for_proxy_dht(ses, started: float) -> None:
@@ -523,18 +668,67 @@ def _wait_for_proxy_dht(ses, started: float) -> None:
             return
     except Exception:
         return
+    ready = proxy_dht_ready(ses)
+    if ready is not None:
+        with _PROXY_READY_LOCK:
+            info = _PROXY_DHT_INFO.get(id(ses)) or {}
+        ready.wait(timeout=info.get("wait") or _BOOTSTRAP_TRIES * (_BOOTSTRAP_RETRY_SECONDS + 4.0))
     wait = started + _PROXY_DHT_RESTART_SECONDS + 1.0 - time.monotonic()
     if wait > 0:
         time.sleep(wait)
 
 
-def _restart_dht_later(ses) -> None:
-    time.sleep(_PROXY_DHT_RESTART_SECONDS)
+def _bootstrap_tries(px) -> int:
+    """How many times the lookup of the starting servers over *px* is tried before the DHT is started
+    without them - or, if Settings let this PC's DNS stand in, before that does it. A proxy that is not
+    there to answer is not tried again (the same goes for one that has just failed a whole round, when
+    this PC's DNS is the way out)."""
+    if px is None:
+        return 1
+    if not px.local_dns:
+        return _BOOTSTRAP_TRIES
+    return 1 if _proxy.gave_up(px) else _LOCAL_DNS_TRIES
+
+
+def _start_dht_behind_proxy(ses, px, names: str, ready) -> None:
+    """Behind a proxy: look the DHT's starting servers up OVER THE PROXY (see core.p2p.proxy - libtorrent
+    would use this PC's own DNS), give libtorrent their addresses, and start its DHT again - the proxy's
+    UDP channel takes a moment to come up, and a DHT started before it is dead. If the proxy will not carry
+    a lookup the DHT is left without starting servers: P2P does not work then, and nothing is looked up
+    on this PC instead (retry_proxy_dht looks again, for a session that lives on) - unless Settings let
+    this PC's DNS do it, after a few tries so that one passing glitch does not tell it."""
+    begun = time.monotonic()
+    nodes = ""
     try:
+        tries = _bootstrap_tries(px)
+        for attempt in range(tries):
+            nodes = _proxy.bootstrap_nodes(px, names) if px is not None else ""
+            if nodes:
+                break
+            if attempt + 1 < tries:
+                time.sleep(_BOOTSTRAP_RETRY_SECONDS)
+        if not nodes and px is not None:
+            _proxy.note_gave_up(px)
+            if px.local_dns:
+                nodes = names                   # (the names: libtorrent looks them up with this PC's own DNS)
+                logger.info("P2P: the proxy would not carry a lookup of the DHT's starting servers; "
+                            "this PC's DNS looks them up, as Settings allow")
+            else:
+                logger.warning("P2P: the proxy would not carry a lookup of the DHT's starting servers; "
+                               "P2P cannot start behind it (nothing is looked up on this PC instead)")
+        pause = _PROXY_DHT_RESTART_SECONDS - (time.monotonic() - begun)
+        if pause > 0:
+            time.sleep(pause)
         ses.apply_settings({"enable_dht": False})
-        ses.apply_settings({"enable_dht": True})
+        ses.apply_settings({"dht_bootstrap_nodes": nodes, "enable_dht": True})
     except Exception:
-        logger.debug("P2P: restarting the DHT behind the proxy failed", exc_info=True)
+        logger.debug("P2P: starting the DHT behind the proxy failed", exc_info=True)
+    finally:
+        with _PROXY_READY_LOCK:
+            info = _PROXY_DHT_INFO.get(id(ses))
+            if info is not None:
+                info["nodes"], info["busy"] = nodes, False
+        ready.set()
 
 
 def _hidden_flags(lt) -> int:
@@ -951,13 +1145,17 @@ class ReceiveSession:
     both the DHT lookup and the torrent download; nothing here blocks.
     """
 
-    def __init__(self):
+    def __init__(self, bind_key: Optional[bytes] = None):
+        """*bind_key*: the session is for one friend, whose key this is (see
+        _TOKEN_BOUND_FLAG): only that friend's SaveSync can use its token."""
         self.created_at = time.time()
+        self.bound = bool(bind_key)
         # Private mode (Tor): the token says so, this session hosts an onion service the
         # token leads to (core.p2p.tor_link.Host) instead of watching a DHT mailbox, and
         # the sender comes to it - nothing of this PC is announced anywhere.
         self._private = tor_enabled()
-        self.token, self._seed32 = generate_token(self.created_at, private=self._private)
+        self.token, self._seed32 = generate_token(self.created_at, private=self._private,
+                                                  bind_key=bind_key)
         self._pub32, _sk64 = _expanded_keys(self._seed32)
         self._host = None
         if self._private:
@@ -2013,7 +2211,7 @@ def send_backup(token_str: str, file_path, sender_username: str,
                 sender_machine_id: str, game_name: str = "",
                 backup_entry: Optional[dict] = None,
                 folder_name: str = "", kind: str = "backup", progress=None,
-                tls: Optional[bool] = None) -> SendHandle:
+                tls: Optional[bool] = None, friend_key: Optional[bytes] = None) -> SendHandle:
     """Create a torrent for *file_path*, start seeding it, and publish the
     offer into the DHT mailbox *token_str* (the RECEIVER's token) points to.
 
@@ -2031,7 +2229,7 @@ def send_backup(token_str: str, file_path, sender_username: str,
     until the transfer is known to be picked up: stopping it removes the
     only seed AND the link (never the original file).
     """
-    seed_from_token(token_str)      # a bad token fails before anything is staged
+    session_seed(token_str, friend_key)     # a bad token (or a bound one with no key) fails before anything is staged
     file_path = Path(file_path)
     if not file_path.is_file():
         raise P2pError(f"{file_path} is not a file")
@@ -2054,7 +2252,7 @@ def send_backup(token_str: str, file_path, sender_username: str,
             "kind": "file" if kind == "file" else "backup",
             "sender_username": sender_username,
             "sender_machine_id": sender_machine_id,
-        }, progress, tls)
+        }, progress, tls, friend_key)
     except BaseException:
         shutil.rmtree(staging_root, ignore_errors=True)
         raise
@@ -2063,7 +2261,7 @@ def send_backup(token_str: str, file_path, sender_username: str,
 def send_files(token_str: str, files, sender_username: str,
                sender_machine_id: str, label: str = "",
                folder_name: str = "", attach: str = "", progress=None,
-               tls: Optional[bool] = None) -> SendHandle:
+               tls: Optional[bool] = None, friend_key: Optional[bytes] = None) -> SendHandle:
     """Seed several files AS THEY ARE (no zip, no backup entry) and publish
     the offer under the receiver's token.
 
@@ -2080,9 +2278,10 @@ def send_files(token_str: str, files, sender_username: str,
     however big the files are, the token's time is not what limits it.
 
     Same lifetime rules as send_backup: keep the handle until the transfer is
-    known to be picked up.
+    known to be picked up. *friend_key*: the key of the friend the token was made for,
+    when it was (see session_seed).
     """
-    seed_from_token(token_str)      # a bad token fails before anything is staged
+    session_seed(token_str, friend_key)     # a bad token (or a bound one with no key) fails before anything is staged
     items = []
     for src, rel in files:
         src = Path(src)
@@ -2123,7 +2322,7 @@ def send_files(token_str: str, files, sender_username: str,
         }
         if attach:
             fields["attach"] = str(attach)[:32]
-        return _seed_and_offer(token_str, staging_root, transfer_dir, fields, progress, tls)
+        return _seed_and_offer(token_str, staging_root, transfer_dir, fields, progress, tls, friend_key)
     except BaseException:
         shutil.rmtree(staging_root, ignore_errors=True)
         raise
@@ -2342,7 +2541,8 @@ def _seed_meta_torrent(lt, ses, seed32: bytes, staging_root: Path, payload: byte
 
 
 def _seed_and_offer(token_str: str, staging_root: Path, transfer_dir: Path,
-                    fields: dict, progress=None, tls: Optional[bool] = None) -> SendHandle:
+                    fields: dict, progress=None, tls: Optional[bool] = None,
+                    friend_key: Optional[bytes] = None) -> SendHandle:
     """Make a torrent of *transfer_dir*, seed it, and publish *fields* + its
     magnet link into the mailbox the receiver's token points to.
 
@@ -2356,7 +2556,7 @@ def _seed_and_offer(token_str: str, staging_root: Path, transfer_dir: Path,
     description of a small first torrent, which in turn carries the real torrent's;
     both are seeded here."""
     lt = _require_libtorrent()
-    seed32 = seed_from_token(token_str, check_age=False)     # checked when the send began
+    seed32 = session_seed(token_str, friend_key, check_age=False)     # checked when the send began
     pub32, sk64 = _expanded_keys(seed32)
     # Private mode (Tor) has to be on at both ends: the token says which this is, and a
     # PC in private mode never goes the open way (its address would be shown), nor does

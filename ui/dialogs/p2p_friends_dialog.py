@@ -14,14 +14,19 @@ it - and has three pages:
 - one friend's CHAT: the conversation - texts both ways (each of mine
   marked as waiting, sent or delivered), tokens they sent as cards you can use
   (Send, pick what to send, and it goes), attachments as cards with their own
-  buttons, and a note where some did not arrive - with a box to write in and a +
+  buttons, requests for a token as cards too (a friend who has a save to send asks for
+  the token to send it to: Accept hands them one, Decline says no - and mine, which say
+  whether they answered), and a note where some did not arrive - with a box to write in and a +
   to attach a file. Opened from the list, or straight from the notification of a
   new message. What is on show is read, which brings the badges down; what arrives
-  while it is open is read as it comes, and is not announced again - which is why
-  the panel closes itself when the window is minimized or put away to the tray: a
-  message must not arrive unannounced into a chat nobody is looking at;
+  while it is open is read as it comes, and is not announced again - but only
+  while somebody is looking: when the window is minimized, put away to the tray, or
+  another program has the focus, the chat is not "viewed" (see _sync_attention), so a
+  message is announced like any other and stays new until the person is back;
 - the LOCK screen, when the list has been locked with a password - with a way
-  back in for a forgotten one that deletes the list (ui.dialogs.p2p_friends_reset).
+  back in for a forgotten one that deletes the list (ui.dialogs.p2p_friends_reset);
+- GROUP CHATS, over the friends on the list and on two pages of their own - a group's chat and
+  its members (all of it in ui.dialogs.p2p_group_pages).
 
 A token is good for 10 minutes. The ⋯ next to Lock holds the lock password
 and linking another PC (a password-protected file, since the friend file is
@@ -38,6 +43,7 @@ ui.widgets.safe_video; Settings can turn both off). SaveSync never opens or runs
 a received file. Files and folders can be dragged onto the conversation (or the
 box) to offer them, exactly as + does.
 """
+import contextlib
 import logging
 import os
 import re
@@ -49,12 +55,13 @@ from PySide6.QtCore import (
     QEasingCurve, QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFontMetrics, QKeySequence, QPalette, QShortcut,
+    QColor, QDesktopServices, QFontMetrics, QGuiApplication, QKeySequence, QPalette,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from core.p2p import attachments as _a
@@ -63,13 +70,19 @@ from core.p2p import markup
 from core.p2p.friends import FriendError
 from i18n import t
 from ui.helpers import scaled
+from ui.dialogs.p2p_group_pages import PAGE_GROUP, PAGE_MEMBERS, GroupPagesMixin
 from ui.p2p_friends_service import format_remaining
-from ui.styles.theme import palette
+from ui.styles.theme import ThemedMixin, palette
 from ui.widgets.count_badge import CountBadge
+from ui.widgets.presence_dot import PresenceDot
 
 logger = logging.getLogger(__name__)
 
 _PAGE_LIST, _PAGE_MESSAGES, _PAGE_LOCK = 0, 1, 2
+# What counts as the person using the list (for the lock timer): a press, a key, the wheel.
+_INPUT_EVENTS = frozenset((QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress, QEvent.Type.Wheel))
+# What changes whether the window is being looked at.
+_WINDOW_EVENTS = frozenset((QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.WindowStateChange))
 _LINK_SUFFIX = ".ssfriends"
 _LINK_HREF = re.compile(r"^l(\d{1,2})$")
 # A download that has had nothing arrive for this long is said to be stuck (it is not
@@ -194,6 +207,7 @@ class _FriendRow(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._pressed = False
         self.setStyleSheet(
             "#p2p_friend_row { background: transparent; border-radius: 8px; }"
             f"#p2p_friend_row:hover, #p2p_friend_row:focus {{ background: {palette('bg_elevated')}; }}")
@@ -201,12 +215,16 @@ class _FriendRow(QFrame):
     def mousePressEvent(self, event):
         # (a press that is not taken goes to the parent, and the release with it)
         if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if (event.button() == Qt.MouseButton.LeftButton
+        # A click is a press AND a release on this row: a release alone - the one that
+        # closes a menu opened over the row, say - is not one.
+        pressed, self._pressed = self._pressed, False
+        if (pressed and event.button() == Qt.MouseButton.LeftButton
                 and self.rect().contains(event.position().toPoint())):
             self.clicked.emit()
         super().mouseReleaseEvent(event)
@@ -218,32 +236,44 @@ class _FriendRow(QFrame):
             super().keyPressEvent(event)
 
 
-class P2pFriendsPanel(QFrame):
+class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
     """The friend list as a drawer: it slides out of *anchor* (the sidebar) over the
     page beside it, and slides back in when closed. *host* is the widget both sit in.
-    Built for one opening - closing deletes it."""
+    Built for one opening - closing deletes it, but never while a dialog it opened is
+    still up (see _modal)."""
     closed = Signal()
 
     _WIDTH = 380            # design pixels (scaled), as much as the window can spare
     _MIN_WIDTH = 280
     _KEEP_VISIBLE = 120     # of the page beside it, in a window too narrow for all of it
 
-    def __init__(self, service, host, anchor, *, open_friend: str = ""):
+    def __init__(self, service, host, anchor, *, open_friend: str = "", open_group: str = ""):
         super().__init__(host)
         self._svc = service
         self._host = host
         self._anchor = anchor
+        self._window = host.window()
         self._slide = 0.0               # 0: tucked behind the sidebar, 1: all the way out
         self._anim = None
         self._closing = False
+        self._finished = False          # hidden and announced as closed
+        self._modal_depth = 0           # flows of ours that are inside a dialog's event loop
+        self._discard_pending = False   # to be deleted as soon as no dialog of ours is up
+        self._attending = False         # is a friend's chat on show AND somebody looking at it
+        self._away = False              # the window is minimized or put away (see _sync_window)
+        self._holding = False           # holds the network on the service (see acquire)
         self._friend_id = ""            # whose messages are on show ("" = the list)
         self._wanted_friend = open_friend   # to show once the list is open
         self._new_ids: set = set()      # messages that were unread when the page opened
         self._msg_labels: dict = {}         # message id -> (label, message)
         self._msgs_sig = None               # what the page shows now (to rebuild only on a change)
+        self._list_sig = None               # what the list shows now (same)
+        self._rows: dict = {}               # friend id -> its row on the list
         self._xfer: dict = {}               # attachment id -> (message, status, bar, speed), for live figures
         self._previews: dict = {}           # attachment id -> the picture the person asked to see
         self._videos: dict = {}             # attachment id -> the video player the person opened
+        self._retexts: list = []            # what sets the words of the fixed widgets (see update_locale)
+        self._init_groups(open_group)
         self.setObjectName("p2p_friends_panel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)     # (so Esc works before anything in it is clicked)
@@ -255,13 +285,23 @@ class P2pFriendsPanel(QFrame):
         esc.activated.connect(self.close_panel)
         host.installEventFilter(self)
         anchor.installEventFilter(self)
+        self._window.installEventFilter(self)
+        QApplication.instance().installEventFilter(self)     # (only to see the person use it)
+        QGuiApplication.instance().applicationStateChanged.connect(self._sync_attention)
         self._svc.changed.connect(self._refresh)
         self._svc.lock_changed.connect(self._on_lock_changed)
-        self._svc.acquire()
+        # Open and left alone, this must not keep the list from locking itself: it holds
+        # the network, and the lock timer runs from the last time it was touched.
+        self._svc.acquire(blocks_lock=False)
+        self._holding = True
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
         self._tick.start()
+        self._copy_timer = QTimer(self)
+        self._copy_timer.setSingleShot(True)
+        self._copy_timer.timeout.connect(
+            lambda: self._copy_btn.setText(t("p2p.friends_copy_code")))
         self._update_net_status()
         self._refresh()
         self._enter()
@@ -269,9 +309,78 @@ class P2pFriendsPanel(QFrame):
 
     def _apply_chrome(self):
         # The sidebar's own colours, so it reads as the sidebar growing sideways.
-        self.setStyleSheet(
+        self._sty(self, lambda: (
             f"#p2p_friends_panel {{ background-color: {palette('bg')}; "
-            f"border-right: 1px solid {palette('border')}; }}")
+            f"border-right: 1px solid {palette('border')}; }}"))
+
+    # The text colours the pages are written in. Read when used, not kept: they have to
+    # follow the theme (see refresh_styles).
+    @property
+    def _ink(self) -> str:
+        return f"color:{palette('text')};"
+
+    @property
+    def _muted(self) -> str:
+        return f"color:{palette('text_secondary')};"
+
+    @property
+    def _bold(self) -> str:
+        return f"font-weight:700;font-size:13px;{self._ink}"
+
+    # ── Theme and language, in place ─────────────────────────────────────
+
+    def refresh_styles(self):
+        """The theme (or the UI scale) changed: restyle what is on show without
+        rebuilding the panel - the draft, the scroll and the pictures stay."""
+        if self._finished:
+            return
+        super().refresh_styles()
+        self._list_sig = self._msgs_sig = self._groups_sig = self._group_sig = self._members_sig = None
+        self._update_net_status()
+        if not self._svc.locked:
+            self._refresh()
+            self._update_compose()
+
+    def update_locale(self):
+        """The language changed: the fixed widgets get their words again, and the
+        friends and the conversation are written out again."""
+        if self._finished:
+            return
+        for apply in self._retexts:
+            apply()
+        self._list_sig = self._msgs_sig = self._groups_sig = self._group_sig = self._members_sig = None
+        self._update_net_status()
+        if not self._svc.locked:
+            self._refresh()
+            self._update_compose()
+
+    def _bind(self, widget, *, text: str = "", tip: str = "", hint: str = ""):
+        """Give *widget* its words (message keys) and remember how, so that
+        update_locale() can say them again in another language."""
+        def apply():
+            if text:
+                widget.setText(t(text))
+            if tip:
+                widget.setToolTip(t(tip))
+            if hint:
+                widget.setPlaceholderText(t(hint))
+        self._retexts.append(apply)
+        apply()
+        return widget
+
+    def _later(self, ms: int, fn):
+        """Run *fn* once, *ms* from now - unless the panel has gone by then. (A bare
+        QTimer.singleShot would call into widgets that are deleted by then; this timer
+        is the panel's child, so it goes with it.)"""
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def fire():
+            timer.deleteLater()
+            if not self._closing:
+                fn()
+        timer.timeout.connect(fire)
+        timer.start(ms)
 
     # ── Sliding in and out ───────────────────────────────────────────────
 
@@ -289,8 +398,16 @@ class P2pFriendsPanel(QFrame):
         self.setGeometry(x, 0, width, self._host.height())
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.Resize and obj in (self._host, self._anchor):
+        etype = event.type()
+        if etype in _INPUT_EVENTS:
+            # (the application's filter: every press, key and wheel turn of the program)
+            if isinstance(obj, QWidget) and (obj is self or self.isAncestorOf(obj)):
+                self._svc.touch()
+        elif etype == QEvent.Type.Resize and obj in (self._host, self._anchor):
             self._place()
+        elif etype in _WINDOW_EVENTS and obj is self._window:
+            self._sync_window()
+            self._sync_attention()
         return False
 
     def _set_slide(self, value):
@@ -298,7 +415,14 @@ class P2pFriendsPanel(QFrame):
         self._place()
 
     def _animate(self, to: float, then=None):
-        anim = QVariantAnimation(self)
+        # One slide at a time: a second one started over the first (a double click, Esc
+        # during the opening) would have both moving the panel, and the stale one would
+        # go on after the panel is gone.
+        old, self._anim = self._anim, QVariantAnimation(self)
+        if old is not None:
+            old.stop()
+            old.deleteLater()
+        anim = self._anim
         anim.setStartValue(float(self._slide))
         anim.setEndValue(float(to))
         anim.setDuration(190 if to else 140)
@@ -306,7 +430,6 @@ class P2pFriendsPanel(QFrame):
         anim.valueChanged.connect(self._set_slide)
         if then is not None:
             anim.finished.connect(then)
-        self._anim = anim
         anim.start()
 
     def open_panel(self):
@@ -318,8 +441,11 @@ class P2pFriendsPanel(QFrame):
         self._animate(1.0)
         if self._stack.currentIndex() == _PAGE_MESSAGES:
             self._compose.setFocus()
+        elif self._stack.currentIndex() == PAGE_GROUP:
+            self._group_compose.setFocus()
         else:
             self.setFocus()
+        self._sync_attention()
 
     @property
     def closing(self) -> bool:
@@ -331,27 +457,63 @@ class P2pFriendsPanel(QFrame):
         if self._closing:
             return
         self._closing = True
-        self._teardown()
+        try:
+            self._teardown()
+        except Exception:
+            # (whatever fails, the panel still goes: half closed it could not be closed)
+            logger.warning("P2P friends: the panel did not tidy up cleanly", exc_info=True)
         if animated and self.isVisible():
             self._animate(0.0, self._finish)
         else:
             self._finish()
 
     def _finish(self):
-        self._host.removeEventFilter(self)
-        self._anchor.removeEventFilter(self)
-        self.hide()
-        self.closed.emit()
-        self.deleteLater()
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            if self._anim is not None:
+                self._anim.stop()
+            self._host.removeEventFilter(self)
+            self._anchor.removeEventFilter(self)
+            self.hide()
+        finally:
+            self.closed.emit()
+            self._discard()
 
-    def hideEvent(self, event):
-        super().hideEvent(event)
-        # The window went away under it (put away to the tray, say): nobody is
-        # reading, so nothing may be marked read or kept quiet on their behalf.
-        if not self._closing:
-            win = self.window()
-            if win is not None and (not win.isVisible() or win.isMinimized()):
-                self.close_panel(animated=False)
+    def _discard(self):
+        """Delete the panel - once no dialog of its own is up. Deleting it under one
+        would take the dialog with it (it is its child) in the middle of exec()."""
+        if self._modal_depth:
+            self._discard_pending = True
+        else:
+            self.deleteLater()
+
+    @contextlib.contextmanager
+    def _modal(self):
+        """Around everything that runs a dialog (or a menu) of the panel's, and around
+        the whole of a flow that runs several: the panel may be closed meanwhile - the
+        window was minimized, a game started, the theme changed - and goes only when the
+        last of them is over. Code after the dialog can still find the panel closed."""
+        self._modal_depth += 1
+        try:
+            yield
+        finally:
+            self._modal_depth -= 1
+            if not self._modal_depth:
+                if self._discard_pending:
+                    self._discard_pending = False
+                    QTimer.singleShot(0, self._discard)
+                elif not self._closing:
+                    self._apply_wanted_friend()
+
+    def _apply_wanted_friend(self):
+        """A friend's chat was asked for while a dialog was up (a notification's
+        "Open message"): it switches the page under the dialog's flow, so it waited."""
+        if self._wanted_friend and not self._svc.locked:
+            self.show_friend(self._wanted_friend)
+        else:
+            self._apply_wanted_group()
 
     # ── Layout ───────────────────────────────────────────────────────────
 
@@ -374,36 +536,34 @@ class P2pFriendsPanel(QFrame):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 16, 14, 14)
         outer.setSpacing(10)
-        self._ink = f"color:{palette('text')};"
-        self._muted = f"color:{palette('text_secondary')};"
-        self._bold = f"font-weight:700;font-size:{scaled(13, self)}px;{self._ink}"
 
         # The head, over every page: the title and the close; with them, except on the
         # lock screen, lock now and the menu.
         head = QHBoxLayout()
         head.setSpacing(6)
-        title = QLabel(t("p2p.friends_title"))
-        title.setStyleSheet(f"font-weight:700;font-size:{scaled(15, self)}px;{self._ink}")
+        title = self._bind(QLabel(), text="p2p.friends_title")
+        self._sty(title, lambda: f"font-weight:700;font-size:15px;{self._ink}")
         head.addWidget(title, 1)
         self._tools = QWidget()
         tools = QHBoxLayout(self._tools)
         tools.setContentsMargins(0, 0, 0, 0)
         tools.setSpacing(6)
-        self._lock_btn = QPushButton(t("p2p.friends_lock"))
-        self._lock_btn.setToolTip(t("p2p.friends_lock_tooltip"))
+        self._lock_btn = self._bind(QPushButton(), text="p2p.friends_lock",
+                                    tip="p2p.friends_lock_tooltip")
         self._lock_btn.clicked.connect(self._svc.lock)
         tools.addWidget(self._lock_btn)
         mark, css = _dots(self)
-        self._menu_btn = self._icon_button(mark, t("p2p.friends_menu_tooltip"), self._show_menu, css)
+        self._menu_btn = self._bind(
+            self._icon_button(mark, "", self._show_menu, css), tip="p2p.friends_menu_tooltip")
         tools.addWidget(self._menu_btn)
         head.addWidget(self._tools)
-        head.addWidget(self._icon_button("✕", t("p2p.receive_close"), self.close_panel))
+        head.addWidget(self._bind(self._icon_button("✕", "", self.close_panel),
+                                  tip="p2p.receive_close"))
         outer.addLayout(head)
         # Whether the network is going through the proxy (or stopped for want of one).
         # On a line of its own: what it says can be long, and the head is narrow.
         self._net_lbl = QLabel("")
         self._net_lbl.setWordWrap(True)
-        self._net_lbl.setStyleSheet(self._muted)
         self._net_lbl.setVisible(False)
         outer.addWidget(self._net_lbl)
 
@@ -411,6 +571,8 @@ class P2pFriendsPanel(QFrame):
         self._stack.addWidget(self._build_list_page())
         self._stack.addWidget(self._build_messages_page())
         self._stack.addWidget(self._build_lock_page())
+        self._stack.addWidget(self._build_group_page())
+        self._stack.addWidget(self._build_members_page())
         outer.addWidget(self._stack, 1)
 
     def _scroller(self, body: QWidget) -> QScrollArea:
@@ -433,9 +595,9 @@ class P2pFriendsPanel(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(10)
 
-        self._reset_lbl = QLabel(t("p2p.friends_reset_note"))
+        self._reset_lbl = self._bind(QLabel(), text="p2p.friends_reset_note")
         self._reset_lbl.setWordWrap(True)
-        self._reset_lbl.setStyleSheet(f"color:{palette('warning')};")
+        self._sty(self._reset_lbl, lambda: f"color:{palette('warning')};")
         self._reset_lbl.setVisible(bool(getattr(self._svc.store, "reset_reason", "")))
         outer.addWidget(self._reset_lbl)
 
@@ -444,13 +606,14 @@ class P2pFriendsPanel(QFrame):
         body_lay = QVBoxLayout(body)
         body_lay.setContentsMargins(0, 0, 4, 0)
         body_lay.setSpacing(6)
-        lbl = QLabel(t("p2p.friends_list_title"))
-        lbl.setStyleSheet(self._bold)
+        self._build_groups_block(body_lay)
+        lbl = self._bind(QLabel(), text="p2p.friends_list_title")
+        self._sty(lbl, lambda: self._bold)
         body_lay.addWidget(lbl)
         # How it works is for whoever has nobody in the list yet.
-        self._intro_lbl = QLabel(t("p2p.friends_intro"))
+        self._intro_lbl = self._bind(QLabel(), text="p2p.friends_intro")
         self._intro_lbl.setWordWrap(True)
-        self._intro_lbl.setStyleSheet(self._muted)
+        self._sty(self._intro_lbl, lambda: self._muted)
         body_lay.addWidget(self._intro_lbl)
         self._friends_box = QVBoxLayout()
         self._friends_box.setSpacing(2)
@@ -462,43 +625,41 @@ class P2pFriendsPanel(QFrame):
         sep.setFrameShape(QFrame.Shape.HLine)
         outer.addWidget(sep)
 
-        lbl = QLabel(t("p2p.friends_my_code"))
-        lbl.setStyleSheet(self._bold)
+        lbl = self._bind(QLabel(), text="p2p.friends_my_code")
+        self._sty(lbl, lambda: self._bold)
         outer.addWidget(lbl)
         row = QHBoxLayout()
         self._code_edit = QLineEdit(self._svc.code if not self._svc.locked else "")
         self._code_edit.setReadOnly(True)
         self._code_edit.setStyleSheet(f"font-family: monospace; font-size: {scaled(12, self)}px;")
         row.addWidget(self._code_edit, 1)
-        self._copy_btn = QPushButton(t("p2p.friends_copy_code"))
+        self._copy_btn = self._bind(QPushButton(), text="p2p.friends_copy_code")
         self._copy_btn.clicked.connect(self._copy_code)
         row.addWidget(self._copy_btn)
         outer.addLayout(row)
         self._name_lbl = QLabel()
         self._name_lbl.setWordWrap(True)
-        self._name_lbl.setStyleSheet(self._muted)
+        self._sty(self._name_lbl, lambda: self._muted)
         outer.addWidget(self._name_lbl)
 
-        lbl = QLabel(t("p2p.friends_add_title"))
-        lbl.setStyleSheet(self._bold + "padding-top:4px;")
+        lbl = self._bind(QLabel(), text="p2p.friends_add_title")
+        self._sty(lbl, lambda: self._bold + "padding-top:4px;")
         outer.addWidget(lbl)
-        self._add_code = QLineEdit()
-        self._add_code.setPlaceholderText(t("p2p.friends_add_code_placeholder"))
+        self._add_code = self._bind(QLineEdit(), hint="p2p.friends_add_code_placeholder")
         self._add_code.returnPressed.connect(self._add_friend)
         outer.addWidget(self._add_code)
         add = QHBoxLayout()
-        self._add_name = QLineEdit()
-        self._add_name.setPlaceholderText(t("p2p.friends_add_name_placeholder"))
+        self._add_name = self._bind(QLineEdit(), hint="p2p.friends_add_name_placeholder")
         self._add_name.returnPressed.connect(self._add_friend)
         add.addWidget(self._add_name, 1)
-        self._add_btn = QPushButton(t("p2p.friends_add_button"))
+        self._add_btn = self._bind(QPushButton(), text="p2p.friends_add_button")
         self._add_btn.setObjectName("primary_btn")
         self._add_btn.clicked.connect(self._add_friend)
         add.addWidget(self._add_btn)
         outer.addLayout(add)
         self._add_msg = QLabel("")
         self._add_msg.setWordWrap(True)
-        self._add_msg.setStyleSheet(self._muted)
+        self._sty(self._add_msg, lambda: self._muted)
         outer.addWidget(self._add_msg)
         return page
 
@@ -508,12 +669,12 @@ class P2pFriendsPanel(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
         head = QHBoxLayout()
-        self._back_btn = QPushButton(t("p2p.friends_back"))
+        self._back_btn = self._bind(QPushButton(), text="p2p.friends_back")
         self._back_btn.clicked.connect(self._back)
         head.addWidget(self._back_btn)
         head.addStretch(1)
-        self._clear_btn = QPushButton(t("p2p.friends_clear"))
-        self._clear_btn.setToolTip(t("p2p.friends_clear_tip"))
+        self._clear_btn = self._bind(QPushButton(), text="p2p.friends_clear",
+                                     tip="p2p.friends_clear_tip")
         self._clear_btn.clicked.connect(self._clear_conversation)
         head.addWidget(self._clear_btn)
         outer.addLayout(head)
@@ -521,11 +682,16 @@ class P2pFriendsPanel(QFrame):
         self._msgs_title = QLabel()
         self._msgs_title.setTextFormat(Qt.TextFormat.PlainText)
         self._msgs_title.setWordWrap(True)
-        self._msgs_title.setStyleSheet(self._bold)
+        self._sty(self._msgs_title, lambda: self._bold)
         outer.addWidget(self._msgs_title)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        self._msgs_dot = PresenceDot(False, scaled(10, self))
+        status_row.addWidget(self._msgs_dot, 0, Qt.AlignmentFlag.AlignVCenter)
         self._msgs_status = QLabel()
-        self._msgs_status.setStyleSheet(self._muted)
-        outer.addWidget(self._msgs_status)
+        self._sty(self._msgs_status, lambda: self._muted)
+        status_row.addWidget(self._msgs_status, 1)
+        outer.addLayout(status_row)
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 4, 0)
@@ -543,25 +709,24 @@ class P2pFriendsPanel(QFrame):
         self._drop_lbl = QLabel(t("p2p.friends_drop_hint", name=""))
         self._drop_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._drop_lbl.setTextFormat(Qt.TextFormat.PlainText)
-        self._drop_lbl.setStyleSheet(f"border: 2px dashed {palette('accent')}; border-radius: 8px; "
-                                     f"padding: 10px; color: {palette('accent')}; font-weight: 600;")
+        self._sty(self._drop_lbl, lambda: (
+            f"border: 2px dashed {palette('accent')}; border-radius: 8px; "
+            f"padding: 10px; color: {palette('accent')}; font-weight: 600;"))
         self._drop_lbl.setVisible(False)
         outer.addWidget(self._drop_lbl)
         self._compose_msg = QLabel("")
         self._compose_msg.setWordWrap(True)
-        self._compose_msg.setStyleSheet(f"color:{palette('warning')};")
+        self._sty(self._compose_msg, lambda: f"color:{palette('warning')};")
         self._compose_msg.setVisible(False)
         outer.addWidget(self._compose_msg)
         row = QHBoxLayout()
-        self._attach_btn = QPushButton("+")
+        self._attach_btn = self._bind(QPushButton("+"), tip="p2p.friends_attach_tip")
         self._attach_btn.setFixedSize(scaled(34, self), scaled(34, self))
-        self._attach_btn.setToolTip(t("p2p.friends_attach_tip"))
         self._attach_btn.setStyleSheet("font-size: 18px; font-weight: 700; padding: 0;")
         self._attach_btn.clicked.connect(self._attach)
         row.addWidget(self._attach_btn, 0, Qt.AlignmentFlag.AlignBottom)
-        self._compose = _ComposeEdit()
-        self._compose.setPlaceholderText(t("p2p.friends_compose_placeholder"))
-        self._compose.setToolTip(t("p2p.friends_compose_hint"))
+        self._compose = self._bind(_ComposeEdit(), hint="p2p.friends_compose_placeholder",
+                                   tip="p2p.friends_compose_hint")
         self._compose.setFixedHeight(scaled(58, self))
         self._compose.textChanged.connect(self._update_compose)
         self._compose.submitted.connect(self._send_text)
@@ -569,13 +734,12 @@ class P2pFriendsPanel(QFrame):
         self._compose.drag_state.connect(self._show_drop_hint)
         row.addWidget(self._compose, 1)
         col = QVBoxLayout()
-        self._send_btn = QPushButton(t("p2p.friends_compose_send"))
+        self._send_btn = self._bind(QPushButton(), text="p2p.friends_compose_send")
         self._send_btn.setObjectName("primary_btn")
         self._send_btn.clicked.connect(self._send_text)
         col.addWidget(self._send_btn)
         self._counter = QLabel("")
         self._counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._counter.setStyleSheet(self._muted)
         col.addWidget(self._counter)
         row.addLayout(col)
         outer.addLayout(row)
@@ -590,24 +754,23 @@ class P2pFriendsPanel(QFrame):
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setStyleSheet(f"font-size:{scaled(40, self)}px;")
         lay.addWidget(icon)
-        title = QLabel(t("p2p.friends_locked_title"))
+        title = self._bind(QLabel(), text="p2p.friends_locked_title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(self._bold)
+        self._sty(title, lambda: self._bold)
         lay.addWidget(title)
-        hint = QLabel(t("p2p.friends_locked_hint"))
+        hint = self._bind(QLabel(), text="p2p.friends_locked_hint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setWordWrap(True)
-        hint.setStyleSheet(self._muted)
+        self._sty(hint, lambda: self._muted)
         lay.addWidget(hint)
         row = QHBoxLayout()
         row.addStretch()
-        self._unlock_edit = QLineEdit()
+        self._unlock_edit = self._bind(QLineEdit(), hint="p2p.friends_unlock_placeholder")
         self._unlock_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._unlock_edit.setPlaceholderText(t("p2p.friends_unlock_placeholder"))
         self._unlock_edit.setMinimumWidth(scaled(240, self))
         self._unlock_edit.returnPressed.connect(self._unlock)
         row.addWidget(self._unlock_edit)
-        self._unlock_btn = QPushButton(t("p2p.friends_unlock"))
+        self._unlock_btn = self._bind(QPushButton(), text="p2p.friends_unlock")
         self._unlock_btn.setObjectName("primary_btn")
         self._unlock_btn.clicked.connect(self._unlock)
         row.addWidget(self._unlock_btn)
@@ -616,17 +779,18 @@ class P2pFriendsPanel(QFrame):
         self._unlock_msg = QLabel("")
         self._unlock_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._unlock_msg.setWordWrap(True)
-        self._unlock_msg.setStyleSheet(f"color:{palette('warning')};")
+        self._sty(self._unlock_msg, lambda: f"color:{palette('warning')};")
         lay.addWidget(self._unlock_msg)
         # The way back in when the password is forgotten: delete the list and start
         # again (Settings has the same button - it is never locked).
         forgot = QHBoxLayout()
         forgot.addStretch()
-        self._forgot_btn = QPushButton(t("p2p.friends_forgot"))
+        self._forgot_btn = self._bind(QPushButton(), text="p2p.friends_forgot",
+                                      tip="p2p.friends_forgot_tooltip")
         self._forgot_btn.setFlat(True)
         self._forgot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._forgot_btn.setToolTip(t("p2p.friends_forgot_tooltip"))
-        self._forgot_btn.setStyleSheet(f"color:{palette('text_secondary')};text-decoration:underline;")
+        self._sty(self._forgot_btn,
+                  lambda: f"color:{palette('text_secondary')};text-decoration:underline;")
         self._forgot_btn.clicked.connect(self._forgot)
         forgot.addWidget(self._forgot_btn)
         forgot.addStretch()
@@ -643,6 +807,8 @@ class P2pFriendsPanel(QFrame):
             self._show_lock()
         elif self._wanted_friend:
             self.show_friend(self._wanted_friend)
+        elif self._wanted_group:
+            self.show_group(self._wanted_group)
         else:
             self._stack.setCurrentIndex(_PAGE_LIST)
         self._sync_bar()
@@ -655,19 +821,20 @@ class P2pFriendsPanel(QFrame):
         self._close_videos()
         for box in (self._friends_box, self._msgs_box):
             _clear(box)
-        self._msg_labels, self._xfer, self._previews = {}, {}, {}
-        self._msgs_sig, self._new_ids, self._friend_id = None, set(), ""
+        self._msg_labels, self._xfer, self._previews, self._rows = {}, {}, {}, {}
+        self._msgs_sig, self._list_sig, self._new_ids, self._friend_id = None, None, set(), ""
+        self._scrub_groups()
         self._compose.clear()
         self._code_edit.clear()
         self._msgs_title.setText("")
         self._msgs_status.setText("")
 
     def _show_lock(self):
-        self._svc.set_viewing(None)
         self._scrub()
         self._unlock_msg.setText("")
         self._unlock_edit.clear()
         self._stack.setCurrentIndex(_PAGE_LOCK)
+        self._sync_attention()
         self._sync_bar()
         self._unlock_edit.setFocus()
 
@@ -675,44 +842,117 @@ class P2pFriendsPanel(QFrame):
         locked = self._stack.currentIndex() == _PAGE_LOCK
         self._tools.setVisible(not locked)
         self._lock_btn.setVisible(self._svc.has_lock_password)
-        self._net_lbl.setVisible(bool(self._net_lbl.text()) and not locked)
+        self._sync_net_visibility()
+
+    def _sync_net_visibility(self):
+        """The network line shows when it has something to say, except on the lock screen."""
+        self._net_lbl.setVisible(bool(self._net_lbl.text())
+                                 and self._stack.currentIndex() != _PAGE_LOCK)
 
     def current_friend(self) -> str:
         """The friend whose messages are on show ("" on the list / lock page)."""
         return self._friend_id if self._stack.currentIndex() == _PAGE_MESSAGES else ""
 
+    # ── Who is looking ───────────────────────────────────────────────────
+
+    def _sync_window(self):
+        """The window was put away (minimized, to the tray) or brought back. The panel
+        stays up - closing it would lose the draft and the place in the chat - but while
+        the window is away it costs nothing: its timer is stopped and the network is no
+        longer held open for it, so what Settings say about listening in the background
+        is all that is left."""
+        if self._closing:
+            return
+        win = self._window
+        away = not win.isVisible() or win.isMinimized()
+        if away == self._away:
+            return
+        self._away = away
+        if away:
+            self._tick.stop()
+            if self._holding:
+                self._holding = False
+                self._svc.release(blocks_lock=False)
+        else:
+            if not self._holding:
+                self._holding = True
+                self._svc.acquire(blocks_lock=False)
+            self._tick.start()
+            self._on_tick()
+
+    def _is_attended(self) -> bool:
+        """Is a friend's chat on show, in a window somebody can see and is using?
+        Another program in front (a game) or a window put away is not: the panel
+        stays up, but what arrives is not read for them."""
+        if self._closing or self._svc.locked or self._stack.currentIndex() not in (_PAGE_MESSAGES, PAGE_GROUP):
+            return False
+        win = self._window
+        return (QGuiApplication.applicationState() == Qt.ApplicationState.ApplicationActive
+                and win.isVisible() and not win.isMinimized())
+
+    def _sync_attention(self, _state=None):
+        """Tell the service whose messages are being looked at - or none - so that what
+        arrives is read as it comes when somebody is reading, and announced when not.
+        Called whenever the page, the lock or the window's state changes."""
+        attended, page = self._is_attended(), self._stack.currentIndex()
+        fid = self._friend_id if attended and page == _PAGE_MESSAGES else None
+        gid = self._group_id if attended and page == PAGE_GROUP else None
+        if fid and not self._attending:
+            # Back after being away: what came meanwhile is new, as when opening the chat.
+            self._new_ids |= {m.id for m in self._svc.messages(fid) if not m.read}
+            self._msgs_sig = None
+        if gid and not self._attending_group:
+            self._group_new |= {e["id"] for e in self._svc.group_log(gid)
+                                if e["dir"] == "in" and not e["read"] and e["kind"] in ("text", "file")}
+            self._group_sig = None
+        self._attending = bool(fid)
+        self._attending_group = bool(gid)
+        self._svc.set_viewing(fid)
+        self._svc.set_viewing_group(gid)
+
     def show_friend(self, fid: str):
-        """Open one friend's messages (also when the dialog is already up and a
+        """Open one friend's messages (also when the panel is already up and a
         notification asks for them)."""
         if self._svc.locked:
             self._wanted_friend = fid
             self._show_lock()
             return
+        if self._modal_depth:
+            # A dialog of ours is up and the flow behind it is about this conversation.
+            self._wanted_friend = fid
+            return
         f = self._svc.friend(fid)
+        self._wanted_friend = ""
         if f is None:
             self._stack.setCurrentIndex(_PAGE_LIST)
             return
-        self._wanted_friend = ""
+        if fid == self._friend_id and self._stack.currentIndex() == _PAGE_MESSAGES:
+            # Already there (a notification for the chat on show): what is typed, the
+            # pictures opened and the "new" marks stay; it is only looked at again.
+            self._sync_attention()
+            self._scroll_bottom()
+            self._compose.setFocus()
+            return
         self._friend_id = fid
         # Which were new when the person got here: they are read from now on,
         # but still marked new on the page itself.
         self._new_ids = {m.id for m in self._svc.messages(fid) if not m.read}
-        self._svc.set_viewing(fid)
         self._msgs_sig = None
         self._previews = {}
         self._close_videos()
         self._compose.clear()
         self._fill_messages(stick=True)
         self._stack.setCurrentIndex(_PAGE_MESSAGES)
+        self._sync_attention()
         self._sync_bar()
         self._update_compose()
         self._compose.setFocus()
 
     def _back(self):
         self._close_videos()
-        self._svc.set_viewing(None)
         self._friend_id = ""
         self._stack.setCurrentIndex(_PAGE_LIST)
+        self._sync_attention()
         self._refresh()
 
     def _on_lock_changed(self, locked: bool):
@@ -737,6 +977,7 @@ class P2pFriendsPanel(QFrame):
         self._name_lbl.setText(t("p2p.friends_my_name", name=name) if name
                                else t("p2p.friends_no_name"))
         self._fill_friends()
+        self._refresh_groups()
         if self._stack.currentIndex() == _PAGE_MESSAGES:
             if self._svc.friend(self._friend_id) is None:
                 self._back()            # the friend was removed under it
@@ -745,9 +986,23 @@ class P2pFriendsPanel(QFrame):
                 self._update_compose()
 
     def _fill_friends(self):
-        _clear(self._friends_box)
+        """The list, written out again only when something it shows changed (a message
+        or any other service signal that leaves it as it was would otherwise rebuild
+        every row and drop the keyboard focus from the one the person is on)."""
         people = self._svc.friends()
         self._intro_lbl.setVisible(not people)
+        sig = tuple((f.id, f.display, f.connected, self._svc.unread(f.id), self._svc.is_online(f.id))
+                    for f in people)
+        if sig == self._list_sig:
+            return
+        self._list_sig = sig
+        # (the window's focus widget, not hasFocus(): it is the same whether or not the
+        # window is the active one at this moment)
+        on = self._window.focusWidget()
+        focused = next((fid for fid, row in self._rows.items()
+                        if row is on or (on is not None and row.isAncestorOf(on))), None)
+        _clear(self._friends_box)
+        self._rows = {}
         if not people:
             empty = QLabel(t("p2p.friends_empty"))
             empty.setStyleSheet(self._muted)
@@ -755,7 +1010,16 @@ class P2pFriendsPanel(QFrame):
             self._friends_box.addWidget(empty)
             return
         for f in people:
-            self._friends_box.addWidget(self._friend_row(f))
+            self._rows[f.id] = row = self._friend_row(f)
+            self._friends_box.addWidget(row)
+        if focused in self._rows:
+            # (once the new row is on screen: focus asked of a widget not yet shown is dropped)
+            self._later(0, lambda fid=focused: self._focus_row(fid))
+
+    def _focus_row(self, fid: str):
+        row = self._rows.get(fid)
+        if row is not None:
+            row.setFocus()
 
     def _friend_row(self, f) -> QWidget:
         """One friend: click it for the chat; the ⋯ on it renames or removes them.
@@ -765,6 +1029,12 @@ class P2pFriendsPanel(QFrame):
         lay = QHBoxLayout(row)
         lay.setContentsMargins(10, 6, 6, 6)
         lay.setSpacing(6)
+        # Green when they are there, red when not (their words are in the tooltip and the accessible name)
+        online = self._svc.is_online(f.id)
+        presence = self._svc.presence_tip(f.id)
+        dot = PresenceDot(online, scaled(10, self))
+        dot.setAccessibleName(presence)
+        lay.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
         col = QVBoxLayout()
         col.setSpacing(0)
         name = QLabel(f.display)
@@ -786,8 +1056,8 @@ class P2pFriendsPanel(QFrame):
         lay.addWidget(badge)
         # (the labels and the badge let a click through to the row, so the row is where
         # their tooltips are)
-        tip = (t("p2p.friends_status_tip_connected") if f.connected
-               else t("p2p.friends_status_tip_waiting"))
+        tip = presence + "\n" + (t("p2p.friends_status_tip_connected") if f.connected
+                                 else t("p2p.friends_status_tip_waiting"))
         if unread:
             tip += "\n" + t("p2p.friends_unread_tip", count=unread)
         row.setToolTip(tip)
@@ -803,15 +1073,16 @@ class P2pFriendsPanel(QFrame):
         menu = QMenu(self)
         menu.addAction(t("p2p.friends_rename"), lambda: self._rename(fid))
         menu.addAction(t("p2p.friends_remove"), lambda: self._remove(fid))
-        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        with self._modal():
+            menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def _at_bottom(self) -> bool:
         bar = self._msgs_scroll.verticalScrollBar()
         return bar.value() >= bar.maximum() - 4
 
     def _scroll_bottom(self):
-        QTimer.singleShot(0, lambda: self._msgs_scroll.verticalScrollBar().setValue(
-            self._msgs_scroll.verticalScrollBar().maximum()))
+        bar = self._msgs_scroll.verticalScrollBar()
+        self._later(0, lambda: bar.setValue(bar.maximum()))
 
     def _fill_messages(self, stick: bool = False):
         """The conversation, oldest first like any chat. Rebuilt only when
@@ -824,7 +1095,7 @@ class P2pFriendsPanel(QFrame):
         sig = (self._friend_id, tuple((m.id, m.state(), m.read, m.delivery,
                                        (m.attachment or {}).get("why", ""), m.id in self._previews,
                                        self._stream_ready(m))
-                                      for m in msgs), f.display, f.connected)
+                                      for m in msgs), f.display, f.connected, self._svc.is_online(f.id))
         if sig == self._msgs_sig:
             return
         self._msgs_sig = sig
@@ -836,8 +1107,14 @@ class P2pFriendsPanel(QFrame):
         self._msg_labels = {}
         self._xfer = {}
         self._msgs_title.setText(t("p2p.friends_messages_title", name=f.display))
-        self._msgs_status.setText(("✓ " + t("p2p.friends_status_connected")) if f.connected
-                                  else ("⏳ " + t("p2p.friends_status_waiting")))
+        online = self._svc.is_online(f.id)
+        self._msgs_dot.set_online(online)
+        self._msgs_dot.setToolTip(self._svc.presence_tip(f.id))
+        self._msgs_dot.setAccessibleName(self._svc.presence_tip(f.id))
+        self._msgs_status.setText(
+            t("p2p.friends_online" if online else "p2p.friends_offline") + "  ·  "
+            + (("✓ " + t("p2p.friends_status_connected")) if f.connected
+               else ("⏳ " + t("p2p.friends_status_waiting"))))
         self._clear_btn.setEnabled(bool(msgs))
         if not msgs:
             empty = QLabel(t("p2p.friends_messages_empty", name=f.display))
@@ -851,6 +1128,8 @@ class P2pFriendsPanel(QFrame):
                 self._msgs_box.addWidget(self._token_card(m, f))
             elif m.kind == "file":
                 self._msgs_box.addWidget(self._file_card(m, f))
+            elif m.kind == "ask":
+                self._msgs_box.addWidget(self._ask_card(m, f))
             elif m.kind == "gap":
                 note = QLabel(t("p2p.friends_gap", count=m.missed))
                 note.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -966,6 +1245,92 @@ class P2pFriendsPanel(QFrame):
             send.clicked.connect(lambda _=False, token=m.token: self._use_token(token))
             row.addWidget(send)
         return card
+
+    # ── Requests for a token ─────────────────────────────────────────────
+
+    def _ask_card(self, m, f) -> QWidget:
+        """A request for a token, either way. Theirs ("X wants to send you Y"): Accept
+        hands them a token - nothing is sent before - and Decline tells them no. Mine
+        ("you asked X for a token to send Y"): where it is, and Cancel takes it back."""
+        incoming = m.direction == "in"
+        state = m.state()
+        card = QFrame()
+        card.setObjectName("p2p_friend_msg")
+        card.setStyleSheet(
+            f"#p2p_friend_msg {{ border: 1px solid {palette('border_hover')}; border-radius: 6px; }}")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(4)
+        key = "p2p.friends_ask_in_title" if incoming else "p2p.friends_ask_out_title"
+        title = QLabel(("🎫 " if incoming else "📨 ") + t(key, name=f.display, label=m.body)
+                       + (("  ·  " + t("p2p.friends_message_new")) if m.id in self._new_ids else ""))
+        title.setTextFormat(Qt.TextFormat.PlainText)            # (their words: never markup)
+        title.setWordWrap(True)
+        title.setStyleSheet(f"font-weight:600;{self._ink}")
+        lay.addWidget(title)
+        sub_lbl = QLabel()
+        sub_lbl.setWordWrap(True)
+        sub_lbl.setStyleSheet(self._muted)
+        lay.addWidget(sub_lbl)
+        self._msg_labels[m.id] = (sub_lbl, m)
+        mid, fid = m.id, m.friend_id
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        if incoming and state == "active":
+            accept = QPushButton(t("p2p.friends_file_accept"))
+            accept.setObjectName("primary_btn")
+            accept.setToolTip(t("p2p.friends_ask_accept_tip", name=f.display))
+            accept.clicked.connect(lambda _=False: self._accept_request(fid, mid))
+            buttons.addWidget(accept)
+            decline = QPushButton(t("p2p.friends_file_decline"))
+            decline.clicked.connect(lambda _=False: self._decline_request(fid, mid))
+            buttons.addWidget(decline)
+        elif not incoming and state == "waiting":
+            cancel = QPushButton(t("p2p.friends_file_cancel"))
+            cancel.setToolTip(t("p2p.friends_ask_cancel_tip"))
+            cancel.clicked.connect(lambda _=False: self._withdraw_request(fid, mid))
+            buttons.addWidget(cancel)
+        buttons.addStretch(1)
+        if buttons.count() > 1:
+            lay.addLayout(buttons)
+        return card
+
+    def _ask_tail(self, m) -> str:
+        """Where a request is, in words (the countdown while it can still be answered)."""
+        state = m.state()
+        key = f"p2p.friends_ask_{'in' if m.direction == 'in' else 'out'}_state_{state}"
+        return t(key, time=format_remaining(m.remaining()))
+
+    def _request_failed(self, e) -> None:
+        """Say why a request could not be accepted (the reasons the service gives)."""
+        code = str(e).replace(" ", "_")
+        for prefix in ("p2p.friends_ask_err_", "p2p.friends_file_err_"):
+            text = t(prefix + code)
+            if text != prefix + code:
+                break
+        else:
+            text = t("p2p.friends_ask_err_error")
+        self._say(text, warn=True)
+
+    def _accept_request(self, fid: str, rid: str):
+        try:
+            self._svc.accept_request(fid, rid)
+        except FriendError as e:
+            self._request_failed(e)
+        self._request_done(fid)
+
+    def _decline_request(self, fid: str, rid: str):
+        self._svc.decline_request(fid, rid)
+        self._request_done(fid)
+
+    def _withdraw_request(self, fid: str, rid: str):
+        self._svc.withdraw_request(fid, rid)
+        self._request_done(fid)
+
+    def _request_done(self, fid: str):
+        self._msgs_sig = None
+        if self._friend_id == fid and not self._svc.locked:
+            self._fill_messages()
 
     # ── Attachments ──────────────────────────────────────────────────────
 
@@ -1182,7 +1547,8 @@ class P2pFriendsPanel(QFrame):
         first (it is called off for the other end too); giving up waiting or taking
         back an offer does not."""
         entry = self._xfer.get(mid)
-        f = self._svc.friend(self._friend_id)
+        fid = self._friend_id           # (fixed now: the page may be another friend's once it is answered)
+        f = self._svc.friend(fid)
         if entry is not None and f is not None:
             m = entry[0]
             state, incoming = m.state(), m.direction == "in"
@@ -1193,15 +1559,17 @@ class P2pFriendsPanel(QFrame):
                 ask = t("p2p.friends_file_cancel_send_confirm", name=f.display)
             if ask is not None:
                 from ui.modal_helpers import question_window_modal
-                reply = question_window_modal(
-                    self, t("p2p.friends_title"), ask,
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply != QMessageBox.StandardButton.Yes:
+                with self._modal():
+                    reply = question_window_modal(
+                        self, t("p2p.friends_title"), ask,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply != QMessageBox.StandardButton.Yes or self._svc.locked:
                     return
             self._close_video(mid)              # (a file being watched is let go of first)
-        self._svc.cancel_file(self._friend_id, mid)
+        self._svc.cancel_file(fid, mid)
         self._msgs_sig = None
-        self._fill_messages()
+        if self._friend_id == fid:
+            self._fill_messages()
 
     def _show_in_folder(self, att):
         """Open the folder a received file is in, with the file selected. The
@@ -1305,26 +1673,32 @@ class P2pFriendsPanel(QFrame):
     def _attach(self):
         """+: pick a file or folder, see exactly what would be offered, offer it.
         Nothing is sent now - the friend gets a card and decides."""
-        f = self._svc.friend(self._friend_id)
+        fid = self._friend_id
+        f = self._svc.friend(fid)
         if f is None:
             return
-        if not self._svc.can_offer(self._friend_id):
-            self._say(t("p2p.friends_compose_full", name=f.display), warn=True)
-            return
-        from ui.widgets.file_pickers import pick_file_or_folder
-        path = pick_file_or_folder(self, t("p2p.friends_attach_pick"))
-        if path:
-            self._offer_paths([path])
+        with self._modal():
+            if not self._svc.can_offer(fid):
+                self._say(t("p2p.friends_compose_full", name=f.display), warn=True)
+                return
+            from ui.widgets.file_pickers import pick_file_or_folder
+            path = pick_file_or_folder(self, t("p2p.friends_attach_pick"))
+            if path:
+                self._offer_paths([path], fid)
 
     # ── Dropping files ───────────────────────────────────────────────────
 
     def _can_take_drop(self) -> bool:
         """Only a friend's open conversation takes files: not the list, not the
         lock screen."""
-        return (not self._svc.locked and self._stack.currentIndex() == _PAGE_MESSAGES
-                and self._svc.friend(self._friend_id) is not None)
+        return (self._can_take_group_drop()
+                or (not self._svc.locked and self._stack.currentIndex() == _PAGE_MESSAGES
+                    and self._svc.friend(self._friend_id) is not None))
 
     def _show_drop_hint(self, on: bool):
+        if self._stack.currentIndex() == PAGE_GROUP:
+            self._show_group_drop_hint(on)
+            return
         f = self._svc.friend(self._friend_id)
         if on and f is not None:
             self._drop_lbl.setText(t("p2p.friends_drop_hint", name=f.display))
@@ -1365,45 +1739,53 @@ class P2pFriendsPanel(QFrame):
     def _on_dropped(self, paths: list):
         """Something was dropped: ask about it once the drop itself is over (a
         window opened inside a drop would hold the other program up)."""
-        if self._can_take_drop():
-            QTimer.singleShot(0, lambda paths=list(paths): self._offer_paths(paths))
+        if self._stack.currentIndex() == PAGE_GROUP:
+            self._on_group_dropped(paths)
+        elif self._can_take_drop():
+            fid = self._friend_id
+            self._later(0, lambda paths=list(paths): self._offer_paths(paths, fid))
 
-    def _offer_paths(self, paths: list):
-        """Offer these files and folders to the friend whose conversation is open:
-        the list of what would go (any file can be ticked off), a refusal for the
-        kinds that are never sent, then the offer. Nothing is sent now - the friend
-        gets a card and decides. The same whether they were picked with + or dropped."""
-        f = self._svc.friend(self._friend_id)
-        if f is None or self._svc.locked or not paths:
+    def _offer_paths(self, paths: list, fid: str = ""):
+        """Offer these files and folders to *fid* (default: the friend whose
+        conversation is open): the list of what would go (any file can be ticked off),
+        a refusal for the kinds that are never sent, then the offer. Nothing is sent
+        now - the friend gets a card and decides. The same whether they were picked with
+        + or dropped. *fid* is fixed before the dialogs: by the time they are answered
+        the page may be another friend's."""
+        fid = fid or self._friend_id
+        f = self._svc.friend(fid)
+        if f is None or self._svc.locked or not paths or self._closing:
             return
-        if not self._svc.can_offer(self._friend_id):
-            self._say(t("p2p.friends_compose_full", name=f.display), warn=True)
-            return
-        sources = [Path(p) for p in paths]
-        from ui.dialogs.p2p_send_confirm_dialog import P2pSendConfirmDialog
-        confirm = P2pSendConfirmDialog(sources if len(sources) > 1 else sources[0], self)
-        if confirm.exec() != QDialog.DialogCode.Accepted:
-            return
-        files = confirm.selected_files()
-        if not files:
-            return
-        files = [(str(p), str(rel)) for p, rel in files]
-        blocked = _a.blocked_names(files)
-        if blocked:
-            shown = "\n".join(blocked[:5]) + ("\n…" if len(blocked) > 5 else "")
-            self._say(t("p2p.friends_attach_blocked", names=shown), warn=True)
-            return
-        label = sources[0].name if len(sources) == 1 else t("p2p.send_confirm_items", count=len(sources))
-        try:
-            self._svc.offer_file(self._friend_id, files, label)
-        except FriendError as e:
-            key = f"p2p.friends_attach_err_{str(e).replace(' ', '_')}"
-            text = t(key, name=f.display)
-            self._say(text if text != key else t("p2p.friends_attach_err_error"), warn=True)
-            return
+        with self._modal():
+            if not self._svc.can_offer(fid):
+                self._say(t("p2p.friends_compose_full", name=f.display), warn=True)
+                return
+            sources = [Path(p) for p in paths]
+            from ui.dialogs.p2p_send_confirm_dialog import P2pSendConfirmDialog
+            confirm = P2pSendConfirmDialog(sources if len(sources) > 1 else sources[0], self)
+            if confirm.exec() != QDialog.DialogCode.Accepted:
+                return
+            files = confirm.selected_files()
+            if not files or self._svc.locked or self._svc.friend(fid) is None:
+                return          # (nothing ticked, or the list was locked / the friend removed meanwhile)
+            files = [(str(p), str(rel)) for p, rel in files]
+            blocked = _a.blocked_names(files)
+            if blocked:
+                shown = "\n".join(blocked[:5]) + ("\n…" if len(blocked) > 5 else "")
+                self._say(t("p2p.friends_attach_blocked", names=shown), warn=True)
+                return
+            label = sources[0].name if len(sources) == 1 else t("p2p.send_confirm_items", count=len(sources))
+            try:
+                self._svc.offer_file(fid, files, label)
+            except FriendError as e:
+                key = f"p2p.friends_attach_err_{str(e).replace(' ', '_')}"
+                text = t(key, name=f.display)
+                self._say(text if text != key else t("p2p.friends_attach_err_error"), warn=True)
+                return
         self._msgs_sig = None
-        self._fill_messages(stick=True)
-        self._update_compose()
+        if self._friend_id == fid:
+            self._fill_messages(stick=True)
+            self._update_compose()
 
     def _open_link(self, href: str, links: list, name: str):
         """A link in a message was clicked: ask first. *href* is only an index
@@ -1412,7 +1794,8 @@ class P2pFriendsPanel(QFrame):
         if m is None or int(m.group(1)) >= len(links):
             return
         from ui.dialogs.p2p_link_dialog import P2pLinkDialog
-        P2pLinkDialog(links[int(m.group(1))], name, self).exec()
+        with self._modal():
+            P2pLinkDialog(links[int(m.group(1))], name, self).exec()
 
     def _update_net_status(self):
         status = self._svc.network_status()
@@ -1441,21 +1824,31 @@ class P2pFriendsPanel(QFrame):
                 self._net_lbl.setStyleSheet(f"color:{palette('success')};")
         else:
             self._net_lbl.setText("")
-        self._net_lbl.setVisible(bool(self._net_lbl.text())
-                                 and self._stack.currentIndex() != _PAGE_LOCK)
+        self._sync_net_visibility()
 
     def _on_tick(self):
+        if self._modal_depth:
+            self._svc.touch()           # (a dialog of ours is up: the person is in the middle of something)
         self._update_net_status()
         self._update_countdowns()
-        if self._stack.currentIndex() == _PAGE_MESSAGES:
+        page = self._stack.currentIndex()
+        if page == _PAGE_MESSAGES:
             self._fill_messages()               # (rebuilt only if something about it changed)
+        elif page == PAGE_GROUP:
+            self._fill_group()
+            self._update_group_files()
+        elif page == PAGE_MEMBERS:
+            self._fill_members()
 
     def _update_countdowns(self):
         for mid, (sub_lbl, m) in self._msg_labels.items():
             state = m.state()
             when = time.strftime("%H:%M:%S", time.localtime(m.received_at))
-            tail = (t("p2p.friends_message_state_active", time=format_remaining(m.remaining()))
-                    if state == "active" else t(f"p2p.friends_message_state_{state}"))
+            if m.kind == "ask":
+                tail = self._ask_tail(m)
+            else:
+                tail = (t("p2p.friends_message_state_active", time=format_remaining(m.remaining()))
+                        if state == "active" else t(f"p2p.friends_message_state_{state}"))
             sub_lbl.setText(t("p2p.friends_message_received", time=when) + "  ·  " + tail)
         for mid in list(self._xfer):
             self._refresh_file(mid)
@@ -1504,25 +1897,28 @@ class P2pFriendsPanel(QFrame):
         self._update_compose()
 
     def _clear_conversation(self):
-        f = self._svc.friend(self._friend_id)
+        fid = self._friend_id
+        f = self._svc.friend(fid)
         if f is None:
             return
         from ui.modal_helpers import question_window_modal
-        reply = question_window_modal(
-            self, t("p2p.friends_title"), t("p2p.friends_clear_confirm", name=f.display),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self._svc.clear_conversation(self._friend_id)
+        with self._modal():
+            reply = question_window_modal(
+                self, t("p2p.friends_title"), t("p2p.friends_clear_confirm", name=f.display),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if (reply == QMessageBox.StandardButton.Yes and not self._svc.locked
+                and self._svc.friend(fid) is not None):
+            self._svc.clear_conversation(fid)
             self._msgs_sig = None
-            self._fill_messages(stick=True)
+            if self._friend_id == fid:
+                self._fill_messages(stick=True)
 
     # ── Actions ──────────────────────────────────────────────────────────
 
     def _copy_code(self):
-        from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(self._code_edit.text())
         self._copy_btn.setText(t("p2p.friends_copied"))
-        QTimer.singleShot(1500, lambda: self._copy_btn.setText(t("p2p.friends_copy_code")))
+        self._copy_timer.start(1500)            # (again if pressed again; gone with the panel)
 
     def _add_friend(self):
         code = self._add_code.text().strip()
@@ -1545,9 +1941,10 @@ class P2pFriendsPanel(QFrame):
         f = self._svc.friend(fid)
         if f is None:
             return
-        text, ok = QInputDialog.getText(self, t("p2p.friends_rename"),
-                                        t("p2p.friends_rename_prompt"), text=f.alias or f.name)
-        if ok:
+        with self._modal():
+            text, ok = QInputDialog.getText(self, t("p2p.friends_rename"),
+                                            t("p2p.friends_rename_prompt"), text=f.alias or f.name)
+        if ok and not self._svc.locked and self._svc.friend(fid) is not None:
             self._svc.rename_friend(fid, text)
 
     def _remove(self, fid: str):
@@ -1555,10 +1952,12 @@ class P2pFriendsPanel(QFrame):
         if f is None:
             return
         from ui.modal_helpers import question_window_modal
-        reply = question_window_modal(
-            self, t("p2p.friends_title"), t("p2p.friends_remove_confirm", name=f.display),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        with self._modal():
+            reply = question_window_modal(
+                self, t("p2p.friends_title"), t("p2p.friends_remove_confirm", name=f.display),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if (reply == QMessageBox.StandardButton.Yes and not self._svc.locked
+                and self._svc.friend(fid) is not None):
             self._svc.remove_friend(fid)
 
     def _use_token(self, token: str):
@@ -1569,8 +1968,10 @@ class P2pFriendsPanel(QFrame):
             return
         self._svc.mark_read(live.friend_id)
         from ui.dialogs.p2p_send_flow import send_files_flow
-        send_files_flow(self, token=token)
-        self._refresh()
+        with self._modal():
+            send_files_flow(self, token=token)
+        if not self._closing and not self._svc.locked:
+            self._refresh()
 
     # ── Lock ─────────────────────────────────────────────────────────────
 
@@ -1590,65 +1991,72 @@ class P2pFriendsPanel(QFrame):
     def _forgot(self):
         """Forgotten password: delete the list (after asking) and start again."""
         from ui.dialogs.p2p_friends_reset import reset_friend_list
-        reset_friend_list(self, self._svc)      # (lock_changed brings the empty list up)
+        with self._modal():
+            reset_friend_list(self, self._svc)      # (lock_changed brings the empty list up)
 
     def _password(self, title: str, label: str) -> tuple:
-        text, ok = QInputDialog.getText(self, title, label, QLineEdit.EchoMode.Password)
+        with self._modal():
+            text, ok = QInputDialog.getText(self, title, label, QLineEdit.EchoMode.Password)
         return (text if ok else None)
 
     def _say(self, text: str, warn: bool = False):
         from ui.modal_helpers import information_window_modal, warning_window_modal
-        (warning_window_modal if warn else information_window_modal)(self, t("p2p.friends_title"), text)
+        with self._modal():
+            (warning_window_modal if warn else information_window_modal)(
+                self, t("p2p.friends_title"), text)
 
     def _new_password(self, label_key: str, minimum: int):
         """Ask for a new password twice; None when cancelled or not usable."""
-        first = self._password(t("p2p.friends_title"), t(label_key, n=minimum))
-        if first is None:
-            return None
-        if len(first) < minimum:
-            self._say(t("p2p.friends_password_short", n=minimum), warn=True)
-            return None
-        again = self._password(t("p2p.friends_title"), t("p2p.friends_password_again"))
-        if again is None:
-            return None
-        if again != first:
-            self._say(t("p2p.friends_password_mismatch"), warn=True)
-            return None
-        return first
+        with self._modal():
+            first = self._password(t("p2p.friends_title"), t(label_key, n=minimum))
+            if first is None:
+                return None
+            if len(first) < minimum:
+                self._say(t("p2p.friends_password_short", n=minimum), warn=True)
+                return None
+            again = self._password(t("p2p.friends_title"), t("p2p.friends_password_again"))
+            if again is None:
+                return None
+            if again != first:
+                self._say(t("p2p.friends_password_mismatch"), warn=True)
+                return None
+            return first
 
     def _lock_password_flow(self):
         svc = self._svc
-        current = ""
-        if svc.has_lock_password:
-            current = self._password(t("p2p.friends_title"), t("p2p.friends_lock_prompt_current"))
-            if current is None:
+        with self._modal():
+            current = ""
+            if svc.has_lock_password:
+                current = self._password(t("p2p.friends_title"), t("p2p.friends_lock_prompt_current"))
+                if current is None or svc.locked:
+                    return
+                if not svc.store.check_lock_password(current):
+                    self._say(t("p2p.friends_lock_wrong"), warn=True)
+                    return
+            new = self._new_password("p2p.friends_lock_prompt_new", _f.MIN_LOCK_PASSWORD)
+            if new is None or svc.locked:       # (locked meanwhile: nothing may be written to it)
                 return
-            if not svc.store.check_lock_password(current):
-                self._say(t("p2p.friends_lock_wrong"), warn=True)
+            try:
+                svc.set_lock_password(new, current)
+            except FriendError as e:
+                self._say(str(e), warn=True)
                 return
-        new = self._new_password("p2p.friends_lock_prompt_new", _f.MIN_LOCK_PASSWORD)
-        if new is None:
-            return
-        try:
-            svc.set_lock_password(new, current)
-        except FriendError as e:
-            self._say(str(e), warn=True)
-            return
-        minutes = svc.autolock_minutes()
-        self._say(t("p2p.friends_lock_set_done", minutes=minutes) if minutes
-                  else t("p2p.friends_lock_set_done_manual"))
+            minutes = svc.autolock_minutes()
+            self._say(t("p2p.friends_lock_set_done", minutes=minutes) if minutes
+                      else t("p2p.friends_lock_set_done_manual"))
         self._sync_bar()
 
     def _remove_lock_flow(self):
         svc = self._svc
-        current = self._password(t("p2p.friends_title"), t("p2p.friends_lock_prompt_current"))
-        if current is None:
-            return
-        try:
-            svc.remove_lock_password(current)
-        except FriendError:
-            self._say(t("p2p.friends_lock_wrong"), warn=True)
-            return
+        with self._modal():
+            current = self._password(t("p2p.friends_title"), t("p2p.friends_lock_prompt_current"))
+            if current is None or svc.locked:
+                return
+            try:
+                svc.remove_lock_password(current)
+            except FriendError:
+                self._say(t("p2p.friends_lock_wrong"), warn=True)
+                return
         self._sync_bar()
 
     # ── Linking another PC ───────────────────────────────────────────────
@@ -1656,61 +2064,62 @@ class P2pFriendsPanel(QFrame):
     def _link_flow(self):
         """Write a link file the other PC can adopt."""
         from ui.widgets.file_pickers import pick_save_path
-        password = self._new_password("p2p.friends_link_prompt", _f.MIN_LINK_PASSWORD)
-        if password is None:
-            return
-        path = pick_save_path(self, t("p2p.friends_link_title"), t("p2p.friends_link_filter"),
-                              default_name="savesync-friends" + _LINK_SUFFIX)
-        if not path:
-            return
-        if not path.lower().endswith(_LINK_SUFFIX):
-            path += _LINK_SUFFIX
-        try:
-            Path(path).write_bytes(self._svc.export_link(password))
-        except (OSError, FriendError) as e:
-            self._say(t("p2p.friends_link_failed", error=str(e)), warn=True)
-            return
         from ui.modal_helpers import question_window_modal
-        reply = question_window_modal(
-            self, t("p2p.friends_link_title"), t("p2p.friends_link_saved", path=path),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self._svc.retire_here()
-            self._say(t("p2p.friends_link_retired"))
+        with self._modal():
+            password = self._new_password("p2p.friends_link_prompt", _f.MIN_LINK_PASSWORD)
+            if password is None:
+                return
+            path = pick_save_path(self, t("p2p.friends_link_title"), t("p2p.friends_link_filter"),
+                                  default_name="savesync-friends" + _LINK_SUFFIX)
+            if not path or self._svc.locked:
+                return
+            if not path.lower().endswith(_LINK_SUFFIX):
+                path += _LINK_SUFFIX
+            try:
+                Path(path).write_bytes(self._svc.export_link(password))
+            except (OSError, FriendError) as e:
+                self._say(t("p2p.friends_link_failed", error=str(e)), warn=True)
+                return
+            reply = question_window_modal(
+                self, t("p2p.friends_link_title"), t("p2p.friends_link_saved", path=path),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes and not self._svc.locked:
+                self._svc.retire_here()
+                self._say(t("p2p.friends_link_retired"))
 
     def _import_flow(self):
         """Adopt the identity and friends of a link file made on another PC."""
         from ui.widgets.file_pickers import pick_file
-        path = pick_file(self, t("p2p.friends_import_pick"), t("p2p.friends_link_filter"))
-        if not path:
-            return
-        try:
-            blob = Path(path).read_bytes()
-        except OSError as e:
-            self._say(t("p2p.friends_link_failed", error=str(e)), warn=True)
-            return
-        password = self._password(t("p2p.friends_title"), t("p2p.friends_import_password"))
-        if password is None:
-            return
-        try:
-            _f.parse_link(blob, password)           # before anything is replaced
-        except FriendError:
-            self._say(t("p2p.friends_import_failed"), warn=True)
-            return
         from ui.modal_helpers import question_window_modal
-        reply = question_window_modal(
-            self, t("p2p.friends_title"), t("p2p.friends_import_confirm"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self._svc.import_link(blob, password)
-        except FriendError:
-            self._say(t("p2p.friends_import_failed"), warn=True)
-            return
-        self._say(t("p2p.friends_import_done", count=len(self._svc.store.friends)))
-        self._stack.setCurrentIndex(_PAGE_LIST)
-        self._refresh()
+        with self._modal():
+            path = pick_file(self, t("p2p.friends_import_pick"), t("p2p.friends_link_filter"))
+            if not path:
+                return
+            try:
+                blob = Path(path).read_bytes()
+            except OSError as e:
+                self._say(t("p2p.friends_link_failed", error=str(e)), warn=True)
+                return
+            password = self._password(t("p2p.friends_title"), t("p2p.friends_import_password"))
+            if password is None:
+                return
+            try:
+                _f.parse_link(blob, password)           # before anything is replaced
+            except FriendError:
+                self._say(t("p2p.friends_import_failed"), warn=True)
+                return
+            reply = question_window_modal(
+                self, t("p2p.friends_title"), t("p2p.friends_import_confirm"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes or self._svc.locked:
+                return
+            try:
+                self._svc.import_link(blob, password)
+            except FriendError:
+                self._say(t("p2p.friends_import_failed"), warn=True)
+                return
+            self._say(t("p2p.friends_import_done", count=len(self._svc.friends())))
+        self._back()            # (the list: whoever was on show is a friend of the old list)
 
     def _show_menu(self):
         menu = QMenu(self)
@@ -1722,18 +2131,32 @@ class P2pFriendsPanel(QFrame):
         menu.addSeparator()
         menu.addAction(t("p2p.friends_link_menu"), self._link_flow)
         menu.addAction(t("p2p.friends_import_menu"), self._import_flow)
-        menu.exec(self._menu_btn.mapToGlobal(self._menu_btn.rect().bottomLeft()))
+        with self._modal():
+            menu.exec(self._menu_btn.mapToGlobal(self._menu_btn.rect().bottomLeft()))
 
     def _teardown(self):
         """Let go of everything the panel held on the service for: balanced with what
         __init__ took."""
-        self._tick.stop()
-        self._close_videos()
-        for sig, slot in ((self._svc.changed, self._refresh),
-                          (self._svc.lock_changed, self._on_lock_changed)):
-            try:
-                sig.disconnect(slot)
-            except (RuntimeError, TypeError):
-                pass
-        self._svc.set_viewing(None)
-        self._svc.release()
+        try:
+            self._tick.stop()
+            self._copy_timer.stop()
+            self._close_videos()
+            for sig, slot in ((self._svc.changed, self._refresh),
+                              (self._svc.lock_changed, self._on_lock_changed),
+                              (QGuiApplication.instance().applicationStateChanged,
+                               self._sync_attention)):
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            self._window.removeEventFilter(self)
+            QApplication.instance().removeEventFilter(self)
+            self._attending = False
+            self._attending_group = False
+            self._svc.set_viewing(None)
+            self._svc.set_viewing_group(None)
+            self._flush_grants(say=False)
+        finally:
+            if self._holding:                           # (balances acquire whatever else failed)
+                self._holding = False
+                self._svc.release(blocks_lock=False)

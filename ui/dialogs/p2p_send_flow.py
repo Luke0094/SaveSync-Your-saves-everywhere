@@ -1,7 +1,7 @@
 """SaveSync - "send a file or folder" as one step for the callers: pick it with
 the app's own picker, let the person untick what should not leave, then open
 the send dialog. Used by the Receive panel (token pasted by the other person)
-and by the Friends dialog (token a friend sent: the send starts at once)."""
+and by the Friends panel (token a friend sent: the send starts at once)."""
 from pathlib import Path
 
 from PySide6.QtWidgets import QDialog

@@ -150,6 +150,7 @@ _DEFAULTS: dict[str, Any] = {
     "p2p_tor": False,               # private mode: transfers and friends go through Tor (the program travels with the app); hides this PC's address from the other side and from the DHT, which is not used then (core.p2p.tor)
     "p2p_proxy_host": "",           # the proxy (its login is kept apart, encrypted: core.p2p.proxy)
     "p2p_proxy_port": 1080,
+    "p2p_proxy_local_dns": False,   # behind the proxy: if it cannot look up the DHT's starting server, let this PC's DNS do it (off: P2P waits)
     "sync_timeout": 120,            # timeout in seconds for sync provider operations
     "schema_version": 1,
     "auto_scan_confirmed_games": [],  # Games where auto-scan was confirmed
@@ -354,6 +355,7 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "p2p_tor": lambda x: isinstance(x, bool),
     "p2p_proxy_host": lambda x: isinstance(x, str),
     "p2p_proxy_port": lambda x: isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= 65535,
+    "p2p_proxy_local_dns": lambda x: isinstance(x, bool),
     "p2p_friends_autolock_minutes": lambda x: (isinstance(x, int) and not isinstance(x, bool)
                                                and 0 <= x <= 1440),
     "schema_version": lambda x: isinstance(x, int) and x >= 1,

@@ -23,7 +23,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                               QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QSpinBox,
                                QStackedWidget, QVBoxLayout, QWidget)
 
@@ -32,11 +32,13 @@ from core.save_editor import (KIND_PRE_RESTORE, SaveEditorError, backup_kind,
                               backup_taken_at, delete_backup, describe,
                               explain, list_backups, open_save,
                               prune_backups, restore_backup)
+from core.save_editor.links import FieldLinks
 from i18n import t
 from ui.helpers import ElidedLabel, PageScrollMixin, scaled
 from ui.modal_helpers import warning_window_modal
 from ui.styles.theme import palette, ThemedMixin
-from ui.widgets.search_inputs import ClearableLineEdit, GhostClearableLineEdit
+from ui.widgets.search_inputs import (SEARCH_DEBOUNCE_MS, ClearableLineEdit,
+                                      GhostClearableLineEdit)
 from ui.widgets.page_size import (PageSizeCombo, SCOPE_CHEATS_GAMES,
                                   SCOPE_CHEATS_SAVES, guarded_render,
                                   page_size)
@@ -247,7 +249,7 @@ def _save_files(entry) -> list:
     return out
 
 
-def _file_sig(path):
+def _file_sig(path, data=None):
     """What a save file IS right now: (mtime, size, content hash), or None
     when it cannot be read.
 
@@ -256,7 +258,13 @@ def _file_sig(path):
     kept copy's, or the backup's), which can equal the one the document was
     loaded under while the contents are entirely different — and the editor
     then redisplayed the old values. The hash settles it. Past 64 MB the
-    hash is skipped (reading it would cost more than it saves)."""
+    hash is skipped (reading it would cost more than it saves).
+
+    *data* is the bytes a document was actually parsed from (or last wrote),
+    hashed instead of reading the file again. Reading it again after the parse
+    leaves a window for an autosave to land in, and the signature would then
+    describe the NEW file next to values from the OLD one: every later check
+    says "unchanged" and the screen stays stale."""
     try:
         st = Path(path).stat()
         sig = (st.st_mtime_ns, st.st_size)
@@ -264,9 +272,12 @@ def _file_sig(path):
             return sig
         import hashlib
         h = hashlib.blake2b(digest_size=16)
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
+        if data is not None:
+            h.update(data)
+        else:
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
         return sig + (h.hexdigest(),)
     except OSError:
         return None
@@ -594,10 +605,26 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._save_load_gen = 0
         self._loaded_path = None
         self._loaded_sig = None     # (mtime, size, content hash) the doc was read from
+        self._links = None          # which values the save stores twice (see core.save_editor.links)
+        self._links_doc = None      # the document _links was built for
+        self._focus_path = None     # the row to bring into view once a page has drawn
+        self._render_gen = 0        # bumped per page drawn, so a late scroll can tell it is stale
         self._load_notice = None
         self._hold_watch = QTimer(self)
         self._hold_watch.setInterval(1000)
         self._hold_watch.timeout.connect(self._watch_hold_game)
+
+        # Searches wait for a pause in typing, like the library's: both lists
+        # are rebuilt from scratch, and watching them redraw between two
+        # letters of one word is what this is for. See SEARCH_DEBOUNCE_MS.
+        self._games_search_timer = QTimer(self)
+        self._games_search_timer.setSingleShot(True)
+        self._games_search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._games_search_timer.timeout.connect(self._apply_game_search)
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._filter_timer.timeout.connect(self._apply_field_filter_now)
 
         # Idle timer: release the loaded save doc from RAM if untouched and no
         # hold is running. The delay follows the machine — 10 minutes was the
@@ -896,12 +923,64 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._filter_mode_btn.clicked.connect(self._toggle_filter_mode)
         self._sync_filter_mode()
         bar.addWidget(self._field_filter, 1)
+        # An optional second search that narrows the first: with thousands of
+        # near-identical rows one search is rarely enough. It splits the same
+        # bar rather than adding a row, has its own name/value switch, and
+        # either keeps what holds the text or drops it. Hidden until asked for.
+        self._filter2_shown = False
+        self._filter2_by_value = False
+        self._filter2_combo = QComboBox()
+        self._filter2_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter2_combo.setMaximumWidth(scaled(200, self))
+        self._fill_filter2_combo()
+        self._filter2_combo.currentIndexChanged.connect(self._on_filter2_combo)
+        self._field_filter2 = ClearableLineEdit()
+        self._field_filter2.setObjectName("list_search")
+        self._field_filter2.setFixedHeight(scaled(30, self))
+        self._field_filter2.textChanged.connect(self._apply_field_filter)
+        self._filter2_mode_btn = self._field_filter2.add_leading_button("Aa")
+        self._filter2_mode_btn.clicked.connect(self._toggle_filter2_mode)
+        # Both fields sit straight in the bar with the same stretch, so they
+        # split what is left evenly; wrapped in a box together with the choice,
+        # the second one would have paid for the choice's width alone.
+        for edit in (self._field_filter, self._field_filter2):
+            edit.setMinimumWidth(scaled(130, self))
+        self._filter2_combo.setVisible(False)
+        self._field_filter2.setVisible(False)
+        bar.addWidget(self._filter2_combo)
+        bar.addWidget(self._field_filter2, 1)
+        self._filter2_toggle = QPushButton("+")
+        self._filter2_toggle.setObjectName("cheats_pager")
+        self._filter2_toggle.setFixedSize(scaled(30, self), scaled(30, self))
+        self._filter2_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter2_toggle.clicked.connect(self._toggle_filter2)
+        bar.addWidget(self._filter2_toggle)
+        self._sync_filter2()
         self._save_btn = QPushButton(t("cheats.apply"))
         self._save_btn.setObjectName("form_primary_btn")
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_btn.clicked.connect(self._apply_edits)
         bar.addWidget(self._save_btn)
         col.addLayout(bar)
+        # After following a link to a value the search and group are paused, so
+        # the target can be seen wherever it is. This is the way back to them.
+        self._jump_back = None      # the view to return to, see _goto_field
+        self._jump_bar = QWidget()
+        jump = QHBoxLayout(self._jump_bar)
+        jump.setContentsMargins(0, 0, 0, 0)
+        jump.setSpacing(10)
+        self._jump_back_btn = QPushButton(t("cheats.jump_back"))
+        self._jump_back_btn.setObjectName("form_link_btn")
+        self._jump_back_btn.setFlat(True)
+        self._jump_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._jump_back_btn.setToolTip(t("cheats.jump_back_tip"))
+        self._jump_back_btn.clicked.connect(self._go_back_to_results)
+        jump.addWidget(self._jump_back_btn)
+        self._jump_note = QLabel("")
+        self._jump_note.setObjectName("form_hint")
+        jump.addWidget(self._jump_note, 1)
+        self._jump_bar.setVisible(False)
+        col.addWidget(self._jump_bar)
         self._edit_hint = QLabel("")
         self._edit_hint.setObjectName("form_hint")
         self._edit_hint.setWordWrap(True)
@@ -1092,6 +1171,19 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         return starts + rest
 
     def _on_game_search_changed(self, _text: str = ""):
+        """The search text changed: re-list after a pause in typing, at once
+        when it was emptied (there is no word left to wait for the end of)."""
+        # The painted completion hint belongs to the text before this
+        # keystroke; leaving it up until the list catches up would show a
+        # completion of something no longer typed.
+        self._search.set_ghost("")
+        if not self._search.text().strip():
+            self._games_search_timer.stop()
+            self._apply_game_search()
+            return
+        self._games_search_timer.start()
+
+    def _apply_game_search(self):
         """A new search is a new list — page 2 of the old one means nothing."""
         self._games_page = 0
         self._refresh_games()
@@ -1109,6 +1201,9 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._refresh_games()
 
     def _refresh_games(self):
+        # The list is built from the text as it stands now, so whatever was
+        # waiting to build it is done.
+        self._games_search_timer.stop()
         with guarded_render(SCOPE_CHEATS_GAMES):
             self._refresh_games_inner()
 
@@ -1167,6 +1262,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
 
 
     def _accept_ghost(self):
+        self._games_search_timer.stop()      # opening a game: nothing left to re-list
         found = self._matches()
         if found:
             self._open_game(found[0])
@@ -1220,18 +1316,47 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                 and self._stack.currentIndex() == self.STEP_EDIT):
             sig = _file_sig(self._loaded_path)
             if sig is None or sig != self._loaded_sig:
-                path = self._loaded_path
-                held_snapshot = dict(self._held)
-                armed_snapshot = self._hold_armed
-                self._open_editor(path)
-                self._held = held_snapshot
-                self._hold_armed = armed_snapshot
-                if self._held and self._hold_armed:
-                    self._hold_watch.start()
+                self._reload_keeping_holds()
                 return
         if self._entry is not None or self._stack.currentIndex() != self.STEP_PICK:
             return
         QTimer.singleShot(0, self._enter_after_paint)
+
+    def _reload_keeping_holds(self):
+        """Open the loaded save again from disk without losing the lock marks.
+
+        _open_editor always clears _held/_hold_armed for what is, from its own
+        point of view, an ordinary re-open; they are put back right after, so
+        a lock armed before the reload keeps being shown as held and
+        _hold_watch resumes on its usual schedule. Unapplied edits are dropped
+        (_open_editor empties _pending): their paths point into a document
+        that is no longer the file's.
+        """
+        held_snapshot = dict(self._held)
+        armed_snapshot = self._hold_armed
+        # Not a no-op open even if the signature happens to match (a save past
+        # the hashing limit is compared by mtime and size alone): the caller
+        # has already decided the file is not what is on screen.
+        self._loaded_sig = None
+        self._open_editor(self._loaded_path)
+        self._held = held_snapshot
+        self._hold_armed = armed_snapshot
+        if self._held and self._hold_armed:
+            self._hold_watch.start()
+
+    def _confirm_reload_after_outside_write(self) -> bool:
+        """Tell the person the save was rewritten under the editor, and ask
+        whether to reload it. True when they chose to."""
+        from PySide6.QtWidgets import QMessageBox
+        from ui.modal_helpers import question_window_modal
+        reply = question_window_modal(
+            self, t("cheats.title"),
+            t("cheats.changed_on_disk", name=Path(self._loaded_path).name),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+            {QMessageBox.StandardButton.Yes: t("cheats.changed_reload")},
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     def _busy_holding_in_game(self) -> bool:
         """The one condition that must never lose a loaded document: the game
@@ -1286,6 +1411,8 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._stop_hold()
             self._hold_watch.stop()
             self._doc = None
+            self._links = self._links_doc = None
+            self._drop_jump_back()
             self._pending.clear()
             self._editors.clear()
             self._clear(self._fields_col)
@@ -1839,9 +1966,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             self._pending = {}
             self._page = 0
             self._apply_doc_header(resolved_path)
-            self._field_filter.blockSignals(True)
-            self._field_filter.clear()
-            self._field_filter.blockSignals(False)
+            self._reset_filters()
             self._render_page()
             self.show_step(self.STEP_EDIT)
             return
@@ -1885,7 +2010,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._edit_hint.setText("")
         self._recipe_retry_btn.setVisible(False)
         self._save_btn.setEnabled(False)
-        self._field_filter.clear()
+        self._reset_filters()
         self._group_combo.blockSignals(True)
         self._group_combo.clear()
         self._group_combo.blockSignals(False)
@@ -2225,7 +2350,10 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # being non-None here already means a snapshot exists.
         self._doc = doc
         self._loaded_path = path
-        self._loaded_sig = _file_sig(path)
+        # From the bytes the document was parsed from, not a fresh read of the
+        # file: see _file_sig.
+        self._loaded_sig = _file_sig(path, getattr(doc, "_original", None))
+        self._build_links(doc)
         # A manual pick or full sweep that worked is worth remembering: the
         # next save from this game should not need the same detour. Only
         # when it actually says something auto-detection didn't already
@@ -2244,7 +2372,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
                           hide_after_ms=0)
             notice.set_activatable(True)
         self._apply_doc_header(path, try_recipes)
-        self._field_filter.clear()
+        self._reset_filters()
         self._fill_groups()
         self._render_page()
         self._reset_idle_save_timer()
@@ -2353,26 +2481,44 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     # ── the value list, a page at a time ─────────────────────────────────────
 
-    def _visible_fields(self) -> list:
-        """The fields the chosen group and the filter leave, across the whole
+    def _visible_fields(self, ignore_filters: bool = False) -> list:
+        """The fields the chosen group and the filters leave, across the whole
         save — the pager walks THIS list, so narrowing narrows the pages
-        rather than hiding rows inside them."""
+        rather than hiding rows inside them.
+
+        *ignore_filters* is the whole save in the chosen order: where a value
+        sits when nothing is searched for (see _goto_field)."""
         fields = self._doc.fields
+        if ignore_filters:
+            return self._sorted_fields(fields)
         group = self._group_combo.currentData() or ""
         if group:
             fields = [f for f in fields if f.group == group]
         q = self._field_filter.text().strip().casefold()
         if q:
-            if getattr(self, "_filter_by_value", False):
-                # Match the value AS IT IS IN THE SAVE, not the unsaved edit:
-                # a filter has to keep its set stable while you change values
-                # inside it, or the row you just edited drops out from under
-                # you on the next repaint.
-                fields = [f for f in fields
-                          if q in str(f.value).casefold()]
-            else:
-                fields = [f for f in fields if q in f.label.casefold()]
+            fields = self._holding(fields, q, self._filter_by_value, True)
+        # The second search narrows the first. Empty text filters nothing —
+        # for "does not contain" that matters: "" is in every string, so an
+        # empty one would otherwise hide every row.
+        if self._filter2_shown:
+            q2 = self._field_filter2.text().strip().casefold()
+            if q2:
+                keep = self._filter2_combo.currentData() != "not"
+                fields = self._holding(fields, q2, self._filter2_by_value, keep)
         return self._sorted_fields(fields)
+
+    @staticmethod
+    def _holding(fields: list, q: str, by_value: bool, keep: bool) -> list:
+        """The *fields* whose name (or value) holds *q* — or, with *keep*
+        False, the ones that do not.
+
+        The value is matched AS IT IS IN THE SAVE, not the unsaved edit: a
+        filter has to keep its set stable while you change values inside it,
+        or the row you just edited drops out from under you on the next
+        repaint."""
+        if by_value:
+            return [f for f in fields if (q in str(f.value).casefold()) == keep]
+        return [f for f in fields if (q in f.label.casefold()) == keep]
 
     def _sorted_fields(self, fields: list) -> list:
         """*fields* in the order chosen in the sort box (the save's own order
@@ -2439,6 +2585,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._group_combo.blockSignals(False)
 
     def _apply_group(self):
+        self._drop_jump_back()
         self._page = 0
         self._render_page()
 
@@ -2470,7 +2617,16 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             best = token
         return best
 
-    def _render_page(self):
+    def _render_page(self, focus=None):
+        """Draw the page. *focus* is the path of a row to bring into view and
+        put the cursor in once the page has drawn (see _goto_field); every
+        other render clears whatever an earlier one was waiting to show."""
+        self._focus_path = focus
+        self._render_gen += 1
+        # This draws from the text as it stands, so a re-list still waiting for
+        # a pause in typing is done — and must not fire afterwards and send the
+        # page back to its first page (a jump to a linked value, say).
+        self._filter_timer.stop()
         self._clear(self._fields_col)
         self._editors = {}
         # Cancels any row-insertion job still in flight from a PREVIOUS
@@ -2513,7 +2669,195 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
             def _field(f=f):
                 return self._fields_col, self._field_row(f)
             jobs.append(_field)
-        self._begin_async_rows(jobs, on_done=self._sync_hold_label)
+        self._begin_async_rows(jobs, on_done=self._rows_ready)
+
+    def _rows_ready(self):
+        """A page of values has finished drawing."""
+        self._sync_hold_label()
+        path, self._focus_path = self._focus_path, None
+        if path is not None:
+            # Rows keep changing height for a moment after they are inserted
+            # (fonts and styles settle), and the scroll area sizes its content
+            # a turn after the layout does. One scroll lands short of a row far
+            # down a long page, so the position is asserted a few times over
+            # the first half second, and given up on if the page is redrawn.
+            gen = self._render_gen
+            for delay in (0, 60, 160, 320, 500):
+                QTimer.singleShot(
+                    delay, lambda p=path, g=gen: self._reveal_row(p, g))
+
+    def _reveal_row(self, path, gen: int):
+        if gen != self._render_gen:
+            return
+        entry = self._editors.get(path)
+        if entry is None:
+            return
+        editor = entry[0]
+        try:
+            area = self._fields_area
+            body = area.widget()
+            if body is not None and body.layout() is not None:
+                body.layout().activate()
+            area.ensureWidgetVisible(editor, 0, scaled(90, self))
+            if not editor.hasFocus():
+                editor.setFocus(Qt.FocusReason.OtherFocusReason)
+        except RuntimeError:
+            pass            # the page was redrawn again in the meantime
+
+    def _view_state(self) -> dict:
+        """What narrows the list and where it is paged to, as the person left it."""
+        return {
+            "text": self._field_filter.text(),
+            "by_value": self._filter_by_value,
+            "shown2": self._filter2_shown,
+            "text2": self._field_filter2.text(),
+            "by_value2": self._filter2_by_value,
+            "not2": self._filter2_combo.currentData() == "not",
+            "group": self._group_combo.currentData() or "",
+            "page": self._page,
+        }
+
+    def _goto_field(self, target, origin=None):
+        """Show the row for *target* wherever the searches, the group or the
+        page have put it out of sight, and keep a way back.
+
+        The searches and the group are paused, not thrown away: they are
+        remembered, and ``_go_back_to_results`` puts them back and returns to
+        *origin*, the row the link was followed from. Following a link from
+        the view a jump already led to keeps the FIRST way back, so a chain of
+        links still returns to where it began."""
+        fields = self._visible_fields(ignore_filters=True)
+        pos = next((i for i, f in enumerate(fields) if f.path == target.path), None)
+        if pos is None:
+            return
+        dest_page = pos // _PAGE_SIZE
+        if self._jump_back is None:
+            state = self._view_state()
+            state["origin"] = origin.path if origin is not None else None
+            narrowed = (state["text"].strip() or state["group"]
+                        or (state["shown2"] and state["text2"].strip()))
+            # Nothing to return to when the view was the whole list on this page.
+            if narrowed or state["page"] != dest_page:
+                self._jump_back = state
+        for edit in (self._field_filter, self._field_filter2):
+            edit.blockSignals(True)
+            edit.clear()
+            edit.blockSignals(False)
+        self._group_combo.blockSignals(True)
+        self._group_combo.setCurrentIndex(0)
+        self._group_combo.blockSignals(False)
+        self._show_jump_bar()
+        self._page = dest_page
+        self._render_page(focus=target.path)
+        self._reset_idle_save_timer()
+
+    def _show_jump_bar(self):
+        st = self._jump_back
+        self._jump_bar.setVisible(st is not None)
+        if st is None:
+            return
+        paused = st["text"].strip() or st["group"] or (
+            st["shown2"] and st["text2"].strip())
+        self._jump_note.setText(t("cheats.jump_note") if paused else "")
+
+    def _drop_jump_back(self):
+        """Forget the way back to an earlier view: the person has taken the
+        list over themselves, or it belongs to a document no longer open."""
+        self._jump_back = None
+        self._jump_bar.setVisible(False)
+
+    def _go_back_to_results(self):
+        """Put back the searches, group and mode paused by a jump, and return
+        to the row the link was followed from."""
+        st, self._jump_back = self._jump_back, None
+        self._jump_bar.setVisible(False)
+        if st is None or self._doc is None:
+            return
+        self._filter_by_value = st["by_value"]
+        self._filter2_by_value = st["by_value2"]
+        self._filter2_combo.blockSignals(True)
+        self._filter2_combo.setCurrentIndex(
+            max(0, self._filter2_combo.findData("not" if st["not2"] else "has")))
+        self._filter2_combo.blockSignals(False)
+        self._set_filter2_shown(st["shown2"], render=False)
+        self._sync_filter_mode()
+        self._sync_filter2()
+        for edit, text in ((self._field_filter, st["text"]),
+                           (self._field_filter2, st["text2"] if st["shown2"] else "")):
+            edit.blockSignals(True)
+            edit.setText(text)
+            edit.blockSignals(False)
+        self._group_combo.blockSignals(True)
+        self._group_combo.setCurrentIndex(
+            max(0, self._group_combo.findData(st["group"])))
+        self._group_combo.blockSignals(False)
+        # Where the origin row is NOW, not the page number it had: an Apply in
+        # between can change which rows a value search holds, and the order may
+        # have been changed while the jump was showing.
+        origin = st.get("origin")
+        fields = self._visible_fields()
+        pos = next((i for i, f in enumerate(fields) if f.path == origin), None) \
+            if origin is not None else None
+        if pos is not None:
+            self._page = pos // _PAGE_SIZE
+            self._render_page(focus=origin)
+        else:
+            self._page = st["page"]
+            self._render_page()
+        self._reset_idle_save_timer()
+
+    # ── values the save stores twice ─────────────────────────────────────────
+
+    def _build_links(self, doc):
+        """Work out which values of *doc* are copies of each other. A hint, so
+        a failure here only means no link buttons, never a save that won't open."""
+        self._links, self._links_doc = None, None
+        try:
+            aliases = getattr(getattr(doc, "_fmt", None), "aliases", None)
+            self._links = FieldLinks(doc.fields, aliases() if callable(aliases) else ())
+            self._links_doc = doc
+        except Exception as e:
+            logger.debug(f"Save editor: could not look for linked values: {e}")
+            self._links = None
+
+    def _links_for(self, f) -> list:
+        if self._links is None or self._links_doc is not self._doc:
+            return []
+        try:
+            return self._links.for_field(f)
+        except Exception:
+            return []
+
+    def _link_button(self, f, partners) -> QPushButton:
+        btn = QPushButton("🔗")
+        btn.setObjectName("cheats_hold_btn")          # the padlock's look, beside it
+        btn.setFixedSize(scaled(24, self), scaled(24, self))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(t("cheats.linked_tip"))
+        btn.clicked.connect(
+            lambda _=False, fld=f, b=btn, ps=partners: self._show_links(b, fld, ps))
+        return btn
+
+    def _show_links(self, btn, f, partners):
+        """The values *f* is connected with, each a way to jump to its row."""
+        who = self._links.identity(f) if self._links is not None else ""
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        head = menu.addAction(t("cheats.linked_title_who", who=who) if who
+                              else t("cheats.linked_title"))
+        head.setEnabled(False)
+        menu.addSeparator()
+        for link in partners:
+            pf = link.field
+            label = pf.label if len(pf.label) <= 70 else "…" + pf.label[-69:]
+            shown = self._pending.get(pf.path, pf.value)
+            act = menu.addAction(f"{label}   =   {shown}")
+            act.setToolTip(pf.label)
+            act.triggered.connect(
+                lambda _=False, tgt=pf, src=f: self._goto_field(tgt, src))
+        menu.addSeparator()
+        menu.addAction(t("cheats.linked_hint")).setEnabled(False)
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def _field_row(self, f) -> QWidget:
         row = QFrame()
@@ -2532,6 +2876,13 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         name.setToolTip(f.label)
         line.addWidget(name, 1)
         line.addWidget(self._editor_for(f))
+
+        # A number the save keeps in a second place: the way to it, because the
+        # game usually reads one copy and rebuilds the other, and changing the
+        # wrong one looks exactly like the editor not working.
+        partners = self._links_for(f)
+        if partners:
+            line.addWidget(self._link_button(f, partners))
 
         # Open/closed padlock. Marks stay selected; the re-apply loop runs
         # only while THIS game is running (see _watch_hold_game).
@@ -2611,28 +2962,113 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         if label in self._held:
             self._held[label] = value
 
-    def _apply_field_filter(self, _text: str):
+    def _apply_field_filter(self, text: str):
+        """Either search changed: re-list after a pause in typing, at once when
+        the field was emptied (there is no word left to wait for the end of).
+        The page is rebuilt from scratch, and a save can hold tens of thousands
+        of values to look through, so doing it between two letters of one word
+        is wasted work the person can watch happen."""
+        # Typing in either search is the person taking the list back: a way
+        # back to what it showed before a jump is no longer wanted.
+        self._drop_jump_back()
+        self._reset_idle_save_timer()
+        if not text.strip():
+            self._filter_timer.stop()
+            self._apply_field_filter_now()
+            return
+        self._filter_timer.start()
+
+    def _apply_field_filter_now(self):
         self._page = 0
         self._render_page()
-        self._reset_idle_save_timer()
+
+    @staticmethod
+    def _sync_mode(btn, edit, by_value: bool):
+        """Reflect a search's name/value mode on its toggle and placeholder."""
+        btn.setText("#" if by_value else "Aa")
+        btn.setToolTip(t("cheats.filter_mode_value") if by_value
+                       else t("cheats.filter_mode_name"))
+        edit.setPlaceholderText(t("cheats.filter_by_value") if by_value
+                                else t("cheats.filter_by_name"))
 
     def _sync_filter_mode(self):
-        """Reflect the current name/value mode on the toggle and placeholder."""
-        by_value = getattr(self, "_filter_by_value", False)
-        self._filter_mode_btn.setText("#" if by_value else "Aa")
-        self._filter_mode_btn.setToolTip(
-            t("cheats.filter_mode_value") if by_value
-            else t("cheats.filter_mode_name"))
-        self._field_filter.setPlaceholderText(
-            t("cheats.filter_by_value") if by_value
-            else t("cheats.filter_by_name"))
+        self._sync_mode(self._filter_mode_btn, self._field_filter,
+                        getattr(self, "_filter_by_value", False))
 
     def _toggle_filter_mode(self):
         self._filter_by_value = not getattr(self, "_filter_by_value", False)
         self._sync_filter_mode()
+        self._drop_jump_back()
         if self._field_filter.text().strip():
             self._page = 0
             self._render_page()
+
+    # ── the second search ────────────────────────────────────────────────────
+
+    def _fill_filter2_combo(self):
+        cur = self._filter2_combo.currentData() or "has"
+        self._filter2_combo.blockSignals(True)
+        self._filter2_combo.clear()
+        self._filter2_combo.addItem(t("cheats.filter2_has"), "has")
+        self._filter2_combo.addItem(t("cheats.filter2_not"), "not")
+        self._filter2_combo.setCurrentIndex(max(0, self._filter2_combo.findData(cur)))
+        self._filter2_combo.blockSignals(False)
+
+    def _sync_filter2(self):
+        self._sync_mode(self._filter2_mode_btn, self._field_filter2,
+                        self._filter2_by_value)
+        self._filter2_toggle.setText("−" if self._filter2_shown else "+")
+        self._filter2_toggle.setToolTip(
+            t("cheats.filter2_remove") if self._filter2_shown
+            else t("cheats.filter2_add"))
+
+    def _toggle_filter2(self):
+        self._set_filter2_shown(not self._filter2_shown)
+
+    def _set_filter2_shown(self, shown: bool, render: bool = True):
+        """Show or hide the second search. Hiding it empties it, so a search
+        nobody can see does not go on narrowing the list."""
+        had_effect = self._filter2_shown and bool(self._field_filter2.text().strip())
+        self._filter2_shown = shown
+        self._filter2_combo.setVisible(shown)
+        self._field_filter2.setVisible(shown)
+        if not shown:
+            self._field_filter2.blockSignals(True)
+            self._field_filter2.clear()
+            self._field_filter2.blockSignals(False)
+        self._sync_filter2()
+        self._drop_jump_back()
+        if shown:
+            self._field_filter2.setFocus()
+        elif render and had_effect and self._doc is not None:
+            self._page = 0
+            self._render_page()
+
+    def _toggle_filter2_mode(self):
+        self._filter2_by_value = not self._filter2_by_value
+        self._sync_filter2()
+        self._drop_jump_back()
+        if self._field_filter2.text().strip() and self._doc is not None:
+            self._page = 0
+            self._render_page()
+
+    def _on_filter2_combo(self, _i: int):
+        self._drop_jump_back()
+        if self._filter2_shown and self._field_filter2.text().strip() \
+                and self._doc is not None:
+            self._page = 0
+            self._render_page()
+            self._reset_idle_save_timer()
+
+    def _reset_filters(self):
+        """Empty both searches, quietly, and forget any jump to return from.
+        For a different document, or the same one read afresh: neither the
+        text nor a saved way back means anything there."""
+        for edit in (self._field_filter, self._field_filter2):
+            edit.blockSignals(True)
+            edit.clear()
+            edit.blockSignals(False)
+        self._drop_jump_back()
 
     def _apply_edits(self):
         if self._doc is None or getattr(self._doc, "read_only", False):
@@ -2642,6 +3078,19 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         was_holding = self._hold is not None and self._hold.is_running()
         if was_holding:
             self._hold.stop()
+        # Before anything is written, and before the typed edits are put into
+        # the document, so cancelling leaves both exactly as they were. The
+        # game may have saved since this was opened (an autosave is enough,
+        # and Ren'Py shifts auto-1 to auto-2 on every one); writing now would
+        # put the older copy back over it.
+        if self._doc.changed_on_disk():
+            logger.info(f"Save editor: {Path(self._loaded_path).name} changed "
+                        f"on disk since it was opened — not applying")
+            if self._confirm_reload_after_outside_write():
+                self._reload_keeping_holds()
+            elif was_holding and self._hold is not None:
+                self._hold.start()
+            return
         from ui.widgets.busy_overlay import busy_over
         try:
             for path, value in self._pending.items():
@@ -2667,7 +3116,7 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         # truth. Without this the next visit saw a different signature and
         # reloaded, and a restore that brought back the old bytes could look
         # like "unchanged" to a stale signature.
-        self._loaded_sig = _file_sig(self._loaded_path)
+        self._loaded_sig = _file_sig(self._loaded_path, self._doc._original)
         self._subtitle.setText(t("cheats.applied", name=applied_name))
         running = self._playing()
         # Marks persist across game stop/start; the loop needs Apply first,
@@ -2924,6 +3373,11 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._subtitle.setText(t("cheats.subtitle"))
         self._search.setPlaceholderText(t("cheats.search_placeholder"))
         self._sync_filter_mode()
+        self._fill_filter2_combo()
+        self._sync_filter2()
+        self._jump_back_btn.setText(t("cheats.jump_back"))
+        self._jump_back_btn.setToolTip(t("cheats.jump_back_tip"))
+        self._show_jump_bar()
         self._fill_sort_combo()
         self._save_btn.setText(t("cheats.apply"))
         self._kept_lbl.setText(t("cheats.kept_copies"))

@@ -25,6 +25,7 @@ from ui.p2p_receive_service import (
     WAITING, OFFER, DOWNLOADING, DONE, ERROR,
 )
 from ui.styles.theme import palette
+from ui.widgets.presence_dot import dot_icon
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,13 @@ class P2pReceiveDialog(QDialog):
         self._friend_note_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
         self._friend_note_lbl.setVisible(False)
         outer.addWidget(self._friend_note_lbl)
+        # A token made for one friend says so: it is of use to nobody else, and must not
+        # be pasted around as if it were.
+        self._bound_lbl = QLabel("")
+        self._bound_lbl.setWordWrap(True)
+        self._bound_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._bound_lbl.setVisible(False)
+        outer.addWidget(self._bound_lbl)
 
         self._status_lbl = QLabel(t("p2p.receive_waiting"))
         self._status_lbl.setWordWrap(True)
@@ -275,6 +283,10 @@ class P2pReceiveDialog(QDialog):
                                     and self._friends is not None and not locked)
         self._friend_btn.setToolTip(t("p2p.receive_friends_locked") if locked
                                     else t("p2p.receive_friends_tooltip"))
+        bound = svc.bound_to if live_token else ""
+        bound_friend = self._friends.friend(bound) if bound and self._friends is not None else None
+        self._bound_lbl.setText(t("p2p.receive_bound_note", name=bound_friend.display) if bound_friend else "")
+        self._bound_lbl.setVisible(bound_friend is not None)
         self._refresh_valid()
 
         offer = svc.offer
@@ -464,7 +476,8 @@ class P2pReceiveDialog(QDialog):
         people = friends.friends()
         for f in people:
             mark = "✓ " if f.connected else "⏳ "
-            act = menu.addAction(mark + t("p2p.receive_send_to", name=f.display))
+            act = menu.addAction(dot_icon(friends.is_online(f.id)), mark + t("p2p.receive_send_to", name=f.display))
+            act.setToolTip(friends.presence_tip(f.id))
             act.triggered.connect(lambda _=False, fid=f.id: self._send_to_friend(fid))
         if not people:
             hint = menu.addAction(t("p2p.receive_friends_none"))
@@ -489,6 +502,10 @@ class P2pReceiveDialog(QDialog):
         svc = self._svc
         f = self._friends.friend(fid) if self._friends is not None else None
         if f is None or svc.state != WAITING or not svc.token:
+            return
+        if svc.bound_to and svc.bound_to != fid:
+            self._friend_note_lbl.setText(t("p2p.receive_bound_other", name=f.display))
+            self._friend_note_lbl.setVisible(True)
             return
         try:
             svc.send_token_to_friend(fid)

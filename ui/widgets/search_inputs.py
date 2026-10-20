@@ -26,6 +26,14 @@ from i18n import t
 from ui.helpers import scaled
 from ui.styles.theme import palette
 
+# How long a search waits after the last keystroke before it re-lists
+# anything. A list that rebuilds between two letters of the same word is a list
+# the person watches flicker while they type; this is long enough to span the
+# gap between keystrokes at an ordinary pace. One value for every page that
+# searches a list, so they cannot drift apart. Emptying the field is not
+# waited for: clearing a search should show everything back at once.
+SEARCH_DEBOUNCE_MS = 320
+
 
 class ClearableLineEdit(QLineEdit):
     """QLineEdit with a small red circular "×" clear button embedded on the

@@ -1725,6 +1725,9 @@ class ProcessMonitor(QObject):
                 session_seconds = int(now_ts - finished_session["start"])
                 if playtime_seconds > 0 or session_seconds > 0:
                     lib = get_library()
+                    # (the save folders are walked here, before the lock: it is held by everything that
+                    # reads the library, and a walk reads the disk)
+                    saves_changed = entry._saves_changed_since_sync()
                     # Use atomic field-level update to avoid clobbering
                     # concurrent changes (e.g. mark_backed_up from backup thread).
                     with lib._lock:
@@ -1736,7 +1739,7 @@ class ProcessMonitor(QObject):
                                 # Full session length (launch → exit),
                                 # shown by the library card's playtime hover.
                                 live.last_session_seconds = session_seconds
-                            live.mark_played()
+                            live.mark_played(saves_changed)
                         else:
                             logger.warning(f"Game {entry.name} was removed from library during play, skipping playtime update")
                     if live is not None:

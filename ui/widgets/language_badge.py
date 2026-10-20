@@ -3,12 +3,15 @@
 One language shows as itself — English when the game has it, the first
 otherwise — and always with a ▾, because a click opens the list as a menu with
 a bin on each row: a game bought in a regional store may carry languages the
-user's own copy does not, and those can be taken off. A game with several also
-opens the whole list on hover, one language per line.
+user's own copy does not, and those can be taken off. The last row adds one:
+picked from the known ones or typed (a language no source names), and it joins
+the list. A game with none shows an "Add language" chip that opens the same
+menu. A game with several also opens the whole list on hover, one language per
+line.
 """
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
                                QSizePolicy, QToolButton, QVBoxLayout, QWidget,
                                QWidgetAction)
 
@@ -93,9 +96,47 @@ class _LanguageMenuRow(QWidget):
         super().leaveEvent(event)
 
 
+class _LanguageAddRow(QWidget):
+    """The last row of the click menu: "＋ Add a language…". The whole row is the button, and it lights up
+    like the others under the pointer."""
+    add_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("language_add_row")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 4, 6, 4)
+        self._lbl = QLabel(t('add_game.languages_add_row'))
+        self._lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(self._lbl, 1)
+        self._apply_colors(hover=False)
+
+    def _apply_colors(self, hover: bool) -> None:
+        bg = palette('accent') if hover else palette('bg_card')
+        fg = palette('accent_text') if hover else palette('accent')
+        self.setStyleSheet(f"#language_add_row{{background:{bg};border-radius:6px;}}")
+        self._lbl.setStyleSheet(
+            f"color:{fg};background:transparent;font-size:{scaled(11, self)}px;font-weight:600;")
+
+    def enterEvent(self, event):
+        self._apply_colors(hover=True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._apply_colors(hover=False)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.add_requested.emit()
+        super().mouseReleaseEvent(event)
+
+
 class LanguageBadge(QLineEdit):
     """Chip styled like the version and engine readouts beside it. Read-only
-    text; a click opens the menu that removes languages."""
+    text; a click opens the menu that removes languages and adds one."""
     languages_changed = Signal(list)
 
     def __init__(self, parent=None):
@@ -103,6 +144,7 @@ class LanguageBadge(QLineEdit):
         self._languages: list = []
         self._popup = None
         self._menu = None
+        self._add_wanted = False        # "add" was clicked in the menu: asked once the menu is gone
         self.setReadOnly(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -113,28 +155,37 @@ class LanguageBadge(QLineEdit):
         font.setWeight(QFont.Weight.DemiBold)
         self.setFont(font)
         self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._apply_style()
+        self.set_languages([])
+
+    def _apply_style(self) -> None:
+        # (a game with none shows the chip as an invitation: dimmer, like a placeholder)
+        color = palette('text') if self._languages else palette('text_muted')
         self.setStyleSheet(
-            f"QLineEdit{{background:{palette('bg_elevated')};color:{palette('text')};"
+            f"QLineEdit{{background:{palette('bg_elevated')};color:{color};"
             f"border:1px solid {palette('border_hover')};border-radius:4px;"
             f"padding:1px 8px;font-size:{scaled(11, self)}px;font-weight:600;}}")
-        self.setVisible(False)
 
     def languages(self) -> list:
         return list(self._languages)
 
+    def retranslate(self) -> None:
+        """The words follow the language of the application."""
+        self.set_languages(self._languages)
+
     def set_languages(self, languages) -> None:
-        """Show *languages* (English names, English first). Hidden when empty."""
+        """Show *languages* (English names, English first). With none the chip reads "Add language"."""
         self._languages = list(languages or [])
         self._hide_list()
+        self._apply_style()
         if not self._languages:
-            self.setText("")
-            self.setToolTip("")
-            self.setVisible(False)
-            return
-        many = len(self._languages) > 1
-        self.setText(self._languages[0] + "  ▾")
-        # With several the hover list carries the hint; one has no list.
-        self.setToolTip("" if many else t('add_game.languages_edit_hint'))
+            self.setText(t('add_game.languages_add_chip') + "  ▾")
+            self.setToolTip(t('add_game.languages_add_hint'))
+        else:
+            many = len(self._languages) > 1
+            self.setText(self._languages[0] + "  ▾")
+            # With several the hover list carries the hint; one has no list.
+            self.setToolTip("" if many else t('add_game.languages_edit_hint'))
         self.setCursorPosition(0)
         fm = self.fontMetrics()
         text = self.text()
@@ -145,7 +196,7 @@ class LanguageBadge(QLineEdit):
     # ── click menu ───────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._languages:
+        if event.button() == Qt.MouseButton.LeftButton:
             self._show_menu()
             event.accept()
             return
@@ -159,9 +210,10 @@ class LanguageBadge(QLineEdit):
         return menu
 
     def _show_menu(self) -> None:
-        """One row per language. A bin drops its row and the menu stays open,
-        so several can go in one visit; the change is announced at once and
-        the owner decides when it is kept (Save) or thrown away (Cancel)."""
+        """One row per language, and a last one that adds one. A bin drops its row and the menu stays
+        open, so several can go in one visit; the change is announced at once and the owner decides
+        when it is kept (Save) or thrown away (Cancel). "Add" closes the menu, asks which language,
+        and opens the menu again with it on the list."""
         self._hide_list()
         menu = self._menu = self._new_menu()
         actions: dict = {}
@@ -173,12 +225,63 @@ class LanguageBadge(QLineEdit):
             actions[name] = action
             row.remove_requested.connect(
                 lambda n=name: self._remove_from_menu(n, menu, actions))
+        if self._languages:
+            menu.addSeparator()
+        add_row = _LanguageAddRow(menu)
+        add_action = QWidgetAction(menu)
+        add_action.setDefaultWidget(add_row)
+        menu.addAction(add_action)
+        add_row.add_requested.connect(lambda: self._add_from_menu(menu))
         menu.setMinimumWidth(max(self.width(), 140))
+        self._add_wanted = False
         try:
             menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
         finally:
             self._menu = None
             menu.deleteLater()
+        if self._add_wanted:
+            self._add_wanted = False
+            self._add_custom()
+
+    def _add_from_menu(self, menu: QMenu) -> None:
+        self._add_wanted = True
+        menu.close()
+
+    def _prompt_language(self) -> str:
+        """Ask which language: pick one that is known (and not on the game yet) or type one. "" when
+        cancelled."""
+        from core.library import known_languages, language_merge_key
+        have = {language_merge_key(x) for x in self._languages}
+        choices = [x for x in known_languages() if language_merge_key(x) not in have]
+        dlg = QInputDialog(self.window())
+        dlg.setWindowTitle(t('add_game.languages_add_title'))
+        dlg.setLabelText(t('add_game.languages_add_prompt'))
+        dlg.setComboBoxItems(choices)
+        dlg.setComboBoxEditable(True)
+        dlg.setTextValue("")
+        combo = dlg.findChild(QComboBox)
+        if combo is not None:
+            combo.setCurrentIndex(-1)           # (empty, ready to type; the list is one click away)
+            combo.setMaxVisibleItems(12)
+            combo.lineEdit().setMaxLength(40)
+            combo.lineEdit().setPlaceholderText(t('add_game.languages_add_placeholder'))
+        if not dlg.exec():
+            return ""
+        return dlg.textValue()
+
+    def _add_custom(self) -> None:
+        """Add the language the person picks or types, then show the list with it on."""
+        from core.library import MAX_LANGUAGES, clean_custom_language, language_merge_key, normalize_languages
+        if len(self._languages) >= MAX_LANGUAGES:
+            return
+        name = clean_custom_language(self._prompt_language())
+        if not name:
+            return
+        if language_merge_key(name) not in {language_merge_key(x) for x in self._languages}:
+            languages = normalize_languages(self._languages + [name])
+            self.set_languages(languages)
+            self.languages_changed.emit(list(languages))
+        QTimer.singleShot(0, self._show_menu)   # (the list, with it on)
 
     def _remove_from_menu(self, name: str, menu: QMenu, actions: dict) -> None:
         action = actions.pop(name, None)

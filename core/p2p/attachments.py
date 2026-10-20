@@ -24,11 +24,9 @@ have on yours:
 """
 import logging
 import os
-import re
 import shutil
 import unicodedata
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +132,14 @@ def blocked_names(files) -> list:
     return [str(rel) for _src, rel in files if is_blocked_name(rel)]
 
 
-def clean_label(text, limit: int = MAX_LABEL_BYTES) -> str:
+def clean_label(text, limit: int = MAX_LABEL_BYTES, *, keep_path: bool = False) -> str:
     """A name as it is shown in a card: no path, no control, invisible or
-    direction characters, one line, at most *limit* bytes."""
-    s = str(text or "").replace("\\", "/").rsplit("/", 1)[-1]
+    direction characters, one line, at most *limit* bytes. *keep_path*: the text is
+    not a file name (the title of a game, "Fate/Grand Order"), so a slash is just a
+    character and nothing before it is dropped."""
+    s = str(text or "")
+    if not keep_path:
+        s = s.replace("\\", "/").rsplit("/", 1)[-1]
     s = "".join(ch for ch in s if ch not in _HIDDEN and unicodedata.category(ch) not in ("Cc", "Cs"))
     s = " ".join(s.split())
     raw = s.encode("utf-8", "replace")
@@ -152,8 +154,11 @@ def human_size(n) -> str:
     v = float(n)
     for unit in ("KB", "MB", "GB", "TB"):
         v /= 1000.0
-        if v < 1000 or unit == "TB":
-            return f"{v:.1f} {unit}" if v < 100 else f"{v:.0f} {unit}"
+        # (as it will be written: a value that rounds up to 100 loses its decimal, and one that rounds
+        # up to 1000 is the next unit's 1.0 - 999 999 bytes are "1.0 MB", not "1000 KB")
+        shown = f"{v:.1f}" if v < 99.95 else f"{v:.0f}"
+        if float(shown) < 1000 or unit == "TB":
+            return f"{shown} {unit}"
     return f"{v:.0f} TB"
 
 

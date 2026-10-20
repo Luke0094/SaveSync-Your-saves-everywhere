@@ -103,6 +103,49 @@ def normalize_language(value) -> str:
     return raw
 
 
+MAX_LANGUAGES = 40              # on one game
+MAX_LANGUAGE_CHARS = 40         # in one name
+
+
+def clean_custom_language(value) -> str:
+    """A language the person typed, as it will be kept: the name of a known one in its English form
+    (what the sources give), anything else as written - one line, no markup, not too long. "" when it
+    is nothing (or "no language")."""
+    import re
+    raw = re.sub(r"<[^>]*>", "", str(value or ""))              # (tags go whole; a stray < or > goes alone)
+    raw = re.sub(r"[\x00-\x1f\x7f<>]", " ", raw)
+    name = normalize_language(" ".join(raw.split()))
+    if len(name) > MAX_LANGUAGE_CHARS:
+        name = name[:MAX_LANGUAGE_CHARS].rstrip()
+    return name[:1].upper() + name[1:]          # ("klingon" -> "Klingon"; the rest as typed)
+
+
+def known_languages(extra=()) -> list:
+    """The languages to offer when one is added to a game: the ones the sources name, then every one
+    any game in the library lists (so a language added by hand once is there for the next game), then
+    *extra*. English names, each once, in that order."""
+    out, seen = [], set()
+
+    def add(name):
+        key = str(name or "").casefold()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(str(name))
+
+    for name in _LANGUAGE_ALIASES.values():
+        add(name)
+    try:
+        mine = sorted({x for g in get_library().all_games() for x in (getattr(g, "languages", None) or [])},
+                      key=str.casefold)
+    except Exception:
+        mine = []                   # (no library yet: only the sources' names)
+    for name in mine:
+        add(name)
+    for name in extra:
+        add(name)
+    return out
+
+
 def language_merge_key(lang: str) -> str:
     """The key two spellings of one language share (case-insensitive)."""
     return normalize_language(lang).casefold()
@@ -346,56 +389,107 @@ def copy_save_data(old_path: Path, new_path: Path, force: bool = False) -> bool:
     return False
 
 
-def mirror_save_data(old_path: Path, new_path: Path) -> "tuple[bool, Optional[Path]]":
-    """Make *new_path* hold exactly what *old_path* holds — files that only
-    *new_path* has are removed too, so the two end up equal by content (see
-    save_data_equal) rather than merged, which would leave the pair differing
-    and the question coming back on every switch.
+def _save_files(root: Path) -> dict:
+    """{relative path: file} of what *root* holds ("" for a single file)."""
+    if root.is_file():
+        return {"": root}
+    return {p.relative_to(root).as_posix(): p for p in root.rglob("*") if p.is_file()}
 
-    What is about to be replaced was never backed up (it is not among the
-    game's tracked paths until now), so it is copied aside first, next to it,
-    as ``<name>.pre-switch-<stamp>``. If that copy cannot be made nothing is
-    touched. A backup is deliberately NOT used for this: a fresh backup of the
-    other version's saves would become the game's newest, and the mirrored
-    state would then read as an older one coming back.
 
-    Returns ``(ok, aside)``: whether the mirror happened and where the previous
-    content went (None when there was none to keep).
-    """
+# The digests worked out lately, by (path, size, modified): a file that is as it was is not read again.
+# Comparing two folders of saves reads every file of both, and is asked when a version is picked and again
+# when the dialog is saved (and every time the same version is picked again).
+_DIGESTS: dict = {}
+_DIGESTS_KEEP = 4096
+_digests_lock = threading.Lock()
+
+
+def _save_digest(p: Path) -> str:
+    import hashlib
+    st = p.stat()
+    key = (str(p), st.st_size, st.st_mtime_ns)
+    with _digests_lock:
+        got = _DIGESTS.get(key)
+    if got is not None:
+        return got
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    got = h.hexdigest()
+    with _digests_lock:
+        if len(_DIGESTS) >= _DIGESTS_KEEP:
+            for old in list(_DIGESTS)[:_DIGESTS_KEEP // 4]:      # (the oldest quarter: dicts keep their order)
+                del _DIGESTS[old]
+        _DIGESTS[key] = got
+    return got
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    return a.stat().st_size == b.stat().st_size and _save_digest(a) == _save_digest(b)
+
+
+def save_data_covered(old_path: Path, new_path: Path) -> bool:
+    """True when everything *old_path* holds is already in *new_path*, byte for byte
+    (compared by content hash; what only *new_path* has does not matter). Switching to
+    a version that holds every save of the one being left has nothing to carry - the
+    question is only worth asking when something would actually be brought across or
+    replaced. (After a merge the target holds the old saves plus its own, so it is
+    covered and the question does not come back.)"""
+    try:
+        fb = _save_files(new_path)
+        for rel, pa in _save_files(old_path).items():
+            pb = fb.get(rel)
+            if pb is None or not _same_file(pa, pb):
+                return False
+        return True
+    except OSError:
+        return False   # cannot read one side: treat as not covered, ask
+
+
+def merge_save_data(old_path: Path, new_path: Path) -> "tuple[bool, Optional[Path]]":
+    """Bring everything at *old_path* into *new_path* - the same carry as into an empty
+    folder (copy_save_data), onto a folder that already has saves: a MERGE. Every file
+    of *old_path* ends up in *new_path*; a file with the same name is replaced; files
+    that only *new_path* has stay where they are. Nothing is removed, so the player finds
+    all the saves they had - and a game's own config next to them cannot take the others
+    with it.
+
+    The files about to be replaced were never backed up (the folder is not among the
+    game's tracked paths until now), so those - only those - are copied aside first, next
+    to the folder, as ``<name>.pre-switch-<stamp>`` under their own relative paths. If
+    that copy cannot be made nothing is touched. A backup is deliberately NOT used: a
+    fresh backup of the other version's saves would become the game's newest, and the
+    merged state would then read as an older one coming back.
+
+    Returns ``(ok, aside)``: whether the merge happened and where the replaced files went
+    (None when none was replaced)."""
     import shutil
     from datetime import datetime as _dt
     try:
         if not path_has_content(old_path):
             return False, None
-        aside = None
+        replaced = []
         if path_has_content(new_path):
+            fb = _save_files(new_path)
+            replaced = [rel for rel, pa in _save_files(old_path).items()
+                        if rel in fb and not _same_file(pa, fb[rel])]
+        aside = None
+        if replaced:
             stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
             aside = new_path.with_name(f"{new_path.name}.pre-switch-{stamp}")
             n = 1
             while aside.exists():
                 aside = new_path.with_name(f"{new_path.name}.pre-switch-{stamp}-{n}")
                 n += 1
-            if new_path.is_dir():
-                shutil.copytree(new_path, aside)
-            else:
-                shutil.copy2(new_path, aside)
-        if old_path.is_file():
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(old_path, new_path)
-            return True, aside
-        if new_path.is_dir():
-            wanted = {p.relative_to(old_path) for p in old_path.rglob("*") if p.is_file()}
-            for p in sorted(new_path.rglob("*"), key=lambda q: len(q.parts), reverse=True):
-                rel = p.relative_to(new_path)
-                if p.is_file():
-                    if rel not in wanted:
-                        p.unlink()
-                elif not any(p.iterdir()):
-                    p.rmdir()
-        shutil.copytree(old_path, new_path, dirs_exist_ok=True)
-        return True, aside
+            for rel in replaced:
+                src = new_path / rel if rel else new_path
+                dst = aside / rel if rel else aside
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        return copy_save_data(old_path, new_path, force=True), aside
     except OSError as e:
-        logger.warning(f"Could not mirror save data from {old_path} to {new_path}: {e}")
+        logger.warning(f"Could not merge save data from {old_path} to {new_path}: {e}")
         return False, None
 
 
@@ -871,15 +965,20 @@ class GameEntry:
             self.cloud_metadata = {k: v for k, v in self.cloud_metadata.items()
                                    if k != "remote_rehomed"}
 
-    def mark_played(self):
+    def mark_played(self, saves_changed: Optional[bool] = None):
         # NOTE: Callers mutate a copy then call update_game() which replaces
         # the entry under _lock, so no additional locking is needed here.
+        # *saves_changed*: the answer to _saves_changed_since_sync(), for a caller that works under
+        # the library's lock and has walked the save folders before taking it (the walk reads the
+        # disk, and everything that reads the library would wait for it).
         from datetime import timezone
         self.last_played = datetime.now(timezone.utc).isoformat()
         # Only flag pending if saves actually changed since last sync.
         # Only move from "synced"; don't downgrade "conflict" or "local_only".
-        if self.sync_status == "synced" and self._saves_changed_since_sync():
-            self.sync_status = "pending"
+        if self.sync_status == "synced":
+            changed = self._saves_changed_since_sync() if saves_changed is None else saves_changed
+            if changed:
+                self.sync_status = "pending"
 
     def _saves_changed_since_sync(self) -> bool:
         """Return True if any BACKUP-RELEVANT save file is newer than the
@@ -907,7 +1006,7 @@ class GameEntry:
             ok, _, _ = scan_relevant_save_mtimes(
                 fs,
                 registry_paths=reg,
-                chain_dirs=_declared_chain_dirs(self.game_id),
+                chain_dirs=_declared_chain_dirs(self.id),
                 stop_if_newer_than=last_sync_ts,
             )
             # ok=False means something newer than last_sync (or unreadable →

@@ -479,7 +479,8 @@ class BackupRow(QFrame, ThemedMixin):
         P2pSendDialog(self._entry, self).exec()
 
 
-from ui.widgets.search_inputs import (GhostClearableLineEdit, _SearchCombo,
+from ui.widgets.search_inputs import (GhostClearableLineEdit, SEARCH_DEBOUNCE_MS,
+                                      _SearchCombo,
                                       _SuggestPopup)  # clearable ghost for title search
 
 
@@ -506,6 +507,7 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         # Duplicates view: only titles that appear more than once, side by side.
         self._dupes_only: bool = False
         self._game_filter_text: str = ""          # current text-filter for game search
+        self._applied_game_filter: str = ""       # the filter the list was last built for
         self._game_combo_updating: bool = False   # guard against recursive textChanged
         # Collapsible per-title sections: which titles are expanded, and the
         # current page of the paginated title list (PAGE_SIZE per page).
@@ -545,11 +547,13 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._cloud_list_map: dict = {}
         self._cloud_list_at: float = 0.0
         self._cloud_list_scan = None
-        # Debounce timer: fires 120 ms after the last keystroke to avoid
-        # rebuilding the combo + list on every character typed.
+        # Debounce timer: fires SEARCH_DEBOUNCE_MS after the last keystroke, the
+        # same pause the library waits, to avoid rebuilding the combo + list on
+        # every character typed. (It used to be 120 ms, shorter than the gap
+        # between two keystrokes, so the list still redrew mid-word.)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(120)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
         self._search_timer.timeout.connect(self._do_game_search)
         # First list build waits until the page is shown so busy_over can cover
         # it (hidden rebuilds have nothing to dim).
@@ -1165,6 +1169,9 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
 
     def _load_games(self, text_filter: str = ""):
         """Repopulate game combo respecting source-filter and optional text search."""
+        # What the list was last built for, whoever asked — so emptying the
+        # search box only rebuilds when the list actually is filtered.
+        self._applied_game_filter = text_filter.strip()
         self._archive_lib_ids = None  # library may have changed; recompute on demand
         self._ensure_cloud_zip_scan()
         mgr = get_backup_manager()
@@ -1659,7 +1666,16 @@ class BackupsPage(PageScrollMixin, QWidget, ThemedMixin):
         self._backups_page_num = 1
         self._refresh_verify_tooltip()
         self._update_suggest_popup()
-        self._search_timer.start()   # (re)starts; fires 120 ms after last key
+        if not self._game_filter_text:
+            # Emptying the field shows everything back at once, as in the
+            # library: there is no word left to wait for the end of. A lone
+            # space, or clearing a list that was never filtered, changes
+            # nothing and rebuilds nothing.
+            self._search_timer.stop()
+            if self._applied_game_filter:
+                self._do_game_search()
+            return
+        self._search_timer.start()   # (re)starts; fires after a pause in typing
 
     def _do_game_search(self):
         """Debounced: rebuild the NATIVE dropdown filtered by the typed

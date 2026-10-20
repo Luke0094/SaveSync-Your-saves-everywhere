@@ -428,6 +428,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     # Save with pictures still coming: they carry on without this dialog, into the
     # game just stored (see LatePictures). Whoever opened the dialog takes it from here.
     pictures_detached = Signal(object)
+    # generation, {(from folder, to folder): covered} - the saves of a picked version compared off the GUI thread
+    _switch_checked = Signal(int, object)
 
     def __init__(self, name: str = "", exe_path: str = "",
                  entry: Optional[GameEntry] = None, parent=None):
@@ -465,6 +467,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # save data still follows the move (see _carry_saves_after_exe_change).
         self._ui_moved: dict[str, str] = {}
         self._ui_chains: dict[str, str] = {}
+        # What Save will do with the save data of a version switched to, decided when it
+        # was picked (see _stage_switch_saves): {(from folder, to folder): "copy" | "same"
+        # | "differs"}, and for the ones that differ the answer - "merge" or "keep".
+        self._switch_state: dict = {}
+        self._switch_choice: dict = {}
+        self._switch_gen = 0                # bumped for every staging: an answer for an earlier one is dropped
+        self._switch_checking: set = set()  # pairs whose saves are being compared just now
+        self._switch_checked.connect(self._on_switch_checked)
         self._created_icon_dirs: set[Path] = set()  # Track icon dirs created during this session
         # The files THIS session wrote into the icon cache (a picture that was
         # already there writes none). Cancel removes these and only these — the
@@ -1833,7 +1843,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         - ⛶ fullscreen toggle anchored to the image's top-right corner; in
           fullscreen every control fades out while the mouse is idle so the
           image can be viewed without distractions (move the mouse to bring
-          the controls back, Esc leaves fullscreen first, then closes)
+          the controls back, Esc leaves fullscreen first, then closes). They
+          stay while the pointer rests on a button or the thumbnails.
         - Prev / Next navigation buttons and ←/→ keys
         - Thumbnail strip at the bottom (between the nav arrows) with active highlight
         """
@@ -1999,6 +2010,24 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                     f"border-radius:3px;background:{'rgba(255,255,255,0.15)' if active else 'transparent'};"
                     f"opacity:{'1' if active else '0.6'};"
                 )
+            # Every way of changing the picture ends here (◀ ▶, ←/→, a click on a
+            # miniature, the first load): the strip follows the selection.
+            _reveal_thumb()
+            # Once more when the strip has its real size: on the first load, and when
+            # the window and its layout have not caught up with what was just done.
+            QTimer.singleShot(0, _reveal_thumb)
+
+        def _reveal_thumb():
+            """Scroll the strip so the active miniature is in view, in the middle of it
+            when the strip is longer than the room it has (the bar clamps the value, and a
+            strip that fits has nothing to scroll). With many pictures and little room -
+            the windowed viewer - an active miniature left where it was is cut off or
+            out of sight altogether."""
+            if not 0 <= self._modal_idx < len(thumb_labels):
+                return
+            lbl = thumb_labels[self._modal_idx]
+            bar = thumb_scroll.horizontalScrollBar()
+            bar.setValue(lbl.x() + lbl.width() // 2 - thumb_scroll.viewport().width() // 2)
 
         # ── Nav row with thumbnail strip in the middle ────────────────────────
         # Floats over the bottom edge of the image (not a layout row) with a
@@ -2137,9 +2166,30 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             else:
                 dlg.setCursor(Qt.CursorShape.BlankCursor)
 
+        def _pointer_on_control() -> bool:
+            """Whether the pointer is resting on a button or on the thumbnails.
+
+            Asked when the idle timer fires rather than tracked from mouse
+            moves: the buttons and thumbnails are children with no mouse
+            tracking, so moves over them never reach the move filter below.
+            Empty space in the top or bottom bar does not count — only
+            something there is to press.
+            """
+            from PySide6.QtGui import QCursor
+            pos = QCursor.pos()
+            for w in (fs_btn, close_btn, prev_btn, next_btn, thumb_scroll):
+                if w.isVisible() and w.rect().contains(w.mapFromGlobal(pos)):
+                    return True
+            return False
+
         def _on_idle():
-            if _fs["on"]:
-                _set_chrome_visible(False)
+            if not _fs["on"]:
+                return
+            if _pointer_on_control():
+                # Someone is using the controls: leave them, look again later.
+                hide_timer.start()
+                return
+            _set_chrome_visible(False)
 
         hide_timer.timeout.connect(_on_idle)
 
@@ -2230,12 +2280,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                             _position_fs_btn()
                     elif obj is outer:
                         _layout_chrome()
+                    elif obj is thumb_scroll.viewport():
+                        _reveal_thumb()         # (fullscreen on/off, the window resized)
                 return False
 
         _watch = _MoveWatch(dlg)
         for _w in (dlg, outer, img_lbl):
             _w.setMouseTracking(True)
             _w.installEventFilter(_watch)
+        thumb_scroll.viewport().installEventFilter(_watch)
 
         # Esc leaves fullscreen first (then the default reject closes);
         # ←/→ navigate between images.
@@ -2666,6 +2719,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if old_primary and old_primary.casefold() == path.casefold():
             # Already the version in use: only its save folders may lag behind.
             self._align_path_rows_to_primary()
+            self._stage_switch_saves()
             return
         from core.library import derive_exe_version_label
         self._exe_versions.pop(path, None)
@@ -2674,6 +2728,126 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._exe_edit.setText(path)
         self._refresh_exe_version_controls()
         self._align_path_rows_to_primary()
+        self._stage_switch_saves()
+
+    # ── Switching version: what happens to the saves ─────────────────────
+    #
+    # The rows under "Your save folders" move onto the version picked (above); the save
+    # DATA follows when the dialog is saved (_carry_saves_after_exe_change). What it will
+    # do is settled here, at the pick - where the choice is made - and each row says so:
+    # a folder with nothing in it receives the saves, one that already holds them is left
+    # alone, and one with different saves of its own is asked about once: MERGE the
+    # saves of the version being left into it (every one of them ends up there, same-named
+    # files replaced after a copy is set aside, nothing removed) or keep it as it is.
+    # Nothing is touched before Save, so Cancel leaves everything as it was; a folder that
+    # is unticked is not tracked and is never carried.
+
+    def _path_rows(self):
+        for i in range(self._paths_layout.count()):
+            item = self._paths_layout.itemAt(i)
+            w = item.widget() if item else None
+            if isinstance(w, PathRow):
+                yield w
+
+    def _stage_switch_saves(self) -> None:
+        """Settle what Save will do with the saves of each folder moved onto the version picked. A folder
+        that holds saves of its own has to be compared with the one they come from - every file of both
+        read and hashed, which takes a while for big saves - so that is done on a thread of its own (the
+        rows say "checking" meanwhile) and the rest, the question included, follows on this one
+        (_finish_staging)."""
+        from core.library import path_has_content
+        entry = self._editing_entry
+        self._switch_gen += 1
+        gen = self._switch_gen
+        self._switch_state = {}
+        self._switch_checking = set()
+        compare = []
+        if entry is not None:
+            prev = set(entry.save_paths or [])
+            unticked = {w._path for w in self._path_rows() if not w.is_checked()}
+            for origin, current in self._ui_moved.items():
+                if origin not in prev:
+                    continue
+                old_p, new_p = Path(origin), Path(current)
+                if not path_has_content(old_p):
+                    continue
+                if current in unticked:
+                    self._switch_state[(origin, current)] = "unticked"      # (not tracked: not carried, and the row says so)
+                elif not path_has_content(new_p):
+                    self._switch_state[(origin, current)] = "copy"
+                else:
+                    compare.append((origin, current))
+        if not compare:
+            self._finish_staging()
+            return
+        self._switch_checking = set(compare)
+        self._refresh_switch_notes()
+
+        def work():
+            from core.library import save_data_covered
+            covered = {}
+            for origin, current in compare:
+                covered[(origin, current)] = save_data_covered(Path(origin), Path(current))
+            try:
+                self._switch_checked.emit(gen, covered)
+            except RuntimeError:
+                pass                            # (the dialog is gone)
+        threading.Thread(target=work, name="add-game-compare-saves", daemon=True).start()
+
+    def _on_switch_checked(self, gen: int, covered: dict) -> None:
+        if gen != self._switch_gen:
+            return                              # (another version was picked since, or Save has taken it over)
+        self._switch_checking = set()
+        for pair, same in covered.items():
+            self._switch_state[pair] = "same" if same else "differs"
+        if self.isVisible():
+            self._finish_staging()
+        else:
+            # (closed with the comparison still running: nobody to ask. Save asks, if it comes to that)
+            self._refresh_switch_notes()
+
+    def _finish_staging(self) -> None:
+        """The comparison is done: ask once about the folders that differ, and show what Save will do."""
+        differing = [k for k, v in self._switch_state.items() if v == "differs"]
+        # (an answer belongs to the pair of folders it was given for)
+        self._switch_choice = {k: v for k, v in self._switch_choice.items() if k in self._switch_state}
+        pending = [k for k in differing if k not in self._switch_choice]
+        if pending:
+            merge = self._ask_carry_saves(
+                'add_game.exe_switch_conflict_msg',
+                yes_key='add_game.exe_switch_merge',
+                no_key='add_game.exe_switch_keep',
+                title_key='add_game.exe_switch_conflict_title')
+            for k in pending:
+                self._switch_choice[k] = "merge" if merge else "keep"
+        self._refresh_switch_notes()
+
+    def _refresh_switch_notes(self) -> None:
+        """The line under each save folder that is to receive saves, saying what Save will do."""
+        rows = {w._path: w for w in self._path_rows()}
+        for w in rows.values():
+            w.set_note("")
+        for origin, current in self._switch_checking:
+            row = rows.get(current)
+            if row is not None:
+                row.set_note(t('add_game.switch_note_checking'), "muted")
+        for (origin, current), state in self._switch_state.items():
+            row = rows.get(current)
+            if row is None:
+                continue
+            src = "/".join(Path(origin).parts[-2:])
+            if not row.is_checked():
+                row.set_note(t('add_game.switch_note_unticked'), "muted")
+            elif state == "copy":
+                row.set_note(t('add_game.switch_note_copy', src=src), "accent")
+            elif state == "same":
+                row.set_note(t('add_game.switch_note_same', src=src), "muted")
+            elif self._switch_choice.get((origin, current)) == "merge":
+                row.set_note(t('add_game.switch_note_merge', src=src), "accent")
+            elif self._switch_choice.get((origin, current)) == "keep":
+                row.set_note(t('add_game.switch_note_keep'), "muted")
+            else:
+                row.set_note(t('add_game.switch_note_ask'), "muted")
 
     def _align_path_rows_to_primary(self) -> bool:
         """Point "Your save folders" at the version in use: a save folder that
@@ -3258,6 +3432,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if not hasattr(self, "_engine_edit"):
             return
         self._exe_lbl.setText(t("add_game.exe_path"))
+        if hasattr(self, "_language_lbl"):
+            self._language_lbl.retranslate()
         self._engine_edit.setPlaceholderText(t("common.unknown"))
         self._engine_edit.setToolTip(t("add_game.engine_tooltip"))
         if hasattr(self, "_exe_version_lbl"):
@@ -3739,8 +3915,8 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._language_lbl.set_languages(self._languages)
 
     def _on_languages_removed(self, languages) -> None:
-        """A bin on the language badge dropped some. Staged like every other
-        field here: Save writes it, Cancel leaves the game as it was."""
+        """A bin on the language badge dropped some, or a language was added by hand. Staged like
+        every other field here: Save writes it, Cancel leaves the game as it was."""
         self._languages = list(languages)
 
     def _apply_web_languages(self, languages) -> None:
@@ -3904,6 +4080,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if self._editing_entry and path_str in (self._editing_entry.excluded_save_paths or []):
             row.set_checked(False)
         row.remove_requested.connect(self._remove_path)
+        row.checkbox.toggled.connect(lambda _=False: self._refresh_switch_notes())
         row.setProperty("detected", detected)
 
         # Manual paths go before the separator; detected go after it
@@ -5087,11 +5264,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         - it holds the very same files (compared by content hash) → nothing to
           do;
         - it holds DIFFERENT saves → only when SWITCHING between tracked
-          versions (the old executable stays as a version), ask whether to
-          overwrite them with the current version's (a mirror: they end up
-          equal, and what was there is copied aside first). A REPLACE has
-          already been asked its own overwrite / keep-both question by
-          _add_game before rebasing, and is never touched here;
+          versions (the old executable stays as a version): the current
+          version's saves are MERGED into them if that was chosen (when the
+          version was picked: _stage_switch_saves; asked here only if it was not) -
+          every one of them ends up there, same-named files replaced after a copy
+          is set aside, nothing removed. A folder that already holds all of them
+          is left alone, and a folder that is unticked (not tracked) is never
+          carried. A REPLACE has already been asked its own overwrite / keep-both
+          question by _add_game before rebasing, and is never touched here;
         - the old location has nothing to copy from (the old version may be
           deleted) → offer the latest backup, see _restore_backup_into_new_install.
 
@@ -5100,37 +5280,51 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         holds nothing; if it already has some they are left alone, and the
         question is asked when that version is switched to.
         """
-        from core.library import (copy_save_data, mirror_save_data, path_has_content,
-                                  rebase_path_for_new_exe, save_data_equal)
+        from core.library import (copy_save_data, merge_save_data, path_has_content,
+                                  rebase_path_for_new_exe, save_data_covered)
+        # (a comparison still running for the pick is dropped: this asks for itself, and its answer
+        # arriving in the middle of that question would ask a second one)
+        self._switch_gen = getattr(self, "_switch_gen", 0) + 1
+        self._switch_checking = set()
         versions = {p.casefold() for p in (entry.exe_path_versions or {})}
         switched = bool(old_exe) and old_exe.casefold() in versions
+        untracked = set(entry.excluded_save_paths or [])
 
         # ── The primary moved ───────────────────────────────────────────
         differing = {}
         had_source = False
         for old_p, new_p in moved.items():
+            if new_p in untracked:
+                continue                # (unticked: not tracked, so not carried)
             old_path, new_path = Path(old_p), Path(new_p)
             if not path_has_content(old_path):
                 continue
             had_source = True
             if not path_has_content(new_path):
                 copy_save_data(old_path, new_path)
-            elif switched and not save_data_equal(old_path, new_path):
+            elif switched and not save_data_covered(old_path, new_path):
                 differing[old_p] = new_p
-        if differing and self._ask_carry_saves(
-                'add_game.exe_switch_conflict_msg',
-                yes_key='add_game.exe_overwrite',
-                no_key='add_game.exe_switch_keep',
-                title_key='add_game.exe_switch_conflict_title'):
-            # A mirror, not a merge: the two must end up equal, or they would
-            # still differ and this question would come back on every switch.
-            # What is replaced is copied aside first (mirror_save_data).
-            for old_p, new_p in differing.items():
-                ok, aside = mirror_save_data(Path(old_p), Path(new_p))
+        if differing:
+            choices = getattr(self, "_switch_choice", {})
+            unanswered = [k for k in differing.items() if k not in choices]
+            asked = None
+            if unanswered:
+                # (not picked from the version menu - the exe was changed some other way)
+                asked = self._ask_carry_saves(
+                    'add_game.exe_switch_conflict_msg',
+                    yes_key='add_game.exe_switch_merge',
+                    no_key='add_game.exe_switch_keep',
+                    title_key='add_game.exe_switch_conflict_title')
+            for pair in differing.items():
+                merge = (choices[pair] == "merge") if pair in choices else bool(asked)
+                if not merge:
+                    continue
+                old_p, new_p = pair
+                ok, aside = merge_save_data(Path(old_p), Path(new_p))
                 if aside is not None:
-                    logger.info(f"Switch: {new_p} copied aside to {aside} before mirroring")
+                    logger.info(f"Switch: files of {new_p} that were replaced are copied aside to {aside}")
                 if not ok:
-                    logger.warning(f"Switch: could not overwrite {new_p} with {old_p}")
+                    logger.warning(f"Switch: could not merge {old_p} into {new_p}")
         if moved and not had_source:
             # Nothing to copy from: the old version may have been deleted, and
             # its saves then only exist as backups.
