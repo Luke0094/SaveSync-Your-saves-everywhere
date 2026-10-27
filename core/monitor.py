@@ -133,6 +133,19 @@ _CANDIDATE_CACHE_MAX = 512
 _WATCHDOG_MIN_MS = 500
 _WATCHDOG_MAX_MS = 5000
 
+# A process snapshot that has been "in flight" this long was lost, not slow. A
+# full pass over the process table takes tens to hundreds of milliseconds; the
+# only ways to run past this are a call that never returns (the system went to
+# sleep in the middle of it, a driver that stopped answering) or a thread that
+# died without saying so. Until now the flag that stops two passes overlapping
+# was only cleared by a pass FINISHING, so one lost pass silenced the monitor —
+# no new game, no unknown-game queue, no exit — for the rest of the session.
+_SNAPSHOT_STUCK_S = 20.0
+# The watchdog ticks every few seconds while the monitor runs. A gap this much
+# longer between two ticks means the whole process was not running: the system
+# slept (or the app was frozen), and whatever was in flight cannot be trusted.
+_RESUME_GAP_S = 30.0
+
 
 def _watchdog_interval_ms() -> int:
     """How often to ask whether the tracked pids are still alive."""
@@ -381,7 +394,7 @@ class ProcessMonitor(QObject):
     # "how should this be tracked" choice. (GameEntry, new_exe_path)
     game_path_changed     = Signal(object, str, object)  # GameEntry, exe_path, alt_ids
     # Worker-thread → GUI-thread hop for the process snapshot (see _poll)
-    _snapshot_ready       = Signal(object)         # dict[ProcessKey, dict]
+    _snapshot_ready       = Signal(object)         # (epoch, dict[ProcessKey, dict])
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -394,6 +407,11 @@ class ProcessMonitor(QObject):
         self._watchdog.setInterval(_watchdog_interval_ms())
         self._watchdog.timeout.connect(self._tracked_watchdog)
         self._snapshot_in_flight = False
+        # (when the snapshot in flight began, and which one it is: an answer from
+        # one that was given up on is ignored, see _poll)
+        self._snapshot_started = 0.0
+        self._snapshot_epoch = 0
+        self._watchdog_last = time.time()
         self._snapshot_ready.connect(self._on_snapshot_ready)
         # Process→entry matching caches (see _find_entry): library lookups
         # built once per library change, per-process answers memoized.
@@ -1304,6 +1322,7 @@ class ProcessMonitor(QObject):
         interval = 500  # Start with 500ms for fast detection
         self._timer.start(interval)
         self._watchdog.setInterval(_watchdog_interval_ms())
+        self._watchdog_last = time.time()       # (a monitor started late is not a resume)
         self._watchdog.start()
         self._active = True
         logger.info(f"Process monitor started ({interval}ms interval with adaptive polling)")
@@ -1399,6 +1418,10 @@ class ProcessMonitor(QObject):
         """
         if not (self._active and PSUTIL_AVAILABLE):
             return
+        # Before the early return below: it is exactly when nothing is tracked
+        # (nobody is playing, the unknown-game watch is all there is) that a
+        # lost poll goes unnoticed.
+        self._check_resume()
         with self._data_lock:
             pids = {key[0] for key in self._tracked}
         if not pids:
@@ -1413,6 +1436,37 @@ class ProcessMonitor(QObject):
                     f"Watchdog: tracked pid {pid} is gone — polling immediately")
                 self.nudge()
                 return
+
+    def _check_resume(self) -> bool:
+        """Notice that the system slept (or the app stood still) since the last
+        tick, and get polling going again. True when it did.
+
+        Everything that was in the air when the clock stopped is suspect: a
+        process snapshot half-made, the timers' own bookkeeping, what the
+        process table looked like. The snapshot is given up on (its late answer
+        is ignored) and a fresh poll is asked for at once, instead of waiting
+        out an interval and a stuck-snapshot timeout.
+        """
+        now = time.time()
+        gap = now - self._watchdog_last
+        self._watchdog_last = now
+        expected = self._watchdog.interval() / 1000.0
+        if gap <= max(_RESUME_GAP_S, expected * 6):
+            return False
+        logger.info(f"Process monitor: no tick for {gap:.0f}s — the system slept, "
+                    "re-arming the poll")
+        self._abandon_snapshot()
+        # The poll timer is restarted rather than trusted: whatever it was
+        # waiting for was measured on a clock that stopped.
+        self._timer.start(self._get_adaptive_interval())
+        self.nudge()
+        return True
+
+    def _abandon_snapshot(self) -> None:
+        """Stop waiting for the snapshot in flight. If it ever answers, the
+        answer is for a world that no longer exists and is dropped."""
+        self._snapshot_epoch += 1
+        self._snapshot_in_flight = False
 
     def nudge(self):
         """Poll on the next event-loop turn, and treat now as fresh activity.
@@ -1461,8 +1515,18 @@ class ProcessMonitor(QObject):
         # on the GUI thread via the queued signal. Overlapping polls are
         # skipped instead of queued.
         if self._snapshot_in_flight:
-            return
+            if time.monotonic() - self._snapshot_started < _SNAPSHOT_STUCK_S:
+                return
+            # Not slow: lost. Without this, one pass that never returned left
+            # every later poll returning here, silently, until the app was
+            # restarted.
+            logger.warning(
+                f"Process snapshot has been running for over "
+                f"{_SNAPSHOT_STUCK_S:.0f}s — giving up on it and polling again")
+            self._abandon_snapshot()
         self._snapshot_in_flight = True
+        self._snapshot_started = time.monotonic()
+        epoch = self._snapshot_epoch
 
         def _bg():
             try:
@@ -1471,19 +1535,27 @@ class ProcessMonitor(QObject):
                 logger.debug(f"Snapshot thread error: {e}")
                 current = {}
             try:
-                self._snapshot_ready.emit(current)
+                self._snapshot_ready.emit((epoch, current))
             except Exception as e:
                 # If emit itself fails (e.g. the QObject was already torn
                 # down mid-shutdown), _on_snapshot_ready never runs and
                 # _snapshot_in_flight would otherwise never be reset —
                 # every later poll would then silently no-op forever.
                 logger.debug(f"Snapshot emit failed: {e}")
-                self._snapshot_in_flight = False
+                if epoch == self._snapshot_epoch:
+                    self._snapshot_in_flight = False
 
         threading.Thread(target=_bg, daemon=True,
                          name="monitor-snapshot").start()
 
-    def _on_snapshot_ready(self, current: dict):
+    def _on_snapshot_ready(self, payload):
+        epoch, current = payload
+        if epoch != self._snapshot_epoch:
+            # Answered after it was given up on: a newer pass is (or was) the
+            # real one, and this describes the process table of before the
+            # sleep. Its flag is not ours to clear either.
+            logger.debug("Process snapshot answered late — ignored")
+            return
         self._snapshot_in_flight = False
         if not self._active:
             return

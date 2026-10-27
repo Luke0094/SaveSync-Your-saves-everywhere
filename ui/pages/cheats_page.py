@@ -185,6 +185,9 @@ def _save_files(entry) -> list:
                 if child.is_dir():
                     if child.name.lower() in skip_dirs:
                         continue
+                    from core.skip_dirs import is_renpy_sync_mirror
+                    if child.name.lower() == "sync" and is_renpy_sync_mirror(child):
+                        continue
                     walk(child, depth + 1, budget, found)
                 elif child.is_file():
                     # Same noise rules as backup: .log / .cache / stem "log", …

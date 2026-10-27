@@ -579,15 +579,6 @@ class SettingsPage(PageScrollMixin, QWidget):
         beh_form = QFormLayout(beh_grp)
         beh_form.setSpacing(14)
 
-        # Shown to whoever's on the other end of a P2P save transfer
-        # ("User X wants to send you save.zip") — otherwise a receiver has
-        # nothing but a machine id to tell one sender from another.
-        self._p2p_username_edit = QLineEdit()
-        self._p2p_username_edit.setPlaceholderText(t("settings.p2p_username_placeholder"))
-        self._p2p_username_edit.setToolTip(t("settings.p2p_username_tooltip"))
-        self._p2p_username_lbl = QLabel(t("settings.p2p_username"))
-        beh_form.addRow(self._p2p_username_lbl, self._p2p_username_edit)
-
         self._startup_cb = WrappedCheckBox(t("settings.launch_on_startup"), t("settings.launch_on_startup_tooltip"))
         self._startup_cb.toggled.connect(self._on_startup_change)
         beh_form.addRow(self._startup_cb)
@@ -781,6 +772,16 @@ class SettingsPage(PageScrollMixin, QWidget):
                               f"font-size:{scaled(11, self)}px;letter-spacing:1px;padding-top:{scaled(6, self)}px;")
             self._p2p_caps.append((key, lbl))
             return lbl
+
+        # Who the other end sees you as - on a save sent by hand ("User X wants to send you
+        # save.zip"), a file, a friend request: otherwise a receiver has nothing but a machine id
+        # to tell one sender from another. It lives with the rest of P2P, first, since it is the
+        # one thing that applies to all of it.
+        self._p2p_username_edit = QLineEdit()
+        self._p2p_username_edit.setPlaceholderText(t("settings.p2p_username_placeholder"))
+        self._p2p_username_edit.setToolTip(t("settings.p2p_username_tooltip"))
+        self._p2p_username_lbl = QLabel(t("settings.p2p_username"))
+        p2p_form.addRow(self._p2p_username_lbl, self._p2p_username_edit)
 
         p2p_form.addRow(caption("settings.p2p_group_saves"))
         self._p2p_max_spin = QSpinBox()

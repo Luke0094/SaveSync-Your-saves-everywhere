@@ -192,6 +192,18 @@ _CANCEL_POLL_SECONDS = 5.0
 _CANCEL_SETTLE_SECONDS = 10.0
 # Private mode: a "cancel" is written to the stream and the stream closed this much later.
 _PRIVATE_CANCEL_LINGER_SECONDS = 3.0
+# The receiver's word back to the sender when its download is over - "done", and which
+# files it left out (see ReceiveSession.set_file_wanted). Over the open network it is an
+# item of its own in the token's mailbox (a salt of its own: the offer's item must never
+# be overwritten by it, the receiver is still reading that one for a "cancel"); in
+# private mode it goes down the control stream. The sender looks for it this often, and
+# the receiver's side is kept up this long after it is written so that it can be stored.
+_DHT_REPLY_SALT = b"savesync-reply"
+# A file's parts map (what the view shows on hovering its bar) has this many slices at most.
+_MAP_BUCKETS = 64
+_REPLY_POLL_SECONDS = 4.0
+_NOTICE_LINGER_SECONDS = 15.0
+_MAX_NOTICE_FILES = 200
 
 
 class P2pError(Exception):
@@ -739,6 +751,13 @@ def _hidden_flags(lt) -> int:
     return f.disable_dht | f.disable_lsd | f.disable_pex
 
 
+def describe_direct_failure(found_peer: bool) -> tuple:
+    """``(i18n key, params)`` for a direct transfer with nobody connected yet: the other PC has not
+    been found at all, or it has and the connection is still being tried (which of the two is
+    all this PC can tell; a closed port is no reason, the connection is made from both sides)."""
+    return ("p2p.no_connection_found" if found_peer else "p2p.no_connection_not_found"), {}
+
+
 class _Rendezvous:
     """How the two sides find each other when the torrent is announced nowhere.
 
@@ -768,6 +787,16 @@ class _Rendezvous:
     # (measured on this PC: 47 MB/s against 220). So the connection is tried over
     # TCP first, and over uTP once that has had this long and nobody is connected.
     TCP_FIRST_SECONDS = 6.0
+    # libtorrent gives up on a peer that has failed a few times in a row, and asking for it again
+    # (connect_peer) does not bring it back - measured over a path that opens 15 s late: never
+    # connected, however often it was asked, while the one that opened at once did. A connection
+    # through a router is made by both sides sending at the same time for as long as it takes (the
+    # other side may only start once its person has accepted), so a peer that has stayed given up on
+    # for this long is forgotten and tried again.
+    GIVEN_UP_AFTER = 3.0
+    # (forgetting is done by putting its address in the IP filter - which takes it out of every
+    # torrent's peer list - and lifting that again after this long, once libtorrent has acted on it)
+    _FILTER_HOLD = 0.6
     _IMPLIED_PORT = 2          # let the DHT record the port it saw us on (NAT)
     _RECENT_SECONDS = 90.0
 
@@ -795,6 +824,8 @@ class _Rendezvous:
         # (behind a proxy uTP over its UDP channel is the only way there is)
         self._tcp_first = not self._proxied
         self._first_endpoint_at = 0.0
+        self._given_up_since = 0.0      # when every peer was first seen given up on (0: not now)
+        self._filtered_at = 0.0         # when the addresses were put in the IP filter (0: they are not)
         if self._tcp_first:
             self._outgoing_utp(False)
 
@@ -859,6 +890,63 @@ class _Rendezvous:
         if out and not self._first_endpoint_at:
             self._first_endpoint_at = now
         return out
+
+    @staticmethod
+    def _given_up_on(handle) -> bool:
+        """Has libtorrent stopped trying the peers of this torrent - some are known, none is connected
+        or being connected to, and none is a candidate for a new attempt?"""
+        try:
+            st = handle.status()
+            return st.list_peers > 0 and st.num_connections == 0 and st.connect_candidates == 0
+        except Exception:
+            return False
+
+    def revive(self, handles, now: float, lonely: bool) -> None:
+        """Keep the connection attempts going for as long as nobody is connected (see GIVEN_UP_AFTER).
+        Called on every pump with the torrents of the transfer (None entries are skipped)."""
+        handles = [h for h in handles if h is not None]
+        try:
+            if self._filtered_at:
+                if now - self._filtered_at < self._FILTER_HOLD:
+                    return
+                lt = _require_libtorrent()
+                self._ses.set_ip_filter(lt.ip_filter())         # (nothing else here uses the filter)
+                self._filtered_at = self._given_up_since = 0.0
+                if lonely:
+                    for h in handles:
+                        for ep in self.recent(now):
+                            h.connect_peer(ep)
+                return
+            recent = self.recent(now)
+            # (behind a proxy the address seen is the proxy's - the same for both friends and for
+            # the connection to the proxy itself - and uTP over its UDP channel is the only way)
+            if self._proxied or not (lonely and recent and handles
+                                     and all(self._given_up_on(h) for h in handles)):
+                self._given_up_since = 0.0
+                return
+            if not self._given_up_since:
+                self._given_up_since = now
+            if now - self._given_up_since < self.GIVEN_UP_AFTER:
+                return
+            lt = _require_libtorrent()
+            blocked = lt.ip_filter()
+            for ip in {ip for ip, _port in recent}:
+                blocked.add_rule(ip, ip, 1)
+            self._filtered_at = now
+            self._ses.set_ip_filter(blocked)
+        except Exception:
+            logger.debug("P2P: reviving the connection attempts failed", exc_info=True)
+            if self._filtered_at:
+                try:
+                    self._ses.set_ip_filter(_require_libtorrent().ip_filter())     # (never left blocking)
+                except Exception:
+                    pass
+            self._filtered_at = self._given_up_since = 0.0
+
+    @property
+    def found_peer(self) -> bool:
+        """Has the other side's address ever been found at the meeting point?"""
+        return bool(self._first_endpoint_at)
 
     def recent(self, now: float) -> list:
         """Addresses handed out lately (a torrent added afterwards - the second
@@ -1221,6 +1309,21 @@ class ReceiveSession:
         self._cancelled = False
         self._kept: list = []
         self._doomed: list = []
+        # Files of a "file" offer the person unticked while it arrives (targets, see
+        # set_file_wanted); once it is over, the ones that were left out for good
+        # (``missing``: not whole) and the name each target has in the torrent.
+        self._skipped: set = set()
+        self._missing: list = []
+        self._orig_names: dict = {}
+        self._notice_sent = False
+        # The torrent's description, kept when a download finishes with files left
+        # out: it is what resume() takes the transfer up again from.
+        self._info_meta: bytes = b""
+        # Pieces the sender's peer sent that did not match the checksums in the
+        # offer (they are thrown away), and which files they belong to.
+        self._hash_failures = 0
+        self._bad_pieces: set = set()
+        self._piece_ranges: Optional[list] = None
         self._stream: Optional[TorrentStream] = None
         # Folders (relative to the save folder) that this transfer creates, as
         # opposed to ones that were already there — so that moving the files
@@ -1294,10 +1397,11 @@ class ReceiveSession:
                 self._ses.dht_get_mutable_item(self._pub32, _DHT_SALT)
             except Exception:
                 logger.debug("P2P receive: dht_get_mutable_item failed", exc_info=True)
-        elif (self.offer is not None and (self._handle is not None or self._meta_phase)
-                and not self.download_done
-                and not self._release_requested and not self.sender_cancelled
-                and now - self._last_get_at > _CANCEL_POLL_SECONDS):
+        elif (self.offer is not None and not self.sender_cancelled
+                and now - self._last_get_at > _CANCEL_POLL_SECONDS
+                and (((self._handle is not None or self._meta_phase) and not self.download_done
+                      and not self._release_requested)
+                     or self.resumable)):          # (left out files can still be asked for: the sender may close)
             # The offer is taken, but the sender can still call it off: the
             # mailbox is looked at now and then for as long as this runs.
             self._last_get_at = now
@@ -1317,15 +1421,25 @@ class ReceiveSession:
                 except Exception:
                     pass
             self._rv.tick(now, lookup=lonely)
+            self._rv.revive((self._handle, self._meta_handle), now, lonely and self.files_placed)
         for a in self._ses.pop_alerts():
             self._on_alert(a)
         self._advance_tls()
         self._advance_remap()
-        if self.released and self._host is not None:
+        if self.released and self._host is not None and not self.resumable:
             # (private mode: the download is over, whole or called off - nobody has any more
-            # business at this onion address, so it is taken down rather than left up)
+            # business at this onion address, so it is taken down rather than left up; a note
+            # for the sender that has just been written is given a moment to leave first. One
+            # that left files out stays up: they can still be asked for, see resume())
             host, self._host = self._host, None
-            host.close()
+            _close_later(host, _NOTICE_LINGER_SECONDS if self._notice_sent else 0.0)
+
+    def connection_hint(self) -> tuple:
+        """``(i18n key, params)``: why nobody has connected yet, as far as this PC can tell (see
+        describe_direct_failure). Private mode has its own reasons: the key says so."""
+        if self._rv is None:
+            return "p2p.no_connection_tor", {}
+        return describe_direct_failure(self._rv.found_peer)
 
     def _on_alert(self, a) -> None:
         name = type(a).__name__
@@ -1347,6 +1461,15 @@ class ReceiveSession:
             if (self._remap in (_REMAP_NONE, _REMAP_DONE) and self._handle is not None
                     and (self.offer is None or not self.offer.tls or a.handle == self._handle)):
                 self.download_done = True
+        elif name == "hash_failed_alert":
+            # A piece that came from the sender's side did not match the checksum the
+            # offer carries: it is thrown away (nothing wrong is ever written into a file),
+            # and counted so that the person can be told something is off.
+            self._hash_failures += 1
+            try:
+                self._bad_pieces.add(int(a.piece_index))
+            except Exception:
+                pass
         elif name == "file_renamed_alert":
             self._renames_left -= 1
         elif name == "file_rename_failed_alert":
@@ -1607,6 +1730,7 @@ class ReceiveSession:
                     new_dirs.add(sub)
         self.new_dirs = sorted(new_dirs)
         self._plan = list(zip(idxs, targets, sizes))
+        self._orig_names = dict(zip(targets, rels))
         self._renames_left = len(idxs)
         self._remap = _REMAP_RENAMING
         self._remap_started = time.monotonic()
@@ -1620,17 +1744,75 @@ class ReceiveSession:
         self._remap = _REMAP_DONE
 
     def files_complete(self) -> bool:
-        """Every byte of every file of a "file" offer has arrived (bytes per
-        file, not the torrent's own "finished", which is also true while
-        nothing is wanted yet)."""
+        """Every byte of every file of a "file" offer that is still wanted has
+        arrived (bytes per file, not the torrent's own "finished", which is also
+        true while nothing is wanted yet). Files the person unticked do not count."""
         if (self._remap != _REMAP_DONE or not self._plan or self._handle is None
                 or self._release_requested):
             return False
         try:
             done = self._whole_pieces_progress()
-            return all(int(done[i]) >= size for i, _t, size in self._plan)
+            return all(int(done[i]) >= size for i, t, size in self._plan if t not in self._skipped)
         except Exception:
             return False
+
+    # ── Leaving files out ────────────────────────────────────────────────
+
+    @property
+    def skipped(self) -> list:
+        """The files (by the name they are given here) the person has left out of
+        a "file" offer that is still arriving, in torrent order."""
+        if not self._plan:
+            return []
+        return [t for _i, t, _s in self._plan if t in self._skipped]
+
+    @property
+    def missing(self) -> list:
+        """Once a "file" offer is over: the files that were left out and are not
+        here (by the name they are given here). A file left out whose bytes arrived
+        anyway - it shared pieces with a wanted one - is not missing, it is kept."""
+        return list(self._missing)
+
+    def missing_original_names(self) -> list:
+        """``missing`` under the names the sender gave them (what it can tell apart)."""
+        return [self._orig_names.get(t, t) for t in self._missing]
+
+    def set_file_wanted(self, target: str, wanted: bool) -> bool:
+        """Tick or untick one file of a "file" offer while it arrives: the torrent
+        is told to fetch only what is still wanted, so the rest of the transfer
+        goes straight to the files that are missing, and its percentage counts
+        them alone. False when that cannot be done: the files are not in place yet,
+        the download is over, the file is whole already (nothing would be saved), or
+        it is the last one wanted (leaving everything out is cancelling - a
+        decision of its own)."""
+        if (self._remap != _REMAP_DONE or not self._plan or self._handle is None
+                or self._release_requested or self._cancelled or self.download_done):
+            return False
+        entry = next(((i, s) for i, t, s in self._plan if t == target), None)
+        if entry is None:
+            return False
+        index, size = entry
+        skipped = set(self._skipped)
+        if wanted:
+            skipped.discard(target)
+        else:
+            try:
+                if int(self._whole_pieces_progress()[index]) >= size:
+                    return False
+            except Exception:
+                return False
+            skipped.add(target)
+            if all(t in skipped for _i, t, _s in self._plan):
+                return False
+        n = self._handle.torrent_file().files().num_files()
+        keep = {i for i, t, _s in self._plan if t not in skipped}
+        try:
+            self._handle.prioritize_files([_WANTED if i in keep else 0 for i in range(n)])
+        except Exception:
+            logger.debug("P2P receive: changing what is wanted failed", exc_info=True)
+            return False
+        self._skipped = skipped
+        return True
 
     def _whole_pieces_progress(self) -> list:
         """Bytes of each file that are in AND checked - counted by whole pieces. The
@@ -1660,11 +1842,122 @@ class ReceiveSession:
             self._root_name = self._handle.status().name      # finalize() needs it
         except Exception:
             logger.debug("P2P receive: torrent name unavailable", exc_info=True)
+        if self._skipped and self._plan and not self._cancelled:
+            # Found out now, while the torrent can still be asked: a file left out
+            # whose bytes all came anyway (they shared pieces with a wanted one) is
+            # whole and stays; any other is half a file - sparse, its size looks
+            # right - and must not be left in the person's folder (finalize_files).
+            try:
+                done = self._whole_pieces_progress()
+                self._missing = [t for i, t, s in self._plan if t in self._skipped and int(done[i]) < s]
+            except Exception:
+                self._missing = [t for _i, t, _s in self._plan if t in self._skipped]
+            if self._save_dir is not None:
+                self._doomed = [self._save_dir / t for t in self._missing]
+            if self._missing:
+                # (what resume() starts again from, if the person wants those files after all)
+                try:
+                    self._info_meta = bytes(self._handle.torrent_file().metadata())
+                except Exception:
+                    self._info_meta = b""
+            self._send_done_notice()
         try:
-            self._ses.remove_torrent(self._handle)
+            lt = _require_libtorrent()
+            # A file skipped before it began leaves its edge pieces in a hidden part file
+            # beside the person's files: it goes with the torrent.
+            flag = int(getattr(lt.session, "delete_partfile", 0)) if self._plan else 0
+            if flag:
+                self._ses.remove_torrent(self._handle, flag)
+            else:
+                self._ses.remove_torrent(self._handle)
         except Exception:
             logger.debug("P2P receive: remove_torrent failed", exc_info=True)
             self.released = True            # nothing to wait for
+
+    def _send_done_notice(self) -> None:
+        """Tell the sender the download is over and which files were left out, so that
+        its window can say so instead of waiting for bytes that will never be asked
+        for (it cannot tell this from a receiver that went away). Only sent when
+        something was left out: a whole transfer is seen by the sender as it is."""
+        if self._notice_sent or not self._missing:
+            return
+        payload = _done_notice(self.missing_original_names(), limit=0 if self._host is not None else _MAX_OFFER_BYTES)
+        self._notice_sent = self._post_notice(payload)
+
+    def _post_notice(self, payload: bytes) -> bool:
+        """Put a note for the sender where it looks for one: down the control stream in
+        private mode, else into the token's mailbox under the reply salt. True if it was
+        handed over (not that it arrived)."""
+        try:
+            blob = _secret.seal(self._seed32, payload)
+            if self._host is not None:
+                self._host.send(blob, sticky=True)
+            else:
+                _pub, sk64 = _expanded_keys(self._seed32)
+                self._ses.dht_put_mutable_item(sk64, self._pub32, blob, _DHT_REPLY_SALT)
+            return True
+        except Exception:
+            logger.debug("P2P receive: writing a note for the sender failed", exc_info=True)
+            return False
+
+    # ── Taking a finished transfer up again ──────────────────────────────
+
+    @property
+    def resumable(self) -> bool:
+        """A "file" offer finished with files left out, and the sender can still be asked
+        for them: the session (its onion service, its meeting point) is kept and the
+        description is here. Wanting one of those files again is resume()."""
+        return bool(self._missing and self._info_meta and self._plan and self._save_dir is not None
+                    and not self._cancelled and not self._closed)
+
+    def resume(self, targets) -> bool:
+        """The person wants some of the files left out after all: put the torrent back (from
+        the kept description, the files already here named as they are, so what is whole is
+        recognised and only the rest is fetched), and let the sender know it can go on -
+        it is still there, offering. *targets* are names as ``missing`` gives them. The
+        files not named stay left out. False when that cannot be done (not released yet,
+        nothing to resume)."""
+        wanted = [t for t in targets if t in self._missing]
+        if not (self.resumable and self.released and wanted):
+            return False
+        lt = _require_libtorrent()
+        try:
+            ti = lt.torrent_info({b"info": lt.bdecode(self._info_meta)})
+            for i, target, _s in self._plan:
+                ti.rename_file(i, target)
+            atp = lt.add_torrent_params()
+            atp.ti = ti
+            atp.save_path = str(self._save_dir)
+            atp.flags |= _hidden_flags(lt) | lt.torrent_flags.default_dont_download
+            handle = self._ses.add_torrent(atp)
+            if self.offer is not None and self.offer.tls and self._leaf is not None:
+                handle.set_ssl_certificate_buffer(self._leaf[0], self._leaf[1], _tls.dh_params_pem())
+        except Exception:
+            logger.debug("P2P receive: taking the transfer up again failed", exc_info=True)
+            return False
+        left = set(self._missing) - set(wanted)
+        n = len(self._plan)
+        keep = {i for i, t, _s in self._plan if t not in left}
+        total_files = ti.files().num_files()
+        handle.prioritize_files([_WANTED if i in keep else 0 for i in range(total_files)])
+        self._handle = handle
+        self._skipped = left
+        self._missing = []
+        self._doomed = []
+        self._release_requested = False
+        self.released = False
+        self.download_done = False
+        self._remap = _REMAP_DONE
+        self._notice_sent = False
+        self._piece_ranges = None
+        self._post_notice(json.dumps({"resume": 1}).encode("utf-8"))
+        if self._rv is not None:
+            for ep in self._rv.recent(time.time()):
+                try:
+                    handle.connect_peer(ep)
+                except Exception:
+                    logger.debug("P2P receive: connect_peer failed", exc_info=True)
+        return n > 0
 
     @property
     def cancelled(self) -> bool:
@@ -1842,8 +2135,15 @@ class ReceiveSession:
         _begin_remap): this only checks that each one is really there, whole."""
         if self._remap != _REMAP_DONE or not self._plan or self._save_dir is None:
             raise P2pError("nothing has been downloaded yet")
+        if self._missing:
+            # What was left out and only partly arrived is not a file: it is removed
+            # (torrent storage is sparse - the half-file has the full size and would
+            # pass for a received one). The folders this made and that are empty go.
+            self.discard_unfinished()
         rels: list = []
         for _i, target, size in self._plan:
+            if target in self._missing:
+                continue
             path = self._save_dir / target
             if size == 0 and not path.exists():
                 # An empty file has no data to write, so nothing creates it.
@@ -1858,6 +2158,50 @@ class ReceiveSession:
                 raise P2pError(f"a received file is incomplete: {target}")
             rels.append(target)
         return self._save_dir, rels
+
+    def file_maps(self, buckets: int = _MAP_BUCKETS) -> dict:
+        """Which parts of each file are here, for the view that opens on hovering a bar:
+        ``{target: bytes}``, one byte (0-255, how much of that slice is in) per slice of
+        the file in torrent order. Pieces do not arrive in order, so the percentage alone
+        hides whether it is the start or a scattering that is there. {} when not known."""
+        if (self._handle is None or self._remap != _REMAP_DONE or not self._plan
+                or self._release_requested):
+            return {}
+        try:
+            lt = _require_libtorrent()
+            ti = self._handle.torrent_file()
+            if self._piece_ranges is None:
+                self._piece_ranges = _file_piece_ranges(ti, [(i, t) for i, t, _s in self._plan])
+            flags = list(self._handle.status(lt.torrent_handle.query_pieces).pieces)
+        except Exception:
+            logger.debug("P2P receive: parts map unavailable", exc_info=True)
+            return {}
+        return {key: _bucket_map(flags, first, last, buckets) for key, first, last in self._piece_ranges}
+
+    def integrity_problem(self) -> Optional[dict]:
+        """None while everything that arrived matched the checksums in the offer. Otherwise
+        ``{"count": pieces thrown away, "files": [names as the sender gave them]}``: the
+        sender's side sent bytes that are not the ones that were offered (a file changed
+        while it was sent, or something sending what was not offered). Nothing wrong is
+        ever written into a file - the offer fixes every file's size and checksum - this is
+        only so that the person can be told why a transfer is not getting anywhere."""
+        if not self._hash_failures:
+            return None
+        names: list = []
+        try:
+            ti = self._handle.torrent_file() if self._handle is not None else None
+            by_index = {i: t for i, t, _s in (self._plan or [])}
+            if ti is not None:
+                for piece in sorted(self._bad_pieces)[:20]:
+                    for sl in ti.map_block(piece, 0, ti.piece_size(piece)):
+                        target = by_index.get(int(sl.file_index))
+                        if target:
+                            name = self._orig_names.get(target, target)
+                            if name not in names:
+                                names.append(name)
+        except Exception:
+            logger.debug("P2P receive: could not name the files of the bad pieces", exc_info=True)
+        return {"count": self._hash_failures, "files": names[:5]}
 
     def file_progress(self) -> Optional[list]:
         """``[(path, size, bytes downloaded)]`` for every file of a "file"
@@ -1920,9 +2264,14 @@ class ReceiveSession:
         except Exception:
             pass
         self._drop_meta()
+        if self._notice_sent and self._host is None and self._ses is not None:
+            # (open network: the note for the sender is an item in the DHT, stored by
+            # the session - which goes with this object unless it is kept for a while)
+            threading.Thread(target=_hold_for, args=(self._ses, _NOTICE_LINGER_SECONDS),
+                             name="p2p-notice-hold", daemon=True).start()
         if self._host is not None:
             try:
-                self._host.close()
+                _close_later(self._host, _NOTICE_LINGER_SECONDS if self._notice_sent else 0.0)
             except Exception:
                 logger.debug("P2P receive: closing the onion service failed", exc_info=True)
 
@@ -1975,6 +2324,28 @@ class SendHandle:
     _contact_by: float = 0.0
     _ready: bool = False
     _bridge_tried: dict = field(default_factory=dict)
+    # What delivery() reads the receiver's progress against: the torrent's own
+    # description, the (path, size, first piece, last piece) of each file, and
+    # every piece any receiver has ever been seen to hold (a bytearray, one byte
+    # a piece) - kept, because a receiver that has everything disconnects, and
+    # nothing is left to ask afterwards.
+    _info: object = None
+    _ranges: Optional[list] = None
+    _have: Optional[bytearray] = None
+
+    # What the receiver said when it finished having left files out (see
+    # ReceiveSession.set_file_wanted): ``{"skipped": [names], "more": n}``; None
+    # while it has said nothing - which is what an older SaveSync always does, so
+    # the figures of delivery() stay the way to tell.
+    receiver_report: Optional[dict] = None
+    _reply_at: float = 0.0
+    _reply_raw: bytes = b""
+    _peer_seen: bool = False
+    # Is a peer still to be reached (see _Rendezvous.revive)? Until one has connected, and again when
+    # the receiver says it is going on (resume): not once the send is over, when nobody is expected.
+    _wants_peer: bool = True
+    _upload_seen: int = 0
+    _upload_mark: int = 0
 
     _BRIDGE_RETRY_SECONDS = 8.0
     _PUT_TRIES = 3
@@ -1983,6 +2354,24 @@ class SendHandle:
     # DHT was ready, or under a DHT that was started again - as one behind a
     # proxy is): it is made again, like one that reached nobody.
     _PUT_SILENCE_SECONDS = 25.0
+
+    def connection_hint(self) -> tuple:
+        """``(i18n key, params)``: why nobody has connected yet, as far as this PC can tell (see
+        describe_direct_failure). Private mode has its own reasons: the key says so."""
+        if self._client is not None or self._rv is None:
+            return "p2p.no_connection_tor", {}
+        return describe_direct_failure(self._rv.found_peer)
+
+    def _take_receiver_note(self, data) -> None:
+        """What the receiver said, decoded: that it finished having left files out (the
+        window then says so and the transfer is over for now), or that it wants some of
+        them after all (``{"resume": 1}``: it is going on again). Anything else is ignored."""
+        report = _read_done_notice(data)
+        if report is not None:
+            self.receiver_report = report
+        elif isinstance(data, dict) and data.get("resume"):
+            self.receiver_report = None
+            self._wants_peer, self._upload_mark = True, self._upload_seen
 
     def _pump_private(self, now: float) -> None:
         """Private mode: read what the receiver says, tell when the offer has gone, and
@@ -1995,6 +2384,7 @@ class SendHandle:
                 continue
             if isinstance(data, dict) and data.get("ready"):
                 self._ready = True
+            self._take_receiver_note(data)
         if self.put_confirmed is None:
             if client.connected_at:
                 self.put_confirmed = True       # (the offer is sent first on every control stream)
@@ -2042,11 +2432,39 @@ class SendHandle:
         if rv is not None:
             lonely = False
             try:
-                lonely = self._handle.status().num_peers == 0
+                st = self._handle.status()
+                lonely = st.num_peers == 0
+                self._peer_seen = self._peer_seen or not lonely or st.all_time_upload > 0
+                self._upload_seen = st.all_time_upload
+                if not lonely or st.all_time_upload > self._upload_mark:
+                    self._wants_peer = False
             except Exception:
                 pass
             rv.tick(time.time(), lookup=lonely)
+            rv.revive((self._handle, self._meta_handle), time.time(), lonely and self._wants_peer)
+        if (self._peer_seen and self._notice is not None
+                and now - self._reply_at > _REPLY_POLL_SECONDS):
+            # Somebody has been connected: it may finish having left files out, and
+            # then says so in an item of its own (see ReceiveSession._send_done_notice) -
+            # and, later, that it wants some of them after all. Kept up for as long as
+            # this send is, since it can happen at any time.
+            self._reply_at = now
+            try:
+                self._session.dht_get_mutable_item(self._notice[2], _DHT_REPLY_SALT)
+            except Exception:
+                logger.debug("P2P send: looking for the receiver's note failed", exc_info=True)
         for a in self._session.pop_alerts():
+            if type(a).__name__ == "dht_mutable_item_alert":
+                salt = getattr(a, "salt", b"")
+                salt = salt.encode("utf-8") if isinstance(salt, str) else bytes(salt or b"")
+                raw = bytes(getattr(a, "item", b"") or b"")
+                if salt == _DHT_REPLY_SALT and raw and raw != self._reply_raw:
+                    try:
+                        data = json.loads(_secret.open_sealed(self._notice[0], raw).decode("utf-8"))
+                    except Exception:
+                        continue        # (not ours, or not readable: nothing to learn from it)
+                    self._reply_raw = raw
+                    self._take_receiver_note(data)
             if type(a).__name__ == "dht_put_alert" and self.put_confirmed is None:
                 if getattr(a, "num_success", 0) > 0:
                     self.put_confirmed = True
@@ -2081,6 +2499,88 @@ class SendHandle:
             "upload_rate": st.upload_rate,
             "all_time_upload": st.all_time_upload,
         }
+
+    def delivery(self) -> Optional[dict]:
+        """How much of the offer the receiver HAS, file by file, or None before
+        anything can be said.
+
+        A sender that is seeding has every piece, so its own progress says
+        nothing. What matters is what the receiver holds, and it tells every
+        peer: the pieces it has completed and checked. Read here, mapped onto
+        the files they belong to, and remembered (see ``_have``).
+
+        ``{"total": bytes offered, "have": bytes the receiver holds, "done":
+        every piece is there, "files": [(relative path, size, bytes held)]}``.
+        Figures are by whole pieces, so a file smaller than one reads 0 or all.
+        The torrent can hold more than the person picked (a backup travels with
+        its description): the caller picks its own files out by path.
+        """
+        info = self._info
+        if self._stopped or info is None:
+            return None
+        n = info.num_pieces()
+        if self._have is None:
+            self._have = bytearray(n)
+            layout = info.files()
+            ranges = []
+            for i in range(layout.num_files()):
+                size = layout.file_size(i)
+                path = layout.file_path(i).replace("\\", "/")
+                rel = path.split("/", 1)[1] if "/" in path else path
+                first = info.map_file(i, 0, 0).piece
+                last = info.map_file(i, size - 1, 0).piece if size > 0 else first
+                ranges.append((rel, size, first, last))
+            self._ranges = ranges
+        try:
+            peers = self._handle.get_peer_info()
+        except Exception:
+            peers = []
+        for peer in peers:
+            try:
+                for i, has in enumerate(peer.pieces):
+                    if has and i < n:
+                        self._have[i] = 1
+            except Exception:
+                continue
+        held = sum(self._have)
+        if held < n and not peers:
+            # A receiver that has everything stops being a peer: two seeds have
+            # nothing to say to each other and the connection closes, usually
+            # before its last pieces were ever reported. So with nobody
+            # connected, everything having gone out at least once is how
+            # "done" is told - the same measure the send window always used.
+            try:
+                uploaded = self._handle.status().all_time_upload
+            except Exception:
+                uploaded = 0
+            if uploaded >= info.total_size():
+                self._have[:] = b"\x01" * n
+                held = n
+        report = self.receiver_report
+        if not held and not peers and report is None:
+            return None
+        prefix = [0]
+        for flag in self._have:
+            prefix.append(prefix[-1] + flag)
+        files, have_total, total = [], 0, 0
+        for rel, size, first, last in self._ranges or []:
+            span = last - first + 1
+            have = int(size * (prefix[last + 1] - prefix[first]) / span) if size > 0 else 0
+            files.append((rel, size, have))
+            have_total += have
+            total += size
+        result = {"total": total, "have": have_total, "done": held >= n, "files": files,
+                  # (what the view shows on hovering a file's bar: which parts of it are in)
+                  "maps": {rel: _bucket_map(self._have, first, last)
+                           for rel, size, first, last in self._ranges or [] if size > 0}}
+        if report is not None:
+            # The receiver has finished, having left some files out (and said so):
+            # that is as much as it will ever take, so this is done - "skipped" says
+            # what it did not, for the window to show.
+            result["done"] = True
+            result["skipped"] = list(report["skipped"])
+            result["more"] = int(report["more"])
+        return result
 
     def cancel(self) -> None:
         """The person called this send off: say so in the receiver's mailbox - a
@@ -2144,8 +2644,14 @@ class SendHandle:
                          name="p2p-send-cleanup", daemon=True).start()
 
 
+def _hold_for(thing, seconds: float) -> None:
+    """Keep a reference to *thing* (a libtorrent session) for *seconds*, so that it is not
+    shut down before what it was asked to store has been."""
+    time.sleep(seconds)
+
+
 def _close_later(client, delay: float) -> None:
-    """Close a private-mode client (core.p2p.tor_link.Client) after *delay* seconds."""
+    """Close a private-mode client or host (core.p2p.tor_link) after *delay* seconds."""
     if delay <= 0:
         client.close()
         return
@@ -2513,6 +3019,64 @@ def _fit_offer(fields: dict, magnet: str) -> bytes:
         fields[longest] = fields[longest][:max(0, len(fields[longest]) // 2)]
 
 
+def _file_piece_ranges(ti, items) -> list:
+    """``[(key, first piece, last piece)]`` for the files of a torrent. *items* is
+    ``[(index in the torrent, key)]``."""
+    layout = ti.files()
+    out = []
+    for index, key in items:
+        size = layout.file_size(index)
+        first = ti.map_file(index, 0, 0).piece
+        last = ti.map_file(index, size - 1, 0).piece if size > 0 else first
+        out.append((key, int(first), int(last)))
+    return out
+
+
+def _bucket_map(flags, first: int, last: int, buckets: int = _MAP_BUCKETS) -> bytes:
+    """How much of the pieces first..last is in, as at most *buckets* slices of 0-255.
+    *flags* has one truthy entry per piece that is here."""
+    span = last - first + 1
+    if span <= 0:
+        return b""
+    n = min(buckets, span)
+    out = bytearray(n)
+    for b in range(n):
+        lo = first + (b * span) // n
+        hi = max(first + ((b + 1) * span) // n, lo + 1)
+        have = sum(1 for i in range(lo, min(hi, len(flags))) if flags[i])
+        out[b] = (255 * have) // (hi - lo)
+    return bytes(out)
+
+
+def _done_notice(names: list, limit: int = 0) -> bytes:
+    """The receiver's "I am done, and left these out" note: ``{"done": 1, "skipped": [names],
+    "more": how many names did not fit}``. Names are free text, and an item in the DHT is
+    capped (*limit* bytes; 0 = no cap but _MAX_NOTICE_FILES names), so the list is cut from
+    the end until it fits and the sender is told how many it is short."""
+    keep = [str(n).encode("utf-8", "replace").decode("utf-8")[:160] for n in names[:_MAX_NOTICE_FILES]]
+    while True:
+        payload = json.dumps({"done": 1, "skipped": keep, "more": len(names) - len(keep)},
+                             ensure_ascii=False).encode("utf-8")
+        if not limit or len(payload) <= limit or not keep:
+            return payload
+        keep.pop()
+
+
+def _read_done_notice(data) -> Optional[dict]:
+    """What a decoded note from the receiver says, if it is the "done" one:
+    ``{"skipped": [names], "more": n}``; None for anything else (nothing it sends is
+    trusted for more than being text to show)."""
+    if not isinstance(data, dict) or not data.get("done"):
+        return None
+    names = data.get("skipped")
+    names = [str(n)[:160] for n in names[:_MAX_NOTICE_FILES]] if isinstance(names, list) else []
+    try:
+        more = max(0, int(data.get("more") or 0))
+    except (TypeError, ValueError):
+        more = 0
+    return {"skipped": names, "more": more}
+
+
 def _seed_meta_torrent(lt, ses, seed32: bytes, staging_root: Path, payload: bytes, leaf: tuple):
     """The first torrent of a TLS transfer: one small file, *payload* (the real
     torrent's description), seeded under the same certificate authority. Returns
@@ -2639,7 +3203,7 @@ def _seed_and_offer(token_str: str, staging_root: Path, transfer_dir: Path,
             client.send(sealed, sticky=True)
             done = True
             return SendHandle(_session=ses, _handle=handle, _staging_root=staging_root,
-                              _client=client, _seed32=seed32,
+                              _client=client, _seed32=seed32, _info=info,
                               _contact_by=token_created_at(token_str) + TOKEN_TTL_SECONDS + _TOKEN_SKEW_SECONDS)
         _wait_for_proxy_dht(ses, started)
         ses.dht_put_mutable_item(sk64, pub32, sealed, _DHT_SALT)
@@ -2648,7 +3212,7 @@ def _seed_and_offer(token_str: str, staging_root: Path, transfer_dir: Path,
                           _rv=_Rendezvous(ses, seed32, announce=("tls",) if use_tls else ("plain",),
                                           lookup="tls" if use_tls else "plain"),
                           _put=(sk64, pub32, sealed), _notice=(seed32, sk64, pub32),
-                          _meta_handle=meta_handle)
+                          _meta_handle=meta_handle, _info=info)
     finally:
         if client is not None and not done:
             client.close()

@@ -1641,6 +1641,23 @@ QPushButton#row_play_btn:pressed {
     background: transparent;
 }
 
+/* The version of the exe the game runs from, to the right of the name. */
+#game_card_version {
+    color: #4a4a5c;
+    font-size: 9px;
+    font-weight: 600;
+    background: rgba(0, 0, 0, 0.07);
+    border-radius: 3px;
+}
+
+/* The pages the info box turns through while the pointer is on a card's picture. */
+#game_card_details {
+    color: #3a3a4c;
+    font-size: 10px;
+    background: transparent;
+    padding: 0px;
+}
+
 QPushButton#card_flat_btn, QPushButton#card_flat_btn_lg {
     background: transparent;
     border: none;

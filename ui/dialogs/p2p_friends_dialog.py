@@ -47,15 +47,14 @@ import contextlib
 import logging
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEasingCurve, QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal,
+    QEasingCurve, QEvent, QPoint, Qt, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFontMetrics, QGuiApplication, QKeySequence, QPalette,
+    QColor, QFontMetrics, QGuiApplication, QKeySequence, QPalette,
     QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -74,7 +73,9 @@ from ui.dialogs.p2p_group_pages import PAGE_GROUP, PAGE_MEMBERS, GroupPagesMixin
 from ui.p2p_friends_service import format_remaining
 from ui.styles.theme import ThemedMixin, palette
 from ui.widgets.count_badge import CountBadge
+from ui.widgets.media_fullscreen import ClickablePicture, fit_pixmap
 from ui.widgets.presence_dot import PresenceDot
+from ui.widgets.transfer_bar import style_transfer_bar
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ _LINK_HREF = re.compile(r"^l(\d{1,2})$")
 # A download that has had nothing arrive for this long is said to be stuck (it is not
 # ended - a connection has no time limit - and can be cancelled).
 _IDLE_HINT_SECONDS = 60
+_NO_CONNECTION_HINT_SECONDS = 45
 
 
 def _video_available() -> bool:
@@ -143,6 +145,12 @@ def dropped_paths(mime) -> list:
         if len(out) >= MAX_DROPPED:
             break
     return out
+
+
+def _breakable(path) -> str:
+    """A path a label may break after each of its folders. A line is only broken at a space, a path
+    has few, and one long folder name wider than the page pushed the whole card out of the drawer."""
+    return str(path).replace("\\", "\\\u200b").replace("/", "/\u200b")
 
 
 class _ComposeEdit(QPlainTextEdit):
@@ -272,6 +280,8 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         self._xfer: dict = {}               # attachment id -> (message, status, bar, speed), for live figures
         self._previews: dict = {}           # attachment id -> the picture the person asked to see
         self._videos: dict = {}             # attachment id -> the video player the person opened
+        self._fs_picture = None             # the picture on show full screen, if any
+        self._placed_width = 0              # the width the panel was last laid out at (see _place)
         self._retexts: list = []            # what sets the words of the fixed widgets (see update_locale)
         self._init_groups(open_group)
         self.setObjectName("p2p_friends_panel")
@@ -396,6 +406,11 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
                     max(scaled(self._MIN_WIDTH, self), room - scaled(self._KEEP_VISIBLE, self)))
         x = round(right - width * (1.0 - self._slide))
         self.setGeometry(x, 0, width, self._host.height())
+        if width != self._placed_width:
+            # (the slide only moves x: this is a window made wider or narrower)
+            self._placed_width = width
+            if self._previews or self._videos:
+                self._later(0, self._refit_media)
 
     def eventFilter(self, obj, event):
         etype = event.type()
@@ -822,6 +837,7 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         for box in (self._friends_box, self._msgs_box):
             _clear(box)
         self._msg_labels, self._xfer, self._previews, self._rows = {}, {}, {}, {}
+        self._svc.forget_previews()
         self._msgs_sig, self._list_sig, self._new_ids, self._friend_id = None, None, set(), ""
         self._scrub_groups()
         self._compose.clear()
@@ -938,8 +954,8 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         # but still marked new on the page itself.
         self._new_ids = {m.id for m in self._svc.messages(fid) if not m.read}
         self._msgs_sig = None
-        self._previews = {}
         self._close_videos()
+        self._restore_previews(fid)
         self._compose.clear()
         self._fill_messages(stick=True)
         self._stack.setCurrentIndex(_PAGE_MESSAGES)
@@ -1374,7 +1390,9 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         lay.addWidget(status)
         bar = QProgressBar()
         bar.setRange(0, 100)
-        bar.setFixedHeight(scaled(14, self))
+        # (the application style draws a bar four pixels high with no readable text:
+        # a transfer's percentage is the point of it)
+        style_transfer_bar(bar, 16, fg)
         bar.setVisible(False)
         lay.addWidget(bar)
         speed = QLabel()
@@ -1383,13 +1401,17 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         lay.addWidget(speed)
 
         pixmap = self._previews.get(m.id)
+        if pixmap is not None and not self._preview_still_there(att):
+            self._previews.pop(m.id, None)              # (the file is gone, or is not the one that came)
+            pixmap = None
+        room = self._media_width()
         if pixmap is not None:
-            pic = QLabel()
-            pic.setPixmap(pixmap)
-            pic.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            pic = ClickablePicture(fit_pixmap(pixmap, room))
+            pic.clicked.connect(lambda mid=m.id, att=att: self._fullscreen_picture(mid, att))
             lay.addWidget(pic)
         player = self._videos.get(m.id)
         if player is not None:
+            player.fit_to(room)
             lay.addWidget(player)
             player.show()
 
@@ -1429,6 +1451,19 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
                             play.setToolTip(t("p2p.friends_file_video_tip"))
         elif state in ("offered", "sending"):
             add(t("p2p.friends_file_cancel"), lambda: self._cancel_file(mid))
+        if mine and count == 1:
+            # What I offered can be looked at too, not only what I was sent: the
+            # one picture or video, from where it is on this PC, under the same
+            # checks (Settings, still exactly the size offered, a plain file).
+            where = self._source_path(att)
+            if where is not None and self._media_ok(where, att):
+                if mid not in self._previews and not _a.image_problem(where):
+                    add(t("p2p.friends_file_picture"), lambda: self._show_picture(mid, att))
+                if mid not in self._videos and not _a.video_problem(where) and _video_available():
+                    play = add(t("p2p.friends_file_video"), lambda: self._play_video(mid, att))
+                    play.setToolTip(t("p2p.friends_file_video_tip"))
+        if pixmap is not None:
+            add(t("p2p.friends_fullscreen"), lambda: self._fullscreen_picture(mid, att))
         buttons.addStretch(1)
         lay.addLayout(buttons)
 
@@ -1469,7 +1504,8 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         if info and info.get("preparing"):      # (theirs: the sender said they are working on it)
             return t("p2p.friends_file_in_preparing", name=name)
         key = f"p2p.friends_file_{side}_{state}"
-        text = t(key, name=name, path=att.get("dir", ""), time=format_remaining((info or {}).get("wait", 0)))
+        text = t(key, name=name, path=_breakable(att.get("dir", "")),
+                 time=format_remaining((info or {}).get("wait", 0)))
         if text == key:
             text = ""                       # (a combination that has no words)
         idle = float((info or {}).get("idle", 0) or 0)
@@ -1478,6 +1514,20 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
             text += "\n" + t("p2p.friends_file_idle", name=name, minutes=max(1, int(idle // 60)))
             if (info or {}).get("tls"):
                 text += " " + t("p2p.receive_idle_tls")
+        # Nothing has ever come across: say why that can be, and what to try.
+        never_connected = ((state == "receiving" and idle >= _NO_CONNECTION_HINT_SECONDS
+                            and not (info or {}).get("pct"))
+                           or (state == "sending"
+                               and float((info or {}).get("unconnected", 0) or 0) >= _NO_CONNECTION_HINT_SECONDS))
+        if never_connected:
+            from core.p2p.transfer import tor_enabled
+            hint = (info or {}).get("hint")
+            if tor_enabled():
+                text += "\n" + t("p2p.no_connection_tor")
+            elif isinstance(hint, tuple) and len(hint) == 2:
+                text += "\n" + t(hint[0], **hint[1])      # (which of the things that can be wrong it is)
+            else:
+                text += "\n" + t("p2p.no_connection_direct")
         if state in ("failed", "offered", "cancelled") and why:
             extra_key = f"p2p.friends_file_why_{why}"
             extra = t(extra_key, name=name, count=len(att.get("files") or []))
@@ -1506,11 +1556,32 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
             from core.p2p.transfer import format_rate
             mbs, mbps = format_rate(info.get("rate", 0))
             speed.setText(mbs)
-            speed.setToolTip(mbps)
             speed.setVisible(True)
+            # Megabits (as the line is quoted) on whichever figure the pointer
+            # rests on, not only on the small speed text.
+            for w in (speed, bar, status):
+                w.setToolTip(mbps)
         else:
             bar.setVisible(False)
             speed.setVisible(False)
+
+    @staticmethod
+    def _source_path(att) -> "Path | None":
+        """Where the one picture or video I offered is on this PC, if it is
+        still there as a plain file (a link, or something else now, is not)."""
+        src = att.get("src") if isinstance(att, dict) else ""
+        if not src:
+            return None
+        try:
+            path = Path(src)
+            return path if path.is_file() and not path.is_symlink() else None
+        except (OSError, ValueError):
+            return None
+
+    def _preview_path(self, att) -> "Path | None":
+        """The file a preview or a player is shown for: the received copy, or
+        for an offer of mine the file I offered."""
+        return self._saved_path(att) or self._source_path(att)
 
     def _saved_path(self, att) -> "Path | None":
         """The first received file of an attachment, if it is still there and
@@ -1571,19 +1642,32 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
         if self._friend_id == fid:
             self._fill_messages()
 
+    def _saved_top(self, att) -> "Path | None":
+        """What an attachment arrived as, for "Show in folder": the file itself, or - for a folder
+        or several files in one - the top folder it came in, not the deepest one the first file
+        happens to be in. None when it is gone or is not inside the folder it was saved to."""
+        folder, files = att.get("dir"), att.get("files") or []
+        if not folder or not files:
+            return None
+        try:
+            base = Path(folder).resolve()
+            parts = Path(files[0]).parts
+            if not parts:
+                return None
+            top = (base / parts[0]).resolve()
+            top.relative_to(base)
+            return top if top.exists() else None
+        except (OSError, ValueError):
+            return None
+
     def _show_in_folder(self, att):
-        """Open the folder a received file is in, with the file selected. The
-        file itself is never opened or run from here."""
-        path = self._saved_path(att)
+        """Open the folder a received file is in, with the file (or the folder it came in)
+        selected. The file itself is never opened or run from here."""
+        path = self._saved_top(att) or self._saved_path(att)
         if path is None:
             return
-        try:
-            if os.name == "nt":
-                subprocess.Popen(["explorer", f"/select,{path}"])
-            else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
-        except OSError:
-            logger.debug("P2P friends: could not show a received file", exc_info=True)
+        from ui.helpers import reveal_in_file_manager
+        reveal_in_file_manager(path)
 
     def _media_ok(self, path, att) -> bool:
         """May this received file be shown or played here: Settings allow it, and
@@ -1599,7 +1683,7 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
     def _play_video(self, mid: str, att):
         """The person pressed Play video: one player, for this one file, under
         the rules in ui.widgets.safe_video."""
-        path = self._saved_path(att)
+        path = self._preview_path(att)
         if path is None or not self._media_ok(path, att) or _a.video_problem(path):
             self._say(t("p2p.friends_video_failed"), warn=True)
             return
@@ -1652,14 +1736,92 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
             player.close_player()
 
     def _close_videos(self):
+        # (a picture on show full screen is let go of at the same moments: the list locking, another
+        # friend's page, the panel going - it shows what was in the chat)
+        self._close_fullscreen_picture()
         for mid in list(self._videos):
             self._close_video(mid)
+
+    def _media_width(self) -> int:
+        """The room a picture or a video has on a card: the page's width less the scroll bar (always
+        counted, so that it appearing does not push the picture out) and the card's own margins,
+        and never more than a card is allowed to be."""
+        view = self._msgs_scroll.viewport().width()
+        by_panel = self.width() - 31                    # (the panel's own margins and edge)
+        if view <= 0 or view > by_panel:                # (not laid out yet: what the panel itself says)
+            view = by_panel
+        bar = self._msgs_scroll.verticalScrollBar().sizeHint().width() or scaled(14, self)
+        card = min(view - bar - 4, scaled(440, self))
+        return max(scaled(100, self), card - 20)
+
+    def _refit_media(self):
+        """The panel's width changed: the pictures and players are made to the new room."""
+        if self._friend_id and self._stack.currentIndex() == _PAGE_MESSAGES and not self._svc.locked:
+            self._msgs_sig = None
+            self._fill_messages()
+
+    def _fullscreen_picture(self, mid: str, att):
+        """The person asked for this picture full screen: decoded again at the size of the screen,
+        under the same limits as the preview."""
+        path = self._preview_path(att)
+        if path is not None and not self._media_ok(path, att):
+            path = None
+        self._close_fullscreen_picture()
+        win = None
+        if path is not None:
+            from ui.widgets.media_fullscreen import open_picture_fullscreen
+            win = open_picture_fullscreen(path, self)
+        if win is None:
+            self._say(t("p2p.friends_file_picture_failed"), warn=True)
+            return
+        self._fs_picture = win
+        win.closed.connect(lambda w=win: self._fullscreen_closed(w))
+
+    def _fullscreen_closed(self, win):
+        if self._fs_picture is win:
+            self._fs_picture = None
+
+    def _close_fullscreen_picture(self):
+        win, self._fs_picture = self._fs_picture, None
+        if win is not None:
+            try:
+                win.close()
+            except RuntimeError:
+                pass                    # (already gone)
+
+    def _preview_still_there(self, att) -> bool:
+        """Is the file a picture was opened for still where it was, and the one it was? (A
+        preview stays for as long as it is: through the end of the transfer, and when the chat is
+        left and come back to.)"""
+        path = self._preview_path(att)
+        return path is not None and self._media_ok(path, att)
+
+    def _restore_previews(self, fid: str):
+        """The pictures that were opened in this chat are opened again (decoded again, under the same
+        limits), the ones whose file is still where it was; the latest few."""
+        self._previews = {}
+        wanted = self._svc.previewed()
+        if not wanted:
+            return
+        from ui.widgets.safe_image import load_preview
+        for m in reversed(list(self._svc.messages(fid))):
+            if len(self._previews) >= 12:
+                break
+            if m.kind != "file" or m.id not in wanted:
+                continue
+            att = m.attachment or {}
+            path = self._preview_path(att)
+            if path is None or not self._media_ok(path, att):
+                continue
+            pixmap = load_preview(path)
+            if pixmap is not None:
+                self._previews[m.id] = pixmap
 
     def _show_picture(self, mid: str, att):
         """The person asked to see this picture: decode it (and only it) under
         the limits of ui.widgets.safe_image."""
         from ui.widgets.safe_image import load_preview
-        path = self._saved_path(att)
+        path = self._preview_path(att)
         if path is not None and not self._media_ok(path, att):
             path = None
         pixmap = load_preview(path) if path is not None else None
@@ -1667,6 +1829,7 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
             self._say(t("p2p.friends_file_picture_failed"), warn=True)
             return
         self._previews[mid] = pixmap
+        self._svc.note_preview(mid)
         self._msgs_sig = None
         self._fill_messages()
 
@@ -1681,10 +1844,10 @@ class P2pFriendsPanel(GroupPagesMixin, QFrame, ThemedMixin):
             if not self._svc.can_offer(fid):
                 self._say(t("p2p.friends_compose_full", name=f.display), warn=True)
                 return
-            from ui.widgets.file_pickers import pick_file_or_folder
-            path = pick_file_or_folder(self, t("p2p.friends_attach_pick"))
-            if path:
-                self._offer_paths([path], fid)
+            from ui.dialogs.p2p_add_files_dialog import pick_paths
+            paths = pick_paths(self, t("p2p.friends_attach_pick"))
+            if paths:
+                self._offer_paths(paths, fid)
 
     # ── Dropping files ───────────────────────────────────────────────────
 

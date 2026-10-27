@@ -4,6 +4,7 @@ NVIDIA App-inspired sidebar with Overview, Library, Sync, Backups, Settings.
 """
 import logging
 import platform
+import re
 import sys
 import threading
 import time
@@ -232,6 +233,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     # surfaced in the sidebar like Backup/Sync Tutti instead of blocking.
     self_check_progress = Signal(str, int, int)  # check_id, index, total
     self_check_done = Signal()
+    _data_guard_done = Signal(list)     # the unpacked program files a look found gone
     # Launcher URL → exe fuzzy search finished off the GUI thread.
     launcher_exe_resolved = Signal(str, str, str)  # game_id, url, exe_path ("" if none)
     # GitHub Releases check finished off the GUI thread.
@@ -493,6 +495,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._regression_rearm: dict[str, bool] = {}
         self._setup_backup_verify()
         self._setup_auto_export_config()
+        self._setup_data_guard()
         self._setup_update_check()
         self._setup_startup_self_checks()
         self._setup_p2p_friends()
@@ -905,6 +908,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # (every show: out of the tray, back from minimised. The first one, right after start-up,
+        # is too soon after the start-up's own look for a request to be answered)
+        from ui import data_guard
+        data_guard.request("shown")
         if hasattr(self, "_stage2_idle_threads_timer"):
             self._stage2_idle_threads_timer.stop()
         if getattr(self, "_overview_page", None) is not None and getattr(self, "_current_page_index", 0) == 0:
@@ -1923,6 +1930,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             svc.attachment_event.connect(svc.friends.on_attachment_event)
             self._p2p_receive_svc = svc
             self._p2p_panel_open = False
+            # A download goes on with the panel closed: the sidebar shows it (and only
+            # its overall percentage); clicking the entry opens the same page again.
+            svc.changed.connect(self._refresh_p2p_receive_shelf)
         return svc
 
     def _open_p2p_receive_dialog(self):
@@ -1931,10 +1941,123 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.dialogs.p2p_receive_dialog import P2pReceiveDialog
         svc = self._p2p_service()
         self._p2p_panel_open = True
+        self._refresh_p2p_receive_shelf()           # (it is on screen: not in the sidebar)
         try:
             P2pReceiveDialog(svc, self).exec()
         finally:
             self._p2p_panel_open = False
+            self._refresh_p2p_receive_shelf()
+
+    def _open_p2p_receive_with_window(self):
+        """Open the page on the person's say-so (a notification's button): the window comes
+        up if it was away, since they asked for it."""
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        self._open_p2p_receive_dialog()
+
+    def _refresh_p2p_receive_shelf(self):
+        """One sidebar entry for the download that is under way (or over with files that can
+        still be asked for) while the panel is closed; none otherwise."""
+        svc = getattr(self, "_p2p_receive_svc", None)
+        if svc is None:
+            return
+        shelf = getattr(self, "_p2p_receive_shelf", None)
+        if shelf is None:
+            from ui.p2p_receive_shelf import P2pReceiveShelf
+            shelf = self._p2p_receive_shelf = P2pReceiveShelf(svc)
+        entry = self._shelved_entry_for(shelf)
+        show = shelf.wanted() and not getattr(self, "_p2p_panel_open", False)
+        if not show:
+            if entry is not None:
+                self._drop_shelf_entry(entry)
+                self._shelved_add_entries = [e for e in self._shelved_add_entries if e is not entry]
+                self._shelved_adds_host.setVisible(bool(self._shelved_add_entries))
+            return
+        try:
+            if entry is None:
+                btn = NavButton(shelf.shelve_nav_label(), "📥")
+                btn.clicked.connect(lambda _=False: self._open_p2p_receive_dialog())
+                self._shelved_adds_layout.addWidget(btn)
+                entry = {"dlg": shelf, "btn": btn, "kind": "p2p_receive"}
+                self._shelved_add_entries.append(entry)
+                self._attach_shelf_cancel(entry, shelf)
+                self._shelved_adds_host.setVisible(True)
+            btn = entry["btn"]
+            # (blinking while it is moving - or while it waits for the person's yes or no)
+            btn.set_status("running" if shelf.shelve_working() or shelf.shelve_attention() else "done")
+            btn.update_label(shelf.shelve_nav_label())
+            btn.setToolTip(shelf.shelve_nav_tooltip())
+            done, total, _name = shelf.shelve_progress()
+            btn.set_progress(done, total)
+            self._tick_shelf_cancel(entry, shelf.has_shelvable_work())
+        except RuntimeError:
+            pass
+
+    # ── Sending by hand ──────────────────────────────────────────────────
+    #
+    # The send window is not modal for good: ✕ puts it away in the sidebar (one
+    # entry each, with its own progress and Cancel) and the transfer goes on
+    # while the person gets on with other things. It follows the pattern of the
+    # other put-away windows (see _on_manual_path_shelved).
+
+    def _open_p2p_send_dialog(self, entry=None, **kwargs):
+        """Open the send window for *entry* (a backup), or for hand-picked files
+        (``files``, ``label``, ``folder_name``, ``token``, ``auto_start``: see
+        P2pSendDialog). Returns it."""
+        from ui.dialogs.p2p_send_dialog import P2pSendDialog
+        dlg = P2pSendDialog(entry, self, **kwargs)
+        dlg.shelved.connect(lambda d=dlg: self._on_p2p_send_shelved(d))
+        dlg.shelve_status.connect(lambda d=dlg: self._refresh_p2p_send_shelf(d))
+        dlg.finished.connect(lambda _r, d=dlg: self._on_p2p_send_finished(d))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        return dlg
+
+    def _refresh_p2p_send_shelf(self, dlg):
+        entry = self._shelved_entry_for(dlg)
+        if entry is None or entry.get("btn") is None:
+            return                      # (still on screen: nothing to keep up to date)
+        try:
+            # (a send that is waiting for the other PC to ask for more is not "running")
+            working = getattr(dlg, "shelve_working", dlg.has_shelvable_work)()
+            btn = entry["btn"]
+            btn.set_status("running" if working else "done")
+            btn.update_label(dlg.shelve_nav_label())
+            btn.setToolTip(dlg.shelve_nav_tooltip())
+            done, total, _name = dlg.shelve_progress()
+            btn.set_progress(done, total)
+            # (the way to end it stays while it only waits for the other PC to ask for more)
+            self._tick_shelf_cancel(entry, dlg.has_shelvable_work())
+        except RuntimeError:
+            pass
+
+    def _on_p2p_send_shelved(self, dlg):
+        if self._shelved_entry_for(dlg) is None:
+            btn = NavButton(t("p2p.send_shelved_nav"), "📤")
+            btn.clicked.connect(lambda _=False, d=dlg: d.unshelve())
+            self._shelved_adds_layout.addWidget(btn)
+            entry = {"dlg": dlg, "btn": btn, "kind": "p2p_send"}
+            self._shelved_add_entries.append(entry)
+            self._attach_shelf_cancel(entry, dlg)
+            self._shelved_adds_host.setVisible(True)
+        self._refresh_p2p_send_shelf(dlg)
+        QTimer.singleShot(0, lambda d=dlg: self._clear_phantom_add_game_modal(d))
+
+    def _on_p2p_send_finished(self, dlg):
+        keep = []
+        for e in self._shelved_add_entries:
+            if e.get("dlg") is dlg:
+                self._drop_shelf_entry(e)
+            else:
+                keep.append(e)
+        self._shelved_add_entries = keep
+        self._shelved_adds_host.setVisible(bool(keep))
+        dlg.deleteLater()
 
     # ── Friends ──────────────────────────────────────────────────────────
 
@@ -2084,22 +2207,43 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         btn.setToolTip(tip)
 
     def _on_p2p_offer_arrived(self):
-        """A sender used the token while the panel was closed: bring it up."""
+        """A sender used the token while the panel was closed. The panel is NOT brought up:
+        it would land in front of whatever the person is doing. It is already in the sidebar,
+        and a notification says so, with a button that opens it (which takes it off the
+        sidebar while it is open, and puts it back if it is closed without an answer)."""
         svc = self._p2p_service()
         if self._p2p_panel_open or svc.state != "offer":
             return
-        if QApplication.activeModalWidget() is not None:
-            # Something else is being answered; try again shortly rather
-            # than stacking a dialog on top of it.
-            QTimer.singleShot(2000, self._on_p2p_offer_arrived)
-            return
-        if self.isMinimized():
-            self.showNormal()
-        elif not self.isVisible():
-            self.show()
-        self.raise_()
-        self.activateWindow()
-        self._open_p2p_receive_dialog()
+        self._refresh_p2p_receive_shelf()
+        text = self._p2p_offer_text(svc.offer)
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.show_p2p_offer(text)
+                return
+            except Exception as e:
+                logger.debug(f"Offer notification failed: {e}")
+        tray = getattr(self, "_tray", None)
+        if tray is not None:
+            try:
+                tray.showMessage(t("p2p.receive_notice_title"), re.sub(r"<[^>]+>", "", text),
+                                 tray.icon(), 8000)
+            except Exception as e:
+                logger.debug(f"Offer tray notice failed: {e}")
+
+    @staticmethod
+    def _p2p_offer_text(offer) -> str:
+        """One line for the notification: who, and what is on offer."""
+        import html
+        from core import fmt_size
+        if offer is None:
+            return ""
+        who = (offer.sender_username or "").strip()
+        if offer.kind == "file":
+            what = t("p2p.receive_notice_files", count=offer.count or 1, size=fmt_size(offer.size))
+        else:
+            what = t("p2p.receive_notice_save", game=offer.game_name or offer.filename)
+        return (f"<b>{html.escape(who)}</b> — " if who else "") + html.escape(what)
 
     def _on_sync_batch_progress(self, done: int, total: int, name: str):
         if total <= 0:
@@ -2534,6 +2678,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             else:
                 if hasattr(self, "_stage2_idle_threads_timer"):
                     self._stage2_idle_threads_timer.stop()
+                if self.isVisible():
+                    from ui import data_guard
+                    data_guard.request("restored")
 
     def closeEvent(self, event):
         config = get_config()
@@ -3109,6 +3256,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # the panel come up.
             QTimer.singleShot(0, lambda fid=context: self._open_p2p_friends_panel(fid))
             return
+        # Files are waiting for an answer: the notification's button opens the page (a turn
+        # of the event loop later, as for a friend's message).
+        if action == "open_p2p_receive":
+            QTimer.singleShot(0, self._open_p2p_receive_with_window)
+            return
         # A group's message (or its invitation, which has no group yet: the list shows it).
         if action == "open_group_messages":
             QTimer.singleShot(0, lambda gid=context: self._open_p2p_friends_panel(
@@ -3384,9 +3536,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         def _do_restore():
             from core.backup import get_backup_manager
             mgr = get_backup_manager()
-            result = mgr.restore_backup(backup_id)
-            game_name = ""
             bk = mgr.get_backup(backup_id)
+            # (the library game this backup belongs to on THIS PC, for a copy
+            # that kept another PC's id: see _restore_game_by_id)
+            _lib = get_library().get_by_id(bk.game_id) if bk else None
+            result = mgr.restore_backup(
+                backup_id, lib_game_id=bk.game_id if _lib is not None else "")
+            game_name = ""
             if bk:
                 # Remember what WE put there: landing on that exact state is
                 # the intended outcome, and must not read as a regression.
@@ -4658,6 +4814,59 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.debug("Could not raise a tray notice for self-check",
                          exc_info=True)
 
+    # ── Keeping SaveSync's own working files in place ────────────────────────
+    #
+    # A cleaning tool can remove files SaveSync made or unpacked for itself while it runs
+    # (the folders under its data directory, what the packaged program unpacked at start).
+    # Most are read once and trusted, so nothing noticed: features that broke until a
+    # restart. See ui.data_guard.
+    #
+    # There is no timer: a look is asked for (ui.data_guard.request) when the window comes back
+    # from the tray or from minimised, when an Add/Edit panel opens, and - at most every ten
+    # minutes - when the pointer goes onto a game card. It runs on a worker thread.
+
+    def _setup_data_guard(self):
+        from ui import data_guard
+        data_guard.remember_bundle()
+        self._bundle_warned = False
+        self._data_guard_busy = False
+        self._data_guard_done.connect(self._on_data_guard_done)
+        data_guard.set_requester(self._start_data_guard_look)
+
+    def _start_data_guard_look(self, reason: str):
+        if self._data_guard_busy:
+            return
+        self._data_guard_busy = True
+        threading.Thread(target=self._data_guard_work, name="data-guard", daemon=True).start()
+
+    def _data_guard_work(self):
+        gone = []
+        try:
+            from ui import data_guard
+            gone = data_guard.look()
+        except Exception:
+            logger.debug("Data guard look failed", exc_info=True)
+        try:
+            self._data_guard_done.emit(gone)
+        except RuntimeError:
+            pass                    # (the window is gone)
+
+    def _on_data_guard_done(self, gone):
+        self._data_guard_busy = False
+        try:
+            if gone and not self._bundle_warned:
+                # Said once: it cannot be put back from inside the running program, and a
+                # message at every look would only be noise. Better now than as a feature
+                # that fails at some later time.
+                self._bundle_warned = True
+                logger.warning(f"Program files unpacked at start are gone: {', '.join(gone)}")
+                msg = t("main.bundle_damaged")
+                self._status_bar.showMessage(msg, 60000)
+                if self._tray is not None:
+                    self._tray.showMessage(t("app.name"), msg, self._tray.icon(), 10000)
+        except Exception:
+            logger.debug("Data guard run failed", exc_info=True)
+
     def _setup_auto_export_config(self):
         """Schedule encrypted config uploads to the sync provider."""
         self._auto_export_timer = QTimer(self)
@@ -4668,8 +4877,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                           self._maybe_run_auto_export_config)
         self._auto_export_thread = None
 
-    def _maybe_run_auto_export_config(self):
-        """Upload config to the sync provider if enabled and due."""
+    def _maybe_run_auto_export_config(self, force: bool = False):
+        """Upload config to the sync provider if enabled and due. *force*: an edit brought it
+        forward (see _export_config_soon), so the interval is not waited for."""
         cfg = get_config()
         if not cfg.get("auto_export_config_enabled", False):
             return
@@ -4677,10 +4887,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
         if get_monitor().currently_playing():
             logger.debug("Auto config export postponed — a game is running")
+            if force:
+                # (the edit is not forgotten: the next hourly look finds the export due)
+                cfg.set("auto_export_config_last", "")
             return
 
         days = max(1, int(cfg.get("auto_export_config_interval_days", 7)))
-        last = cfg.get("auto_export_config_last", "") or ""
+        last = "" if force else (cfg.get("auto_export_config_last", "") or "")
         if last:
             try:
                 from datetime import datetime, timedelta
@@ -7047,6 +7260,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Save paths / unticked folders or files / install changed by the edit:
         # the new configuration is backed up now (see on_game_config_changed).
         dlg.config_changed.connect(self.on_game_config_changed)
+        # A new title, or the game's details: sent on, instead of left waiting (see below).
+        dlg.details_changed.connect(self._on_game_details_changed)
         dlg.finished.connect(lambda _r, d=dlg: self._on_add_game_dialog_finished(d))
 
     @Slot(object)
@@ -7611,6 +7826,53 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                              notif_gated=notif_gated, config_changed=config_changed,
                              exit_backup=exit_backup)
         self._pump_backup_queue()
+
+    def _on_game_details_changed(self, game_id: str, what: str = "") -> None:
+        """An edit changed something a backup does not carry (see AddGameDialog.details_changed).
+
+        "name": the game was renamed. Nothing writes a backup for that, so it was only marked
+        "pending" and left there until a backup, a sweep or the ⟳ happened to send it. It is
+        sent now - the rule is the one for every other automatic send, "sync after backup" -
+        for a game that is in the cloud already; one that never was is not uploaded for the
+        first time just because its title changed.
+
+        "details": developer, year, tags, languages and the rest describe the game in the
+        library, and reach the provider only inside the exported configuration, on a timer
+        of days. When that export is switched on it is brought forward (see
+        _export_config_soon)."""
+        parts = {p.strip() for p in (what or "").split(",")}
+        if "name" in parts:
+            entry = get_library().get_by_id(game_id)
+            if entry is not None:
+                if entry.sync_status == "synced":
+                    try:
+                        get_library().update_game_fields(game_id, sync_status="pending")
+                    except Exception:
+                        logger.debug("Could not mark the renamed game as pending sync", exc_info=True)
+                    entry = get_library().get_by_id(game_id) or entry
+                if (entry.sync_status == "pending" and entry.save_paths
+                        and get_config().get("auto_sync_after_backup", False)):
+                    logger.info(f"Auto-syncing {entry.name} after it was renamed")
+                    self._sync_game(game_id)
+        if "details" in parts:
+            self._export_config_soon()
+
+    # The wait before an edit's configuration export, so that several edits in a row make one.
+    _EXPORT_SOON_MS = 20_000
+
+    def _export_config_soon(self) -> None:
+        """Bring the scheduled configuration export forward, shortly: the library's descriptions
+        of the games changed, and that upload is how another PC hears of it. Only when the person
+        switched the export on, and the export itself still skips an upload that would change
+        nothing."""
+        if not get_config().get("auto_export_config_enabled", False):
+            return
+        timer = getattr(self, "_export_soon_timer", None)
+        if timer is None:
+            timer = self._export_soon_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._maybe_run_auto_export_config(force=True))
+        timer.start(self._EXPORT_SOON_MS)
 
     def on_game_config_changed(self, game_id: str, what: str = "") -> None:
         """What a game's backups are MADE OF has just changed — its save paths,
@@ -8373,8 +8635,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         def _do_restore():
             mgr = get_backup_manager()
+            # The library game this restore is FOR, not just the id the backup
+            # happens to be filed under: a copy that came from another PC keeps
+            # that PC's id, and without this the game's install folder (where
+            # its chain says the files belong) could not be found.
             result = mgr.restore_backup(
                 backup_id, target_dir=target_dir, only_roots=only_roots,
+                lib_game_id=game_id if lib_entry is not None else "",
                 safety_provisional=safety_provisional)
             # Remember what WE put there: landing on that exact state is
             # the intended outcome, and must not read as a regression. Both

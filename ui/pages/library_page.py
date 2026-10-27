@@ -579,12 +579,29 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
         from core.engines.game_engine import engine_display, engine_for_game
         engine_labels = {}
         unknown_ids = set()
+        # Reading the engine of every game off its folders is the longest stretch of this rebuild
+        # (measured: 2.4 s for 200 games, with the event loop held throughout), and the please-wait
+        # sheet's seconds only move when the loop turns - so it is turned here, every 200 ms.
+        import time as _time
+        gen0 = self._insert_gen
+        last_turn = _time.monotonic()
         for g in all_games:
             shown = engine_display(engine_for_game(g))
             if shown:
                 engine_labels[g.id] = shown
             else:
                 unknown_ids.add(g.id)
+            if _time.monotonic() - last_turn >= 0.2:
+                last_turn = _time.monotonic()
+                busy = getattr(self, "_deferred_busy", None)
+                if busy is not None:
+                    busy.pump()
+                if self._insert_gen != gen0:
+                    # Called off from the sheet meanwhile: nothing more is built, and the page knows
+                    # its render is incomplete (as _cancel_insert leaves it).
+                    self._pending_initial_load = True
+                    self._initial_load_scheduled = False
+                    return
         self._folder_tree.update_engines(
             list(engine_labels.values()), has_unknown=bool(unknown_ids))
         self._update_language_sidebar(all_games)

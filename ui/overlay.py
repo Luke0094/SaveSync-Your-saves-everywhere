@@ -2484,6 +2484,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             game_id=f"friend:{friend_id}", notif_type="friend_message",
             action=(t("p2p.friends_notice_open"), "open_friend_messages", friend_id))
 
+    def show_p2p_offer(self, text: str) -> None:
+        """Somebody used the person's token: files (or a save) are waiting for a yes or a no.
+        A button opens the page; ignoring it leaves the page in the sidebar, where it can be
+        opened from at any time. Nothing is put in front of what the person is doing."""
+        self._push_notification(
+            "📥", t("p2p.receive_notice_title"), text, _FRIEND_AUTO_HIDE_MS,
+            action=(t("p2p.receive_notice_open"), "open_p2p_receive", ""))
+
     def show_group_message(self, group_id: str, group: str, sender: str, preview: str) -> None:
         """A message (or an attachment offer) arrived in a group: which group, who said it and a line
         of it, a button that opens the group, and a "don't show again" that silences THIS group."""

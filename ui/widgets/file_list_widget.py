@@ -302,6 +302,9 @@ class FileListWidget(QWidget):
                     rel_parts = f.relative_to(p).parts
                     if any(part.lower() in _BACKUP_SKIP_DIRS for part in rel_parts[:-1]):
                         continue
+                    from core.skip_dirs import renpy_sync_between
+                    if renpy_sync_between(p, rel_parts):
+                        continue
                     rel_path = str(f.relative_to(p))
                 except ValueError:
                     continue

@@ -207,6 +207,13 @@ class P2pReceiveService(QObject):
         # [(relative path, size, bytes done, bytes/s)] of a multi-file
         # download in progress, for the panel's per-file list.
         self.file_rows: list = []
+        # Which parts of each file are in (name -> bytes, see ReceiveSession.file_maps),
+        # for the view that opens on hovering a bar; and a note when what arrived did not
+        # match the checksums of the offer (ReceiveSession.integrity_problem).
+        self.file_maps: dict = {}
+        self.integrity = None
+        # Set when the files left out can no longer be asked for (the sender closed its window).
+        self.resume_note = ""
         self._file_prev: dict = {}
         self._file_speed: dict = {}
         self._file_prev_t = 0.0
@@ -491,6 +498,15 @@ class P2pReceiveService(QObject):
             if not self.importing and not s.download_done and not s.release_requested:
                 self._begin_cancel("sender")
             return
+        if self.resumable:
+            # Over for now with files left out, and the sender has closed its window: what is
+            # here stays (it is whole), what was left out cannot be asked for any more.
+            self._drop_session()
+            self.state = DONE
+            self.resume_note = t("p2p.receive_sender_closed")
+            self.file_rows = []
+            self.changed.emit()
+            return
         exp, self.expected = self.expected, None
         if exp is not None:
             self.attachment_event.emit(exp["fid"], exp["mid"], "cancelled", {"by": "sender", "kept": [], "dir": ""})
@@ -528,7 +544,9 @@ class P2pReceiveService(QObject):
     def panel_opened(self) -> None:
         """The panel is up: keep (or, if the last one is spent, make) a session."""
         self._panel_open = True
-        if (self.state in (DONE, ERROR) or self.session is None
+        if self.resumable:
+            self.changed.emit()             # (files were left out: the list is what to show)
+        elif (self.state in (DONE, ERROR) or self.session is None
                 or (self.state == WAITING and self.session.lapsed)):
             self.new_session()
         else:
@@ -536,7 +554,7 @@ class P2pReceiveService(QObject):
 
     def panel_closed(self) -> None:
         self._panel_open = False
-        if self.state in (DONE, ERROR):
+        if self.state in (DONE, ERROR) and not self.resumable:
             self._drop_session()          # spent: nothing worth keeping
         # WAITING / OFFER: the same token stays until its 10 minutes are up
         # (see _pump); DOWNLOADING runs on and is retired when it finishes.
@@ -563,6 +581,9 @@ class P2pReceiveService(QObject):
         self._drop_session()
         self.token_renewed = False
         self.token_renewed_proxy = False
+        self.resume_note = ""
+        self.integrity = None
+        self.file_maps = {}
         try:
             from core.p2p.transfer import ReceiveSession
             sig = _current_proxy_signature()
@@ -652,7 +673,7 @@ class P2pReceiveService(QObject):
         self.session.pump()
         self._send_waiting_tokens()
         if (self.session.sender_cancelled and not self._cancelling
-                and self.state in (WAITING, OFFER, DOWNLOADING)):
+                and (self.state in (WAITING, OFFER, DOWNLOADING) or self.resumable)):
             self._sender_cancelled()
             if self.session is None or self.state != DOWNLOADING:
                 return
@@ -819,6 +840,64 @@ class P2pReceiveService(QObject):
         if not self._panel_open:
             self._notify_received()
 
+    @property
+    def resumable(self) -> bool:
+        """The transfer is over for now with some files left out, and they can still be
+        asked for: ticking one of them goes on with the same transfer."""
+        return self.state == DONE and self.session is not None and self.session.resumable
+
+    @property
+    def skipped_files(self) -> list:
+        """The files of the transfer that the person has left out (still arriving, or
+        over with those not taken)."""
+        if self.session is None:
+            return []
+        return list(self.session.missing if self.resumable else self.session.skipped)
+
+    def set_file_wanted(self, rel: str, wanted: bool) -> bool:
+        """Tick or untick a file of the transfer (the panel's list). False when that
+        cannot be done - see ReceiveSession.set_file_wanted. Ticking a file that was left
+        out once the transfer is over takes the same transfer up again."""
+        if self.session is None:
+            return False
+        if self.resumable:
+            return wanted and self._resume([rel])
+        if self.state != DOWNLOADING:
+            return False
+        ok = self.session.set_file_wanted(rel, wanted)
+        if ok:
+            self._update_file_rows()
+            self.changed.emit()
+        return ok
+
+    def _resume(self, rels: list) -> bool:
+        if not self.session.resume(rels):
+            return False
+        self.state = DOWNLOADING
+        self.pct = 0
+        self.rate = 0.0
+        self._moved_at = time.time()
+        self._last_pct = -1
+        self._release_ticks = 0
+        self.resume_note = ""
+        # (the note of what is here, with its Move to..., goes while files are arriving again:
+        # moving them now would take them from under the download; it is made anew at the end,
+        # or from what was kept if the download is called off)
+        self.received = None
+        self._reset_file_rows()
+        self._timer.start()
+        self._update_file_rows()
+        self.changed.emit()
+        return True
+
+    def _final_rows(self) -> None:
+        """The list for a transfer that is over: every file, whole ones full and the
+        ones left out empty (and untickable-never: ticking one asks for it again)."""
+        left = set(self.session.missing)
+        self.file_rows = [(t, size, 0 if t in left else size, 0.0)
+                          for _i, t, size in (self.session._plan or [])]
+        self.file_maps = {}
+
     def _reset_file_rows(self) -> None:
         self.file_rows = []
         self._file_prev = {}
@@ -851,6 +930,8 @@ class P2pReceiveService(QObject):
             self._file_prev = {rel: done for rel, _s, done in fp}
             self._file_prev_t = now
         self.file_rows = rows
+        self.file_maps = self.session.file_maps()
+        self.integrity = self.session.integrity_problem()
 
     def _finish_files(self) -> None:
         """A "file" offer arrived — and is already in its folder, downloaded
@@ -884,16 +965,25 @@ class P2pReceiveService(QObject):
             "dir": Path(dest), "files": list(rels), "size": size,
             "sender": (offer.sender_username or "").strip() if offer else "",
             "new_dirs": list(self.session.new_dirs),
+            # What the person left out and is not here (as the sender named it)
+            "skipped": self.session.missing_original_names(),
         }
         self.imported_name = ""
         self.saved_path = None
         self.pct = 100
         self._reset_file_rows()
         self.state = DONE
-        try:
-            self.session.close()
-        except Exception:
-            pass
+        if self.session.resumable:
+            # Files were left out and the sender is still offering: the session stays (its
+            # onion service, its meeting point), and the list stays on the panel so that
+            # ticking one of them goes on with this transfer.
+            self._final_rows()
+            self._timer.start()
+        else:
+            try:
+                self.session.close()
+            except Exception:
+                pass
         self.changed.emit()
         if exp is not None:
             self._clear_expected("saved", {"dir": str(dest), "files": list(rels)})
@@ -910,6 +1000,13 @@ class P2pReceiveService(QObject):
         dest = Path(dest)
         if not rec or self.moving:
             return
+        if self.resumable:
+            # The files that are whole are about to be somewhere else; asking for the rest
+            # would find them gone and fetch them all again. Moving ends that possibility.
+            self._drop_session()
+            self.state = DONE
+            self.file_rows = []
+            self.resume_note = t("p2p.receive_resume_ended_moved")
         src_dir, rels = Path(rec["dir"]), list(rec["files"])
         try:
             if dest.resolve() == src_dir.resolve():

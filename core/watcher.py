@@ -1027,6 +1027,20 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
         except Exception:
             pass   # best-effort, like the check above
 
+        # A folder that is never a save location (Ren'Py's "sync" mirror of its save folder):
+        # the shared skip-list already keeps it out of every scan, but a write in it used to
+        # arrive here as any other and become "the folder a save was written in" - proposed
+        # in the confirmation panel next to the real one. Dropped with everything else the
+        # watcher funnels through this handler. Recognised by where it is
+        # (<Ren'Py data folder>/<game>/sync), not by its name: a "sync" folder anywhere else
+        # is not excluded.
+        try:
+            from core.save_detector import is_never_save_location
+            if is_never_save_location(event.src_path):
+                return
+        except Exception:
+            pass   # best-effort, like the checks above
+
         # Correlation ANCHOR — set BEFORE any rejection below. This handler
         # only receives game-linked events (game-scoped watches, or common
         # -root events that passed the name filter), so even a file we then
@@ -2172,6 +2186,12 @@ def get_pending_save_paths(game_id: str, exe_dir: str = "") -> list[str]:
     try:
         from core.save_detector import is_rejected_save_path
         out = [p for p in out if not is_rejected_save_path(game_id, p)]
+    except Exception:
+        pass
+    # ...nor a folder that is never a save location (see on_any_event), whenever it got in.
+    try:
+        from core.save_detector import is_never_save_location
+        out = [p for p in out if not is_never_save_location(p)]
     except Exception:
         pass
     return out

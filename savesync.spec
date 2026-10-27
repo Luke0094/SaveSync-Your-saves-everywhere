@@ -151,10 +151,30 @@ _THEME_MODULES = _collect_submodules('ui.styles')
 # every lazy-imported package this project relies on.
 _LIBTORRENT_BINARIES = _collect_dynamic_libs('libtorrent')
 
+# Qt Multimedia's FFmpeg backend. PyInstaller bundles the plugin
+# (plugins/multimedia/ffmpegmediaplugin.dll, via the QtMultimedia hiddenimport
+# below) but NOT the libraries that plugin loads: avcodec, avformat, avutil,
+# swresample and swscale, which sit beside Qt6Multimedia.dll. The one copy of
+# them the build had came from a stray PyQt6 folder, where the plugin never
+# looks, so a video in a friend's chat played from source and did nothing from
+# the .exe. Taken from the PySide6 that is being built, into the same folder
+# as Qt6Multimedia.dll.
+import PySide6 as _pyside6
+_PYSIDE6_DIR = Path(_pyside6.__file__).resolve().parent
+_FFMPEG_BINARIES = [
+    (str(_dll), 'PySide6')
+    for _pat in ('avcodec-*.dll', 'avformat-*.dll', 'avutil-*.dll',
+                 'swresample-*.dll', 'swscale-*.dll')
+    for _dll in sorted(_PYSIDE6_DIR.glob(_pat))
+]
+if len(_FFMPEG_BINARIES) < 5:
+    print(f'WARNING: only {len(_FFMPEG_BINARIES)} of the 5 FFmpeg libraries were found next to '
+          f'PySide6 ({_PYSIDE6_DIR}) - video in the friends chat will not play in this build')
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
-    binaries=_LIBTORRENT_BINARIES,
+    binaries=_LIBTORRENT_BINARIES + _FFMPEG_BINARIES,
     datas=_datas,
     hiddenimports=_THEME_MODULES + [
         'core', 'core.config_transfer', 'core.config_manager', 'core.library',
@@ -430,6 +450,13 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
+    # Where the one-file build unpacks itself. The default is the system temp folder, which
+    # cleaning tools sweep: files of a RUNNING program taken out from under it (its
+    # translations, images, the Tor program) leave features broken until it is restarted. Under
+    # SaveSync's own data folder they are not "temp files" to anyone. The bootloader expands
+    # the variable (checked with PyInstaller 6.3.0); the stale ones left by a crash are
+    # removed at start (ui.data_guard.clean_stale_runtime).
+    runtime_tmpdir=r'%LOCALAPPDATA%\SaveSync\runtime',
     icon=str(ROOT / 'assets' / 'icon.ico'),
     version=_version_info,
 )

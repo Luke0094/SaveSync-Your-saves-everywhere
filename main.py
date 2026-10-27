@@ -698,6 +698,16 @@ def main():
     # "already running".
     sys._savesync_instance_checked = True
 
+    # The lock is ours, so no other copy is using an unpack folder an earlier run left behind
+    # (a crash, a kill) in SaveSync's own runtime folder; and what this run unpacked is noted,
+    # to be looked at again now and then (a cleaner can sweep files out from under it).
+    try:
+        from ui.data_guard import clean_stale_runtime, remember_bundle
+        remember_bundle()
+        clean_stale_runtime()
+    except Exception:
+        logging.debug("Runtime folder housekeeping failed", exc_info=True)
+
     # ── Second-launch focus listener, as early as possible ──────────────
     # A new instance pings a local pipe/socket and exits; we answer by
     # bringing the existing window to the foreground. Started BEFORE the

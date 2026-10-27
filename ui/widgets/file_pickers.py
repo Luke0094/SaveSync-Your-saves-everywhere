@@ -185,10 +185,20 @@ def _emoji_icon(glyph: str, px: int, dpr: float = 1.0):
     return QIcon(pm)
 
 
-def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
-    """True ONLY for the 3 fixed places: My Computer / Questo PC, User, Desktop.
+def _downloads_dir() -> str:
+    """The system's own Downloads folder - it can be moved to another drive or renamed, so it is
+    asked for rather than assumed - or "" when there is none."""
+    path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+    try:
+        return path if path and Path(path).is_dir() else ""
+    except OSError:
+        return ""
 
-    These three are the sidebar the dialog ships with, and removing one
+
+def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
+    """True ONLY for the 4 fixed places: My Computer / Questo PC, User, Desktop, Downloads.
+
+    These four are the sidebar the dialog ships with, and removing one
     leaves no way to put it back — there is no "restore default places"
     anywhere. Everything else in the sidebar the user pinned themselves and
     can unpin at will, DRIVE ROOTS INCLUDED: this used to call any root a
@@ -207,14 +217,14 @@ def _is_system_pin(url: QUrl, system_urls: list[QUrl] = None) -> bool:
     except Exception:
         norm_incoming = os.path.normcase(path_str.replace("/", "\\").rstrip("\\"))
 
-    # The 3 default system locations: Desktop, User Home, Computer
+    # The 4 default system locations: Desktop, User Home, Downloads, Computer
     desktop_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
     home_p = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.HomeLocation)
     user_home = os.path.expanduser("~")
     userprofile = os.environ.get("USERPROFILE")
 
     system_paths = set()
-    for p in (desktop_p, home_p, user_home, userprofile):
+    for p in (desktop_p, home_p, user_home, userprofile, _downloads_dir()):
         if p:
             system_paths.add(p)
             if p in (user_home, userprofile, home_p):
@@ -250,7 +260,7 @@ class _LnkAwareDialog(QFileDialog):
 
     Also provides:
     - Full Italian/English localisation for all visible labels, columns, tooltips, and actions.
-    - Protected system sidebar pins (My Computer, User Home, Desktop, Drives, Documents, Downloads).
+    - Protected system sidebar pins (My Computer, User Home, Desktop, Downloads).
     - Right-click on any folder in the view with "Aggiungi alla barra laterale".
     """
 
@@ -269,6 +279,8 @@ class _LnkAwareDialog(QFileDialog):
     # _ACCEPT_LABEL_KEY, for the same reason: _localize_labels re-applies it
     # on every directory change, so anything set later would be overwritten.
     _FILENAME_LABEL_KEY = "file_picker.file_name"
+    # The label of the "Files of type" box, with the same reason for being a class attribute.
+    _FILETYPE_LABEL_KEY = "file_picker.file_type"
 
     # Shared across every subclass on purpose, not per-class: two of these
     # open at once — even two of the exact same subclass — hit a real Qt
@@ -704,7 +716,7 @@ class _LnkAwareDialog(QFileDialog):
             self.setLabelText(QFileDialog.DialogLabel.FileName,
                               t(self._FILENAME_LABEL_KEY))
             self.setLabelText(QFileDialog.DialogLabel.FileType,
-                              t("file_picker.file_type"))
+                              t(self._FILETYPE_LABEL_KEY))
             self.setLabelText(QFileDialog.DialogLabel.Accept,
                               t(self._ACCEPT_LABEL_KEY))
             self.setLabelText(QFileDialog.DialogLabel.Reject,
@@ -772,7 +784,7 @@ class _LnkAwareDialog(QFileDialog):
     # ── Sidebar places ────────────────────────────────────────────────────────
 
     def _add_common_places(self):
-        """Desktop and Home in the sidebar."""
+        """Desktop, Home and Downloads in the sidebar."""
         urls = list(self.sidebarUrls())
         # Home first. Qt's own default sidebar already carries it on
         # Windows, so only Desktop was ever appended there and the order
@@ -786,6 +798,11 @@ class _LnkAwareDialog(QFileDialog):
                 url = QUrl.fromLocalFile(path)
                 if url not in urls:
                     urls.append(url)
+        downloads = _downloads_dir()
+        if downloads:
+            url = QUrl.fromLocalFile(downloads)
+            if url not in urls:
+                urls.append(url)
         self.setSidebarUrls(urls)
         self._system_sidebar_urls = [u for u in self.sidebarUrls() if _is_system_pin(u)]
 
@@ -829,7 +846,7 @@ class _LnkAwareDialog(QFileDialog):
             self._apply_sidebar_icons()
 
     def _reassert_system_pins(self, *_args):
-        """Restore any of the 3 fixed places that just left the sidebar."""
+        """Restore any of the fixed places that just left the sidebar."""
         if getattr(self, "_reasserting_pins", False):
             return
         protected = getattr(self, "_system_sidebar_urls", None)
@@ -1188,47 +1205,6 @@ class SavePathPickerDialog(_LnkAwareDialog):
             self._FILENAME_LABEL_KEY = "file_picker.folder_path"
 
 
-class FileOrFolderPickerDialog(_LnkAwareDialog):
-    """Pick ONE file or ONE folder, whichever the person points at.
-
-    The other pickers commit to a kind: Qt's file mode ExistingFile treats
-    Open on a folder as "go into it", and Directory mode refuses a file. Here
-    a folder is entered by double-clicking it (or typing a path), and the
-    confirm button takes whatever is selected — a file, a selected folder, or
-    the folder currently shown when nothing else is picked (the path box
-    mirrors it, see _sync_path_field).
-    """
-
-    _ACCEPT_LABEL_KEY = "file_picker.select"
-    _FILENAME_LABEL_KEY = "file_picker.folder_path"
-
-    def __init__(self, parent, caption: str):
-        super().__init__(parent, caption)
-        self.setFileMode(QFileDialog.FileMode.ExistingFile)
-        self.setNameFilter(t("file_picker.filter_all_files"))
-
-    def accept(self):
-        files = self.selectedFiles()
-        if (len(files) == 1 and not files[0].lower().endswith('.lnk')
-                and Path(files[0]).is_dir()):
-            # A folder chosen outright: skip QFileDialog.accept, which would
-            # only navigate into it in this mode.
-            QDialog.accept(self)
-            return
-        super().accept()
-
-
-def pick_file_or_folder(parent, caption: str, start_dir: str = "") -> str:
-    """Shared "a file or a folder" picker. Returns "" when cancelled."""
-    path = _run_picker(FileOrFolderPickerDialog(parent, caption), start_dir)
-    if path.lower().endswith('.lnk'):
-        from core.resolvers import resolve_lnk_target
-        target = resolve_lnk_target(path).strip().strip('"')
-        if target and Path(target).exists():
-            return target
-    return path
-
-
 def pick_executable(parent, caption: str, name_filter: str = "",
                     start_dir: str = "") -> str:
     """Shared executable picker. Returns "" when cancelled."""
@@ -1333,6 +1309,105 @@ def pick_file(parent, caption: str, name_filter: str = "",
               start_dir: str = "") -> str:
     """Shared any-file picker. Returns "" when cancelled."""
     return _run_picker(FilePickerDialog(parent, caption, name_filter), start_dir)
+
+
+class FilesPickerDialog(_LnkAwareDialog):
+    """Pick one or more existing files."""
+
+    def __init__(self, parent, caption: str):
+        super().__init__(parent, caption)
+        self.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        self.setNameFilter(t("file_picker.filter_all_files"))
+
+
+class FilesOrFolderPickerDialog(_LnkAwareDialog):
+    """Pick what a send is made of: files (as many as wanted) or a folder, in the one dialog.
+
+    The "type" box is the switch: its first entry is files, its second a folder. Qt greys that box
+    out the moment a dialog is put in folder mode - which would leave no way back - so it is
+    switched on again here. Files come back as picked; a folder as the one folder.
+    """
+
+    _FILETYPE_LABEL_KEY = "p2p.add_files_type_label"
+
+    def __init__(self, parent, caption: str):
+        super().__init__(parent, caption)
+        self._folder_mode = False
+        self.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        self.setNameFilters([t("p2p.add_files_type_files"), t("p2p.add_files_type_folder")])
+        from PySide6.QtWidgets import QComboBox
+        self._type_combo = self.findChild(QComboBox, "fileTypeCombo")
+        if self._type_combo is not None:
+            self._type_combo.activated.connect(self._on_type)
+
+    @property
+    def folder_mode(self) -> bool:
+        return self._folder_mode
+
+    def _on_type(self, index: int):
+        folder = index == 1
+        if folder == self._folder_mode:
+            return
+        self._folder_mode = folder
+        if folder:
+            self.setFileMode(QFileDialog.FileMode.Directory)
+            self.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        else:
+            self.setOption(QFileDialog.Option.ShowDirsOnly, False)
+            self.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        if self._type_combo is not None:
+            self._type_combo.setEnabled(True)           # (Qt greys it out in folder mode)
+            self._type_combo.setCurrentIndex(index)
+        # Per instance, not per class: it changes with the box (see _ACCEPT_LABEL_KEY).
+        self._ACCEPT_LABEL_KEY = "file_picker.select" if folder else "common.open"
+        self._FILENAME_LABEL_KEY = "file_picker.folder_path" if folder else "file_picker.file_name"
+        self._localize_labels()
+
+
+def pick_files(parent, caption: str, start_dir: str = "") -> list:
+    """Shared "one or more files" picker. Returns [] when cancelled; a shortcut comes back as what
+    it points to when that exists."""
+    dialog = FilesPickerDialog(parent, caption)
+    if start_dir:
+        try:
+            if Path(start_dir).is_dir():
+                dialog.setDirectory(start_dir)
+        except OSError:
+            pass
+    if dialog.exec() != QFileDialog.DialogCode.Accepted:
+        return []
+    out = []
+    for chosen in dialog.selectedFiles():
+        if chosen.lower().endswith('.lnk'):
+            from core.resolvers import resolve_lnk_target
+            target = resolve_lnk_target(chosen).strip().strip('"')
+            if target and Path(target).exists():
+                chosen = target
+        out.append(chosen)
+    return out
+
+
+def pick_files_or_folder(parent, caption: str, start_dir: str = "") -> list:
+    """The one picker for files or a folder (see FilesOrFolderPickerDialog). Returns [] when
+    cancelled; a shortcut comes back as what it points to when that exists."""
+    dialog = FilesOrFolderPickerDialog(parent, caption)
+    if start_dir:
+        try:
+            if Path(start_dir).is_dir():
+                dialog.setDirectory(start_dir)
+        except OSError:
+            pass
+    if dialog.exec() != QFileDialog.DialogCode.Accepted:
+        return []
+    out = []
+    for chosen in dialog.selectedFiles():
+        if chosen.lower().endswith('.lnk'):
+            from core.resolvers import resolve_lnk_target
+            target = resolve_lnk_target(chosen).strip().strip('"')
+            if target and Path(target).exists():
+                chosen = target
+        out.append(chosen)
+    return out
 
 
 def pick_save_path(parent, caption: str, name_filter: str = "",

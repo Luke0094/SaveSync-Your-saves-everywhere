@@ -414,6 +414,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
     # folders or files, which install it points at): game id, what changed.
     # Emitted at the very end of the save, once the exclusions are on disk.
     config_changed = Signal(str, str)
+    # (game id, what): the edit changed something the provider or another PC should hear of that
+    # a backup does not carry - "name" (the title and with it the backup folder; only when no
+    # backup follows, which would carry it) and/or "details" (developer, year, tags, languages,
+    # description, category, store links, engine, reviews: they live in the library, and travel
+    # with the exported configuration, not with a game's saves).
+    details_changed = Signal(str, str)
     search_finished = Signal(object, object)  # list[GameInfo] | GameInfo | None, error
     # gen, reachable — primary-page probe finished off the GUI thread
     primary_reachability_done = Signal(int, bool)
@@ -575,6 +581,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         if hasattr(self, "_body_scroll"):
             mediate_panel_scroll(self._body_scroll, capped_w=False, capped_h=False)
         self._center_on_parent()
+        # The folders this panel writes to, and the program files, are looked over as it opens (a
+        # cleaning tool may have been through since SaveSync last needed them): see ui.data_guard.
+        from ui import data_guard
+        data_guard.request("add_edit")
         self.show_settled()
         self._start_async_build()
 
@@ -4230,6 +4240,14 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._is_live_tracking = is_live_tracking
         self._detection_method = "live_tracking" if is_live_tracking else "filesystem"
         
+        # What the user excluded (Settings > excluded paths, and what they trashed from this
+        # list a moment ago) is not proposed again - whichever scan found it. The detector
+        # applies this itself for a game already in the library; a game being added, or one
+        # whose executable was just changed, is only known here.
+        from core.save_detector import drop_excluded_paths
+        gid = self._editing_entry.id if self._editing_entry else ""
+        paths = drop_excluded_paths(paths, gid, extra_excluded=self._pending_removed_paths())
+
         # Path-normalized membership: a detected path differing only by
         # case/trailing separator from an already-listed one is a duplicate,
         # not a new row.
@@ -4298,6 +4316,15 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if "100% accurate" in current_text:
                 self._status_lbl.setText(current_text + " (auto-selected)")
                 logger.info("Live tracking paths auto-selected due to 100% accuracy")
+
+    @staticmethod
+    def _details_snapshot(entry) -> tuple:
+        """The parts of a library entry that describe the game rather than its saves - what
+        an edit can change without a backup being involved."""
+        return (entry.description or "", entry.category or "", tuple(entry.tags or ()),
+                tuple(entry.languages or ()), entry.developer or "", entry.release_year or "",
+                entry.store_url or "", entry.engine or "",
+                tuple(sorted(str(sorted(r.items())) for r in (entry.reviews or []))))
 
     @staticmethod
     def _file_exclusions_snapshot(game_id: str) -> dict:
@@ -5424,6 +5451,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             _prev_excluded = set(entry.excluded_save_paths or [])
             _prev_file_excl = self._file_exclusions_snapshot(entry.id)
             _prev_name = entry.name or ""
+            _prev_details = self._details_snapshot(entry)
             _prev_versions = {p.casefold() for p in (entry.exe_path_versions or {})}
             entry.name       = name
             entry.exe_path   = exe
@@ -5653,6 +5681,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 _changed.append("install")
             if _changed:
                 self.config_changed.emit(entry.id, ", ".join(_changed))
+            # What the provider or another PC should hear of that a backup does not carry. A
+            # rename is sent now unless a backup is already on its way (it carries the new
+            # title, and "sync after backup" sends it); the rest only travels with the
+            # configuration. Neither was told to anyone before: a rename was left "pending"
+            # until something else happened to sync the game, and the rest changed nothing.
+            _heard = []
+            if ((_prev_name and _prev_name != entry.name or old_folder_name != new_folder_name)
+                    and not _changed):
+                _heard.append("name")
+            if self._details_snapshot(entry) != _prev_details:
+                _heard.append("details")
+            if _heard:
+                self.details_changed.emit(entry.id, ", ".join(_heard))
 
         else:
             raw_all_paths, raw_excluded_paths = self._get_all_and_excluded_paths()

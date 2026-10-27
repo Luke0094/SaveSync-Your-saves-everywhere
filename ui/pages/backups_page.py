@@ -475,6 +475,13 @@ class BackupRow(QFrame, ThemedMixin):
             warning_window_modal(
                 self, t("p2p.send_title"), t("p2p.send_needs_local_copy"))
             return
+        # Through the main window: its send window can be put away in the sidebar
+        # (and has to outlive this row, which a refresh of the list deletes).
+        window = self.window()
+        opener = getattr(window, "_open_p2p_send_dialog", None)
+        if callable(opener):
+            opener(self._entry)
+            return
         from ui.dialogs.p2p_send_dialog import P2pSendDialog
         P2pSendDialog(self._entry, self).exec()
 

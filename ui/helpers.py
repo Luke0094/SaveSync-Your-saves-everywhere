@@ -7,6 +7,7 @@ import os
 import platform
 import subprocess
 from collections import OrderedDict
+from pathlib import Path
 from typing import NamedTuple
 
 import shiboken6 as sip
@@ -176,6 +177,24 @@ def open_in_file_manager(target) -> None:
             target, ", ".join(n for n, _ in _UNIX_OPENERS))
     except Exception as e:
         logger.warning(f"Could not open folder '{target}': {e}")
+
+
+def reveal_in_file_manager(path) -> None:
+    """Open the folder *path* is in with *path* selected, in the system file manager.
+
+    On Windows that is ``explorer /select,"<path>"`` - the path in quotes inside ONE command line.
+    Handed over as a list item (``["explorer", "/select," + path]``) the whole argument is quoted
+    instead, which Explorer cannot read when the path has a space or a comma in it: it gives up and
+    opens the user's Documents folder, whatever was asked for. Elsewhere the folder is opened (most
+    file managers cannot select)."""
+    try:
+        target = Path(path)
+        if platform.system() == "Windows":
+            subprocess.Popen(f'explorer /select,"{target}"')
+            return
+        open_in_file_manager(target.parent if target.is_file() else target)
+    except Exception as e:
+        logger.warning(f"Could not show '{path}': {e}")
 
 
 def game_is_running() -> bool:

@@ -26,6 +26,8 @@ from ui.p2p_receive_service import (
 )
 from ui.styles.theme import palette
 from ui.widgets.presence_dot import dot_icon
+from ui.widgets.transfer_bar import transfer_bar
+from ui.widgets.transfer_files_view import TransferFilesView
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ class P2pReceiveDialog(QDialog):
     def __init__(self, service, parent=None):
         super().__init__(parent)
         self._svc = service
+        self.setAcceptDrops(True)       # files dropped here are sent (see dropEvent)
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setWindowTitle(t("p2p.receive_title"))
         self._apply_window_chrome()
@@ -143,39 +146,29 @@ class P2pReceiveDialog(QDialog):
         self._offer_detail_lbl.setVisible(False)
         outer.addWidget(self._offer_detail_lbl)
 
-        # The percentage is always shown, on the bar itself as well as in the
-        # status line - whether it is one file or many.
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 100)
-        self._progress.setTextVisible(True)
-        self._progress.setFormat("%p%")
-        self._progress.setVisible(False)
-        outer.addWidget(self._progress)
-
-        self._speed_lbl = QLabel()
-        self._speed_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
-        self._speed_lbl.setVisible(False)
-        outer.addWidget(self._speed_lbl)
-
-        # One row per file with its own percentage and speed, for a transfer
-        # of several files (the overall bar above stays).
-        self._files_tree = QTreeWidget()
-        self._files_tree.setRootIsDecorated(False)
-        self._files_tree.setUniformRowHeights(True)
-        self._files_tree.setAlternatingRowColors(True)
-        self._files_tree.setHeaderLabels([t("p2p.col_file"), t("p2p.col_done"),
-                                          t("p2p.col_speed")])
-        hdr = self._files_tree.header()
-        hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._files_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self._files_tree.setMinimumHeight(scaled(110, self))
-        self._files_tree.setMaximumHeight(scaled(210, self))
-        self._files_tree.setVisible(False)
-        self._tree_names: list = []
-        outer.addWidget(self._files_tree)
+        # The page a transfer shows - the same one the sending window has: the overall bar
+        # (with its percentage, whether it is one file or many) and the speed, then a row per
+        # file with its tick, bar and speed; resting the pointer on a file's bar shows which
+        # parts of it are in.
+        self._view = TransferFilesView()
+        self._view.setVisible(False)
+        self._view.ticked.connect(self._on_file_ticked)
+        # (the names this window and its tests know the parts by)
+        self._progress = self._view.bar
+        self._speed_lbl = self._view.speed_lbl
+        self._files_tree = self._view.tree
+        outer.addWidget(self._view)
+        self._tick_hint_lbl = QLabel(t("p2p.receive_files_tick_hint"))
+        self._tick_hint_lbl.setWordWrap(True)
+        self._tick_hint_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._tick_hint_lbl.setVisible(False)
+        outer.addWidget(self._tick_hint_lbl)
+        # Something that arrived did not match what was offered (see ReceiveSession.integrity_problem).
+        self._integrity_lbl = QLabel()
+        self._integrity_lbl.setWordWrap(True)
+        self._integrity_lbl.setStyleSheet(f"color:{palette('warning')};")
+        self._integrity_lbl.setVisible(False)
+        outer.addWidget(self._integrity_lbl)
 
         # ── Files received by hand, already in their folder ────────────
         # Says where they went. Kept across closing the panel (the service
@@ -213,6 +206,14 @@ class P2pReceiveDialog(QDialog):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._recv_list_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
         recv.addWidget(self._recv_list_lbl)
+        # What was left out on purpose and is not here.
+        self._recv_skipped_lbl = QLabel()
+        self._recv_skipped_lbl.setWordWrap(True)
+        self._recv_skipped_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._recv_skipped_lbl.setStyleSheet(f"color:{palette('text_secondary')};")
+        self._recv_skipped_lbl.setVisible(False)
+        recv.addWidget(self._recv_skipped_lbl)
         recv_btns = QHBoxLayout()
         recv_btns.addStretch()
         self._recv_ok_btn = QPushButton(t("common.ok"))
@@ -310,12 +311,19 @@ class P2pReceiveDialog(QDialog):
         self._cancel_btn.setVisible(state == DOWNLOADING and not svc.importing and not svc.cancelling)
         self._new_token_btn.setEnabled(state in (WAITING, ERROR, DONE))
         downloading = state == DOWNLOADING and not svc.importing
-        self._progress.setVisible(downloading)
-        self._speed_lbl.setVisible(downloading)
-        rows = svc.file_rows if downloading else []
-        self._files_tree.setVisible(len(rows) > 1)
-        if len(rows) > 1:
-            self._update_file_tree(rows)
+        # (a transfer that finished with files left out keeps its page: ticking one goes on)
+        show_page = downloading or svc.resumable
+        self._view.setVisible(show_page)
+        self._speed_lbl.setVisible(show_page)
+        rows = svc.file_rows if show_page else []
+        self._tick_hint_lbl.setVisible(len(rows) > 1)
+        self._update_file_tree(rows)
+        problem = svc.integrity if downloading else None
+        self._integrity_lbl.setVisible(bool(problem))
+        if problem:
+            names = t("p2p.integrity_names", names=", ".join(problem.get("files") or [])) \
+                if problem.get("files") else ""
+            self._integrity_lbl.setText("⚠ " + t("p2p.integrity_warning", count=problem["count"], names=names))
         self._open_folder_btn.setVisible(
             state == DONE and not svc.imported_name and svc.saved_path is not None)
 
@@ -332,7 +340,13 @@ class P2pReceiveDialog(QDialog):
             self._status_lbl.setText(t("p2p.receive_cancelling"))
         elif state == DOWNLOADING:
             self._progress.setValue(svc.pct)
-            self._status_lbl.setText(t("p2p.receive_downloading", percent=svc.pct))
+            # Nothing has arrived yet (the sender is still being reached, or the
+            # file list is on its way): not "0%", which reads as stuck.
+            waiting = svc.pct == 0 and svc.rate <= 0
+            self._status_lbl.setText(t("p2p.receive_connecting") if waiting
+                                     else t("p2p.receive_downloading", percent=svc.pct))
+            if waiting and svc.idle_seconds >= 45:
+                self._status_lbl.setText(self._status_lbl.text() + "\n" + self._connection_hint())
             if svc.idle_seconds >= 60:
                 self._status_lbl.setText(self._status_lbl.text() + "\n" + t(
                     "p2p.receive_idle", minutes=max(1, int(svc.idle_seconds // 60))))
@@ -341,9 +355,14 @@ class P2pReceiveDialog(QDialog):
             from core.p2p.transfer import format_rate
             mbs, mbps = format_rate(svc.rate)
             self._speed_lbl.setText(t("p2p.speed_down", speed=mbs))
-            self._speed_lbl.setToolTip(mbps)
+            # (megabits on every figure the pointer can rest on)
+            for w in (self._speed_lbl, self._progress, self._status_lbl):
+                w.setToolTip(mbps)
         elif state == DONE and files_done:
-            self._status_lbl.setText(t("p2p.receive_complete"))
+            self._view.set_global(100, "", "")
+            self._status_lbl.setText(t("p2p.receive_complete") + (
+                "\n" + t("p2p.receive_skipped_resumable") if svc.resumable else "")
+                + ("\n" + svc.resume_note if svc.resume_note else ""))
         elif state == DONE:
             if svc.imported_name:
                 self._status_lbl.setText(
@@ -358,37 +377,50 @@ class P2pReceiveDialog(QDialog):
             self._status_lbl.setText(t("p2p.receive_error", error=svc.error))
         self._refresh_received()
 
+    def _connection_hint(self) -> str:
+        """Why nothing has arrived, as far as the session can tell (the other PC not found at
+        all, or found and still being connected to): see core.p2p.transfer.describe_direct_failure."""
+        from core.p2p.transfer import tor_enabled
+        if tor_enabled():
+            return t("p2p.no_connection_tor")
+        try:
+            key, params = self._svc.session.connection_hint()
+            return t(key, **params)
+        except Exception:
+            return t("p2p.no_connection_direct")
+
     def _update_file_tree(self, rows):
-        """Fill the per-file list: built once per transfer, then only the
-        cells that changed are rewritten (a transfer can hold thousands)."""
-        from core.p2p.transfer import format_rate
-        names = [r[0] for r in rows]
-        tree = self._files_tree
-        if names != self._tree_names:
-            tree.clear()
-            for rel, _size, _done, _speed in rows:
-                item = QTreeWidgetItem([rel, "", ""])
-                item.setToolTip(0, rel)
-                item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                tree.addTopLevelItem(item)
-            self._tree_names = names
-        for i, (_rel, size, done, speed) in enumerate(rows):
-            item = tree.topLevelItem(i)
-            if item is None:
-                continue
-            pct = 100 if size <= 0 else min(100, int(done * 100 / size))
-            pct_txt = f"{pct}%"
-            if item.text(1) != pct_txt:
-                item.setText(1, pct_txt)
-            if speed >= 5120 and pct < 100:      # under 5 KB/s is idle, not "0.0 MB/s"
-                mbs, mbps = format_rate(speed)
-                spd_txt, tip = mbs, mbps
+        """Hand the page its rows: each file with its tick, bar and speed. A file that is
+        left out shows as such and may be ticked again (asking for it, if the transfer is
+        over); one that is whole cannot be unticked, nor the last one still wanted (leaving
+        everything out is cancelling, which has its own button)."""
+        from core import fmt_size
+        from ui.widgets.transfer_files_view import ACTIVE, LEFT_OUT, WHOLE, FileRow
+        svc = self._svc
+        left_out = set(svc.skipped_files)
+        maps = svc.file_maps or {}
+        wanted_left = [r[0] for r in rows if r[0] not in left_out]
+        out = []
+        for rel, size, done, speed in rows:
+            if rel in left_out:
+                state, tickable = LEFT_OUT, True
+            elif size <= 0 or done >= size:
+                state, tickable = WHOLE, False
             else:
-                spd_txt, tip = "—", ""
-            if item.text(2) != spd_txt:
-                item.setText(2, spd_txt)
-                item.setToolTip(2, tip)
+                state, tickable = ACTIVE, wanted_left != [rel]
+            out.append(FileRow(rel, size, done, speed, state, tickable, maps.get(rel)))
+        self._view.set_rows(out)
+        counted = [r for r in rows if r[0] not in left_out]
+        self._view.sizes_lbl.setText(
+            t("p2p.send_sizes", sent=fmt_size(sum(r[2] for r in counted)), total=fmt_size(sum(r[1] for r in counted)))
+            if counted and svc.state == DOWNLOADING else "")
+
+    def _on_file_ticked(self, name, wanted):
+        """The person ticked or unticked a file of the list."""
+        if not self._svc.set_file_wanted(name, wanted):
+            # (not possible any more - it finished, or it was the last one wanted):
+            # the box goes back to what is true
+            self._view.set_checked(name, not wanted)
 
     def _refresh_received(self):
         from core import fmt_size
@@ -411,6 +443,14 @@ class P2pReceiveDialog(QDialog):
         if len(files) > len(shown):
             text += "\n" + t("p2p.receive_files_more", count=len(files) - len(shown))
         self._recv_list_lbl.setText(text)
+        left_out = list(rec.get("skipped") or [])
+        self._recv_skipped_lbl.setVisible(bool(left_out))
+        if left_out:
+            shown_out = left_out[:_LIST_PREVIEW]
+            names = ", ".join(shown_out)
+            if len(left_out) > len(shown_out):
+                names += ", " + t("p2p.receive_files_more", count=len(left_out) - len(shown_out))
+            self._recv_skipped_lbl.setText(t("p2p.receive_skipped_note", count=len(left_out), names=names))
         busy = self._svc.moving
         self._recv_ok_btn.setEnabled(not busy)
         self._recv_move_btn.setEnabled(not busy)
@@ -532,10 +572,47 @@ class P2pReceiveDialog(QDialog):
         self._copy_btn.setText(t("p2p.receive_copied"))
         QTimer.singleShot(1500, lambda: self._copy_btn.setText(t("p2p.receive_copy")))
 
-    def _send_file(self):
-        """Pick a file or folder with the app's own picker, then send it."""
+    def _send_file(self, paths=None):
+        """Send a file or folder: pick it with the app's own picker, or take the
+        *paths* dropped on this panel.
+
+        The panel closes first. What happens next is a picker, a list to tick
+        and a send window of its own, and leaving this one open behind them is a
+        window in the way of every one (closing it does not end the session:
+        see done()). The steps run once it is gone, from the main window."""
+        window = self.parent()
+        self.accept()
         from ui.dialogs.p2p_send_flow import send_files_flow
-        send_files_flow(self)
+        QTimer.singleShot(0, lambda: send_files_flow(window, paths=paths))
+
+    # ── Files dropped on the panel are sent, as if picked with "Send a file…" ──
+
+    @staticmethod
+    def _dropped(event) -> list:
+        from ui.dialogs.p2p_friends_dialog import dropped_paths
+        return dropped_paths(event.mimeData())
+
+    def dragEnterEvent(self, event):
+        if self._dropped(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._dropped(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._dropped(event)
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # (asked once the drop itself is over: a window opened inside it would
+        # hold the program the files came from)
+        QTimer.singleShot(0, lambda: self._send_file(paths))
 
     def _move_received(self):
         """"Move to…": the folder picker, then the move itself."""

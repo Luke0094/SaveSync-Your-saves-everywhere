@@ -961,10 +961,10 @@ class GroupPagesMixin:
         if not self._can_take_group_drop():
             return
         with self._modal():
-            from ui.widgets.file_pickers import pick_file_or_folder
-            path = pick_file_or_folder(self, t("p2p.friends_attach_pick"))
-            if path:
-                self._offer_group_paths([path], gid)
+            from ui.dialogs.p2p_add_files_dialog import pick_paths
+            paths = pick_paths(self, t("p2p.friends_attach_pick"))
+            if paths:
+                self._offer_group_paths(paths, gid)
 
     def _offer_group_paths(self, paths: list, gid: str = ""):
         """Offer these files and folders to the group: what would go (any file can be ticked off),

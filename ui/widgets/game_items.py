@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QObject, QSize, QRectF, QEvent
-from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QImageReader, QRegion
+from PySide6.QtGui import QCursor, QIcon, QPixmap, QColor, QPainter, QImageReader, QRegion
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QMenu, QApplication, QGraphicsOpacityEffect, QSizePolicy,
@@ -29,6 +29,7 @@ from ui.helpers import (display_scale, load_pixmap_any as _load_pixmap_any,
                         scaled_for_screen)
 from ui.styles.theme import palette, ThemedMixin
 from ui.widgets.library_drag import _active_drag, DragProxy
+from ui.widgets.marquee_label import MarqueeLabel
 from ui.widgets.library_folders import (FolderRow, _clean_tag_display,
                                         _ensure_children_field,
                                         _flatten_folders,
@@ -1287,6 +1288,16 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._fade_from: Optional[QPixmap] = None
         self._fade_to: Optional[QPixmap] = None
         self._fade_t: float = 0.0
+        # The info box turning through the description and tags while the pointer is on the
+        # picture (see ui.widgets.card_details): made the first time a card that has any is hovered.
+        self._details = None
+        # While the pointer is on the card it is looked at (see _hover_sync): where it is - on the
+        # picture or on the info box - decides what the box shows, and that is read from the pointer
+        # itself, not only from the enter and leave events the hover effects of the buttons and labels
+        # in the box can swallow.
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setInterval(100)
+        self._hover_timer.timeout.connect(self._hover_sync)
         self._build()
 
     # ── Hover slideshow ───────────────────────────────────────────────────────
@@ -1322,14 +1333,64 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             self._update_dot_highlight()
             if n > 1:
                 self._slideshow_timer.start()
+        # A look at SaveSync's own working files, now that somebody is about to use a game (at
+        # most every ten minutes, however many cards the pointer goes over): see ui.data_guard.
+        from ui import data_guard
+        data_guard.request("hover", hover=True)
+        self._hover_timer.start()
+        self._hover_sync()
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
+        self._end_hover()
+
+    def _hover_sync(self):
+        """Where the pointer is on the card now, and what that asks for: the name and the version
+        move (if they do not fit) anywhere on the card, and the info box turns to the description
+        and tags while the pointer is on the picture and back to its buttons while it is on the
+        box. Read from the pointer every 100 ms while the card is hovered, so that a transition the
+        enter and leave events missed is made at the next look."""
+        if not self.isVisible():                # (hidden or gone while hovered: no leave comes)
+            self._end_hover()
+            return
+        pos = self._pointer_pos()
+        if not self.rect().contains(pos):
+            self._end_hover()
+            return
+        self._name_lbl.set_hover(True)
+        self._version_lbl.set_hover(True)
+        if self._entry.description or self._entry.tags:
+            ctl = self._details_ctl()
+            if self._bottom.geometry().contains(pos):
+                ctl.stop()
+            else:
+                ctl.start()
+
+    def _end_hover(self):
+        self._hover_timer.stop()
         self._slideshow_timer.stop()
         self._stop_cover_fade()
         self._dots_bar.setVisible(False)
+        if self._details is not None:
+            self._details.stop()
+        self._name_lbl.set_hover(False)
+        self._version_lbl.set_hover(False)
         # Reset to cover image
         self._update_cover()
+
+    def _pointer_pos(self) -> QPoint:
+        """The pointer in this card's own coordinates."""
+        return self.mapFromGlobal(QCursor.pos())
+
+    def _details_ctl(self):
+        if self._details is None:
+            from ui.widgets.card_details import CardDetails
+            self._details = CardDetails(
+                self, self._bottom, self._status_lbl, self._launch_btn,
+                [self._status_lbl, self._sync_card_btn, self._play_strip,
+                 self._launch_btn, self._backup_btn, self._more_btn],
+                lambda: self._entry, self._pointer_pos, lambda: palette("accent"))
+        return self._details
 
     # ── Slideshow dot indicators ──────────────────────────────────────────────
     #
@@ -1623,17 +1684,15 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
             scaled(10, self), scaled(6, self), scaled(10, self), scaled(6, self))
         bl.setSpacing(2)
 
-        # _clean_tag_display heals a name still stored with HTML entities
-        # ("N&amp;R") for display, without rewriting the stored value.
-        _disp_name = _clean_tag_display(self._entry.name)
-        self._name_lbl = QLabel(_disp_name)
+        # The name, and to its right the version of the exe the game runs from - the same readout
+        # as in Add/Edit (see _apply_title).
+        self._name_lbl = MarqueeLabel(pad=0, flexible=True)
         self._name_lbl.setObjectName("game_card_name")
-        self._name_lbl.setWordWrap(False)
-        fm = self._name_lbl.fontMetrics()
-        elided = fm.elidedText(
-            _disp_name, Qt.TextElideMode.ElideRight, max(40, cw - scaled(24, self)))
-        self._name_lbl.setText(elided)
-        self._name_lbl.setToolTip(_disp_name)
+        self._version_lbl = MarqueeLabel(pad=scaled(4, self))
+        self._version_lbl.setObjectName("game_card_version")
+        self._version_lbl.setToolTip(t("add_game.exe_version_tooltip"))
+        self._version_lbl.setVisible(False)
+        self._apply_title()
 
         # Sync-status label with a hover effect: shows when the game was last
         # synced while hovered (no popup — in-place text swap). Its palette-
@@ -1641,7 +1700,12 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self._status_lbl = _HoverSwapLabel()
         self._apply_status()
 
-        bl.addWidget(self._name_lbl)
+        _title_row = QHBoxLayout()
+        _title_row.setContentsMargins(0, 0, 0, 0)
+        _title_row.setSpacing(scaled(6, self))
+        _title_row.addWidget(self._name_lbl, 1)
+        _title_row.addWidget(self._version_lbl, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bl.addLayout(_title_row)
 
         # Status row: status label + compact sync button side-by-side
         _status_row = QHBoxLayout()
@@ -1702,6 +1766,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
                       policy_h=QSizePolicy.Policy.Fixed,
                       policy_v=QSizePolicy.Policy.Fixed)
         more_btn.clicked.connect(lambda: self._show_context_menu(more_btn))
+        self._more_btn = more_btn
 
         bar.addWidget(self._launch_btn, 1)
         bar.addWidget(self._backup_btn)
@@ -1745,6 +1810,22 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         self.setStyleSheet(sheet)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    def _apply_title(self):
+        """The name, with the version of the exe the game runs from to its right: what Add/Edit
+        shows beside Engine - the version token alone ("v1.2.3"), and nothing when the folders name
+        none. The name takes the room the version leaves; a version too long for its share moves
+        back and forth while the card is hovered (see MarqueeLabel)."""
+        from core.save_detector import find_version_near
+        # _clean_tag_display heals a name still stored with HTML entities
+        # ("N&amp;R") for display, without rewriting the stored value.
+        disp = _clean_tag_display(self._entry.name)
+        version = find_version_near(self._entry.exe_path) if self._entry.exe_path else ""
+        row_w = max(40, getattr(self, "_cw", _CARD_W0) - scaled(20, self))     # (the box's margins)
+        self._version_lbl.fit(version, int(row_w * 0.42))
+        # (the name takes what the version leaves; too long, it ends in "..." and moves on hover)
+        self._name_lbl.setText(disp)
+        self._name_lbl.setToolTip(disp)
 
     def _apply_status(self):
         """(Re)compute the sync-status label's text + palette-derived styles
@@ -1800,6 +1881,8 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
 
     def refresh(self, entry: GameEntry):
         self._entry = entry
+        if self._details is not None:
+            self._details.stop()        # (the box goes back to what it was; the next hover reads the new entry)
         # Invalidate the cached slideshow list so images added or deleted since
         # the last scan (e.g. after editing details, or clearing the icon cache)
         # are re-picked-up on the next hover instead of cycling stale frames.
@@ -1810,11 +1893,7 @@ class GameCard(_GameItemMixin, QFrame, ThemedMixin):
         if new_img != self._img_path or new_img is None:
             self._img_path = new_img
             self._update_cover()
-        _disp_name = _clean_tag_display(entry.name)
-        fm = self._name_lbl.fontMetrics()
-        elided = fm.elidedText(_disp_name, Qt.TextElideMode.ElideRight, 166)
-        self._name_lbl.setText(elided)
-        self._name_lbl.setToolTip(_disp_name)
+        self._apply_title()
         self._apply_status()   # self._entry already == entry (set above)
         self._playtime_lbl.set_entry(entry)
         self._play_strip.set_rating(entry.average_rating())
@@ -1887,8 +1966,10 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         name_row = QHBoxLayout()
         name_row.setSpacing(8)
         name_row.setContentsMargins(0, 0, 0, 0)
-        self._name_lbl = QLabel(_clean_tag_display(self._entry.name))
+        self._name_lbl = MarqueeLabel(pad=0, flexible=True)
         self._name_lbl.setObjectName("game_name")
+        self._name_lbl.setText(_clean_tag_display(self._entry.name))
+        self._name_lbl.setToolTip(_clean_tag_display(self._entry.name))
         # A bare QLabel compresses to a sliver at narrow widths, so list rows
         # became a wall of buttons with the title gone — the "list view cut
         # off" report. Keep a readable floor: the page then H-scrolls instead
@@ -1977,6 +2058,14 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
         for b in (self._launch_btn, self._backup_btn, self._sync_btn, more_btn):
             row.addWidget(b)
 
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._name_lbl.set_hover(True)          # (moves only if it does not fit)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._name_lbl.set_hover(False)
+
     def _update_folder_dot(self):
         cat = self._entry.category
         if not cat:
@@ -2025,6 +2114,7 @@ class GameRow(_GameItemMixin, QFrame, ThemedMixin):
             else:
                 _show_placeholder(self._thumb, entry, scaled(32, self))
         self._name_lbl.setText(_clean_tag_display(entry.name))
+        self._name_lbl.setToolTip(_clean_tag_display(entry.name))
         self._played_lbl.setText(f"{t('library.last_played')}: {_fmt_dt(entry.last_played)}")
         self._synced_lbl.setText(f"{t('library.last_synced')}: {_fmt_dt(entry.last_synced)}")
         self._apply_playtime()   # self._entry already == entry (set above)

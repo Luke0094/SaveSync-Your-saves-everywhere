@@ -236,6 +236,10 @@ class P2pFriendsService(QObject):
         self._ask_kept_at: dict = {}        # friend id -> when I last took a request of theirs in
         self._users = 0
         self._lock_users = 0            # of those, the ones that keep the list from locking
+        # Which attachments have a picture opened on their card: only the ids, so that the picture
+        # is there again when the chat is come back to (decoded again, if the file is still where it
+        # was). Forgotten when the list locks - nothing of what it shows outlives that.
+        self._preview_ids: set = set()
         self._active_until = 0.0
         self._started = False
         self._last_active = time.time()
@@ -293,7 +297,32 @@ class P2pFriendsService(QObject):
         self.net.close()
         self.net = self._make_net(private)
         self.net.boost(30)
+        self._retire_tokens(private)
         self.changed.emit()
+
+    @staticmethod
+    def _token_fits(token: str, private: bool) -> bool:
+        """Was this token made for the way of connecting that is on now? (The token says
+        which: a private-mode one leads to an onion address, a plain one to a mailbox.)"""
+        from core.p2p import transfer as _tr
+        try:
+            return _tr.token_is_private(token) == private
+        except Exception:
+            return True                 # (not something to judge: leave it be)
+
+    def _retire_tokens(self, private: bool) -> None:
+        """Private mode was switched: a token made for the other way cannot be used - by
+        me with a friend's, nor by a friend with mine - so none of them is offered or
+        handed on any more. They show as replaced, like a token a newer one has outdated."""
+        changed = False
+        for m in self._messages:
+            if m.kind != "token" or m.used or m.replaced or not m.token:
+                continue
+            if not self._token_fits(m.token, private):
+                m.replaced = True
+                changed = True
+        if changed:
+            self.changed.emit()
 
     def start(self) -> None:
         """Begin looking after the friends (the main window calls this a few
@@ -358,6 +387,7 @@ class P2pFriendsService(QObject):
         self._locked = True
         self._viewing = None
         self._viewing_group = None
+        self._preview_ids.clear()
         self._seal_pending = True
         self._try_seal()
         self.lock_changed.emit(True)
@@ -482,6 +512,17 @@ class P2pFriendsService(QObject):
         self.changed.emit()
         return {"deleted": deleted, "failed": len(failed), "preferences": forgotten}
 
+    def note_preview(self, mid: str) -> None:
+        """A picture was opened on the card of attachment *mid*."""
+        self._preview_ids.add(mid)
+
+    def previewed(self) -> set:
+        """The attachments whose picture was opened (and not forgotten since)."""
+        return set(self._preview_ids)
+
+    def forget_previews(self) -> None:
+        self._preview_ids.clear()
+
     def media_allowed(self) -> bool:
         """May a received picture or video be shown inside the chat (Settings)?"""
         try:
@@ -588,7 +629,9 @@ class P2pFriendsService(QObject):
             att = {"label": info.get("l", ""), "count": int(info.get("c") or 0),
                    "size": int(info.get("s") or 0), "state": e.get("fs", "failed"),
                    "why": e.get("fw", ""), "dir": e.get("sd", ""),
-                   "files": list(e.get("sf") or [])}
+                   "files": list(e.get("sf") or []),
+                   # (mine: where the one picture or video I offered is, to look at it again)
+                   "src": e.get("sp", "") if e["dir"] == "out" else ""}
         return FriendMessage(
             id=e["id"], friend_id=fid, kind=e["kind"], token="", name=name,
             received_at=float(e.get("ts") or 0), deadline=0.0, read=bool(e.get("read", True)),
@@ -758,7 +801,9 @@ class P2pFriendsService(QObject):
         if self.locked:
             return []
         now = time.time()
-        return sorted((m for m in self._messages if m.kind == "token" and m.state(now) == "active"),
+        private = _tor_enabled()
+        return sorted((m for m in self._messages if m.kind == "token" and m.state(now) == "active"
+                       and self._token_fits(m.token, private)),
                       key=lambda m: m.deadline)
 
     def consume(self, token: str) -> None:
@@ -954,13 +999,27 @@ class P2pFriendsService(QObject):
         s = self._sends.get((fid, mid))
         if s is not None:
             pct = 100 if s.done_at else (min(99, int(s.uploaded * 100 / s.total)) if s.total else 0)
-            return {"pct": pct, "rate": s.rate}
+            # ("unconnected": how long the friend has not connected to take it)
+            hint = None
+            if not s.peers_seen:
+                try:
+                    hint = s.handle.connection_hint()       # (why nobody has connected, if it can tell)
+                except Exception:
+                    hint = None
+            return {"pct": pct, "rate": s.rate, "hint": hint,
+                    "unconnected": 0.0 if s.peers_seen else max(0.0, time.time() - s.started)}
         recv = self._recv
         exp = getattr(recv, "expected", None) if recv is not None else None
         if exp and exp.get("mid") == mid and exp.get("fid") == fid:
             from ui import p2p_receive_service as rs
             if recv.state == rs.DOWNLOADING:
-                return {"pct": int(recv.pct), "rate": float(recv.rate),
+                hint = None
+                if not recv.pct:
+                    try:
+                        hint = recv.session.connection_hint()
+                    except Exception:
+                        hint = None
+                return {"pct": int(recv.pct), "rate": float(recv.rate), "hint": hint,
                         "idle": float(getattr(recv, "idle_seconds", 0.0) or 0.0),
                         "tls": bool(getattr(getattr(recv, "offer", None), "tls", False))}
             if recv.state == rs.WAITING:
@@ -1275,7 +1334,9 @@ class P2pFriendsService(QObject):
             outcome = None
             if s.handle.put_confirmed is False:
                 outcome = ("offered", "network")        # nobody could take the offer: try again
-            elif not s.done_at and (uploaded >= s.total and s.peers_seen):
+            elif not s.done_at and ((uploaded >= s.total and s.peers_seen)
+                                    or getattr(s.handle, "receiver_report", None) is not None):
+                # (or the friend finished having left files out, and said so)
                 s.done_at = now
                 self.store.set_file_state(fid, mid, "sent")
                 changed = True

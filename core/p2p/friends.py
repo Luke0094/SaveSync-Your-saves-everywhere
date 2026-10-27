@@ -831,8 +831,9 @@ def parse_link(blob: bytes, password: str) -> dict:
 FILE_STATES = ("offered", "waiting", "receiving", "sending", "saved", "sent", "failed",
                "declined", "cancelled", "expired", "blocked")
 # What belongs to THIS PC only (where a file is, where one was put): it does not
-# travel in a link file.
-_LOCAL_FILE_KEYS = ("fp", "sd", "sf")
+# travel in a link file. "sp" is where the one picture or video I offered is, kept
+# after the offer is over (unlike "fp") so I can still look at what I sent.
+_LOCAL_FILE_KEYS = ("fp", "sd", "sf", "sp")
 
 
 def _friend_to_dict(f: "Friend", local: bool = True) -> dict:
@@ -877,7 +878,8 @@ def _chat_entry_from_dict(e) -> Optional[dict]:
         state = e.get("fs") if e.get("fs") in FILE_STATES else "failed"
         entry.update(f=info, fs=state, fw=str(e.get("fw") or "")[:40], fp=_file_paths(e.get("fp")),
                      sd=str(e.get("sd") or "")[:600],
-                     sf=[str(x)[:240] for x in (e.get("sf") or [])[:50]] if isinstance(e.get("sf"), list) else [])
+                     sf=[str(x)[:240] for x in (e.get("sf") or [])[:50]] if isinstance(e.get("sf"), list) else [],
+                     sp=str(e.get("sp") or "")[:600] if e["dir"] == "out" else "")
         if e["dir"] == "out" and state in ("offered", "waiting", "sending") and not entry["fp"]:
             entry["fs"] = "expired"         # the files it was made of are not on this PC
         if e["dir"] == "in":
@@ -1374,10 +1376,23 @@ class FriendStore:
                  "ts": now, "n": wire["n"], "read": True, "state": "pending", "missed": 0}
         if info:
             entry.update(f=info, fs="offered", fw="", fp=_file_paths([list(p) for p in paths or []]),
-                         sd="", sf=[])
+                         sd="", sf=[], sp=self._preview_source(paths))
         self._chat_add(f, entry)
         self.save()
         return wire
+
+    @staticmethod
+    def _preview_source(paths) -> str:
+        """Where the one picture or video I am offering is, so I can look at it
+        after the offer is over; "" for anything else (several files, or a kind
+        that is never shown). Kept on this PC only: see _LOCAL_FILE_KEYS."""
+        from core.p2p import attachments as _a
+        found = list(paths or [])
+        if len(found) != 1:
+            return ""
+        src = str(found[0][0])
+        ext = _a.extension(src)
+        return src[:600] if (ext in _a.VIDEO_EXTENSIONS or not _a.image_problem(src)) else ""
 
     def receive_text(self, fid: str, msg: dict, now: Optional[float] = None,
                      read: bool = False) -> Optional[dict]:

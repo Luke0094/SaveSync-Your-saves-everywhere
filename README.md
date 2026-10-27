@@ -107,6 +107,17 @@ Four groups. Each one lists what it covers; open it for the details.
 - **Launcher URL support** — games launched through `steam://`-style URLs are
   resolved to their real executable
 - **Playtime tracking** per game, with per-session detail on hover
+- **Library cards turn through the game's details** while the pointer rests on the picture: the info
+  box swaps its buttons for a page of the description and then the tags, one after the other (the
+  picture's slideshow goes on). Moving onto the box, or off the card, puts it back, so Play is there
+  to click. Where the pointer is is read from the pointer itself every 100 ms, not only from enter and
+  leave events, so passing between the box and the picture works however often it is done. A game
+  with no description and no tags is left as it is
+- **The version on the card**: to the right of a card's name, the version of the exe the game runs
+  from - the same readout Add/Edit shows beside Engine (the version token in the install folder's
+  name, nothing when there is none). A name or a version too long for its space slides back and forth
+  while the card is hovered - anywhere on it, picture or box - and is cut with an ellipsis the rest of
+  the time; a name does the same on a hovered row of the list view
 - **Multiple exe-path versions per game** — a reinstall, an update, or a
   second copy kept side by side can all be tracked under the same library
   entry instead of forking into a duplicate. Add, switch between, or remove
@@ -853,7 +864,7 @@ never deletes them.
 
 | Setting | Where | Default | What it does |
 |---|---|---|---|
-| `p2p_username` | Behaviour → *P2P display name* | empty | The name the receiver sees in your offer |
+| `p2p_username` | P2P → *P2P display name* | empty | The name the receiver sees in your offer |
 | `p2p_max_per_game` | P2P → Received saves → *Archives to keep per game* | 3 | Received **saves** beyond this are pruned, oldest first |
 | `p2p_retention_days` | P2P → Received saves → *Delete after* | 7 | Received **saves** older than this are pruned (the newest is always kept) |
 | `p2p_files_dir` | P2P → Received saves → *Folder for received files* | empty = `<SaveSync data>/p2p_files` | Where files and folders sent by hand are downloaded. *Browse…* picks one, *Default* goes back |
@@ -988,7 +999,10 @@ picture you opened stay as they were.
   arriving**, as an extra that changes nothing about the download. Both cards show
   progress and speed, then *sent* / *saved*; a saved card has **Show in folder**
   first and, as extras that work on the saved copy, **Show picture** for a plain
-  picture and **Play video** for a video. **Either end can stop a transfer at any
+  picture and **Play video** for a video. A picture you opened stays open for as long as its file is
+  where it was (and the one that came): through the end of the transfer, when you leave the chat and
+  come back, and when the list is opened again - until the list locks. A video's player is not kept
+  running in the background: it closes when you leave the chat page. **Either end can stop a transfer at any
   time** — see *Stopping a transfer* below. The rules, on both sides:
   - what arrives must be **exactly what was offered** — the same number of files
     and the same total size — or it is refused before a byte is fetched. A
@@ -1008,8 +1022,9 @@ picture you opened stay as they were.
     - a **picture** — PNG, JPEG, GIF, WebP or BMP, under 8 MB and 16 megapixels,
       first frame only, header checked before a pixel is read, with a memory cap;
     - a **video** — MP4, M4V, MOV, 3GP, MKV, WebM, AVI, WMV/ASF, OGV, FLV, MPEG or
-      MPEG-TS, in a small player inside the card (play/pause, seek, volume, close;
-      no full screen): **Play video** plays the downloaded copy, and **Watch while
+      MPEG-TS, in a small player inside the card (play/pause, seek, volume, close,
+      and a full screen button that shows the same player on a black window, whose
+      controls and pointer hide while the mouse is idle; Esc ends it): **Play video** plays the downloaded copy, and **Watch while
       downloading** (on a single-file video that is still arriving, once its start is
       in) plays it as it comes. The download is not touched either way: the file
       still lands whole in your folder, and whether or not you ever press Play. A
@@ -1221,7 +1236,7 @@ end the same way a direct message is.
   then speaks for themselves): an inviter who lies can show a newcomer the wrong members. An inviter who lies
   selectively can let in one person more than their number to some of the members, each of whom counts for
   themselves. There is no history: a newcomer sees only what is said after they joined. A name is not proof of
-  anyone. Nothing here has been tried over a live DHT or Tor - it was tested over simulated mailboxes.
+  anyone.
 - **If somebody is away.** What you say waits for them and goes when they are back. When more than twenty
   messages are waiting for somebody who has been away that long, the oldest chat is dropped from the queue, but never a message that changes the group (a
   join, a removal, a permission): the log shows a ✗ for that member and they get a note that some did not reach
@@ -1241,6 +1256,15 @@ meeting point only they know, see below — and then connect directly. That
 usually takes a few seconds, longer on a slow network. If the sender sits at 0
 peers:
 
+- With no reachable port on either side the two PCs reach each other by both
+  sending at the same moment (uTP), which on some networks takes a minute or more,
+  and SaveSync keeps trying for as long as the transfer waits. libtorrent stops
+  retrying a peer after several failed attempts (4 to 7 were seen) and takes no
+  notice of being asked for it again, so one that has stayed given up on for 3
+  seconds is forgotten (its address is put in the IP filter for a moment, which
+  removes it from the torrent's peer list) and connected to again. Both ends do
+  this while nobody is connected - the sender only until somebody has come, and
+  again when the receiver asks for files it left out - and not behind a proxy.
 - Keep **UPnP** on (the default) so the router opens the port itself.
 - If your router has UPnP switched off, set a fixed **Connection port** in
   Settings and forward it (TCP and UDP) to your PC. Only one of the two sides
@@ -1556,8 +1580,7 @@ mailbox and the key it is signed with, the key the offer, the "hold" and the "ca
 under, the rendezvous hash, the TLS authority, the onion address - so a holder of the token alone
 derives none of them: it is not their token. The send entry points refuse a bound token that
 comes without its key rather than send to the wrong mailbox, and the key is read on the GUI thread
-before the sending work starts. Verified at the level of the derivation and the services, not
-over a live DHT or Tor.
+before the sending work starts.
 
 **Group chats.** A group is no new kind of channel: a group message is a numbered, acknowledged text with a
 `g` field - the group, what it is (a message, an offered attachment, an invitation, the roster, a member added,

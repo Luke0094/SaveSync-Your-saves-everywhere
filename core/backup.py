@@ -173,8 +173,14 @@ def _is_in_skipped_subdir(f: Path, root: Path, keep: frozenset = frozenset()) ->
         rel_parts = f.relative_to(root).parts
     except ValueError:
         return True
-    return any(part.lower() in _BACKUP_SKIP_DIRS and part.lower() not in keep
-               for part in rel_parts[:-1])
+    if any(part.lower() in _BACKUP_SKIP_DIRS and part.lower() not in keep
+           for part in rel_parts[:-1]):
+        return True
+    # Ren'Py's own mirror of the folder (<Ren'Py data folder>/<game>/sync) is a copy of what is
+    # beside it: backing it up doubled every save. By place, not by name - a "sync" folder in
+    # any other game's saves is data.
+    from core.skip_dirs import renpy_sync_between
+    return renpy_sync_between(root, rel_parts)
 
 
 def _library_entry(game_id: str):
@@ -247,6 +253,35 @@ def restore_arc_prefix(chosen: str, root: str, interior: str = "") -> list:
             if low[-k:] == folded[:k]:
                 return cand[:k] if whole else root_parts + inner[:k]
     return []
+
+
+def infer_arc_interior(names, root: str) -> str:
+    """The folders every member under *root* shares, read off the archive.
+
+    For an archive whose recorded chain is missing — a copy that came from
+    another PC, whose sources and destinations are not on this one — the
+    members still say what the folder looked like: ``<root>/www/save/a``,
+    ``<root>/www/save/b`` share ``www/save``. Only directories count, never the
+    file name, and members that share nothing give "" (nothing is guessed).
+    """
+    shared = None
+    key = (root or "").casefold()
+    for name in names:
+        parts = _chain_parts(name)
+        if len(parts) < 2 or parts[0].casefold() != key:
+            continue
+        dirs = parts[1:-1]
+        if shared is None:
+            shared = dirs
+            continue
+        n = 0
+        while (n < len(shared) and n < len(dirs)
+               and shared[n].casefold() == dirs[n].casefold()):
+            n += 1
+        shared = shared[:n]
+        if not shared:
+            break
+    return "/".join(shared or [])
 
 
 def strip_arc_prefix(arc_name: str, prefix: list) -> str:
@@ -2937,14 +2972,26 @@ class BackupManager(QObject):
                     # <source>/<source>/... Worked out per zip root: one
                     # archive holds one per source folder, and a target that
                     # continues one of them says nothing about the others.
-                    _interiors = self._orphan_interiors(entry)
+                    _interiors = self._archive_interiors(entry, zf.namelist())
                     _prefixes: dict = {}
 
                     def _prefix_for(_root: str) -> list:
                         _key = _root.casefold()
                         if _key not in _prefixes:
-                            _prefixes[_key] = restore_arc_prefix(
-                                target_dir, _root, _interiors.get(_key, ""))
+                            _inner = _interiors.get(_key, "")
+                            _pfx = restore_arc_prefix(target_dir, _root, _inner)
+                            if not _pfx:
+                                # Nothing in the chosen folder's NAME says what
+                                # it is, but what is INSIDE it can: when the
+                                # first folder of the structure (www, of
+                                # www/save) is already there, this is the
+                                # game's own folder, and the files belong
+                                # beneath it — not under a copy of the folder
+                                # they were handed over in.
+                                _first = (_chain_parts(_inner) or [""])[0]
+                                if _first and (target_path / _first).is_dir():
+                                    _pfx = [_root]
+                            _prefixes[_key] = _pfx
                         return _prefixes[_key]
 
                     _want = ({str(r).casefold() for r in only_roots}
@@ -3009,6 +3056,24 @@ class BackupManager(QObject):
                         if _sp0.is_dir() or (not _sp0.exists() and not _sp0.suffix):
                             _single_dir_target = _sp0
 
+                    # What that stale root has to shed besides its own name: the
+                    # resolved folder IS the end of the structure the archive
+                    # records ("www/save"), so landing the members beneath it
+                    # as they stand would rebuild that structure a second time
+                    # inside itself — www/save/www/save/…
+                    _single_interiors = (
+                        self._archive_interiors(entry, zf.namelist())
+                        if _single_dir_target is not None else {})
+                    _single_prefixes: dict = {}
+
+                    def _single_prefix(_root: str) -> list:
+                        _k = _root.casefold()
+                        if _k not in _single_prefixes:
+                            _single_prefixes[_k] = restore_arc_prefix(
+                                str(_single_dir_target), _root,
+                                _single_interiors.get(_k, "")) or [_root]
+                        return _single_prefixes[_k]
+
                     work: list[tuple[Path, bytes, str]] = []
 
                     for arc_name in zf.namelist():
@@ -3052,7 +3117,9 @@ class BackupManager(QObject):
                                 # above): drop the stale root component and
                                 # land inside the resolved directory.
                                 restore_root = _single_dir_target
-                                dest = _single_dir_target / Path(*arc_path.parts[1:])
+                                dest = _single_dir_target / strip_arc_prefix(
+                                    arc_name_clean,
+                                    _single_prefix(arc_path.parts[0]))
                         if dest is None:
                             dest = restore_root / arc_path
                         if not _is_relative_to(dest.resolve(), restore_root.resolve()):
@@ -4611,6 +4678,30 @@ class BackupManager(QObject):
             root = Path(src).name
             if root:
                 out[root.casefold()] = inner or ""
+        return out
+
+    def _archive_interiors(self, entry: BackupEntry, names) -> dict:
+        """``{zip root (casefolded): the chain INSIDE it}`` for any archive.
+
+        The recorded answer first (_orphan_interiors), then the chains the
+        entry carries beside its save paths, then what the archive itself shows
+        (infer_arc_interior). A copy brought from another PC has often lost the
+        first two — its recorded sources point at folders that are not here —
+        and a restore that does not know the structure inside a root can only
+        drop the whole tree where it is told, which is how ``www/save`` ended
+        up inside the ``save`` folder it belongs to.
+        """
+        out = dict(self._orphan_interiors(entry))
+        for sp, chain in zip(entry.save_paths or [], entry.content_chains or []):
+            root = Path(sp).name
+            if root and chain and not out.get(root.casefold()):
+                out[root.casefold()] = chain
+        roots = {_chain_parts(n)[0] for n in names if len(_chain_parts(n)) > 1}
+        for root in roots:
+            if not out.get(root.casefold()):
+                inferred = infer_arc_interior(names, root)
+                if inferred:
+                    out[root.casefold()] = inferred
         return out
 
     def _orphan_targets(self, entry: BackupEntry,

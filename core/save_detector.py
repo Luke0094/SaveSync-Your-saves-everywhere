@@ -136,6 +136,7 @@ _SAVE_EXTENSIONS = frozenset({
 # core.skip_dirs and are reused by the backup content-walk under
 # _BACKUP_SKIP_DIRS; the scan set adds OS/system/browser/AV/app folders.
 from core.skip_dirs import SCAN_SKIP_DIRS as _SKIP_DIRS
+from core.skip_dirs import is_renpy_sync_mirror, renpy_sync_between  # noqa: F401  (re-exported)
 
 # Generic exe stems that are meaningless as search terms or context.
 # Shared across save detection and API search.
@@ -268,6 +269,25 @@ def dedupe_paths(paths) -> list[str]:
         seen.add(key)
         result.append(p)
     return result
+
+
+def drop_excluded_paths(paths, game_id: str = "", extra_excluded=()) -> list[str]:
+    """*paths* without the ones the user excluded: the folders trashed for *game_id* (Settings
+    lists them as excluded paths) and *extra_excluded* - this session's deletions, in a panel
+    that has not been saved yet. EXACT, like is_rejected_save_path: a folder inside an excluded
+    one is judged on its own. Case/separator spellings of one folder are the same folder (see
+    path_identity). For the places that take what a scan found as it is."""
+    excluded: list[str] = list(extra_excluded or [])
+    if game_id:
+        try:
+            from core.config_manager import get_config
+            excluded += list((get_config().get("auto_scan_deleted_paths", {}) or {}).get(game_id) or [])
+        except Exception:
+            pass
+    keys = {path_identity(p) for p in excluded if p}
+    if not keys:
+        return list(paths or [])
+    return [p for p in (paths or []) if path_identity(p) not in keys]
 
 
 def _rule_key(path_str: str) -> str:
@@ -640,6 +660,70 @@ def _engine_allows_skipped_path(path_str: str, exe_path: str) -> bool:
         return False
 
 
+def is_skipped_save_location(path_str: str, exe_path: str = "", depth: Optional[int] = None) -> bool:
+    """True when *path_str* is in, or under, a folder the shared skip list names (game
+    assets, engine mirrors such as Ren'Py's ``sync``, caches...) - unless this game's engine
+    genuinely saves there (see _engine_allows_skipped_path).
+
+    One answer for every route that proposes a save folder - the scans, live tracking, and the
+    watcher's discoveries - so that a folder excluded from detection is excluded from all of
+    them. *depth*, when given, looks only at that many of the path's last components: the
+    watcher sees the file a game wrote, and the folders far above a save (the user's Desktop,
+    a temp folder the game was unpacked into) say nothing about whether the folder it sits in
+    is a save location."""
+    if is_renpy_sync_mirror(path_str):
+        return True
+    try:
+        parts = Path(path_str).parts
+        if depth:
+            parts = parts[-depth:]
+        if not ({p.lower() for p in parts} & _SKIP_DIRS):
+            return False
+    except (OSError, ValueError):
+        return False
+    return not _engine_allows_skipped_path(path_str, exe_path or "")
+
+
+def is_never_save_location(path_str: str) -> bool:
+    """True when *path_str* is in, or under, a folder that is never a save location whatever
+    the engine: Ren'Py's own ``sync`` mirror, ``<Ren'Py data folder>/<game>/sync`` - recognised by
+    where it is, never by its name (see core.skip_dirs). The narrow question the file watcher
+    asks of every write: it has no engine exceptions and does not need to know the game, so it
+    is cheap enough to run on each event."""
+    return is_renpy_sync_mirror(path_str)
+
+
+def _renpy_install_root(exe_dir: Path) -> Optional[Path]:
+    """The root of a Ren'Py install (the folder with ``game/`` and ``renpy/`` in it) that the
+    executable in *exe_dir* belongs to, or None. The executable sits at the install root, or a
+    level or two down (``lib/<platform>/``), so the root is looked for upward."""
+    base = exe_dir
+    for _ in range(3):
+        try:
+            if (base / "game").is_dir() and (base / "renpy").is_dir():
+                return base
+        except OSError:
+            return None
+        if base.parent == base:
+            break
+        base = base.parent
+    return None
+
+
+def _renpy_install_save_dirs(exe_dir: Path) -> list[Path]:
+    """Where Ren'Py writes beside the game: ``<install>/game/saves`` (or ``save``). Ren'Py puts
+    a copy there AND one under Roaming/RenPy, and the Roaming one is found by name; this one
+    is a fixed place."""
+    root = _renpy_install_root(exe_dir)
+    if root is None:
+        return []
+    game = root / "game"
+    try:
+        return [game / sub for sub in ("saves", "save") if (game / sub).is_dir()]
+    except OSError:
+        return []
+
+
 def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                   extra_terms: Optional[list[str]] = None) -> list[tuple[int, str]]:
     """
@@ -703,6 +787,12 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                     matched = True; break
             if matched:
                 results.append((92, str(child)))
+
+    # The copy beside the game. A known place like the Roaming one, so live tracking proposes
+    # both in the same poll - they hold the same saves, in two locations - rather than this one
+    # only after an open-file poll happens to catch a (very brief) write.
+    for install_saves in _renpy_install_save_dirs(exe_dir):
+        results.append((92, str(install_saves)))
 
     # ── RPGMaker VX Ace / MV / MZ ────────────────────────────────────────────
     # VX Ace: AppData/Roaming/<GameName>/
@@ -1395,6 +1485,9 @@ def _live_save_paths(pid: int) -> list[str]:
             f_parts = {part.lower() for part in fp.parts}
             if f_parts & _SKIP_DIRS:
                 continue
+            # Ren'Py's own mirror of its save folder (by place, not by name)
+            if is_renpy_sync_mirror(fp):
+                continue
 
             # Chromium/NW.js/CEF player-profile tree: keep a game's own
             # subfolder (Default\<GameName>\*.rpgsave), drop everything the
@@ -1864,6 +1957,9 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
             return 0
     except (OSError, ValueError):
         pass
+    # ...nor Ren'Py's own mirror of a save folder
+    if is_renpy_sync_mirror(folder):
+        return 0
     game_slug = match_slug(game_name)
 
     # Skip obvious non-save directories
@@ -2292,8 +2388,18 @@ def detect_save_paths(
         game_entry = library.get_by_exe(exe_path) if exe_path else None
     except Exception:
         game_entry = None
+    # Paths the user trashed for this game (Settings lists them as excluded): not proposed again,
+    # whichever route finds them. Exactly those folders - see is_rejected_save_path - and not
+    # one the game lists as a save path today.
+    rejected_keys: set[str] = set()
     if game_entry is not None:
         deselected_paths = set(config.get("auto_scan_deselected_paths", {}).get(game_entry.id, []))
+        try:
+            raw_deleted = (config.get("auto_scan_deleted_paths", {}) or {}).get(game_entry.id) or []
+            confirmed_keys = {_rule_key(p) for p in (game_entry.save_paths or []) if p}
+            rejected_keys = {_rule_key(p) for p in raw_deleted if p} - confirmed_keys
+        except Exception:
+            rejected_keys = set()
 
     def _add(path_str: str, is_live_result: bool = False, engine_detected: bool = False):
         # Virtual registry entries (registry:HKCU\...) short-circuit every
@@ -2322,18 +2428,18 @@ def detect_save_paths(
         # Skip paths whose components match _SKIP_DIRS (lib, savesync, etc.),
         # unless the engine this game was built with is one that genuinely
         # saves under such a folder — see _engine_allows_skipped_path.
-        try:
-            p_parts = set(part.lower() for part in Path(path_str).parts)
-            if p_parts & _SKIP_DIRS and not _engine_allows_skipped_path(
-                    path_str, exe_path or ""):
-                logger.debug(f"Skipping path with skip dir: {path_str}")
-                return
-        except (OSError, ValueError):
-            pass
+        if is_skipped_save_location(path_str, exe_path or ""):
+            logger.debug(f"Skipping path with skip dir: {path_str}")
+            return
 
         # Skip paths that user has previously deselected
         if path_str in deselected_paths:
             logger.debug(f"Skipping deselected path: {path_str}")
+            return
+
+        # ...or deleted (Settings: excluded paths)
+        if rejected_keys and _rule_key(path_str) in rejected_keys:
+            logger.debug(f"Skipping excluded path: {path_str}")
             return
 
         key = str(Path(path_str)).lower()
@@ -2593,10 +2699,22 @@ def detect_save_paths(
         logger.info("Top candidates: %s",
             [(s, str(p)[-60:]) for s, p in sorted(candidates, key=lambda x: -x[0])[:5]])
     
+    def _user_excluded(path_str: str) -> bool:
+        """Answers the user already gave (deselected, or excluded in Settings) and the folders
+        that are never a save location - what _add applies to every other route, and this one
+        used to skip: it put its candidates straight into the results, so a folder the user
+        had excluded came back from every scan."""
+        return (path_str in deselected_paths
+                or (bool(rejected_keys) and _rule_key(path_str) in rejected_keys)
+                or is_never_save_location(path_str))
+
     for score, path in sorted(candidates, key=lambda x: -x[0]):
         if len(results) >= MAX_RESULTS_PER_GAME:
             break
         key = str(path).lower()
+        if _user_excluded(str(path)):
+            logger.debug(f"Skipping excluded scan candidate: {path}")
+            continue
         if key not in seen and score >= MIN_CONFIDENCE_THRESHOLD:
             # Validate against every search term — a path found via a short
             # exe stem must pass context check with that term, not just the
@@ -2681,6 +2799,8 @@ def path_has_backup_content(path_str, include_detection_excluded: bool = True,
                 rel_parts = f.relative_to(p).parts
                 if any(part.lower() in skip_dirs for part in rel_parts[:-1]):
                     continue
+                if renpy_sync_between(p, rel_parts):
+                    continue            # (Ren'Py's mirror of this folder: a copy, not content)
             except ValueError:
                 pass
             return True
@@ -2801,6 +2921,7 @@ def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3,
                 out.append(f)
             for sub in sorted((c for c in direct if c.is_dir()
                                and c.name.lower() not in _excluded_dirs
+                               and not is_renpy_sync_mirror(c)
                                and any(h in c.name.lower() for h in _hints)),
                               key=lambda c: c.name.lower()):
                 _expand(sub, depth + 1, out)
@@ -2820,7 +2941,8 @@ def expand_selectable_paths(paths: list[str], max_expand_depth: int = 3,
         subdirs = []
         try:
             subdirs = [c for c in p.iterdir()
-                       if c.is_dir() and c.name.lower() not in _excluded_dirs]
+                       if c.is_dir() and c.name.lower() not in _excluded_dirs
+                       and not is_renpy_sync_mirror(c)]
         except (PermissionError, OSError):
             out.append(p)               # unreadable: keep original entry
             return
@@ -2890,6 +3012,9 @@ def _scan_dir(
             if not entry.is_dir():
                 continue
             if entry.name.lower() in _SKIP_DIRS:
+                continue
+            # Ren'Py's own mirror of a save folder: by place, never by name
+            if entry.name.lower() == "sync" and is_renpy_sync_mirror(entry):
                 continue
             # Chromium/CEF/Electron's OWN internal bookkeeping ("Stability",
             # "Crashpad", …) inside a "User Data" browser-profile tree many
@@ -3007,9 +3132,21 @@ def general_scan_paths(game_name: str, exe_path: str, hints: list[str],
                 logger.debug(f"General scan error in {root} ({term!r}): {e}")
 
     already_set = {str(p) for p in already}
+    # A Ren'Py install's own folders - the install root and its "game" folder - score well
+    # (their parent is named after the game) but are the game, not its saves: they hold the
+    # scripts, images and fonts, and proposing "game" also swallowed "game/saves" in the merge
+    # that follows (a folder with files of its own covers what is inside it). The saves are a
+    # known place of their own (see _renpy_install_save_dirs).
+    not_saves: set = set()
+    if exe_path:
+        _rp_root = _renpy_install_root(Path(exe_path).parent)
+        if _rp_root is not None:
+            not_saves = {os.path.normcase(str(_rp_root)), os.path.normcase(str(_rp_root / "game"))}
     finals: list = []
     for score, path in candidates:
         if str(path) in already_set:
+            continue
+        if not_saves and os.path.normcase(str(path)) in not_saves:
             continue
         rescore = _score_folder(path, game_name, hints, exe_path=exe_path)
         combined = max(score, rescore) if rescore > 0 else score
