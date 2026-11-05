@@ -168,6 +168,7 @@ class SettingsPage(PageScrollMixin, QWidget):
     # hotkey in the file may differ from the one actually listening, and
     # hotkey_changed cannot say what the old one was.
     hotkeys_reload = Signal()
+    settings_saved = Signal()           # Save was pressed: the host may want to push the configuration
     theme_changed  = Signal(str)
     p2p_proxy_checked = Signal(str)     # the Test button's answer (core.p2p.proxy.check)
 
@@ -454,6 +455,14 @@ class SettingsPage(PageScrollMixin, QWidget):
             return
         self._section_jobs_gen += 1  # kill a running pump
         self._stop_deferred_busy()
+        # The Tor status line is refreshed by a timer of the page (made with the privacy section): the widgets it writes to are deleted below,
+        # and the timer went on every second, raising "Internal C++ object already deleted" until the section was built again - which it is
+        # only when the page is shown (the memory trim wipes the pages when a game exits, and the page may not be shown for hours).
+        timer = getattr(self, "_p2p_tor_timer", None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._p2p_tor_timer = None
         self._built = False
         self._jump_combo.setEnabled(False)
         self._jump_targets = []
@@ -1100,7 +1109,15 @@ class SettingsPage(PageScrollMixin, QWidget):
         """What to say under the private-mode box: whether the Tor program is in this
         installation, and - once it is switched on and saved - how Tor is doing."""
         from core.p2p import tor as _tor
-        if self._p2p_mode.mode() != "tor":
+        try:
+            mode = self._p2p_mode.mode()
+        except (RuntimeError, AttributeError):
+            # the section's widgets are gone (the page was wiped): nothing to refresh, and the timer has no more business
+            timer = getattr(self, "_p2p_tor_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+        if mode != "tor":
             text, color = "", palette("text_secondary")
         elif not _tor.service().available():
             text, color = "✗ " + t("settings.p2p_tor_missing"), palette("error")
@@ -1349,17 +1366,6 @@ class SettingsPage(PageScrollMixin, QWidget):
         # sync provider so a wipe or new machine still has library/settings.
         self._auto_export_cb = WrappedCheckBox(t("settings.auto_export_config"), t("settings.auto_export_config_tooltip"))
         transfer_form.addRow(self._auto_export_cb)
-        self._auto_export_days_spin = QSpinBox()
-        self._auto_export_days_spin.setRange(1, 365)
-        self._auto_export_days_spin.setSuffix(" " + t("settings.days_suffix"))
-        self._auto_export_days_spin.setToolTip(
-            t("settings.auto_export_config_interval_tooltip"))
-        self._auto_export_days_lbl = QLabel(
-            t("settings.auto_export_config_interval"))
-        transfer_form.addRow(self._auto_export_days_lbl,
-                             self._auto_export_days_spin)
-        self._auto_export_cb.toggled.connect(self._auto_export_days_spin.setEnabled)
-        self._auto_export_cb.toggled.connect(self._auto_export_days_lbl.setEnabled)
 
         self._scroll_layout.addWidget(transfer_grp)
         return transfer_grp, "settings.section_config_transfer"
@@ -1458,7 +1464,6 @@ class SettingsPage(PageScrollMixin, QWidget):
             getattr(self, "_idle_after_spin", None),
             getattr(self, "_correlation_spin", None),
             getattr(self, "_self_checks_freq_spin", None),
-            getattr(self, "_auto_export_days_spin", None),
         ):
             if spin is not None:
                 lock_min_size(spin, scaled(100, self, min_px=80), scaled(28, self, min_px=24))
@@ -1720,7 +1725,11 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._poll_spin.valueChanged.connect(self._mark_dirty)
         self._idle_after_spin.valueChanged.connect(self._mark_dirty)
         self._auto_export_cb.stateChanged.connect(self._mark_dirty)
-        self._auto_export_days_spin.valueChanged.connect(self._mark_dirty)
+        try:
+            from sync import get_orchestrator
+            get_orchestrator().providers_updated.connect(self._apply_provider_state)
+        except Exception:
+            pass
         self._correlation_cb.stateChanged.connect(self._mark_dirty)
         self._correlation_spin.valueChanged.connect(self._mark_dirty)
         self._hints_edit.textChanged.connect(self._mark_dirty)
@@ -2096,7 +2105,6 @@ class SettingsPage(PageScrollMixin, QWidget):
             "poll": self._poll_spin.value(),
             "idle_after": self._idle_after_spin.value(),
             "auto_export": self._auto_export_cb.isChecked(),
-            "auto_export_days": self._auto_export_days_spin.value(),
             "correlation": self._correlation_cb.isChecked(),
             "correlation_window": self._correlation_spin.value(),
             "ignored": "",  # managed via unified process list, not a textarea
@@ -2152,7 +2160,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._hide_on_game_cb.setChecked(config.get("hide_to_tray_on_game_launch", True))
         self._archives_too_cb.setChecked(config.get("backup_archives_too", True))
         self._backup_on_exit_cb.setChecked(config.get("backup_on_exit", True))
-        self._auto_sync_cb.setChecked(config.get("auto_sync_after_backup", False))
+        self._auto_sync_cb.setChecked(config.get("auto_sync_after_backup", True))
         self._auto_scan_cb.setChecked(config.get("auto_scan_on_exit", True))
         self._updates_cb.setChecked(config.get("check_for_updates", True))
         self._load_suppression_list()
@@ -2205,12 +2213,9 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._self_checks_freq_spin.blockSignals(False)
         self._self_checks_freq_spin.setEnabled(self._self_checks_cb.isChecked())
         self._self_checks_freq_lbl.setEnabled(self._self_checks_cb.isChecked())
-        _auto_exp = config.get("auto_export_config_enabled", False)
+        _auto_exp = config.get("auto_export_config_enabled", True)
         self._auto_export_cb.setChecked(_auto_exp)
-        self._auto_export_days_spin.setValue(
-            config.get("auto_export_config_interval_days", 7))
-        self._auto_export_days_spin.setEnabled(_auto_exp)
-        self._auto_export_days_lbl.setEnabled(_auto_exp)
+        self._apply_provider_state()
         _corr_on = config.get("save_correlation_enabled", False)
         self._correlation_cb.setChecked(_corr_on)
         self._correlation_spin.setValue(config.get("save_correlation_window_ms", 1000))
@@ -2332,8 +2337,6 @@ class SettingsPage(PageScrollMixin, QWidget):
         config.set("process_poll_interval",  self._poll_spin.value())
         config.set("idle_after_minutes",     self._idle_after_spin.value())
         config.set("auto_export_config_enabled", self._auto_export_cb.isChecked())
-        config.set("auto_export_config_interval_days",
-                   self._auto_export_days_spin.value())
         config.set("save_correlation_enabled",   self._correlation_cb.isChecked())
         config.set("save_correlation_window_ms", self._correlation_spin.value())
 
@@ -2395,6 +2398,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             except RuntimeError:
                 pass
         QTimer.singleShot(2000, _hide_saved_lbl)
+        self.settings_saved.emit()
 
     def _cancel(self):
         # Revert theme and language to what they were before changes
@@ -2526,12 +2530,27 @@ class SettingsPage(PageScrollMixin, QWidget):
         "auto_scan_deleted_paths":   "_load_excluded_paths_list",
     }
 
+    def _apply_provider_state(self, *_):
+        """The two options that only mean something with a sync provider - sync after backup, and keeping the
+        configuration in step - are on by default and greyed out (still showing their value) until one is connected."""
+        try:
+            from sync import get_orchestrator
+            online = bool(get_orchestrator().is_online())
+        except Exception:
+            online = False
+        for cb, key in ((self._auto_sync_cb, "settings.auto_sync_after_backup_tooltip"),
+                        (self._auto_export_cb, "settings.auto_export_config_tooltip")):
+            cb.setEnabled(online)
+            cb.setToolTip(t(key) if online else t(key) + "\n\n" + t("settings.needs_provider"))
+
     def showEvent(self, event):
         """Re-read the dynamic lists every time the page becomes visible:
         "don't show again" (unknown-game notifications) and path exclusions
         land in config while the user is elsewhere — without this the table
         showed the state from when the page was first built."""
         super().showEvent(event)
+        if getattr(self, "_built", False):
+            self._apply_provider_state()
         if not getattr(self, "_built", False):
             self._lists_pending = True
             return
@@ -2845,7 +2864,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             "hide_to_tray_on_game_launch": True,
             "start_minimized_on_startup": False,
             "backup_on_exit":         True,
-            "auto_sync_after_backup": False,
+            "auto_sync_after_backup": True,
             "auto_scan_on_exit":      True,
             "check_for_updates":      True,
             "show_overlay_on_launch": True,
@@ -2860,8 +2879,7 @@ class SettingsPage(PageScrollMixin, QWidget):
             "idle_after_minutes":     10,
             "backup_verify_enabled":      True,
             "backup_verify_interval_days": 7,
-            "auto_export_config_enabled": False,
-            "auto_export_config_interval_days": 7,
+            "auto_export_config_enabled": True,
             "save_correlation_enabled":   False,
             "save_correlation_window_ms": 1000,
             "ignored_processes":      [],
@@ -3102,10 +3120,7 @@ class SettingsPage(PageScrollMixin, QWidget):
         self._hints_edit.setPlaceholderText(t("settings.save_hints_desc"))
         self._auto_export_cb.setText(t("settings.auto_export_config"))
         self._auto_export_cb.setToolTip(t("settings.auto_export_config_tooltip"))
-        self._auto_export_days_lbl.setText(t("settings.auto_export_config_interval"))
-        self._auto_export_days_spin.setSuffix(" " + t("settings.days_suffix"))
-        self._auto_export_days_spin.setToolTip(
-            t("settings.auto_export_config_interval_tooltip"))
+        self._apply_provider_state()
         self._correlation_cb.setText(t("settings.save_correlation"))
         self._correlation_cb.setToolTip(t("settings.save_correlation_tooltip"))
         self._correlation_lbl.setText(t("settings.save_correlation_window"))

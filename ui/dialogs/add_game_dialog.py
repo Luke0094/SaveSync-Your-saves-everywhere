@@ -468,6 +468,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # into a library card of its own on Save — like the dict above, nothing
         # is done until then.
         self._exe_splits: list[tuple] = []
+        # Cards picked in the "merge another card into this one" list: (game id, name), each absorbed
+        # into this card on Save (core.merge_cards) - nothing is done until then, as with the splits.
+        self._merges: list[tuple] = []
+        # A merge on Save touched cards that had been in the cloud: the host syncs the surviving one.
+        self._merge_cloud = False
         # Save folders moved on screen by switching version: {original: current},
         # and the chain each new one belongs to. Save reads them back so the
         # save data still follows the move (see _carry_saves_after_exe_change).
@@ -1633,6 +1638,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         self._detected_hdr_row = detected_hdr_row
         self._paths_layout.addWidget(self._detected_sep)
         self._paths_layout.addWidget(detected_hdr_row)
+        # The second copy of the same saves (Ren'Py writes them twice): under its own heading, unticked.
+        self._dup_section_lbl, dup_hdr_row = self._build_path_section_header(
+            t('auto_scan.duplicate_header'), "duplicate", "form_section_lbl_faint")
+        self._dup_section_lbl.setToolTip(t('auto_scan.duplicate_tip'))
+        dup_hdr_row.setVisible(False)
+        self._dup_hdr_row = dup_hdr_row
+        self._paths_layout.addWidget(dup_hdr_row)
         self._paths_layout.addStretch()
         self._paths_scroll.setWidget(self._paths_container)
         layout.addWidget(self._paths_scroll, 1)
@@ -1871,6 +1883,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         dlg.setModal(True)
         dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
         dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        dlg.setProperty("xs_designed_translucent", True)      # (its rounded corners are drawn by its own widgets: see ui.exclusive_session)
         dlg.setStyleSheet("QDialog{background:transparent;}")
 
         outer = QWidget(dlg)
@@ -2628,13 +2641,69 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         """'+' next to the exe Browse button — plain Browse when there's
         nothing to branch on yet; once a path is already set, a choice
         between tracking a second version and replacing the current one."""
-        if not self._exe_edit.text().strip():
+        has_exe = bool(self._exe_edit.text().strip())
+        can_merge = self._can_merge()
+        if not has_exe and not can_merge:
             self._browse_exe()
             return
         menu = self._new_small_menu()
-        menu.addAction(t('add_game.exe_add_version'), self._browse_new_exe_version)
-        menu.addAction(t('add_game.exe_overwrite'), lambda: self._browse_exe())
+        if has_exe:
+            menu.addAction(t('add_game.exe_add_version'), self._browse_new_exe_version)
+            menu.addAction(t('add_game.exe_overwrite'), lambda: self._browse_exe())
+        else:
+            menu.addAction(t('add_game.browse'), lambda: self._browse_exe())
+        if can_merge:
+            menu.addAction(t('add_game.exe_merge'), self._pick_cards_to_merge)
         menu.exec(self._exe_add_btn.mapToGlobal(self._exe_add_btn.rect().bottomLeft()))
+
+    def _can_merge(self) -> bool:
+        """Merging is offered while editing a card of a library that has another one."""
+        return bool(self._editing_entry) and len(get_library().all_game_ids() - {self._editing_entry.id}) > 0
+
+    def _pick_cards_to_merge(self):
+        """The list of the other cards; what is ticked is staged for Save (see _apply_staged_merges)."""
+        from ui.dialogs.merge_card_dialog import MergeCardDialog
+        entry = self._editing_entry
+        dlg = MergeCardDialog(entry.id, self._name_edit.text().strip() or entry.name,
+                              staged=[gid for gid, _n in self._merges], parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        lib = get_library()
+        chosen = []
+        for gid in dlg.chosen_ids():
+            other = lib.get_by_id(gid)
+            if other is not None:
+                chosen.append((gid, other.name))
+        self._merges = chosen
+        if not chosen:
+            self._status_lbl.setText("")
+            return
+        self._status_lbl.setText(t('add_game.exe_merge_pending', names=", ".join(n for _g, n in chosen)))
+        self._status_lbl.setStyleSheet(f"color:{palette('accent')};font-size:{scaled(12, self)}px;")
+
+    def _apply_staged_merges(self, entry):
+        """Save-time half of the merge: every staged card is absorbed into this one, after the rest of
+        the edit has been stored (a version joining before that would be taken for one just added by
+        this dialog). Returns the card as stored now."""
+        if not self._merges:
+            return entry
+        from core.merge_cards import merge_cards
+        for gid, name in self._merges:
+            try:
+                out = merge_cards(entry.id, gid)
+            except Exception:
+                logger.exception(f"Could not merge '{name}' into '{entry.name}'")
+                continue
+            if out.keep is not None:
+                entry = out.keep
+            if out.merged and out.in_cloud:
+                self._merge_cloud = True
+            if out.reason == "playing":
+                warning_window_modal(self, t('app.name'), t('add_game.merge_skipped_playing', name=name))
+            elif out.reason == "backups_left":
+                warning_window_modal(self, t('app.name'), t('add_game.merge_skipped_backups', name=name))
+        self._merges = []
+        return entry
 
     def _browse_new_exe_version(self):
         """Pick an exe to track as an EXTRA version. Unlike _browse_exe this
@@ -3407,9 +3476,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         # yet means the button is still plain Browse, not "+"/"track
         # another version" — matched here so the label never promises a
         # menu the click wouldn't actually show.
-        if exe_path:
+        if exe_path or self._can_merge():
             self._exe_add_btn.setText(t("add_game.exe_browse_plus"))
-            self._exe_add_btn.setToolTip(t("add_game.exe_add_tooltip"))
+            self._exe_add_btn.setToolTip(t("add_game.exe_add_tooltip") if exe_path else t("add_game.exe_browse_tooltip"))
         else:
             self._exe_add_btn.setText(t("add_game.browse"))
             self._exe_add_btn.setToolTip(t("add_game.exe_browse_tooltip"))
@@ -4072,8 +4141,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 return
         self._add_path(path_str)
 
-    def _add_path(self, path_str: str, detected: bool = False):
-        """Add a save path row. detected=True places it in the detected section."""
+    def _add_path(self, path_str: str, detected: bool = False, duplicate: bool = False):
+        """Add a save path row. detected=True places it in the detected section; duplicate=True (a detected path
+        that is the second copy of saves already proposed or listed) in the duplicate section, unticked."""
         if path_str in self._save_paths:
             return
         # A row deleted earlier in THIS session must not be resurrected by a
@@ -4089,28 +4159,25 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         row = PathRow(path_str, game_id=game_id)
         if self._editing_entry and path_str in (self._editing_entry.excluded_save_paths or []):
             row.set_checked(False)
+        if duplicate:
+            row.set_checked(False)      # the same saves as another row: on the list, not backed up unless ticked
         row.remove_requested.connect(self._remove_path)
         row.checkbox.toggled.connect(lambda _=False: self._refresh_switch_notes())
         row.setProperty("detected", detected)
+        row.setProperty("duplicate", duplicate)
 
-        # Manual paths go before the separator; detected go after it
+        # Manual paths go before the separator; detected go after it, and the duplicates after those
         sep_idx = self._paths_layout.indexOf(self._detected_sep)
-        if detected:
-            # Only show separator when BOTH manual and detected paths exist
-            has_manual = any(
-                isinstance(self._paths_layout.itemAt(i).widget() if self._paths_layout.itemAt(i) else None, PathRow)
-                and not (self._paths_layout.itemAt(i).widget().property("detected") if self._paths_layout.itemAt(i).widget() else False)
-                for i in range(self._paths_layout.count())
-            )
-            self._detected_sep.setVisible(has_manual)
-            self._detected_hdr_row.setVisible(True)
-            # Insert before stretch (last item)
-            insert_at = self._paths_layout.count() - 1
+        if duplicate:
+            insert_at = self._paths_layout.count() - 1          # before the stretch (last item)
+        elif detected:
+            insert_at = self._paths_layout.indexOf(self._dup_hdr_row)
         else:
             # Insert before the separator
             insert_at = sep_idx if sep_idx >= 0 else self._paths_layout.count() - 1
 
         self._paths_layout.insertWidget(insert_at, row)
+        self._refresh_path_sections()
         # Recompute net sizes for all rows (exclude child-paths from parent sizes)
         self._refresh_path_sizes()
 
@@ -4155,22 +4222,21 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 self._paths_layout.removeWidget(w)
                 w.deleteLater()
                 break
-        # Hide detected section markers if no detected rows remain
-        has_detected = any(
-            isinstance(self._paths_layout.itemAt(i).widget() if self._paths_layout.itemAt(i) else None, PathRow)
-            and (self._paths_layout.itemAt(i).widget().property("detected") if self._paths_layout.itemAt(i).widget() else False)
-            for i in range(self._paths_layout.count())
-        )
-        has_manual = any(
-            isinstance(self._paths_layout.itemAt(i).widget() if self._paths_layout.itemAt(i) else None, PathRow)
-            and not (self._paths_layout.itemAt(i).widget().property("detected") if self._paths_layout.itemAt(i).widget() else False)
-            for i in range(self._paths_layout.count())
-        )
-        # Only show separator when BOTH manual and detected paths exist
-        self._detected_sep.setVisible(has_detected and has_manual)
-        self._detected_hdr_row.setVisible(has_detected)
+        self._refresh_path_sections()
         if not self._save_paths:
             self._paths_empty_lbl.setVisible(True)
+
+    def _refresh_path_sections(self) -> None:
+        """Show the section markers the rows on screen call for: the separator only between your own folders and
+        what was found, the "detected" heading only above detected rows, the "duplicate" heading only above copies."""
+        rows = [w for w in (self._paths_layout.itemAt(i).widget() if self._paths_layout.itemAt(i) else None
+                            for i in range(self._paths_layout.count())) if isinstance(w, PathRow)]
+        has_manual = any(not r.property("detected") for r in rows)
+        has_detected = any(r.property("detected") and not r.property("duplicate") for r in rows)
+        has_dup = any(r.property("duplicate") for r in rows)
+        self._detected_sep.setVisible(has_manual and (has_detected or has_dup))
+        self._detected_hdr_row.setVisible(has_detected)
+        self._dup_hdr_row.setVisible(has_dup)
 
     # ── Auto-detect ───────────────────────────────────────────────────────────
 
@@ -4248,6 +4314,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         gid = self._editing_entry.id if self._editing_entry else ""
         paths = drop_excluded_paths(paths, gid, extra_excluded=self._pending_removed_paths())
 
+        # The second copy of the same saves (Ren'Py writes them beside the game AND in its own data folder) is
+        # shown too, under its own heading and unticked: on the game's list afterwards, so a scan does not
+        # offer it again as something new, and still there to tick if the backup should move to it.
+        from core.save_twins import split_twin_copies
+        paths, duplicates = split_twin_copies(paths, listed=self._save_paths)
+
         # Path-normalized membership: a detected path differing only by
         # case/trailing separator from an already-listed one is a duplicate,
         # not a new row.
@@ -4261,6 +4333,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 self._add_path(p, detected=True)   # below separator
                 existing.add(_norm(p))
                 added += 1
+        for p in duplicates:
+            if _norm(p) not in existing:
+                self._add_path(p, detected=True, duplicate=True)
+                existing.add(_norm(p))
 
         if added:
             if is_live_tracking:
@@ -4280,7 +4356,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # If we found paths via live tracking, we can be more confident
             if is_live_tracking and added > 0:
                 self._auto_select_detected_paths()
-        elif paths:
+        elif paths or duplicates:
             # Detection DID find the save location — it just matches what is
             # already listed. That's a confirmation, not a failure.
             self._status_lbl.setText(t("add_game.paths_already_saved"))
@@ -4305,7 +4381,7 @@ class AddGameDialog(SearchFlowMixin, QDialog):
         for i in range(self._paths_layout.count()):
             item = self._paths_layout.itemAt(i)
             widget = item.widget() if item else None
-            if isinstance(widget, PathRow) and widget.property("detected"):
+            if isinstance(widget, PathRow) and widget.property("detected") and not widget.property("duplicate"):
                 # This is a detected path - check it (should already be checked by default)
                 widget.set_checked(True)
                 logger.info(f"Auto-selected live tracking path: {widget.get_path()}")
@@ -5425,6 +5501,13 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             if existing:
                 self._editing_entry = existing
 
+        # A new game whose program sits in a Steam library: Play can start it through Steam, so the launch URL is recorded now.
+        if not self._editing_entry and exe and not appid:
+            from core.resolvers import launcher_url_for_exe
+            appid = launcher_url_for_exe(exe) or ""
+            if appid:
+                self._appid_edit.setText(appid)
+
         # For brand-new games without launcher URLs or save paths, require valid executable if entered
         if not self._editing_entry and exe and not Path(exe).exists() and not _launcher_url:
             self._status_lbl.setText(t('add_game.executable_not_found', exe=exe))
@@ -5631,6 +5714,10 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                         f"Could not carry the rename of {entry.name} into its "
                         f"backup index: {e}")
 
+            # The cards picked to be merged into this one join it now that the edit itself is stored:
+            # from here on the card is the merged one.
+            entry = self._apply_staged_merges(entry)
+
             # Saving the edit dialog is a genuine confirmation (every path is
             # visible/checkable here), so temporary (pre-confirmation) session
             # backups are resolved PER PATH — a backup covering a row the user
@@ -5692,6 +5779,9 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                 _heard.append("name")
             if self._details_snapshot(entry) != _prev_details:
                 _heard.append("details")
+            if self._merge_cloud:
+                _heard.append("merged")
+                self._merge_cloud = False
             if _heard:
                 self.details_changed.emit(entry.id, ", ".join(_heard))
 

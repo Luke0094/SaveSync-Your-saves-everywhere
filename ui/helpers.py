@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import shiboken6 as sip
-from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QCursor, QFontMetrics, QImage, QPainter, QPen, QPixmap,
     QPolygon,
@@ -155,6 +155,48 @@ _UNIX_OPENERS = (
 )
 
 
+#: The generic openers: they hand the folder to whatever the desktop has registered for it, so they only work when something is.
+_GENERIC_OPENERS = frozenset({"xdg-open", "gio", "gnome-open", "kde-open5", "kde-open", "exo-open"})
+
+
+def _directory_handler_registered() -> bool:
+    """Is any program registered to open a folder? True when that cannot be told: the opener is then left to try.
+
+    Without one the generic openers do nothing AND report success (``gio open`` prints "failed to find default application" and exits 0),
+    which on a system with no file manager made every "open folder" button do nothing, silently."""
+    import shutil as _shutil
+    from core.resolvers import _unbundled_env
+    env = dict(_unbundled_env(os.environ), LC_ALL="C", LANG="C")       # (the host's own tools: not with the AppImage's libraries)
+    try:
+        xdg_mime = _shutil.which("xdg-mime")
+        if xdg_mime:
+            out = subprocess.run([xdg_mime, "query", "default", "inode/directory"], capture_output=True, text=True, timeout=4, env=env).stdout
+            return bool(out.strip())
+        gio = _shutil.which("gio")
+        if gio:
+            out = subprocess.run([gio, "mime", "inode/directory"], capture_output=True, text=True, timeout=4, env=env).stdout
+            return "Default application for" in out        # i18n-ignore (gio's own output, matched and never shown; not "No default applications for")
+    except Exception:
+        logger.debug("Could not ask for the folder handler", exc_info=True)
+    return True
+
+
+def _tell_no_file_manager(target) -> None:
+    """Nothing here can open a folder: say so where the player can see it, and put the path on the clipboard so it is not lost."""
+    logger.warning("Could not open '%s': no file manager is installed (or none is registered for folders). Install the file manager of your "
+                   "desktop (Thunar, Nautilus, Dolphin...).", target)
+    try:
+        app = QApplication.instance()
+        if app is None or QThread.currentThread() is not app.thread():
+            return
+        from i18n import t
+        from ui.modal_helpers import warning_window_modal
+        app.clipboard().setText(str(target))
+        warning_window_modal(app.activeWindow(), t("core.open_folder_no_manager_title"), t("core.open_folder_no_manager", path=str(target)))
+    except Exception:
+        logger.debug("Could not show the no-file-manager notice", exc_info=True)
+
+
 def open_in_file_manager(target) -> None:
     """Open a folder (or a file's location) in the system file manager."""
     try:
@@ -165,16 +207,16 @@ def open_in_file_manager(target) -> None:
             subprocess.Popen(["open", str(target)])
             return
         import shutil as _shutil
+        from core.resolvers import _unbundled_env
         for name, prefix in _UNIX_OPENERS:
             path = _shutil.which(name)
             if not path:
                 continue
-            subprocess.Popen([path, *prefix, str(target)])
+            if name in _GENERIC_OPENERS and not _directory_handler_registered():
+                continue
+            subprocess.Popen([path, *prefix, str(target)], env=_unbundled_env(os.environ))
             return
-        logger.warning(
-            "Could not open '%s': none of %s is installed. Install "
-            "xdg-utils, or the file manager of your desktop.",
-            target, ", ".join(n for n, _ in _UNIX_OPENERS))
+        _tell_no_file_manager(target)
     except Exception as e:
         logger.warning(f"Could not open folder '{target}': {e}")
 
@@ -224,6 +266,7 @@ class _SoftwareCursor(QWidget):
 
     # Design units at 96 DPI (compact); painted / sized with ``_scale``.
     _BASE_W, _BASE_H = 14, 20
+    _BOX = 26                                  # the square every shape is drawn in (the arrow sits in its corner)
     _BASE_BODY = (
         (1, 1), (1, 14), (4, 11), (7, 18), (9, 17), (6, 10), (11, 10),
     )
@@ -245,6 +288,7 @@ class _SoftwareCursor(QWidget):
         self.setCursor(Qt.CursorShape.BlankCursor)
         self._scale = 1.0
         self._hotspot = QPoint(1, 1)
+        self._kind = "arrow"
         self._apply_scale(self._dpi_scale())
 
     @staticmethod
@@ -260,16 +304,111 @@ class _SoftwareCursor(QWidget):
 
     def _apply_scale(self, scale: float) -> None:
         self._scale = scale
-        self._hotspot = QPoint(max(1, round(scale)), max(1, round(scale)))
-        self.setFixedSize(
-            max(10, round(self._BASE_W * scale)),
-            max(14, round(self._BASE_H * scale)),
-        )
+        side = max(14, round(self._BOX * scale))
+        self.setFixedSize(side, side)
+        self._place_hotspot()
         self.update()
+
+    def _place_hotspot(self) -> None:
+        s = self._scale
+        if self._kind == "arrow":
+            self._hotspot = QPoint(max(1, round(s)), max(1, round(s)))
+        else:
+            self._hotspot = QPoint(round(self._BOX / 2 * s), round(self._BOX / 2 * s))
+
+    _KINDS = {
+        Qt.CursorShape.IBeamCursor: "ibeam",
+        Qt.CursorShape.PointingHandCursor: "hand", Qt.CursorShape.OpenHandCursor: "hand", Qt.CursorShape.ClosedHandCursor: "hand",
+        Qt.CursorShape.SizeHorCursor: "h", Qt.CursorShape.SplitHCursor: "h",
+        Qt.CursorShape.SizeVerCursor: "v", Qt.CursorShape.SplitVCursor: "v",
+        Qt.CursorShape.SizeFDiagCursor: "fdiag", Qt.CursorShape.SizeBDiagCursor: "bdiag",
+        Qt.CursorShape.SizeAllCursor: "all", Qt.CursorShape.ForbiddenCursor: "no", Qt.CursorShape.CrossCursor: "cross",
+    }
+
+    def set_shape(self, shape) -> None:
+        """Draw the shape a widget asks for (a text field: the I-beam; a grip: the resize arrows). Over a game that has hidden the
+        pointer the system's own is blanked (so that two are not drawn) and this one is all there is - an arrow only, whatever the
+        widget under it asked for."""
+        kind = self._KINDS.get(shape, "arrow")
+        if kind != self._kind:
+            self._kind = kind
+            self._place_hotspot()
+            self.update()
+
+    def _shape_here(self):
+        """The cursor shape of the widget of ours under the pointer; an arrow when it is over something that is not ours."""
+        w = QApplication.widgetAt(QCursor.pos())
+        if w is None:
+            return Qt.CursorShape.ArrowCursor
+        try:
+            if w.window() is self:
+                return {v: k for k, v in self._KINDS.items()}.get(self._kind, Qt.CursorShape.ArrowCursor)
+            return w.cursor().shape()
+        except RuntimeError:
+            return Qt.CursorShape.ArrowCursor
+
+    def _paint_shape(self, p, s: float) -> None:
+        from PySide6.QtCore import QPointF, QRectF
+        from PySide6.QtGui import QPolygonF
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.scale(s, s)
+        dark, light = QColor(20, 20, 24), QColor(245, 245, 248)
+        k = self._kind
+        c = self._BOX / 2
+
+        def lines(items, width_dark=3.2, width_light=1.4):
+            for color, width in ((dark, width_dark), (light, width_light)):
+                pen = QPen(color, width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                p.setPen(pen)
+                for x1, y1, x2, y2 in items:
+                    p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        def shapes(draw_all):
+            p.setPen(QPen(dark, 1.6))
+            p.setBrush(QBrush(light))
+            draw_all()
+            p.setPen(Qt.PenStyle.NoPen)                  # (a second time, without the outline: where two shapes overlap)
+            draw_all()
+
+        double = QPolygonF([QPointF(x, y) for x, y in
+                            ((2, 13), (8, 7), (8, 11), (18, 11), (18, 7), (24, 13), (18, 19), (18, 15), (8, 15), (8, 19))])
+        if k == "ibeam":
+            lines([(c, 5, c, 21), (9.5, 5, 16.5, 5), (9.5, 21, 16.5, 21)])
+        elif k == "cross":
+            lines([(c, 4, c, 22), (4, c, 22, c)])
+        elif k == "no":
+            for color, width in ((dark, 3.6), (light, 1.6)):
+                p.setPen(QPen(color, width))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(c, c), 8, 8)
+                p.drawLine(QPointF(7.4, 7.4), QPointF(18.6, 18.6))
+        elif k == "hand":
+            def draw_hand():
+                p.drawRoundedRect(QRectF(10.5, 3, 4.5, 12), 2.2, 2.2)       # the finger
+                p.drawRoundedRect(QRectF(7, 12, 12, 9.5), 2.5, 2.5)         # the palm
+                p.drawRoundedRect(QRectF(4.5, 13, 4, 6.5), 2, 2)            # the thumb
+            shapes(draw_hand)
+        else:                                                              # h, v, fdiag, bdiag, all
+            angles = {"h": [0], "v": [90], "fdiag": [45], "bdiag": [-45], "all": [0, 90]}.get(k, [0])
+
+            def draw_arrows():
+                for angle in angles:
+                    p.save()
+                    p.translate(c, c)
+                    p.rotate(angle)
+                    p.translate(-c, -c)
+                    p.drawPolygon(double)
+                    p.restore()
+            shapes(draw_arrows)
 
     def paintEvent(self, _event):
         s = self._scale
         p = QPainter(self)
+        if self._kind != "arrow":
+            self._paint_shape(p, s)
+            p.end()
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing, s >= 1.25)
         body = QPolygon([QPoint(round(x * s), round(y * s))
                          for x, y in self._BASE_BODY])
@@ -278,14 +417,41 @@ class _SoftwareCursor(QWidget):
         p.drawPolygon(body)
         p.end()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if platform.system() == "Linux":
+            # The flag above is not enough under every window manager. An empty X input shape is - but a window manager that frames the
+            # window does so a moment after it is mapped and does not always carry the shape over to the frame, so it is set again then.
+            self._x11_let_through()
+            for delay in (30, 250):
+                QTimer.singleShot(delay, self._x11_let_through)
+
+    def _x11_let_through(self) -> None:
+        try:
+            if not self.isVisible():
+                return
+            from PySide6.QtGui import QGuiApplication
+            if QGuiApplication.platformName() == "xcb":
+                from ui.x11_fullscreen import make_input_transparent
+                make_input_transparent(int(self.winId()))
+        except RuntimeError:
+            pass                                         # (the window was deleted in the meantime)
+        except Exception:
+            logger.debug("could not make the drawn arrow input-transparent", exc_info=True)
+
     def follow(self) -> None:
         scale = self._dpi_scale()
         if abs(scale - self._scale) > 0.04:
             self._apply_scale(scale)
+        self.set_shape(self._shape_here())
         tip = QCursor.pos() - self._hotspot
         self.move(tip)
         if not self.isVisible():
-            self.show()
+            # A window made in the ordinary band takes a game out of exclusive fullscreen; this one is made like the
+            # overlay's (see ui.win_band_hook) so the arrow can be drawn over such a game as well.
+            from ui import win_band_hook
+            with win_band_hook.band_windows():
+                self.show()
         self.raise_()
 
 
@@ -305,6 +471,7 @@ class SystemCursor:
 
     _raised = 0
     _holders: set = set()
+    _observers: list = []
     _qt_override = False
     _IDC_ARROW = 32512
     _soft: QWidget | None = None
@@ -316,6 +483,7 @@ class SystemCursor:
         cls._holders.add(key)
         cls._raise()
         cls._ensure_timer()
+        cls._notify()
 
     @classmethod
     def release(cls, key: str) -> None:
@@ -323,12 +491,70 @@ class SystemCursor:
         if not cls._holders:
             cls._stop_timer()
             cls._lower()
+        cls._notify()
 
     @classmethod
     def release_all(cls) -> None:
         cls._holders.clear()
         cls._stop_timer()
         cls._lower()
+        cls._notify()
+
+    @classmethod
+    def add_observer(cls, callback) -> None:
+        """*callback()* is called whenever the pointer is taken or let go: what is on screen over a game may need to start or stop
+        taking the mouse (a pin; see PinItem._apply_click_through)."""
+        cls._observers.append(callback)
+
+    @classmethod
+    def _notify(cls) -> None:
+        for callback in list(cls._observers):
+            try:
+                callback()
+            except Exception:
+                logger.debug("SystemCursor: an observer failed", exc_info=True)
+
+    @classmethod
+    def game_hides_cursor(cls) -> bool:
+        """The game in front has hidden the OS cursor and nothing of ours holds the pointer: the player has no pointer to aim with,
+        so what we show over the game must not take the mouse. (A game that shows its own cursor, or a view that was summoned and
+        holds the pointer, is the other case.)"""
+        if cls._holders:
+            return False
+        if cls._pointer_over_our_window():
+            # Over a window of ours the cursor the system reports is OURS (the arrow our window asks for), whatever the game has
+            # done - read there, "the game shows its cursor" would be true for as long as the pointer rests on a pin or a notice,
+            # and what is on screen would never let the mouse through. The last answer taken over the game stands meanwhile.
+            return cls._last_game_hides
+        cls._last_game_hides = cls._os_cursor_hidden()
+        return cls._last_game_hides
+
+    _last_game_hides = True                  # (until the pointer has been seen over the game: the game keeps its mouse)
+
+    @classmethod
+    def _pointer_over_our_window(cls) -> bool:
+        if platform.system() != "Windows":
+            return False
+        try:
+            import ctypes
+            import os
+            from ctypes import wintypes
+            u = ctypes.WinDLL("user32", use_last_error=True)       # (its own function objects: the argument types set here are ours)
+            u.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+            u.WindowFromPoint.argtypes = [wintypes.POINT]
+            u.WindowFromPoint.restype = wintypes.HWND
+            u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            pt = wintypes.POINT()
+            if not u.GetCursorPos(ctypes.byref(pt)):
+                return False
+            hwnd = u.WindowFromPoint(pt)
+            if not hwnd:
+                return False
+            pid = wintypes.DWORD(0)
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value) == os.getpid()
+        except Exception:
+            return False
 
     @classmethod
     def held_by(cls) -> set:
@@ -353,6 +579,17 @@ class SystemCursor:
         # the desktop — two cursors, the drawn one sized from a DPI the
         # desktop is not using, which is what a giant cursor looks like.
         need_soft = platform.system() != "Windows" and game_is_running()
+        if need_soft and platform.system() == "Linux":
+            # On X11 (and XWayland) the pointer over a window is drawn from THAT window's cursor, whatever the game set on its own window.
+            # Over SaveSync's windows the real arrow, I-beam and resize shapes are there by themselves, so a pointer of ours was only ever
+            # a second one (with the game's own sprite and the desktop's, three) - and its window sat under the pointer, so a pin under it
+            # could not be moved. A game that grabs the pointer outright is out of reach for either kind.
+            try:
+                from PySide6.QtGui import QGuiApplication
+                if QGuiApplication.platformName() == "xcb":
+                    need_soft = False
+            except Exception:
+                logger.debug("could not tell which windowing system this is", exc_info=True)
         if platform.system() == "Windows":
             try:
                 import ctypes
@@ -592,6 +829,35 @@ def z_report(widget) -> str:
         return f"z-order unreadable: {e}"
 
 
+_tool_menus = None                       # menus shown as windows of their own (see note_tool_menu)
+
+
+def note_tool_menu(menu) -> None:
+    """A menu shown as a window of its own is no Qt popup, so Qt cannot say that it is open (popup_is_open asks Qt). Over a game in
+    exclusive fullscreen the 📌 menu is one: a Qt popup takes the game to the desktop. It is listed here instead."""
+    global _tool_menus
+    import weakref
+    if _tool_menus is None:
+        _tool_menus = weakref.WeakSet()
+    _tool_menus.add(menu)
+
+
+def set_click_through(widget, on: bool) -> None:
+    """WS_EX_TRANSPARENT on a layered window of ours: the mouse goes through it to what is under it (the game)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = int(widget.winId())
+        ex = user32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF
+        want = (ex | 0x00000020) if on else (ex & ~0x00000020)
+        if want != ex:
+            user32.SetWindowLongW(hwnd, -20, ctypes.c_long(want - (1 << 32) if want >= (1 << 31) else want))
+    except Exception:
+        logger.debug("could not set whether the mouse goes through a window", exc_info=True)
+
+
 def popup_is_open() -> bool:
     """Whether one of our own menus is up.
 
@@ -603,9 +869,17 @@ def popup_is_open() -> bool:
     """
     try:
         from PySide6.QtWidgets import QApplication
-        return QApplication.activePopupWidget() is not None
+        if QApplication.activePopupWidget() is not None:
+            return True
     except Exception:
         return False
+    for menu in list(_tool_menus or ()):
+        try:
+            if menu.isVisible():
+                return True
+        except RuntimeError:
+            continue                     # (already deleted)
+    return False
 
 
 def force_topmost(widget) -> None:
@@ -660,6 +934,16 @@ def force_topmost(widget) -> None:
             widget.raise_()
         except Exception:
             pass
+
+def format_clock(seconds) -> str:
+    """A running time as H:MM:SS ("0:07:05", "12:03:00"): the minutes and seconds always take two digits,
+    so a counter that ticks every second keeps the width of the thing it sits in."""
+    try:
+        s = max(0, int(seconds))
+    except (TypeError, ValueError):
+        s = 0
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
 
 def system_idle_seconds() -> float:
     """Seconds since the last keyboard or mouse input ANYWHERE on this machine.
@@ -720,6 +1004,16 @@ def force_foreground(widget) -> None:
     """
     if widget is None:
         return
+    # A window of the higher band (the application opened over a game in exclusive fullscreen, a dialog made for it) never takes the
+    # foreground: taking it is what takes the game to the desktop. MainWindow.show() ended with this call - the log of a real game
+    # shows "ACTIVATED MainWindow" 0.2 s after Open App, and the game lost the front at that moment.
+    try:
+        if platform.system() == "Windows" and widget.windowHandle() is not None:
+            from ui import win_band_hook
+            if win_band_hook.installed() and win_band_hook.window_band(int(widget.winId())) == win_band_hook.BAND_SYSTEM_TOOLS:
+                return
+    except Exception:
+        pass
     try:
         widget.raise_()
         widget.activateWindow()
@@ -778,8 +1072,12 @@ def _set_x11_dark_frame(widget, dark: bool | None = None) -> None:
             from ui.styles.theme import get_theme_manager
             dark = get_theme_manager().is_dark()
         from PySide6.QtGui import QGuiApplication
-        native = QGuiApplication.platformNativeInterface()
-        if native is None:
+        # Qt 6: QNativeInterface.QX11Application (platformNativeInterface() is gone - it raised here on every window, so on Linux no window
+        # ever asked for a dark frame). Under a Wayland platform the interface has no display(): nothing to do.
+        app = QGuiApplication.instance()
+        native = app.nativeInterface() if app is not None else None
+        get_display = getattr(native, "display", None)
+        if get_display is None:
             return
         import ctypes
         import ctypes.util
@@ -787,7 +1085,12 @@ def _set_x11_dark_frame(widget, dark: bool | None = None) -> None:
         if not name:
             return
         xlib = ctypes.cdll.LoadLibrary(name)
-        display = native.nativeResourceForIntegration(b"display")
+        xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        xlib.XInternAtom.restype = ctypes.c_ulong
+        xlib.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_char_p, ctypes.c_int]
+        xlib.XFlush.argtypes = [ctypes.c_void_p]
+        display = get_display()
         if not display:
             return
         display = ctypes.c_void_p(int(display))

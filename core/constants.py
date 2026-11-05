@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # App identity
 APP_NAME = "SaveSync"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 APP_ID = "com.savesync.app"
 GITHUB_REPO = "Luke0094/SaveSync-Your-saves-everywhere"
 GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
@@ -296,25 +296,80 @@ def strip_dlsite_code(name: str) -> str:
     return cleaned or name
 
 
+# The version marker's head ("v", "ver", "version", "b", "build" and the number
+# that follows). Only the HEAD is a regex: what may trail the number is decided
+# in locate_version_token, so a version is read whole or not at all.
+_VERSION_HEAD_RE = None
+
+# Release-stage words that sit glued to a version number: "v0.7.1EA",
+# "v2beta", "v1.0rc2". A single number takes ONLY these (or one letter); see
+# locate_version_token.
+_VERSION_STAGE_RE = None
+
+
+def locate_version_token(name: str):
+    """(start, end) of the version marker in *name*, or None.
+
+    The marker is the head ("v", "ver", "version", "b", "build"), then the whole
+    run of numbers joined by ``.``, ``_``, ``-`` or ``,`` ("v1.2.3", "v0_7_1",
+    "v1,27"), then at most one glued suffix:
+
+    - a release stage - ``EA`` (early access), ``alpha``, ``beta``, ``rc2``,
+      ``fix1`` - after any version;
+    - a build letter - ``b`` in "v1.2b" - after any version, and after a version
+      with SEVERAL numbers up to two letters and a digit ("v1.0ex", "v1.2b3").
+
+    A single number does not take a longer word: "V2ray" is a name, not a
+    version. Whatever follows must end the token: a suffix that is not one of the
+    above makes this candidate NOT a version at all, and is never trimmed back to
+    a shorter one. The old pattern did that trimming - handing back digit groups
+    until the end test passed - which is how "v0_7_1EA" came out as "v0_7": a
+    wrong version is worse than none, since it is shown as the release's identity.
+
+    Used for the label of a release (find_version_near) and for taking the whole
+    marker out of a display name. strip_version_tokens - which builds the
+    cloud-folder identity of a game - is deliberately not this function and is not
+    changed by it.
+    """
+    import re
+    global _VERSION_HEAD_RE, _VERSION_STAGE_RE
+    if not name:
+        return None
+    if _VERSION_HEAD_RE is None:
+        _VERSION_HEAD_RE = re.compile(
+            r'(?<![a-zA-Z0-9])(?:v(?:er(?:sion)?)?|b(?:uild)?)[\s._\-]*'
+            r'\d+(?:[._\-,]\d+)*', re.IGNORECASE)
+        _VERSION_STAGE_RE = re.compile(
+            r'(?:alpha|beta|hotfix\d*|fix\d*|rc\d*|ea\d*)(?![a-zA-Z0-9])', re.IGNORECASE)
+    for m in _VERSION_HEAD_RE.finditer(name):
+        rest = name[m.end():]
+        # ASCII only, like the pattern this replaces: "v1.0日本語" is still v1.0
+        if not rest or not re.match(r'[a-zA-Z0-9]', rest):
+            return m.start(), m.end()          # the number ends the token
+        multi = re.search(r'[._\-,]', re.sub(r'^[^\d]*', '', m.group(0))) is not None
+        suffix = _VERSION_STAGE_RE.match(rest)
+        if suffix is None:
+            letters = r'[a-z]{1,2}\d?' if multi else r'[a-z]'
+            suffix = re.match(letters + r'(?![a-zA-Z0-9])', rest, re.IGNORECASE)
+        if suffix is not None:
+            return m.start(), m.end() + suffix.end()
+    return None
+
+
 def extract_version_token(name: str) -> str:
-    """The version marker itself out of *name* — "v1.2.3" out of
-    "[GOG] Some Title v1.2.3-CODEX" — or "" when none is found.
+    """The version marker itself out of *name* - "v1.2.3" out of
+    "[GOG] Some Title v1.2.3-CODEX", "v0_7_1EA" out of
+    "[RJ01394574] Some Title v0_7_1EA JAP" - or "" when none is found.
 
     The inverse of strip_version_tokens: that one throws the marker away
     and keeps the title; this one IS the marker, for the one place that
     wants to show the version and nothing else (not a DLsite product code
-    — those identify a release, not a version, so unlike
-    strip_version_tokens this deliberately doesn't match them).
+    - those identify a release, not a version, so unlike
+    strip_version_tokens this deliberately doesn't match them). What counts
+    as the marker is decided in locate_version_token.
     """
-    import re
-    if not name:
-        return ""
-    m = re.search(
-        r'(?<![a-zA-Z0-9])((?:v(?:er(?:sion)?)?|b(?:uild)?)[\s._\-]*\d+(?:[._\-,]\d+)*[a-z]?)'
-        r'(?![a-zA-Z0-9])',
-        name, flags=re.IGNORECASE,
-    )
-    return m.group(1).strip() if m else ""
+    span = locate_version_token(name)
+    return name[span[0]:span[1]].strip() if span else ""
 
 
 # The kana voiced/semi-voiced sound marks. Combining characters, but part of

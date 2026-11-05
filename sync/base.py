@@ -47,6 +47,10 @@ def restrict_file_acl(path) -> None:
         logging.getLogger(__name__).debug(f"Could not restrict ACL on {path}: {e}")
 
 
+# What BackupEntry.origin holds for a backup made on this machine (core.backup's default) - and also the id of the plain local-folder provider.
+_OWN_BACKUPS_ORIGIN = "local"
+
+
 def has_published_to(provider_id: str, entries) -> bool:
     """True when any of *entries* (BackupEntry rows) was uploaded to
     *provider_id* (``synced_to``) or downloaded from it (``origin``) — i.e. a
@@ -54,11 +58,17 @@ def has_published_to(provider_id: str, entries) -> bool:
     asks "has this game's history been through this provider?": the
     failed-fetch guard in sync_backups, and the launch-time lookup for a folder
     another machine renamed (SyncOrchestrator.find_renamed_remote_folder).
-    A row that cannot be read counts as "no", never as a reason to fail."""
+    A row that cannot be read counts as "no", never as a reason to fail.
+
+    The ``origin`` half is not used for the plain local-folder provider, whose id is "local": that is ALSO the origin of every backup made on
+    this machine, so for it an origin of "local" says nothing about having come through that folder - and read as if it did, the very first
+    sync to it was refused ("could not confirm the shared backup index") for every game. There ``synced_to`` is the record: it is written when
+    a backup goes up and it travels with the row in the index. (The cloud providers, and the OneDrive/Drive/Dropbox folder modes, have ids of
+    their own and are untouched.)"""
     try:
         return any(
             provider_id in ((getattr(e, "cloud_metadata", None) or {}).get("synced_to") or [])
-            or getattr(e, "origin", "") == provider_id
+            or (provider_id != _OWN_BACKUPS_ORIGIN and getattr(e, "origin", "") == provider_id)
             for e in entries)
     except Exception:
         return False

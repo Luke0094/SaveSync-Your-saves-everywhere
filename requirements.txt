@@ -11,6 +11,7 @@ dropbox>=11.36.0
 webdavclient3>=3.14.6
 python-dateutil>=2.8.2
 pynput>=1.7.6
+python-xlib>=0.33; sys_platform == "linux"   # the overlay and the pins ask the window manager (EWMH) whether a fullscreen window is in front
 cryptography>=41.0.0
 keyring>=24.0.0
 Pillow>=10.0.0

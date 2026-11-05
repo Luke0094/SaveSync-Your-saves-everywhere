@@ -6,6 +6,7 @@ object crashes.
 """
 from datetime import datetime
 import logging
+import time
 
 import math
 
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from i18n import t
 from ui.exe_icon import show_exe_icon
-from ui.helpers import PageScrollMixin, safe_widget as _safe, scaled
+from ui.helpers import PageScrollMixin, format_clock, safe_widget as _safe, scaled
 from ui.styles.theme import palette, ThemedMixin
 from core.config_manager import get_config
 from core.library import get_library
@@ -591,6 +592,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
     # answers the overlay offers, handled by the same main-window code.
     unknown_add_requested = Signal(str)       # exe path
     unknown_dismiss_requested = Signal(str)   # "don't show again"
+    unknown_remove_requested = Signal(str)    # the bin: out of the queue, not banned
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -762,6 +764,15 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         self._active_name.setObjectName("active_game_name")
         self._active_sub  = QLabel("")
         self._active_sub.setObjectName("active_game_sub")
+        # The session counter: time since the running game started, ticking once a second (see _tick_session)
+        self._active_session = QLabel("")
+        self._active_session.setObjectName("active_game_sub")
+        self._active_session.setToolTip(t("overview.session_tooltip"))
+        self._active_session.setVisible(False)
+        self._session_start = 0.0
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(1000)
+        self._session_timer.timeout.connect(self._tick_session)
         self._active_backup_btn = QPushButton(t("buttons.backup_now"))
         self._active_backup_btn.setObjectName("primary_btn")
         self._active_backup_btn.setVisible(False)
@@ -772,6 +783,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         left_col.addWidget(self._active_sub)
         bl.addWidget(self._active_icon)
         bl.addLayout(left_col, 1)
+        bl.addWidget(self._active_session)
         bl.addWidget(self._active_backup_btn)
         root.addWidget(self._active_banner)
 
@@ -784,6 +796,7 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         self._unknown_banner.setVisible(False)
         self._unknown_banner.add_requested.connect(self.unknown_add_requested)
         self._unknown_banner.dismiss_requested.connect(self.unknown_dismiss_requested)
+        self._unknown_banner.remove_requested.connect(self.unknown_remove_requested)
         self._unknown_banner.entries_changed.connect(self._sync_unknown_banner)
         root.addWidget(self._unknown_banner)
 
@@ -1097,6 +1110,22 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
                 pass
             self._refresh_busy = None
 
+    def _update_session_label(self) -> None:
+        if self._session_start > 0:
+            self._active_session.setText(f"{t('overlay.session')}  {format_clock(time.time() - self._session_start)}")
+            self._active_session.setVisible(True)
+        else:
+            self._active_session.setVisible(False)
+
+    def _tick_session(self) -> None:
+        """Once a second, for the session counter ONLY: the page's full refresh takes a snapshot of the
+        backup index and is far too heavy for that. Nothing is drawn while the page is not on screen."""
+        if self._session_start <= 0:
+            self._session_timer.stop()
+            return
+        if self.isVisible():
+            self._update_session_label()
+
     def _sync_unknown_banner(self, playing: bool | None = None):
         """The carousel replaces the idle banner when nothing is being played
         and the queue has something in it; a running game brings the
@@ -1158,6 +1187,10 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             show_exe_icon(self._active_icon, e.exe_path, scaled(28, self),
                           "\U0001f3ae", self.devicePixelRatioF())
             self._active_sub.setText(t("overview.running_saves", count=len(e.save_paths)))
+            self._session_start = get_monitor().session_start_time(e.id)
+            self._update_session_label()
+            if self._session_start > 0 and not self._session_timer.isActive():
+                self._session_timer.start()
             self._active_backup_btn.setVisible(True)
             self._active_backup_btn.setProperty("_game_id", e.id)
         else:
@@ -1165,6 +1198,9 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             # Back to the glyph, or the last game's icon outlives its session.
             self._active_icon.setText("\U0001f3ae")
             self._active_sub.setText("")
+            self._session_start = 0.0
+            self._active_session.setVisible(False)
+            self._session_timer.stop()
             self._active_backup_btn.setVisible(False)
         self._unknown_banner.refresh()
         self._sync_unknown_banner(bool(active_entries))
@@ -1670,6 +1706,8 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
         if not _safe(self._header):
             return
         self._header.setText(t("overview.title"))
+        self._active_session.setToolTip(t("overview.session_tooltip"))
+        self._update_session_label()
         self._activity_header.setText(t("overview.recent_activity"))
         self._actions_header.setText(t("overview.quick_actions"))
         for btn, key in self._action_btns:
@@ -1763,6 +1801,8 @@ class OverviewPage(PageScrollMixin, QWidget, ThemedMixin):
             "last_backup":   last_bk_str,
             "sync_status":   t("common.online") if orch.is_online() else t("common.offline"),
             "provider":      ", ".join(get_config().get("sync_providers", [])) or t("common.none"),
+            # when the running game's session began - the overlay's dashboard counts from it
+            "session_start": get_monitor().session_start_time(active[0].id) if active else 0.0,
         }
 
 

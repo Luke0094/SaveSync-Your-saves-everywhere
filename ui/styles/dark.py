@@ -2116,6 +2116,36 @@ QComboBox#filter_kind_combo {
     margin: -3px 0;
     border-radius: 4px;
 }
+/* The zoom bar down the right side of a pin, shown while the pointer is on it. */
+#pin_zoom_bar {
+    background: rgba(30, 30, 40, 0.88);
+    border-radius: 5px;
+}
+#pin_zoom_slider {
+    background: transparent;
+}
+#pin_zoom_slider::groove:vertical {
+    background: #2a2a38;
+    width: 3px;
+    border-radius: 2px;
+}
+#pin_zoom_slider::sub-page:vertical {
+    background: #6c5ce7;
+    width: 3px;
+    border-radius: 2px;
+}
+#pin_zoom_slider::handle:vertical {
+    background: #e8e8ea;
+    width: 9px;
+    height: 9px;
+    margin: 0 -3px;
+    border-radius: 4px;
+}
+#pin_zoom_label {
+    background: transparent;
+    color: #a8a8b8;
+    font-size: 9px;
+}
 /* One line of the 📌 menu. */
 #pin_row {
     background: transparent;

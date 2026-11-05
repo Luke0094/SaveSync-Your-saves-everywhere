@@ -11,15 +11,18 @@ import logging
 import os
 import platform
 import re
+import time
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, Slot, QPoint
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, Slot, QPoint, QObject, QEvent
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QCursor
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QApplication
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QApplication,
+                               QStyle, QStyleOptionButton, QStylePainter)
 
 from i18n import t
 from ui.backup_labels import origin_badge
 from ui.helpers import scaled
 from ui.styles.theme import palette
+from ui import win_band_hook
 
 if platform.system() == "Windows":
     import ctypes
@@ -41,6 +44,14 @@ def _xwayland_session() -> bool:
     return bool(os.environ.get("WAYLAND_DISPLAY")
                 or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland")
 
+# What the shell believes about the foreground, and whether a window fills its monitor, are answered in
+# ui.exclusive_presenter - the pins ask the same questions. Kept here under their old names.
+from ui.exclusive_presenter import (QUNS_RUNNING_D3D_FULL_SCREEN as _QUNS_RUNNING_D3D_FULL_SCREEN,
+                                    shell_notification_state as _shell_notification_state,
+                                    window_fills_monitor as _window_fills_monitor)
+
+
+_XP_WATCH_S = 3.0        # how long a picture shown over an exclusive-fullscreen game is watched for a kick
 _AUTO_HIDE_MS  = 5000    # default timeout if user doesn't hover
 # A message from a friend has a button to read it: it stays a little longer.
 _FRIEND_AUTO_HIDE_MS = 12000
@@ -48,7 +59,7 @@ _FADE_IN_MS    = 200
 _FADE_OUT_MS   = 280
 
 
-from ui.helpers import (force_topmost as _force_topmost, popup_is_open,
+from ui.helpers import (format_clock, force_topmost as _force_topmost, popup_is_open,
                         ScreenSignalMixin, SystemCursor, TRACE_Z, z_report)
 
 
@@ -112,6 +123,33 @@ def _main_line_first(backups) -> list:
 _PIN_MENU_ROWS = 5
 
 
+class _PaintAsHovered(QObject):
+    """Makes one push button paint the way its stylesheet draws it with the pointer on it (and, when asked, pressed).
+
+    The picture over an exclusive-fullscreen game is a still taken of the widget, and there is no pointer on the
+    widget to make its :hover rules apply. Setting the "under the mouse" flag by hand does not change how a
+    stylesheet-styled button is drawn; asking the style to draw it with the state set does - and it is the very
+    rule the live window uses, so every button looks the same in both."""
+
+    def __init__(self, button, pressed: bool = False):
+        super().__init__(button)
+        self._button = button
+        self._pressed = pressed
+
+    def eventFilter(self, obj, event):
+        if obj is self._button and event.type() == QEvent.Type.Paint:
+            opt = QStyleOptionButton()
+            self._button.initStyleOption(opt)
+            opt.state |= QStyle.StateFlag.State_MouseOver
+            if self._pressed:
+                opt.state |= QStyle.StateFlag.State_Sunken
+                opt.state &= ~QStyle.StateFlag.State_Raised
+            painter = QStylePainter(self._button)
+            painter.drawControl(QStyle.ControlElement.CE_PushButton, opt)
+            return True
+        return False
+
+
 class OverlayWidget(QWidget, ScreenSignalMixin):
     action_requested  = Signal(str, str)   # action, context
     dismissed         = Signal()
@@ -122,13 +160,16 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # NEVER emitted for a button click, only a genuine unattended expiry.
     path_changed_expired = Signal(str)
     # Emitted when exclusive fullscreen prevents the overlay from showing.
-    # Carries (title, message) so the caller can provide audio/toast feedback.
+    # Carries (title, message) so the caller can route it through another channel.
     exclusive_blocked = Signal(str, str)
     # "Don't show again" on a friend's message (the friend's id): the friend is silenced
     # in the sealed friend file, not in config.json - which would list the friends.
     friend_silenced = Signal(str)
     # The same for a group's messages (the group's id): silenced in the sealed friend file too.
     group_silenced = Signal(str)
+    # The bin on the unknown-game queue (the exe path): out of the queue, NOT banned - the main window
+    # takes it out of the shared queue and nothing is added to the suppress list.
+    unknown_trashed = Signal(str)
     # Provider restore-list fetch completed (payload: entries, game_id,
     # local_ids, seq). Emitted FROM THE WORKER THREAD — a queued signal is
     # the only safe hop back to the GUI thread; the old QTimer.singleShot
@@ -168,7 +209,45 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # Timer to periodically re-assert topmost status for fullscreen games
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self._ensure_topmost)
-        self._topmost_timer.setInterval(1000)  # Check every second
+        self._topmost_timer.setInterval(400)   # Check every moment: an ordinary window left over a game that has just gone exclusive is invisible but still takes the mouse
+
+        # A picture of the overlay in a click-through window, for a game in exclusive
+        # fullscreen (see _present_over_exclusive). The window is made on first use.
+        self._xp = None
+        self._xp_watch = None
+        self._xp_exe = ""
+        self._xp_watch_until = 0.0
+        self._xp_suspects: dict[str, int] = {}     # exe -> consecutive unclear losses (see _presenter_lost_front)
+        self._xp_mon = None                        # the monitor the picture is on, in physical pixels
+        self._xp_game = 0                          # the game window the picture is shown over
+        self._xp_own: set = set()                  # the app's own windows that were up when it appeared
+        self._xp_hits: list = []                   # (rect in picture pixels, button): what a click can reach
+        self._xp_hover = False
+        self._xp_pressed = None
+        self._xp_hover_btn = None                  # the button the pointer is on, in the picture
+        # True while the overlay's own window is up over a game in exclusive fullscreen (made in band 16, see
+        # ui.win_band_hook) - the picture is only the fallback for when that cannot be done.
+        self._rw_exclusive = False
+        self._capturing = False                    # a screen capture is under way (it holds the exclusive session)
+        self.setProperty("xs_keep", True)          # its band-16 window is managed here, not swept (ui.exclusive_session)
+        self._tool_menu = None                     # the menu that is open as a non-activating tool window
+        self._tool_menu_outside = 0
+        self._tool_menu_timer = QTimer(self)
+        self._tool_menu_timer.setInterval(500)
+        self._tool_menu_timer.timeout.connect(self._tool_menu_tick)
+        self._xp_arrow = None                      # a second picture: the mouse arrow, when the game hid the real one
+        self._xp_arrow_data = None
+        self._xp_cursor_timer = QTimer(self)
+        self._xp_cursor_timer.setInterval(30)
+        self._xp_cursor_timer.timeout.connect(self._xp_cursor_tick)
+        self._session_start = 0.0                  # epoch seconds the running game's session began; 0 = none
+        self._x11_bypass = False                   # X11: override-redirect while a fullscreen window is in front
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(1000)
+        self._session_timer.timeout.connect(self._session_tick)
+        self._xp_watch_timer = QTimer(self)
+        self._xp_watch_timer.setInterval(40)    # the front can be empty for only ~150 ms in a real kick
+        self._xp_watch_timer.timeout.connect(self._check_presenter_front)
 
         # Unity (and similar) re-clip the pointer every frame in fullscreen.
         # Releasing ClipCursor once at show is not enough — keep undoing it
@@ -333,6 +412,17 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._pin_btn.setObjectName("icon_btn")
         self._pin_btn.clicked.connect(self._show_pin_menu)
         self._pin_btn.setVisible(False)
+        # The bin on the unknown-game queue: this game leaves the list WITHOUT being banned (it is asked about
+        # again the next time it runs). In the header beside the close button, away from "Add to library", so a
+        # press meant for one cannot land on the other. Shown only on the queue view - see _render_unknown_entry.
+        self._trash_btn = QPushButton("\U0001f5d1")
+        self._trash_btn.setObjectName("icon_btn")
+        self._trash_btn.setFixedSize(_ib, _ib)
+        self._trash_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._trash_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._trash_btn.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._trash_btn.clicked.connect(self._on_trash_unknown)
+        self._trash_btn.setVisible(False)
         close_btn = QPushButton("✕")
         close_btn.setObjectName("icon_btn")
         close_btn.setFixedSize(_ib, _ib)
@@ -343,6 +433,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         header.addWidget(self._title, 1)
         header.addWidget(self._pin_btn)
         header.addWidget(self._info_btn)
+        header.addWidget(self._trash_btn)
         header.addWidget(close_btn)
         layout.addLayout(header)
 
@@ -423,6 +514,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             row.addWidget(k); row.addWidget(v, 1)
             dl.addLayout(row)
             self._dash_rows.append((k, v))
+        # The session counter: a row of its own (so that hiding it leaves no gap), shown only while a
+        # tracked game is running. Fed by show_manual, ticked by _session_tick.
+        self._session_row = QWidget()
+        self._session_row.setObjectName("transparent_bg")
+        srow = QHBoxLayout(self._session_row)
+        srow.setContentsMargins(0, 0, 0, 0)
+        srow.setSpacing(8)
+        sk = QLabel(); sk.setObjectName("dash_key")
+        sv = QLabel(); sv.setObjectName("dash_value")
+        srow.addWidget(sk); srow.addWidget(sv, 1)
+        dl.addWidget(self._session_row)
+        self._session_row.setVisible(False)
+        self._dash_rows.append((sk, sv))
         layout.addWidget(self._dashboard)
 
         self._btn_area     = QHBoxLayout(); self._btn_area.setSpacing(6)
@@ -434,6 +538,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._restore_area = QVBoxLayout()
         self._restore_area.setSpacing(3)
         layout.addLayout(self._restore_area)
+
+        # A list of choices shown inside the card in place of a popup menu (the picture over an exclusive-fullscreen
+        # game). A layout of its own: the restore list above can be open on the same card.
+        self._inline_area = QVBoxLayout()
+        self._inline_area.setSpacing(3)
+        layout.addLayout(self._inline_area)
 
         self._suppress_btn = QPushButton()
         self._suppress_btn.setObjectName("overlay_suppress_btn")
@@ -508,11 +618,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             # hand. mapFromGlobal asks the platform where the window really
             # is. underMouse() is checked too, for the case where Qt has
             # tracked the enter but the coordinates disagree.
-            inside = self.underMouse()
-            if not inside:
+            presented = self._presenting()
+            inside = self._xp_hover if presented else self.underMouse()
+            if not inside and not presented:
                 inside = self.rect().contains(
                     self.mapFromGlobal(QCursor.pos()))
-            if self.isVisible() and inside:
+            if (self.isVisible() or presented) and inside:
                 self._hover_active = True
                 # The FULL countdown, not a 1.5 s stub. Granting a fixed
                 # scrap each time the timer expired meant the panel lived
@@ -567,7 +678,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._info_btn.setVisible(False)
         if hasattr(self, "_pin_btn"):
             self._pin_btn.setVisible(False)
-        for layout in (self._btn_area, self._quick_area, self._restore_area):
+        if hasattr(self, "_trash_btn"):
+            self._trash_btn.setVisible(False)
+        for layout in (self._btn_area, self._quick_area, self._restore_area, self._inline_area):
             while layout.count():
                 item = layout.takeAt(0)
                 w = item.widget()
@@ -613,6 +726,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         arrow_btn.setFixedWidth(scaled(24, self))
 
         def _open_menu():
+            if self._presenting() and not self._rw_exclusive:
+                # Over an exclusive-fullscreen game a popup menu is an ordinary window, which takes the game back
+                # to the desktop: the alternatives are listed inside the card instead.
+                self._toggle_inline(lambda: [
+                    self._inline_btn(label, lambda a=act: self._on_action(a)) for label, act in menu_items])
+                return
             menu = QMenu(self)
             menu.setStyleSheet(
                 f"QMenu{{background:{palette('bg_card')};color:{palette('text')};"
@@ -622,7 +741,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             )
             for label, act in menu_items:
                 menu.addAction(label, lambda a=act: self._on_action(a))
-            menu.exec(arrow_btn.mapToGlobal(arrow_btn.rect().bottomLeft()))
+            self._popup_menu(menu, arrow_btn.mapToGlobal(arrow_btn.rect().bottomLeft()))
 
         arrow_btn.clicked.connect(_open_menu)
 
@@ -1067,7 +1186,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         is still there, or hands over to its neighbour — and closes when the
         queue has emptied."""
         self.refresh_unknown_badge()
-        if self._unknown_queue is None or not self.isVisible():
+        if self._unknown_queue is None or not self._on_screen():
             return
         entries = self._pending_unknown_entries()
         if not entries:
@@ -1080,10 +1199,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._unknown_queue = entries
         self._render_unknown_entry()
         self._rerender_in_place()
+        self._refresh_presenter()
 
     def _on_badge_clicked(self):
         if self._overlay_mode == "unknown":
             return
+        self.note_user_summon()
         self.show_unknown_queue()
 
     def _set_mode(self, mode: str):
@@ -1099,9 +1220,184 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._unknown_queue = None
         self._refresh_badge_interactivity()
 
+    def _ensure_band_window(self) -> None:
+        """The overlay's native window must be a band-16 window (see ui.win_band_hook). Qt makes it on first need, and
+        anything that needs the handle before the first show (a z-order helper) would make it in the ordinary band
+        for good - so one that already exists in the wrong band is dropped and made again here."""
+        if platform.system() != "Windows" or not win_band_hook.installed():
+            return
+        try:
+            if self.windowHandle() is not None:
+                if win_band_hook.window_band(int(self.winId())) == win_band_hook.BAND_SYSTEM_TOOLS:
+                    return
+                super().setVisible(False)
+                self.destroy()
+            with win_band_hook.band_windows():
+                self.create()
+        except Exception:
+            logger.debug("Overlay: could not make its window in the higher band", exc_info=True)
+
+    def _ensure_ordinary_window(self) -> None:
+        """Band 16 is for the overlay only while a game is in exclusive fullscreen: a band-16 window is above every window
+        of the ordinary band (the pins, the overlay's own menus, the app), whatever their topmost flags. So a native window
+        made for that is dropped as soon as the overlay is shown for any other reason, and the next one is an ordinary one."""
+        if platform.system() != "Windows" or not win_band_hook.installed() or self.windowHandle() is None:
+            return
+        try:
+            if win_band_hook.window_band(int(self.winId())) == win_band_hook.BAND_SYSTEM_TOOLS:
+                super().setVisible(False)
+                self.destroy()
+        except Exception:
+            logger.debug("Overlay: could not drop its band-16 window", exc_info=True)
+
+    def setVisible(self, visible):
+        if visible and win_band_hook.installed():
+            if getattr(self, "_rw_exclusive", False):
+                self._ensure_band_window()
+                with win_band_hook.band_windows():
+                    super().setVisible(visible)
+                return
+            self._ensure_ordinary_window()
+        super().setVisible(visible)
+
+    def setWindowFlags(self, flags):
+        if getattr(self, "_rw_exclusive", False):
+            with win_band_hook.band_windows():          # a change of flags makes the native window again
+                super().setWindowFlags(flags)
+        else:
+            super().setWindowFlags(flags)
+
+    def _real_window_ok(self) -> bool:
+        """May the overlay's own window be shown over a game in exclusive fullscreen? Yes when it can be made in the
+        higher band, the setting allows it and the game is not on the deny-list."""
+        if platform.system() != "Windows" or not win_band_hook.installed():
+            return False
+        try:
+            from core.config_manager import get_config
+            cfg = get_config()
+            if not cfg.get("overlay_over_exclusive", True):
+                return False
+            from ui.exclusive_presenter import foreground_hwnd, process_name
+            exe = process_name(foreground_hwnd())
+            denied = {str(e).lower() for e in (cfg.get("overlay_window_deny", []) or [])}
+            return not (exe and exe.lower() in denied)
+        except Exception:
+            return False
+
+    def _begin_exclusive_session(self) -> None:
+        """While the overlay's window is up over the game, what it opens (a dialog, a menu, a text field) is made for that game
+        too (ui.exclusive_session). It ends by itself when the window is gone."""
+        try:
+            from ui.exclusive_session import get_session
+            get_session().begin("overlay", lambda: self._rw_exclusive and self.isVisible())
+        except Exception:
+            logger.debug("Overlay: could not begin the exclusive session", exc_info=True)
+
+    def _start_real_window_watch(self) -> None:
+        """For the first seconds after the window appears over an exclusive game, the same watch as for the picture: if
+        the game is taken out of its exclusive mode while it still has the front it is remembered (and not tried
+        again); the player pressing Alt+Tab never counts."""
+        try:
+            from ui.exclusive_presenter import FrontWatch, process_name
+            watch = FrontWatch()
+            self._xp_watch, self._xp_exe, self._xp_game = watch, process_name(watch.hwnd), watch.hwnd
+            self._xp_own = self._own_windows()
+            self._xp_watch_until = time.monotonic() + _XP_WATCH_S
+            self._xp_watch_timer.start()
+        except Exception:
+            logger.debug("Overlay: could not start watching the game", exc_info=True)
+
+    # ── A menu of the overlay over a game in exclusive fullscreen ─────────────────────────────────────
+
+    def _popup_menu(self, menu, pos, on_closed=None) -> None:
+        """Show *menu* at *pos* (global). Normally it is the usual blocking popup. Over a game in exclusive fullscreen a
+        Qt popup takes the foreground when it opens (measured), and that takes the game out of exclusive mode, so the
+        very same menu is shown as a non-activating tool window in the higher band instead: it highlights, takes the
+        mouse and runs its actions as it always did. Being no popup, Qt does not close it: it closes when an action
+        runs, when something else of ours is pressed, when the overlay goes, or after the pointer has been away."""
+        if not self._rw_exclusive:
+            menu.exec(pos)
+            if on_closed:
+                on_closed()
+            return
+        self._close_tool_menu("another menu was opened")
+        self._tool_menu_why = ""
+        menu.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+                            | Qt.WindowType.WindowDoesNotAcceptFocus)
+        menu.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        menu.setProperty("xs_keep", True)      # the overlay closes it itself (_close_tool_menu): the end of a session must not sweep it away
+        menu.triggered.connect(lambda *_: (setattr(self, "_tool_menu_why", "an entry was chosen"), menu.hide()))
+        menu.aboutToHide.connect(lambda: self._tool_menu_closed(menu, on_closed))
+        self._tool_menu, self._tool_menu_outside = menu, 0
+        with win_band_hook.band_windows():
+            menu.popup(pos)
+        # Qt rewrites the extended style when it shows the window and drops the non-activating bit, which is put back here, before
+        # anything can be pressed: a press on a window that can be activated takes the game out of exclusive fullscreen.
+        win_band_hook.ensure_noactivate(int(menu.winId()), layered=True)
+        # The overlay raises itself every moment (_ensure_topmost) and the menu opens inside the overlay's own rectangle: unless the
+        # menu is known to be open (popup_is_open), the overlay climbs back over it and it is gone before anything can be chosen.
+        from ui.helpers import note_tool_menu
+        note_tool_menu(menu)
+        self._tool_menu_timer.start()
+        QApplication.instance().installEventFilter(self)
+
+    def _tool_menu_closed(self, menu, on_closed) -> None:
+        logger.debug("Overlay: the menu closed - %s",
+                     getattr(self, "_tool_menu_why", "") or "nothing of ours closed it (Qt or the system hid it)")
+        self._tool_menu_why = ""
+        if self._tool_menu is menu:
+            self._tool_menu = None
+            self._tool_menu_timer.stop()
+            try:
+                QApplication.instance().removeEventFilter(self)
+            except Exception:
+                pass
+        if on_closed:
+            on_closed()
+
+    def _close_tool_menu(self, why: str = "the overlay went") -> None:
+        menu, self._tool_menu = self._tool_menu, None
+        self._tool_menu_timer.stop()
+        if menu is not None:
+            self._tool_menu_why = why
+            try:
+                menu.hide()
+                menu.deleteLater()
+            except RuntimeError:
+                pass
+
+    def _tool_menu_tick(self) -> None:
+        """The pointer has been away from both the menu and the overlay for a while (a click in the game cannot be seen
+        from here): the menu goes."""
+        menu = self._tool_menu
+        if menu is None or not menu.isVisible():
+            self._tool_menu_timer.stop()
+            return
+        pos = QCursor.pos()
+        if menu.geometry().contains(pos) or self.geometry().contains(pos):
+            self._tool_menu_outside = 0
+            return
+        self._tool_menu_outside += 1
+        if self._tool_menu_outside >= 6:
+            self._tool_menu_why = "the pointer was away from it and from the overlay for a while"
+            menu.hide()
+
+    def eventFilter(self, obj, event):
+        menu = self._tool_menu
+        if (menu is not None and event.type() == QEvent.Type.MouseButtonPress and isinstance(obj, QWidget)
+                and obj.window() is not menu and obj.window() is not menu.window()):
+            self._tool_menu_why = f"something else of ours was pressed ({type(obj).__name__})"
+            menu.hide()                              # something else of ours was pressed
+        return super().eventFilter(obj, event)
+
     def showEvent(self, event):
         self.refresh_unknown_badge()
         self._install_dpi_change_watch()
+        if self._rw_exclusive:
+            # Whichever way the window came back (the capture selector was cancelled and the panel is shown again, ...), what it
+            # opens is made for the game again. (Starting it twice is harmless.)
+            self._begin_exclusive_session()
         super().showEvent(event)
 
     def _install_dpi_change_watch(self):
@@ -1120,15 +1416,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         screen. That is the "shrunk overlay after a monitor switch" report.
 
         windowHandle() only exists once the native window is created, so
-        this runs from showEvent (idempotent — connects once) rather than
-        __init__.
+        this runs from showEvent (idempotent — connects once per native
+        window) rather than __init__.
         """
-        if getattr(self, "_dpi_watch_installed", False):
-            return
         wh = self.windowHandle()
         if wh is None:
             return
-        self._dpi_watch_installed = True
+        # Keyed on the window itself, not on a flag: the native window is dropped and made again (the higher band over a
+        # game in exclusive fullscreen, the ordinary one afterwards, the X11 bypass flag), and the signals of the old
+        # QWindow die with it.
+        if getattr(self, "_dpi_watch_handle", None) is wh:
+            return
+        self._dpi_watch_handle = wh
         try:
             wh.screenChanged.connect(self._on_overlay_screen_changed)
         except Exception:
@@ -1240,6 +1539,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._last_scale_log = seen
         if changed:
             self._applied_scale = cur
+            if prev:
+                self._rescale_queued_text(cur / prev)
             try:
                 _recalculate_all_scaled_dimensions(only_within=self)
             except Exception:
@@ -1248,6 +1549,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         else:
             self._apply_own_stylesheet()
         return changed
+
+    def _rescale_queued_text(self, factor: float) -> None:
+        """The text of a queued notification has its font sizes written into it (as HTML) when it is queued, for the scale of
+        that moment, and drawing it again after a scale change reads that very text: the card came out with the new frame
+        and the old text. The sizes are brought to the new scale here, before anything is drawn again."""
+        if abs(factor - 1.0) < 0.01 or not self._notif_queue:
+            return
+        from ui.helpers import scale_stylesheet_fonts
+        for i, item in enumerate(self._notif_queue):
+            try:
+                self._notif_queue[i] = item[:2] + (scale_stylesheet_fonts(item[2], factor),) + item[3:]
+            except Exception:
+                logger.debug("Overlay: could not rescale a queued notification", exc_info=True)
 
     def _rerender_current(self) -> None:
         """Draw what is on screen again at the current scale.
@@ -1262,6 +1576,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 self._render_current_notification(in_place=True)
             elif self._overlay_mode == "unknown" and self._unknown_queue is not None:
                 self._render_unknown_entry()
+                self._rerender_in_place()
+            elif self._overlay_mode == "tracking" and getattr(self, "_tracking_args", None):
+                self._build_tracking_card(*self._tracking_args)
                 self._rerender_in_place()
             else:
                 self.adjustSize()
@@ -1290,9 +1607,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._position_top_right()
 
     def _on_action(self, action: str):
+        self._last_user_action_at = time.monotonic()       # (the player pressed a button of the overlay: see _dashboard_in_use)
         self.action_requested.emit(action, self._context_exe)
         # Always hide overlay after any action, including open_app
         self.hide_animated()
+
+    def _on_trash_unknown(self):
+        """The bin on the unknown-game queue: take THIS game out of the list, without a ban. The main
+        window removes it from the shared queue (nothing is added to the suppress list); the queue view
+        then shows the next game, or closes when the queue is empty (_on_unknown_queue_changed)."""
+        exe = self._context_exe
+        if exe:
+            self.unknown_trashed.emit(exe)
 
     def _on_suppress(self):
         exe = self._context_exe
@@ -1414,12 +1740,70 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         new. Ticking an entry pins it, unticking closes it."""
         # The overlay fades itself out on a timer. A player reading this menu
         # must not have the window under it disappear mid-choice.
+        if self._presenting() and not self._rw_exclusive:
+            self._toggle_inline(self._fill_inline_pin_menu)       # picture fallback: a popup would take the game to the desktop
+            return
         self._auto_hide_timer.stop()
         menu = self._build_pin_menu()
-        menu.exec(self._pin_btn.mapToGlobal(QPoint(0, self._pin_btn.height())))
-        # Reading a menu is not idling: the countdown starts again whole.
+
+        def _again():
+            # Reading a menu is not idling: the countdown starts again whole.
+            if self._auto_hide_ms > 0:
+                self._auto_hide_timer.start(self._auto_hide_ms)
+
+        self._popup_menu(menu, self._pin_btn.mapToGlobal(QPoint(0, self._pin_btn.height())), on_closed=_again)
+
+    # ── Menus inside the card (the picture over an exclusive-fullscreen game) ─────────────────────
+
+    def _clear_inline(self) -> None:
+        area = self._inline_area
+        while area.count():
+            item = area.takeAt(0)
+            w = item.widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+
+    def _inline_btn(self, text: str, fn) -> None:
+        """One entry of a menu shown inside the card: choosing it closes the list, does its thing on the next
+        turn, and draws the card again."""
+        btn = QPushButton(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def _go():
+            self._clear_inline()
+            QTimer.singleShot(0, fn)
+            QTimer.singleShot(90, self._refresh_presenter)
+            if self._auto_hide_ms > 0:
+                self._auto_hide_timer.start(self._auto_hide_ms)
+
+        btn.clicked.connect(_go)
+        self._inline_area.addWidget(btn)
+
+    def _toggle_inline(self, fill) -> None:
+        """Open the list *fill* builds, or close it when it is already open. Opening it gives the card a fresh
+        countdown (hovering holds it, as everywhere on the card); it is not stopped, so a list nobody answers
+        does not keep the card over the game for good."""
+        if self._inline_area.count():
+            self._clear_inline()
+        else:
+            fill()
         if self._auto_hide_ms > 0:
             self._auto_hide_timer.start(self._auto_hide_ms)
+        self._refresh_presenter()
+
+    def _fill_inline_pin_menu(self) -> None:
+        """The 📌 menu as a list in the card: what was pinned recently (a pin marks what is on screen), a new
+        note, close all. "Pin a file" and "capture a region" open real windows - a file picker, a screen-wide
+        selector - which would take the game to the desktop, so they are left out here."""
+        from ui.widgets.pins import get_pin_manager
+        mgr = get_pin_manager()
+        for path in mgr.recent():
+            label, _tip, _unsaved = mgr.menu_entry(path)
+            self._inline_btn(f"\U0001f4cc {label}" if mgr.is_open(path) else label, lambda p=path: mgr.toggle(p))
+        self._inline_btn(t("pin.new_note"), mgr.new_note)
+        if mgr.open_paths() or mgr.unsaved_pins():
+            self._inline_btn(t("pin.close_all"), mgr.close_all)
 
     def _pin_capture(self) -> None:
         """Grab a piece of the screen and pin it.
@@ -1432,17 +1816,42 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         from ui.widgets.screen_capture import capture_region
 
         was_visible = self.isVisible()
+        exclusive = bool(self._rw_exclusive)
+        # The panel is down while the selector is up, and its countdown must not run out meanwhile: it would hide the panel for
+        # good and bring it back, when the selector is cancelled, as a window at opacity 0.
+        self._auto_hide_timer.stop()
+        screen = None
+        if exclusive:
+            # Over a game in exclusive fullscreen the picker is a window of the higher band on the game's monitor; the session
+            # (ui.exclusive_session) is held for the capture from here, before the overlay goes: the overlay is what holds it
+            # now, and the sweep at the end of a session would take the picker with it.
+            from ui import exclusive_app
+            from ui.exclusive_session import get_session
+            self._capturing = True
+            get_session().begin("capture", lambda: self._capturing)
+            screen = exclusive_app.screen_of_game(self.presented_game())
         self.hide()
         QApplication.processEvents()
         piece = None
+        blank = False
         try:
-            piece = capture_region(None)
+            from ui.widgets import screen_capture
+            piece = capture_region(None, screen=screen, exclusive=exclusive)
+            blank = piece is None and screen_capture.last_grab_blank
         finally:
+            if exclusive:
+                self._capturing = False
             # Only when nothing was captured — cancelled, or a display mode we
             # cannot read. On success the player got what they opened this for,
             # and bringing the panel back would just cover the new pin.
             if piece is None and was_visible and not self.isVisible():
-                self.show()
+                if blank:
+                    self.show_notice(t("pin.capture_blank"))      # said instead of the panel: the frame could not be read
+                else:
+                    self.setWindowOpacity(1.0)
+                    self.show()
+                    if self._auto_hide_ms > 0:
+                        self._auto_hide_timer.start(self._auto_hide_ms)
         if piece is not None:
             # The panel stays down, so _do_hide never runs: let go here, or
             # the overlay's hold would outlive the overlay itself.
@@ -1456,7 +1865,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         from ui.widgets.file_pickers import pick_file
         from ui.widgets.pins import get_pin_manager, pin_name_filter
 
-        path = pick_file(self, t("pin.add_title"), pin_name_filter())
+        # (Over a game in exclusive fullscreen the picker has no parent: the overlay's own window is the one that is dropped when
+        # it hides, and a dialog made for the game must not depend on it.)
+        path = pick_file(None if self._rw_exclusive else self, t("pin.add_title"), pin_name_filter())
         if path:
             get_pin_manager().pin(path)
 
@@ -1576,13 +1987,26 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         show_exe_icon(self._icon_label, self._context_exe, scaled(24, self), "🎮",
                       self._scale_dpr())
         self._title.setText(t("app.name"))
+        # The install folder's name, beside the detected one (a program a list of known names has not met reads as a game of its own name)
+        from ui.unknown_history import folder_reference
+        _ref = folder_reference(h)
+        _ref_txt = f" · {t('unknown_history.folder_ref', folder=html.escape(_ref))}" if _ref else ""
         self._message.setText(
             f"<b>{game_name}</b> {t('overlay.detected_msg')}<br>"
-            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>{t('overlay.save_detected')}</span>"
+            f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>{t('overlay.save_detected')}{_ref_txt}</span>"
         )
         self._hide_dashboard()
         self._clear_buttons()
         self._add_btn(self._btn_area, t("overlay.add_to_library"), "add_game", primary=True)
+        # The bin (header, beside the close button): this game leaves the queue WITHOUT being banned. Not
+        # "don't show again", which is the link below. A hover that can be seen: the stock one is a shade
+        # off the card's own colour and an emoji ignores a change of text colour.
+        self._trash_btn.setToolTip(t("unknown_history.trash_tooltip"))
+        self._trash_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;border-radius:4px;padding:0;"
+            f"font-size:{scaled(13, self)}px;}}"
+            f"QPushButton:hover{{background:{palette('error')};}}")
+        self._trash_btn.setVisible(True)
         # Rewire explicitly: a previous notification may have pointed the
         # shared suppress button at a different handler.
         self._set_suppress_link("dont_show_again", self._on_suppress)
@@ -1639,6 +2063,15 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 lambda: self.show_game_launched(game_name, exe_path, engine)):
             return
         self._clear_notification_queue()
+        self._build_tracking_card(game_name, exe_path, engine)
+        self._position_top_right()
+        self.show_animated(auto_hide=_AUTO_HIDE_MS)
+
+    def _build_tracking_card(self, game_name: str, exe_path: str = "", engine: str = "") -> None:
+        """The content of the "now tracking" card, measured for the screen it is on. Kept apart from showing it so it can be
+        drawn again when the scale changes under it (a display mode switch, another monitor): its text carries font sizes
+        written at the scale of the moment."""
+        self._tracking_args = (game_name, exe_path, engine)
         self._set_mode("tracking")
         self._context_exe = exe_path
         # The game's own icon, as on the detection card; the controller when
@@ -1669,8 +2102,6 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._btn_area.addWidget(hotkey_lbl)
 
         self._hide_suppress_btn()
-        self._position_top_right()
-        self.show_animated(auto_hide=_AUTO_HIDE_MS)
 
     def show_restore_result(self, success: bool, game_name: str):
         """Brief notification showing restore result."""
@@ -1702,9 +2133,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     # _defer_if_priority) and never auto-hide. Closing without choosing means
     # "later" — no state is popped, so the hotkey can re-summon them.
 
-    def show_cloud_saves(self, game_name: str, exe_path: str):
-        """Cloud saves exist for a library game whose local copy isn't synced."""
-        if self._defer_if_priority(lambda: self.show_cloud_saves(game_name, exe_path),
+    def show_cloud_saves(self, game_name: str, exe_path: str, compare: bool = False):
+        """Cloud saves exist for a library game whose local copy isn't synced. *compare*: both versions exist and differ, so the comparison
+        window (both dated, and every way to settle it) is offered too."""
+        if self._defer_if_priority(lambda: self.show_cloud_saves(game_name, exe_path, compare),
                                    context=exe_path, is_priority=True):
             return
         self._begin_cloud_prompt(game_name, exe_path, "cloud_available")
@@ -1713,9 +2145,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # "Dismiss" here suggested nothing — the player could not tell
         # whether closing it meant keeping local saves, postponing, or
         # losing something.
+        # "Continue with local saves" here means: not THAT cloud copy - a different game with the same name, or a new playthrough - so the game
+        # takes a cloud folder of its own (see main_window "continue_local_cloud_available"); the way to say "same game, local wins" is the comparison.
+        _items = [(t("overlay.continue_local_fork"), "continue_local_cloud_available")]
+        if compare:
+            _items.insert(0, (t("overlay.compare_versions"), "resolve_conflict_details"))
         self._add_split_btn(
             self._btn_area, t("overlay.download_saves"), "download_saves",
-            menu_items=[(t("overlay.continue_local"), "dismiss")],
+            menu_items=_items,
             primary=True,
         )
         self._set_suppress_link(
@@ -1771,7 +2208,27 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._begin_cloud_prompt(game_name, exe_path, "cloud_no_local")
         self._add_split_btn(
             self._btn_area, t("overlay.download_saves"), "download_saves_no_local",
-            menu_items=[(t("overlay.continue_local"), "continue_local_no_local")],
+            menu_items=[(t("overlay.continue_local_fork"), "continue_local_no_local")],
+            primary=True,
+        )
+        self._set_suppress_link(
+            "dont_show_again", lambda: self._on_action("suppress_cloud_no_local"))
+        self._show_priority_prompt()
+
+    def show_cloud_saves_no_local_copies(self, game_name: str, exe_path: str, several: bool = True):
+        """The no-saves-here prompt for a LIBRARY game when the data cannot say which cloud copy is its own: SEVERAL folders share its name
+        (or a copy and an archive on this PC that are not the same data), or the one copy is not its folder - so there is no plain "download"
+        (it would pick one for the player). Primary opens the picker (the one unknown games get); the dropdown keeps this PC's saves, as on
+        the single-copy prompt (a cloud folder of its own where a same-name copy is already there)."""
+        if self._defer_if_priority(lambda: self.show_cloud_saves_no_local_copies(game_name, exe_path, several),
+                                   context=exe_path, is_priority=True):
+            return
+        self._begin_cloud_prompt(game_name, exe_path, "cloud_conflict" if several else "cloud_no_local")
+        self._add_split_btn(
+            self._btn_area,
+            t("overlay.verify_conflicts") if several else t("overlay.verify_details"),
+            "verify_conflicts_known_game" if several else "verify_details_known_game",
+            menu_items=[(t("overlay.continue_local_fork"), "continue_local_no_local")],
             primary=True,
         )
         self._set_suppress_link(
@@ -1797,14 +2254,17 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             "dont_show_again", lambda: self._on_action("never_renamed_game"))
         self._show_priority_prompt()
 
-    def show_cloud_saves_different_machine(self, game_name: str, exe_path: str):
+    def show_cloud_saves_different_machine(self, game_name: str, exe_path: str, compare: bool = False):
         """Cloud saves were last uploaded by a DIFFERENT machine — local saves
-        here may be older. Download & replace, or keep local."""
-        if self._defer_if_priority(lambda: self.show_cloud_saves_different_machine(game_name, exe_path),
+        here may be older. Download & replace, or keep local. *compare*: there are
+        local saves too, so the comparison window is offered to choose by the dates."""
+        if self._defer_if_priority(lambda: self.show_cloud_saves_different_machine(game_name, exe_path, compare),
                                    context=exe_path, is_priority=True):
             return
         self._begin_cloud_prompt(game_name, exe_path, "cloud_different_machine")
         self._add_btn(self._btn_area, t("overlay.download_and_replace"), "download_saves_different_machine", primary=True)
+        if compare:
+            self._add_btn(self._btn_area, t("overlay.compare_versions"), "resolve_conflict_details")
         self._add_btn(self._btn_area, t("overlay.keep_local"),           "decline_cloud_different_machine")
         self._hide_suppress_btn()
         self._show_priority_prompt()
@@ -1854,20 +2314,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._show_priority_prompt()
 
     def show_path_changed(self, game_name: str, game_id: str, new_exe_path: str,
-                          alternates: list | None = None):
+                          alternates: list | None = None, same_install: bool = False):
         """A stem/name match found *game_name* running from a path that
         differs from the one on record — its stored exe is presumably gone
         (a reinstall, an update, a moved folder). Tracking already proceeded
         on the stem match; this only asks how the new path should be filed.
 
-        Not a decision-required prompt like show_unverified_match: left to
-        expire (or answered "don't ask again") it applies the primary
-        action itself — track it, rebase the save-path pointer — so
-        nothing here withholds tracking while it waits. The pending entry
-        is NOT cleared by that expiry (see main_window's
-        _on_path_changed_expired): the question stays hotkey-resummonable
-        even after the safe default has already taken effect, so a later
-        correction is always possible.
+        A decision-required prompt like the others: it does not expire (it
+        used to apply the primary action by itself after a few seconds);
+        it stays up until it is answered, and the hotkey calls it up
+        again. Tracking has already proceeded on the stem match, so
+        nothing is withheld while it waits - only the filing of the new
+        path waits for the answer.
 
         *alternates* are other library entries the match was ambiguous
         against — (game_id, game_name) pairs, offered in the dropdown as
@@ -1877,10 +2335,13 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         actually copying the old save DATA into the new location waits
         for the match to be unambiguous first (no alternates, or an
         explicit choice) — seeing alternates, expiry moves only the
-        tracking pointer and leaves the physical data copy for later."""
+        tracking pointer and leaves the physical data copy for later.
+
+        *same_install*: the program is NOT at a different location - it is another file of the install the game already has (a 64-bit build beside the 32-bit
+        one), and the wording says so. It was recognised as the game by its NAME; a program found only by where it sits is an ordinary detection (the queue)."""
         context = f"{game_id}|{new_exe_path}"
         if self._defer_if_priority(
-                lambda: self.show_path_changed(game_name, game_id, new_exe_path, alternates),
+                lambda: self.show_path_changed(game_name, game_id, new_exe_path, alternates, same_install),
                 context=context, is_priority=True):
             return
         self._set_mode("cloud")          # same decision-prompt chrome
@@ -1888,10 +2349,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._priority_context = context
         self._icon_label.setText("📁")
         self._title.setText(t("app.name"))
+        _kind = "path_sibling" if same_install else "path_changed"
         self._message.setText(
-            f"<b>{t('overlay.path_changed_msg', game=game_name)}</b><br>"
+            f"<b>{t(f'overlay.{_kind}_msg', game=game_name)}</b><br>"
             f"<span style='color:{palette('text_hint')};font-size:{scaled(11, self)}px;'>"
-            f"{t('overlay.path_changed_hint')}</span>"
+            f"{t(f'overlay.{_kind}_hint')}</span>"
         )
         self._hide_dashboard()
         self._clear_buttons()
@@ -1909,8 +2371,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         )
         self._set_suppress_link(
             "dont_show_again", lambda: self._on_action("path_add_version"))
-        self._show_priority_prompt(auto_hide_ms=_AUTO_HIDE_MS)
-        self._on_expire_action = lambda: self.path_changed_expired.emit(context)
+        self._show_priority_prompt()
 
     def show_overwrite_saves_conflict(self, game_name: str, game_id: str, new_exe_path: str,
                                       is_data_copy: bool = False):
@@ -2114,13 +2575,31 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         context = f"{proc_name}|{game_id}"
         if self._priority_context != context:
             return
-        if self.isVisible() and self.windowOpacity() > 0.1:
+        if self._presenting() or (self.isVisible() and self.windowOpacity() > 0.1):
             self.hide_animated()      # drops priority and replays deferred
             self._priority_context = ""
             return
         self.clear_priority_for(context)
 
     # ── Priority prompt gating ───────────────────────────────────────────────
+
+    def _dashboard_in_use(self) -> bool:
+        """The hotkey dashboard is on screen and the player is using it: the pointer is on it, or a menu of it (the 📌 one) is open."""
+        try:
+            now = time.monotonic()
+            # What the player just ASKED for is not a notice that came by itself, and must never wait behind the dashboard it was asked from:
+            # the unknown-game badge (note_user_summon) held back its own click - nothing seemed to happen - and the answer to a dashboard
+            # button (a backup that finishes a few seconds after "Backup" was pressed) is the answer to a request.
+            if now - getattr(self, "_user_summon_at", -10.0) < 1.5 or now - getattr(self, "_last_user_action_at", -100.0) < 30.0:
+                return False
+            if self._overlay_mode != "manual" or not self._on_screen():
+                return False
+            if not self._presenting() and self.windowOpacity() <= 0.3:
+                return False                                   # (on its way out)
+            hovered = self._xp_hover if self._presenting() else (self._hover_active or self.underMouse())
+            return bool(hovered or popup_is_open())
+        except RuntimeError:
+            return False
 
     def _defer_if_priority(self, fn, context: str = "", is_priority: bool = False) -> bool:
         """If a decision-required priority prompt (cloud-save decision) is
@@ -2140,10 +2619,14 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # interrupted is right after it was raised. _priority_active is the
         # honest signal: hide_animated drops it before the fade-out starts,
         # so a prompt on its way out never holds the lock here.
-        if not (self._priority_active and self.isVisible()):
+        if self._priority_active and self._on_screen():
+            if is_priority and context and context == self._priority_context:
+                return False
+        elif is_priority or not self._dashboard_in_use():
             return False
-        if is_priority and context and context == self._priority_context:
-            return False
+        # (else: a notice that came by itself, while the dashboard the player asked for is being used - the pointer is on it, or its pin
+        # menu is open. It replaced the dashboard, and the menu with it: "the tracking notification closed my overlay". It is shown once
+        # the dashboard has gone, like one that comes behind a prompt.)
         # Bounded: a long-lived prompt must not accumulate stale toasts.
         if len(self._deferred_notifs) >= 20:
             self._deferred_notifs.pop(0)
@@ -2296,6 +2779,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # continues over the swapped content.
         if in_place and self.isVisible():
             self._rerender_in_place()
+        elif in_place and self._presenting():
+            self._refresh_presenter()
         else:
             self._position_top_right()
             self.show_animated(auto_hide=auto_hide_ms)
@@ -2540,6 +3025,11 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     def show_manual(self, stats: dict | None = None):
         """Toggle dashboard. If visible → hide; else → show with live stats."""
+        # Over a game in exclusive fullscreen the dashboard is a picture (see
+        # _present_over_exclusive): the second press closes that one.
+        if self._xp is not None and self._xp.visible:
+            self._end_presenter()
+            return
         if self.isVisible() and self.windowOpacity() > 0.3:
             self.hide_animated()
             return
@@ -2576,9 +3066,15 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 palette("accent") if is_online else palette("text_hint")
             )
             self._set_dash(3, t('overlay.provider'),    stats.get("provider", t("common.none")))
+            start = float(stats.get("session_start") or 0)
+            self._session_start = start if (stats.get("active_game") and start > 0) else 0.0
+            self._session_row.setVisible(self._session_start > 0)
+            if self._session_start > 0:
+                self._set_dash(4, t('overlay.session'), format_clock(time.time() - self._session_start))
         else:
             self._message.setText(f"<span style='color:{palette('text_hint')};'>{t('app.tagline')}</span>")
             self._hide_dashboard()
+            self._session_start = 0.0
 
         self._clear_buttons()
         # [i] shortcut to the save-path scan panel (accept detected files
@@ -2631,30 +3127,73 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._position_top_right()
         # Hotkey dashboard only: notifications must not steal / redraw the pointer.
         self.show_animated(auto_hide=_AUTO_HIDE_MS, pointer=True)
+        if self._session_start > 0:
+            self._session_timer.start()
+        else:
+            self._session_timer.stop()
 
     # ── Animation ─────────────────────────────────────────────────────────────
 
+    # The views a player has to click in: a question to answer ("cloud": a conflict, a restore, a verification ...), a game to add or
+    # bin ("unknown"), the dashboard. They bring the pointer with them when a game has hidden its own: the question does not go
+    # away by itself, and a question that cannot be answered is no question. Passive notices (a backup was made, a game is being
+    # watched, a restore is done) leave the player's pointer alone.
+    _POINTER_MODES = frozenset({"manual", "cloud", "unknown"})
+
+    def note_user_summon(self) -> None:
+        """The player asked for what is about to be shown (the hotkey, the badge): it gets the pointer. A notice that
+        appears by itself leaves the player's mouse alone - as it does over a borderless game."""
+        self._user_summon_at = time.monotonic()
+
+    def _needs_pointer(self) -> bool:
+        return (self._overlay_mode in self._POINTER_MODES
+                or time.monotonic() - getattr(self, "_user_summon_at", -10.0) < 1.5)
+
+    def _fullscreen_game_in_front(self) -> bool:
+        """A game is being played: SaveSync is tracking one, or a fullscreen window is in front (a game that is
+        not in the library yet is a game all the same, and the one the queue asks about)."""
+        return self._game_is_running() or self._is_fullscreen_active()
+
     def show_animated(self, auto_hide: int = _AUTO_HIDE_MS, *,
-                      pointer: bool = False):
+                      pointer: bool = False, over_exclusive: bool = False):
         """Show the overlay above any window — safely handles fullscreen games.
 
         Fullscreen handling:
         - **Borderless fullscreen**: safe — show with TOPMOST + NOACTIVATE.
         - **Exclusive fullscreen** (DirectX/Vulkan): showing ANY window forces
           the DWM to composite, kicking the game out of exclusive mode (black
-          flicker, fps drop, possible crash).  We skip the overlay entirely
-          and emit ``exclusive_blocked(title, message)`` so the caller can
-          give audio feedback (a notification sound).  No defer — by the time
+          flicker, fps drop, possible crash).  So the overlay window itself
+          is never shown.  Instead what it holds is shown as a PICTURE in a
+          layered, non-activating window that was measured not to take the game
+          out of exclusive mode, and that takes the mouse so its buttons work
+          (_present_over_exclusive).  When that cannot be done - the game is on
+          the deny-list, the setting is off, the API is refused - the overlay is
+          skipped and ``exclusive_blocked(title, message)`` is emitted so the
+          caller can route it through another channel.  No defer — by the time
           exclusive mode ends the notification is stale.
-
         *pointer*: when True (hotkey / ``show_manual`` only) **and** a game is
         running, free clip/capture so the overlay is reachable. The software
         arrow appears only if the game has hidden the OS cursor — titles that
         already draw their own pointer are left alone. Outside a session, and
         for toasts/notifications, the player's cursor is untouched.
         """
+        pointer = pointer or self._needs_pointer()
+        self._user_summon_at = -10.0          # a request applies to the one view it produced
         # ── Exclusive fullscreen guard ──────────────────────────────────────
-        if platform.system() == "Windows" and self._is_exclusive_fullscreen():
+        self._rw_exclusive = False
+        # (*over_exclusive*: the caller has just judged that the game in front is exclusive. Asked again here, with the foreground at
+        # that moment being some window of ours, the answer can be "no" and an ordinary window is shown over an exclusive game: invisible,
+        # and still taking the mouse.)
+        exclusive_now = platform.system() == "Windows" and (over_exclusive or self._is_exclusive_fullscreen())
+        if exclusive_now and self._real_window_ok():
+            # The overlay's own window, made in the higher band: the mouse, the hover, the menus and the pointer are
+            # the window's own. No picture.
+            self._rw_exclusive = True
+            logger.debug("Overlay shown over exclusive fullscreen as a window")
+        elif exclusive_now:
+            if self._present_over_exclusive(auto_hide, pointer):
+                logger.debug("Overlay shown over exclusive fullscreen as a click-through picture")
+                return
             title = self._title.text() if hasattr(self, '_title') else t("app.name")
             msg = self._message.text() if hasattr(self, '_message') else ""
             msg_plain = re.sub(r'<[^>]+>', '', msg).strip()
@@ -2665,8 +3204,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             logger.info("Overlay skipped — exclusive fullscreen active")
             return
 
-        # In-game hotkey dashboard only. Desktop / toasts: no second cursor.
-        if pointer and self._game_is_running():
+        # An ordinary screen again: a picture left over from the exclusive-fullscreen case has
+        # no place next to the real overlay.
+        self._hide_presenter()
+        if self._rw_exclusive:
+            self._start_real_window_watch()       # after the line above, which ends any watch
+            self._begin_exclusive_session()
+        if not self.isVisible():
+            self._apply_fullscreen_stacking()
+
+        # Views that are clicked in (dashboard, questions, the queue) while a game is being played. Desktop /
+        # passive toasts: no second cursor.
+        if pointer and self._fullscreen_game_in_front():
             SystemCursor.hold("overlay")
             self._cursor_timer.start()
         else:
@@ -2685,6 +3234,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._hide_anim_connected = False
         self._hover_active        = False
         self.setWindowOpacity(0.0)
+        # Over a game a notice that appears by itself leaves the player's mouse alone - the cursor already did (no pointer, below),
+        # but its rectangle still took every click and every hover: the player moves the mouse, or clicks in the game, and a notice
+        # that is not even asked for gets it. Only a view that was asked for (the hotkey, the badge) takes the mouse.
+        # (And only while the game has hidden its cursor: a game that shows its own has a player who can see the notice and the pointer
+        # and reach it - see _click_through_now.)
+        self._interactive_view = bool(pointer)
 
         # ── Capture current foreground ──────────────────────────────────────
         _saved_foreground = None
@@ -2737,8 +3292,39 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._auto_hide_ms = max(0, int(auto_hide))
         if auto_hide > 0:
             self._auto_hide_timer.start(auto_hide)
+        self._apply_click_through()
+
+    def _click_through_now(self) -> bool:
+        """Does the mouse go through the overlay to the game right now? Only for a notice nobody asked for, as a window over a game,
+        while the game has HIDDEN its cursor - the player has no pointer to aim with, and moving the mouse in the game must not
+        land on a notice. A game that shows its own cursor is another matter: the player sees the notice and the pointer, and
+        can reach it. A cursor held by us (a view that was asked for, a pin being dragged) is not the game's to judge."""
+        if not self._rw_exclusive or getattr(self, "_interactive_view", True):
+            return False
+        try:
+            return SystemCursor.game_hides_cursor()
+        except Exception:
+            return False
+
+    def _apply_click_through(self) -> None:
+        """WS_EX_TRANSPARENT on the overlay's window while it is a notice nobody asked for (see show_animated). Qt rewrites the
+        extended style now and then, and the game may hide or show its cursor, so it is put right again whenever the overlay
+        re-orders itself."""
+        if platform.system() != "Windows" or not self.isVisible():
+            return
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            ex = user32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF
+            want = (ex | 0x00000020) if self._click_through_now() else (ex & ~0x00000020)
+            if want != ex:
+                user32.SetWindowLongW(hwnd, -20, ctypes.c_long(want - (1 << 32) if want >= (1 << 31) else want))
+        except Exception:
+            logger.debug("Overlay: could not set whether the mouse goes through", exc_info=True)
 
     def hide_animated(self):
+        self._hide_presenter()
+        self._clear_inline()
         self._auto_hide_timer.stop()
         self._topmost_timer.stop()
         self._uninstall_foreground_hook()
@@ -2847,11 +3433,426 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._fg_hook_proc = None
             logger.debug("Foreground change hook removed")
 
+    # ── A picture over a game in exclusive fullscreen ────────────────────────
+
+    def _apply_fullscreen_stacking(self) -> None:
+        """Plain X11 only (ui.x11_fullscreen has the measurements): a managed window is stacked UNDER a
+        fullscreen one, so while a fullscreen window is in front the overlay is an override-redirect window,
+        and a managed one again when it is not. Changing the flag recreates the native window, so it is done
+        only when the answer changes - hidden first, and shown again if it was on screen."""
+        try:
+            from ui.x11_fullscreen import dynamic_bypass_applies, fullscreen_window_in_front
+            if not dynamic_bypass_applies():
+                return
+            want = fullscreen_window_in_front()
+        except Exception:
+            return
+        if want == self._x11_bypass:
+            return
+        self._x11_bypass = want
+        was_visible = self.isVisible()
+        self.hide()
+        self.setWindowFlag(Qt.WindowType.X11BypassWindowManagerHint, want)
+        logger.info("Overlay: %s a fullscreen window in front - %s", "there is" if want else "there is no longer",
+                    "now an override-redirect window" if want else "a managed window again")
+        if was_visible:
+            # Not in the same turn of the event loop: a window hidden, re-flagged and shown within one turn is
+            # left unmapped by the xcb plugin (measured).
+            QTimer.singleShot(40, self._reshow_after_stacking)
+
+    def _reshow_after_stacking(self) -> None:
+        if not getattr(self, "_cleaned_up", False) and self._overlay_mode:
+            self.show()
+            self._take_the_front()
+
+    def _presenting(self) -> bool:
+        """The picture over an exclusive-fullscreen game is up."""
+        return self._xp is not None and self._xp.visible
+
+    def _on_screen(self) -> bool:
+        """The overlay is showing something: its own window, or the picture."""
+        return self.isVisible() or self._presenting()
+
+    def _present_over_exclusive(self, auto_hide: int, pointer: bool = False) -> bool:
+        """Show what the overlay holds as a PICTURE over a game in exclusive fullscreen, and make it
+        work like the window does. True when it is on screen; False leaves the caller to skip, as
+        before this existed.
+
+        Not a window the game would have to share the screen with: an ordinary window takes the
+        game back to the desktop within half a second. A layered, non-activating window in the one
+        higher band an ordinary process may use is shown by Windows without taking it out of
+        exclusive mode - measured on a Direct3D 11 title, including with the mouse reaching it
+        (ui.exclusive_presenter has the details). The picture is the overlay as it looks, buttons
+        included; a click is mapped back to the button under it and that button's own slot runs, so
+        prompts are answered, the carousel steps and "don't show again" works as in the window. The
+        countdown, the hover pause and the way it is closed are the window's own.
+
+        *pointer* (the hotkey dashboard) frees the mouse from the game's clip and, when the game
+        has hidden the pointer, draws an arrow the same way - what SystemCursor does for the window.
+
+        For the first seconds the game is watched (_check_presenter_front). It is held against the
+        picture only when the exclusive mode was taken away from the game while nothing else had
+        the front - never because the player pressed Alt+Tab - and then that game is not tried
+        again (overlay_exclusive_deny).
+        """
+        try:
+            from core.config_manager import get_config
+            cfg = get_config()
+            if not cfg.get("overlay_over_exclusive", True):
+                return False
+            from ui.exclusive_presenter import (ExclusivePresenter, FrontWatch,
+                                                monitor_rect, process_name)
+            if not ExclusivePresenter.supported():
+                return False
+            watch = FrontWatch()
+            exe = process_name(watch.hwnd)
+            denied = {str(e).lower() for e in (cfg.get("overlay_exclusive_deny", []) or [])}
+            if exe and exe.lower() in denied:
+                return False
+            self._xp_mon = monitor_rect(watch.hwnd)
+            if self._xp_mon is None:
+                return False
+            self._xp_game = watch.hwnd
+            self._xp_own = self._own_windows()
+            if self._xp is None:
+                self._xp = ExclusivePresenter(click_through=False, on_mouse=self._on_presenter_mouse_raw)
+            if not self._paint_presenter():
+                return False
+        except Exception:
+            logger.debug("Overlay: could not present over exclusive fullscreen", exc_info=True)
+            return False
+        self._xp_watch, self._xp_exe = watch, exe
+        self._xp_watch_until = time.monotonic() + _XP_WATCH_S
+        self._xp_watch_timer.start()
+        # The window's own countdown and expiry action (a path-changed prompt's, for one).
+        self._on_expire_action = None
+        self._auto_hide_ms = max(0, int(auto_hide))
+        if self._auto_hide_ms > 0:
+            self._auto_hide_timer.start(self._auto_hide_ms)
+        else:
+            self._auto_hide_timer.stop()
+        if pointer:
+            # Over a game in exclusive fullscreen by definition: no need for it to be one SaveSync tracks.
+            logger.info("Overlay pointer: freeing the mouse from the game's clip; an arrow of our own is drawn "
+                        "whenever the game hides the system pointer")
+            self._xp_cursor_timer.start()
+            self._xp_cursor_tick()
+        else:
+            self._xp_cursor_timer.stop()
+        return True
+
+    def _render_for_presenter(self):
+        """The overlay as it would look, as a premultiplied-alpha QImage, and what a click can reach:
+        [(rect in the picture's own pixels, QPushButton)]. (None, []) on failure."""
+        from PySide6.QtCore import QRect
+        from PySide6.QtGui import QImage
+        # What showEvent does for the window and a widget that is only grabbed never gets: the
+        # pending-games badge. Without it the first picture lacked a badge the window has.
+        self.refresh_unknown_badge()
+        self._sync_scale_to_screen("show")
+        # A hidden widget does not re-lay itself out when children change: without this the
+        # size comes from whatever the layout last computed (a render that depended on the
+        # one before it).
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        self.adjustSize()
+        lit = self._xp_hover_btn if self._presenting() else None
+        painters = []
+        for b, pressed in ((lit, self._xp_pressed is lit and lit is not None),):
+            if b is not None:
+                try:
+                    p = _PaintAsHovered(b, pressed)
+                    b.installEventFilter(p)
+                    painters.append((b, p))
+                except RuntimeError:
+                    pass                  # deleted meanwhile
+        try:
+            pixmap = self.grab()
+        finally:
+            for b, p in painters:
+                try:
+                    b.removeEventFilter(p)
+                    p.deleteLater()
+                except RuntimeError:
+                    pass
+        if pixmap.isNull():
+            return None, []
+        dpr = pixmap.devicePixelRatio()
+        hits = []
+        for b in self.findChildren(QPushButton):
+            try:
+                if b.isVisibleTo(self) and b.isEnabled():
+                    corner = b.mapTo(self, QPoint(0, 0))
+                    hits.append((QRect(round(corner.x() * dpr), round(corner.y() * dpr),
+                                       round(b.width() * dpr), round(b.height() * dpr)), b))
+            except RuntimeError:
+                pass          # deleted meanwhile
+        return pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied), hits
+
+    def _paint_presenter(self) -> bool:
+        """Render the overlay and put it in the top-right of the monitor the game is on."""
+        image, hits = self._render_for_presenter()
+        if image is None or self._xp_mon is None:
+            return False
+        w, h = image.width(), image.height()
+        margin = max(2, round(10 * image.devicePixelRatio()))
+        x, y = self._xp_mon[2] - w - margin, self._xp_mon[1] + margin       # the top-right, as the window is
+        if not self._xp.present(w, h, bytes(image.constBits())[:w * h * 4], x, y):
+            return False
+        self._xp_hits = hits
+        return True
+
+    def _refresh_presenter(self) -> None:
+        """The overlay's content changed while the picture is up (a button was pressed, a notification
+        stepped): draw it again."""
+        if self._presenting():
+            self._paint_presenter()
+
+    def _on_presenter_mouse_raw(self, kind: str, x: int, y: int) -> None:
+        """From the picture's window procedure: handed on at once, so nothing slow happens there."""
+        QTimer.singleShot(0, lambda: self._on_presenter_mouse(kind, x, y))
+
+    def _presenter_hit(self, x: int, y: int):
+        for rect, button in self._xp_hits:
+            if rect.contains(x, y):
+                return button
+        return None
+
+    def _on_presenter_mouse(self, kind: str, x: int, y: int) -> None:
+        """The mouse over the picture: hover holds the countdown, a press and release on the same
+        button presses it."""
+        if not self._presenting():
+            return
+        if kind == "move":
+            if not self._xp_hover:
+                self._xp_hover = True
+                if self._auto_hide_ms > 0:               # the window restarts it whole when the pointer arrives
+                    self._auto_hide_timer.start(self._auto_hide_ms)
+            self._set_picture_hover(self._presenter_hit(x, y))
+        elif kind == "leave":
+            self._xp_hover = False
+            self._set_picture_hover(None)
+        elif kind == "down":
+            self._xp_pressed = self._presenter_hit(x, y)
+            if self._xp_pressed is not None:
+                self._xp_hover_btn = self._xp_pressed
+                self._refresh_presenter()
+        elif kind == "up":
+            pressed, self._xp_pressed = self._xp_pressed, None
+            if pressed is not None and pressed is self._presenter_hit(x, y):
+                self._xp_watch_timer.stop()          # what a button opens is not the picture's doing
+                self._xp_watch = None
+                try:
+                    pressed.click()
+                except RuntimeError:
+                    pass          # deleted by an earlier press
+                QTimer.singleShot(60, self._refresh_presenter)
+
+    def _set_picture_hover(self, button) -> None:
+        """The picture is a still, so a button under the pointer is shown highlighted the way the window shows it
+        (see _PaintAsHovered), and the picture is drawn again."""
+        if button is self._xp_hover_btn:
+            return
+        self._xp_hover_btn = button
+        self._refresh_presenter()
+
+    def _xp_cursor_tick(self) -> None:
+        """While the picture is up and the mouse was asked for: keep the pointer free of the game's
+        clip, and draw an arrow of our own - the same safe way - when the game has hidden the real one."""
+        if not self._presenting():
+            self._xp_cursor_timer.stop()
+            return
+        try:
+            from ui.exclusive_presenter import ExclusivePresenter, free_cursor, cursor_state
+            free_cursor()
+            state = cursor_state()
+            if state is not None and not state[0]:
+                if self._xp_arrow is None:
+                    logger.info("Overlay pointer: the game has hidden the system pointer - drawing an arrow")
+                    self._xp_arrow = ExclusivePresenter()                  # click-through
+                self._xp_arrow.present(32, 32, self._arrow_picture(), state[1], state[2])
+            elif self._xp_arrow is not None:
+                self._xp_arrow.hide()
+        except Exception:
+            logger.debug("Overlay: pointer handling over exclusive fullscreen failed", exc_info=True)
+
+    def _arrow_picture(self) -> bytes:
+        """A mouse arrow, 32x32, premultiplied BGRA."""
+        if self._xp_arrow_data is None:
+            from PySide6.QtCore import QPointF
+            from PySide6.QtGui import QImage, QPainter, QColor, QPen, QPolygonF
+            img = QImage(32, 32, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(0)
+            painter = QPainter(img)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor(0, 0, 0), 2))
+            painter.setBrush(QColor(255, 255, 255))
+            painter.drawPolygon(QPolygonF([QPointF(2, 2), QPointF(2, 24), QPointF(8, 18), QPointF(12, 28),
+                                           QPointF(16, 26), QPointF(12, 17), QPointF(20, 17)]))
+            painter.end()
+            self._xp_arrow_data = bytes(img.constBits())[:32 * 32 * 4]
+        return self._xp_arrow_data
+
+    def _session_tick(self) -> None:
+        """The session counter on the hotkey dashboard: once a second, while that view is on screen."""
+        if self._overlay_mode != "manual" or self._session_start <= 0 or not self._on_screen():
+            self._session_timer.stop()
+            return
+        self._dash_rows[4][1].setText(format_clock(time.time() - self._session_start))
+        if self._presenting():
+            self._refresh_presenter()          # the picture over an exclusive game is a still: draw it again
+
+    def _hide_presenter(self):
+        """Take the picture down (or do nothing when there is none)."""
+        self._xp_watch_timer.stop()
+        self._xp_cursor_timer.stop()
+        self._xp_watch = None
+        self._xp_hits = []
+        self._xp_hover = False
+        self._xp_pressed = None
+        self._xp_hover_btn = None
+        if self._xp_arrow is not None:
+            self._xp_arrow.hide()
+        if self._xp is not None:
+            self._xp.hide()
+
+    def _end_presenter(self):
+        """Take the picture away the way the window is taken away: hide_animated. That also empties the
+        notification queue (which drops a notification identical to one it still holds, so without
+        it the second "Saved - <game>" of a session would never be shown), releases a prompt's
+        priority and replays what was deferred behind it."""
+        if self._presenting() or self._rw_exclusive:
+            self.hide_animated()
+        else:
+            self._hide_presenter()
+
+    def _check_presenter_front(self):
+        """While the picture is young: did something happen to the game? Judged by what happened
+        FIRST (ui.exclusive_presenter.classify_front_change): the player pressing Alt+Tab, opening
+        the Start menu or answering a popup moves the front to another window before anything
+        else, and must never count against the picture."""
+        watch = self._xp_watch
+        if watch is None:
+            self._xp_watch_timer.stop()
+            return
+        if time.monotonic() > self._xp_watch_until:
+            # It stayed up its whole watch with the game in front: a clean presentation, so
+            # whatever doubts earlier ones left about this game are over.
+            self._xp_suspects.pop(self._xp_exe, None)
+            self._xp_watch_timer.stop()
+            return
+        if self._own_windows() - self._xp_own:
+            # The app opened a window of its own (a button that opens the app, a dialog): that takes
+            # the front from the game just as surely, and is not the picture's doing.
+            logger.debug("Overlay: the app opened a window - no longer judging the picture")
+            self._xp_watch_timer.stop()
+            self._xp_watch = None
+            return
+        verdict = watch.check()
+        if verdict is not None:
+            self._presenter_lost_front(verdict, watch)
+
+    def _own_windows(self) -> set:
+        """The app's visible top-level windows other than this one (the main window, a dialog, the
+        blur backdrop, a pin)."""
+        try:
+            return {id(w) for w in QApplication.topLevelWidgets() if w is not self and w.isVisible()}
+        except Exception:
+            return set()
+
+    def presented_game(self) -> int:
+        """The window of the game the picture is up over, or 0 when there is no picture. For a button's
+        handler: a window it opens takes the game out of exclusive mode, and the game has to be
+        given the screen back afterwards."""
+        return self._xp_game if (self._presenting() or (self._rw_exclusive and self.isVisible())) else 0
+
+    def _presenter_lost_front(self, verdict: str, watch) -> None:
+        """The game is no longer as it was when the picture appeared. The picture always comes
+        down; what is REMEMBERED depends on what happened:
+
+        - "left"     somebody else took the front first (Alt+Tab, the Start menu, another
+                     program): nothing is remembered.
+        - "suspect"  the front went to no window: counted, and remembered only when it happens
+                     twice in a row for this game with no clean presentation in between. A UAC
+                     prompt or Ctrl+Alt+Del does this once; a game that really cannot take the
+                     picture does it every time.
+        - "kick"     the game was taken out of its exclusive mode while it still had the front:
+                     remembered at once.
+
+        What triggered it is written to the log, so a report can be answered from it.
+        """
+        exe = self._xp_exe
+        detail = watch.describe()
+        real = bool(self._rw_exclusive)              # the overlay's own window was what was shown, not the picture
+        self._end_presenter()
+        record = verdict == "kick"
+        if verdict == "suspect":
+            self._xp_suspects[exe] = self._xp_suspects.get(exe, 0) + 1
+            record = self._xp_suspects[exe] >= 2
+        logger.info("Overlay: %s left its place after the %s was shown over it: %s (%s)%s",
+                    exe or "a game", "window" if real else "picture", verdict, detail,
+                    " - not tried on it again" if record else "")
+        if not record:
+            return
+        if self._xp is not None and not real:
+            self._xp.destroy()
+        self._xp_suspects.pop(exe, None)
+        try:
+            from core.config_manager import get_config
+            cfg = get_config()
+            key = "overlay_window_deny" if real else "overlay_exclusive_deny"
+            if exe:
+                deny = list(cfg.get(key, []) or [])
+                if exe.lower() not in {str(d).lower() for d in deny}:
+                    deny.append(exe)
+                    cfg.set(key, deny)
+            elif real:
+                logger.warning("Overlay: the game could not be named - its window cannot be remembered as refused")
+            else:
+                cfg.set("overlay_over_exclusive", False)
+                logger.warning("Overlay: the game could not be named - the picture is turned off")
+        except Exception:
+            logger.debug("Overlay: could not record the deny-list entry", exc_info=True)
+
+    def _re_show_over_exclusive(self):
+        """The overlay is up as an ordinary window and the game in front has just gone exclusive (a notice shown while the
+        game was still starting, the display mode switching under it). The ordinary window goes, and what it held is shown
+        again the way it is shown over such a game - its own window in the higher band, or the picture - which also
+        measures it again for the screen it is on now. Only when neither is possible is it hidden, as before."""
+        pointer = self._cursor_timer.isActive()
+        # What was left of the time it was given. A countdown that is not running (paused while the pointer is over the notice, or
+        # not started yet) is the whole time again - not "no end": that left the notice on screen for good.
+        if self._auto_hide_timer.isActive():
+            left = max(self._auto_hide_timer.remainingTime(), 1500)
+        else:
+            left = self._auto_hide_ms
+        self._auto_hide_timer.stop()
+        self._topmost_timer.stop()
+        self._uninstall_foreground_hook()
+        self._anim.stop()
+        if self._hide_anim_connected:
+            try:
+                self._anim.finished.disconnect(self._do_hide)
+            except (RuntimeError, TypeError):
+                pass
+            self._hide_anim_connected = False
+        self.hide()
+        self._cursor_timer.stop()
+        SystemCursor.release("overlay")
+        self.show_animated(auto_hide=max(0, left), pointer=pointer, over_exclusive=True)
+        if self._rw_exclusive:
+            # The display mode is still settling: measure once more when it has.
+            QTimer.singleShot(700, lambda: self._resync_visible(force=True))
+        logger.info("Overlay: the game went exclusive while it was up - shown again over it (as a window of the higher band: %s, "
+                    "goes by itself in %s ms)", self._rw_exclusive, max(0, left) or "never")
+
     def _hide_for_exclusive(self):
         """Hide the overlay to protect a game's exclusive fullscreen mode.
 
         Centralised helper so every code path (hook, poll) behaves identically:
-        stops timers, unhooks, hides, and emits the signal for audio feedback.
+        stops timers, unhooks, hides, and emits the exclusive_blocked signal.
         """
         # Collect info before hiding (widget may not be queryable after hide)
         title = self._title.text() if hasattr(self, '_title') else t("app.name")
@@ -2893,8 +3894,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         if not self.isVisible() or self.windowOpacity() < 0.1:
             return
 
-        if self._is_exclusive_fullscreen_hwnd(fg_hwnd):
-            self._hide_for_exclusive()
+        if self._is_exclusive_fullscreen_hwnd(fg_hwnd) and not self._rw_exclusive:
+            self._re_show_over_exclusive()
         elif not popup_is_open():
             self._take_the_front()
             self._trace_z("the window in front changed")  # i18n-ignore (log text)
@@ -2940,16 +3941,18 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         # buries it, so nothing is raised while a menu of ours is open.
         if popup_is_open():
             return
+        self._apply_click_through()
 
         if platform.system() != "Windows":
             # On Linux/macOS: unconditional raise_() via _force_topmost.
             # This is the only mechanism we have to recover z-order.
+            self._apply_fullscreen_stacking()
             self._take_the_front()
             return
 
         if self._is_fullscreen_active():
-            if self._is_exclusive_fullscreen():
-                self._hide_for_exclusive()
+            if self._is_exclusive_fullscreen() and not self._rw_exclusive:
+                self._re_show_over_exclusive()
             else:
                 self._take_the_front()
                 self._trace_z("borderless fullscreen")
@@ -2966,12 +3969,25 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         does passes through this.
         """
         _force_topmost(self)
+        self._keep_menu_on_top()
         try:
             from ui.widgets.pins import get_pin_manager
             get_pin_manager().assert_topmost_all("the overlay came forward")  # i18n-ignore (log text)
         except Exception:
             logger.debug("overlay: could not put the pins back on top",
                          exc_info=True)
+
+    def _keep_menu_on_top(self) -> None:
+        """Raising the overlay does not carry the windows it owns with it (the raise is made so that it does not), and the 📌 menu is
+        one that opens inside the overlay's own rectangle: whenever the overlay comes forward, an open menu goes back over it."""
+        menu = self._tool_menu
+        if menu is None:
+            return
+        try:
+            if menu.isVisible():
+                _force_topmost(menu)
+        except RuntimeError:
+            pass
 
     def _trace_z(self, why: str):
         """Say where the overlay ended up, on the same switch as the pins.
@@ -2991,6 +4007,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     def _do_hide(self):
         """Slot called when hide animation finishes — resets the connection flag."""
+        self._close_tool_menu()
+        self._rw_exclusive = False
         # Let go of the pointer. It only actually goes down if nothing else
         # still needs it — a note being typed into, or a pin mid-drag.
         self._cursor_timer.stop()
@@ -3005,6 +4023,9 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self.hide()
         # Now that nothing is on screen, the queue's controls can go.
         self._hide_carousel_controls()
+        if platform.system() == "Windows" and win_band_hook.installed():
+            from ui.exclusive_session import log_windows
+            QTimer.singleShot(1200, lambda: log_windows("1.2 s after the overlay was hidden"))
 
     def _get_active_screen_geometry(self):
         """Get the available geometry of the screen where the active window / cursor is."""
@@ -3063,18 +4084,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
                 hwnd = user32.GetForegroundWindow()
                 if not hwnd:
                     return False
-
-                rect = wintypes.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                win_w = rect.right - rect.left
-                win_h = rect.bottom - rect.top
-
-                center = QPoint((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
-                screen = QApplication.screenAt(center)
-                if screen:
-                    sg = screen.geometry()
-                    if abs(win_w - sg.width()) <= 2 and abs(win_h - sg.height()) <= 2:
-                        return True
+                return _window_fills_monitor(int(hwnd))
             else:
                 # On Linux/macOS, Qt doesn't expose a reliable fullscreen-window query.
                 # Comparing screen.geometry() == screen.availableGeometry() gives false
@@ -3092,12 +4102,19 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             return False
         try:
             hwnd = ctypes.windll.user32.GetForegroundWindow()
-            return self._is_exclusive_fullscreen_hwnd(int(hwnd) if hwnd else 0)
+            if not hwnd:
+                return bool(getattr(self, "_last_exclusive", False))     # (no window in front for a moment: the last answer stands)
+            verdict = self._is_exclusive_fullscreen_hwnd(int(hwnd))
+            self._last_exclusive = verdict
+            return verdict
         except Exception:
             return False
 
     def _is_exclusive_fullscreen_hwnd(self, hwnd: int) -> bool:
-        """Check if *hwnd* is in exclusive fullscreen mode.
+        """Check if *hwnd* is in exclusive fullscreen mode: a chrome-less window the
+        size of its screen WHILE the shell reports an exclusive-mode Direct3D
+        application (see _shell_notification_state). A borderless fullscreen game
+        is not exclusive and gets the overlay.
 
         Separated from _is_exclusive_fullscreen so the hook callback can pass
         the HWND captured at event time (avoids race with GetForegroundWindow).
@@ -3120,21 +4137,71 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             if bool(style & WS_CAPTION) or bool(style & WS_BORDER):
                 return False  # has window chrome → borderless at most
 
-            # Check if the window covers the full screen
-            rect = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            win_w = rect.right - rect.left
-            win_h = rect.bottom - rect.top
-
-            center = QPoint((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
-            screen = QApplication.screenAt(center)
-            if screen:
-                sg = screen.geometry()
-                if abs(win_w - sg.width()) <= 2 and abs(win_h - sg.height()) <= 2:
-                    return True
+            # Check if the window covers the whole monitor
+            if _window_fills_monitor(hwnd):
+                # Chrome-less and monitor-sized is what a borderless game looks
+                # like too - the shape cannot tell the two apart, and treating
+                # it as proof kept the overlay off every fullscreen game. Ask the
+                # shell whether an exclusive-mode Direct3D application is really
+                # running; only that is a reason to stay away. When it cannot be
+                # asked, keep the cautious answer.
+                qstate = _shell_notification_state()
+                if qstate is None or qstate == _QUNS_RUNNING_D3D_FULL_SCREEN:
+                    verdict = True
+                    if qstate is not None:
+                        self._exclusive_seen_hwnd = hwnd
+                elif qstate == 2 and win_band_hook.installed() and (
+                        hwnd == getattr(self, "_exclusive_seen_hwnd", 0) or self._switched_mode(hwnd)):
+                    # QUNS_BUSY, for the game that the shell called an exclusive Direct3D application a moment ago: it said so
+                    # every time, half a second after a window of ours came up over the game (the log shows 3, then 2). Taken as
+                    # "a borderless game" the overlay was shown as an ordinary window - invisible over the game, and still
+                    # taking the mouse and the cursor. Or a game that has switched the display mode of its monitor, which no
+                    # borderless game does: the log of a real game shows it start as a window, switch its monitor to 1920x1080 (sixteen
+                    # screen changes), and the shell say "busy" ever after.
+                    verdict = True
+                    self._exclusive_seen_hwnd = hwnd
+                else:
+                    verdict = False
+                    if qstate != 2:
+                        self._exclusive_seen_hwnd = 0
+                self._log_fullscreen_verdict(hwnd, style, qstate, verdict)
+                return verdict
         except Exception:
             pass
         return False
+
+    def _switched_mode(self, hwnd: int) -> str:
+        """"1920x1080 on a 3840x2160 desktop" when the game has switched the display mode of its monitor, else ""."""
+        try:
+            from ui.exclusive_presenter import display_mode_switch
+            self._mode_switch_seen = display_mode_switch(hwnd)
+        except Exception:
+            self._mode_switch_seen = ""
+        return self._mode_switch_seen
+
+    def _log_fullscreen_verdict(self, hwnd: int, style: int, qstate, exclusive: bool) -> None:
+        """Say why a fullscreen window was (not) treated as exclusive - once per change
+        of answer, not per check: this runs for every foreground change and hotkey.
+        The inputs are what is needed to tell, from a log, a game that really is in
+        exclusive mode from one the shell reports otherwise."""
+        switched = getattr(self, "_mode_switch_seen", "") if exclusive and qstate == 2 else ""
+        key = (qstate, exclusive, bool(switched))
+        if getattr(self, "_fs_verdict_logged", None) == key:
+            return
+        self._fs_verdict_logged = key
+        exe = ""
+        try:
+            import psutil
+            pid = wintypes.DWORD(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            exe = psutil.Process(pid.value).name()
+        except Exception:
+            pass
+        logger.info("Fullscreen window %r: shell state=%s, style=0x%08X -> %s%s", exe, qstate,
+                    style & 0xFFFFFFFF,
+                    "exclusive (overlay kept off)" if exclusive
+                    else "not exclusive (overlay may show over it)",
+                    f" - the shell says busy, but the game has switched its monitor's display mode ({switched})" if switched else "")
 
     # Screen add/remove/geometry wiring comes from ScreenSignalMixin;
     # only the reaction is overlay-specific:
@@ -3158,6 +4225,10 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
     def cleanup(self):
         """Disconnect screen signals and hooks to prevent crashes after widget destruction."""
         self._cleaned_up = True
+        self._hide_presenter()
+        if self._xp is not None:
+            self._xp.destroy()
+            self._xp = None
         self._uninstall_foreground_hook()
         self._screen_signals_cleanup()
 

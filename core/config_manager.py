@@ -55,8 +55,18 @@ _DEFAULTS: dict[str, Any] = {
     "show_overlay_on_cloud": True,
     "show_overlay_on_backup": True,
     "overlay_hotkey": "alt+ctrl+s",
+    # Over a game in exclusive fullscreen no window can appear without taking it back to the desktop,
+    # so the overlay is shown as a picture in a click-through, non-activating window instead (see
+    # ui.exclusive_presenter). Off: it stays away from such a game, as before.
+    "overlay_over_exclusive": True,
+    # Games (exe names) that DID lose exclusive fullscreen when that window was shown: never tried on
+    # them again. Filled in by the overlay itself; per machine, so it is not exported.
+    "overlay_exclusive_deny": [],
+    # The same for the overlay's (and the pins') own WINDOW over such a game, which is a different thing from the picture
+    # above: a game that lost exclusive mode when the window was shown can still take the picture.
+    "overlay_window_deny": [],
     "auto_backup": False,             # auto backup+sync without asking
-    "auto_sync_after_backup": False,  # auto sync after backup completes
+    "auto_sync_after_backup": True,   # auto sync after backup completes (greyed out in Settings until a provider is connected)
     "auto_scan_on_exit": True,        # auto scan for save paths when game exits
     "backup_on_exit": True,           # backup when game closes
     "backup_during_game": False,      # periodic backup while playing (per-game interval controls timing)
@@ -79,7 +89,7 @@ _DEFAULTS: dict[str, Any] = {
     # weaker candidates get a stricter 0.4 s slice) and every claimed folder
     # still passes the save-content validation pass before it is offered —
     # on by default so save search actually finds these folders.
-    "save_correlation_enabled": True,
+    "save_correlation_enabled": False,       # off: the Settings page, the watcher's fallback and the README all say so (this stored default said True)
     "save_correlation_window_ms": 1000,
     # Periodic backup integrity check. Opens each archive and confirms every
     # member still passes its CRC — the cheap check that catches a truncated
@@ -110,8 +120,10 @@ _DEFAULTS: dict[str, Any] = {
     "backup_verify_last": "",      # ISO datetime of the last completed run
     # Periodic cloud config export — same encrypted payload as a manual
     # "export to provider", so library/settings are not lost between machines.
-    "auto_export_config_enabled": False,
-    "auto_export_config_interval_days": 7,
+    "auto_export_config_enabled": True,   # keep the configuration in step through the provider (greyed out until one is connected)
+    "config_separate_tag": "",     # non-empty: this PC keeps its library apart (its own file on the provider)
+    "config_push_signature": "",   # what the last push of the configuration was made from
+    "config_push_games": 0,        # how many games the last push held
     "auto_export_config_last": "",  # ISO datetime of last successful/skipped run
     # GitHub Releases check. No auto-update (onefile build): notify only.
     # Interval is stored in seconds with jitter (~12 h ± 2 h) so every
@@ -126,8 +138,10 @@ _DEFAULTS: dict[str, Any] = {
     "pins_open": {},               # game_id -> re-pinned when that game runs
     "pins_geometry": {},           # path -> [x, y, w, h]
     "pins_opacity": {},            # path -> percent
+    "pins_zoom": {},               # path -> percent (50-400); 100 is not stored. Not listed = not loaded: it would not survive a restart
     "save_folder_hints": list(SAVE_FOLDER_HINTS),  # sourced from constants to avoid duplication
     "extra_watch_paths": [],
+    "browse_sidebar_pins": [],      # folders added to the file picker's sidebar ("Add to sidebar"); a key not listed here is not loaded
     "sync_provider": None,             # deprecated: single provider (migrated to sync_providers)
     "sync_credentials": {},             # deprecated: legacy plaintext creds
     "sync_providers": [],               # list of active provider IDs
@@ -222,7 +236,9 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "self_checks_frequency": lambda x: isinstance(x, int) and 1 <= x <= 365,
     "last_self_check": lambda x: isinstance(x, (int, float)) and x >= 0,
     "auto_export_config_enabled": lambda x: isinstance(x, bool),
-    "auto_export_config_interval_days": lambda x: isinstance(x, int) and 1 <= x <= 365,
+    "config_separate_tag": lambda x: isinstance(x, str),
+    "config_push_signature": lambda x: isinstance(x, str),
+    "config_push_games": lambda x: isinstance(x, int) and x >= 0,
     # A plain list is the pre-per-game shape; still accepted so an existing
     # config loads and is migrated on first read instead of being reset.
     "pins_recent": lambda x: (
@@ -232,6 +248,8 @@ _VALIDATION_RULES: dict[str, Callable] = {
             for v in x.values())),
     "pins_opacity": lambda x: isinstance(x, dict) and all(
         isinstance(v, int) and 0 <= v <= 100 for v in x.values()),
+    "pins_zoom": lambda x: isinstance(x, dict) and all(
+        isinstance(v, int) and 50 <= v <= 400 for v in x.values()),
     "pins_open": lambda x: (
         isinstance(x, list) and all(isinstance(p, str) for p in x)) or (
         isinstance(x, dict) and all(
@@ -267,6 +285,9 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "show_overlay_on_unknown": lambda x: isinstance(x, bool),
     "show_overlay_on_cloud": lambda x: isinstance(x, bool),
     "show_overlay_on_backup": lambda x: isinstance(x, bool),
+    "overlay_over_exclusive": lambda x: isinstance(x, bool),
+    "overlay_exclusive_deny": lambda x: isinstance(x, list) and all(isinstance(p, str) for p in x),
+    "overlay_window_deny": lambda x: isinstance(x, list) and all(isinstance(p, str) for p in x),
     "auto_sync_after_backup": lambda x: isinstance(x, bool),
     "auto_scan_on_exit": lambda x: isinstance(x, bool),
     "max_backup_size_mb": lambda x: isinstance(x, int) and 10 <= x <= 4096,
@@ -307,6 +328,8 @@ _VALIDATION_RULES: dict[str, Callable] = {
     "save_folder_hints": lambda x: isinstance(x, list) and all(
         isinstance(p, str) for p in x),
     "extra_watch_paths": lambda x: isinstance(x, list) and all(
+        isinstance(p, str) for p in x),
+    "browse_sidebar_pins": lambda x: isinstance(x, list) and all(
         isinstance(p, str) for p in x),
     "ignored_processes": lambda x: isinstance(x, list) and all(
         isinstance(p, str) for p in x),

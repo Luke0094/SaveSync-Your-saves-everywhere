@@ -34,6 +34,10 @@ _MACHINE_SPECIFIC_KEYS = frozenset({
     "last_cloud_config_hash",
     "last_cloud_config_import",
     "suppress_cloud_config_prompt",
+    # Where THIS PC keeps its configuration on the provider, and what it last wrote there (core.config_sync).
+    "config_separate_tag",
+    "config_push_signature",
+    "config_push_games",
     # Per-machine schedule stamps — each install tracks its own last run. Every
     # one of them belongs here: a stamp that can be imported (or restored from
     # a snapshot, see restore_config_snapshot) resets that machine's schedule
@@ -47,6 +51,9 @@ _MACHINE_SPECIFIC_KEYS = frozenset({
     "update_notified_version",
     # Answers about archive FOLDERS on this machine's disk.
     "archive_choices",
+    # What THIS PC's display stack did when the overlay was shown over a game in exclusive fullscreen.
+    "overlay_exclusive_deny",
+    "overlay_window_deny",
     # Note: suppressed_overlay_apps and ignored_processes ARE exported so the
     # blocklist roams with the user.  On a machine where a path doesn't exist
     # it simply never matches — no harm done.
@@ -243,10 +250,17 @@ def apply_import(
     import_library: bool = True,
     import_credentials: bool = True,
     merge_strategy: str = "keep_local",
+    machine_paths: bool = True,
 ) -> dict:
     """Apply an imported config. Returns summary dict.
 
     merge_strategy: "keep_local" | "prefer_imported" | "merge"
+
+    machine_paths: False when the file comes from ANOTHER PC that this one is being kept in step with (core.config_sync):
+    where a game lives is that PC's business - the same games may sit on D: there and on C: here - so a game this library
+    already has keeps every path and every provider record it has (nothing is added, nothing is cleared, even a folder
+    that does not exist right now: a drive that is unplugged, a game not yet started), and a game it lacks comes in
+    with only the paths that exist on this PC.
     """
     from core.config_manager import get_config
     from core.library import get_library, GameEntry
@@ -287,8 +301,8 @@ def apply_import(
             existing = current_by_name.get(name_lower)
             if existing:
                 # Merge into existing game
-                _merge_game(existing, gd, merge_strategy)
-                cleared = _clear_invalid_paths(existing)
+                _merge_game(existing, gd, merge_strategy, machine_paths=machine_paths)
+                cleared = _clear_invalid_paths(existing) if machine_paths else False
                 if cleared:
                     summary["paths_cleared"].append(name)
                 lib.update_game(existing)
@@ -299,6 +313,8 @@ def apply_import(
                 import uuid
                 new_entry.id = str(uuid.uuid4())
                 cleared = _clear_invalid_paths(new_entry)
+                if not machine_paths:
+                    _drop_foreign_paths(new_entry)
                 if cleared:
                     summary["paths_cleared"].append(name)
                 lib.add_game(new_entry)
@@ -327,7 +343,7 @@ def apply_import(
 
 
 def _merge_game(existing: 'GameEntry', imported_dict: dict,
-                strategy: str) -> None:
+                strategy: str, machine_paths: bool = True) -> None:
     """Merge imported game data into an existing entry.
 
     User-valuable title info must never be silently dropped by an import:
@@ -372,7 +388,7 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
     # wins on a path both sides know, since it was derived the same way
     # either side would derive it.
     imported_versions = imported_dict.get("exe_path_versions") or {}
-    if imported_versions:
+    if imported_versions and machine_paths:
         merged_versions = dict(existing.exe_path_versions or {})
         for path, label in imported_versions.items():
             merged_versions.setdefault(path, label)
@@ -413,14 +429,22 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
 
     # Merge cloud metadata (copy to avoid in-place mutation before update_game)
     imported_cloud = imported_dict.get("cloud_metadata", {})
-    if imported_cloud:
+    if imported_cloud and machine_paths:
         merged = dict(existing.cloud_metadata)
         merged.update(imported_cloud)
         existing.cloud_metadata = merged
+    elif imported_cloud:
+        # What the other PC records about ITS providers and folders is about its own machine; the one thing
+        # that is about the game is whom it absorbed, which tells this PC's sync which zips are the game's.
+        theirs = [i for i in (imported_cloud.get("merged_from") or []) if i]
+        if theirs:
+            merged = dict(existing.cloud_metadata or {})
+            merged["merged_from"] = list(dict.fromkeys(list(merged.get("merged_from") or []) + theirs))
+            existing.cloud_metadata = merged
 
-    # Merge per-game settings
+    # Merge per-game settings (not when keeping in step with another PC: how often THIS PC backs a game up is its own)
     for key in ("auto_backup_enabled", "backup_interval_sec"):
-        if key in imported_dict:
+        if key in imported_dict and machine_paths:
             setattr(existing, key, imported_dict[key])
 
     # Path merge depends on strategy
@@ -438,6 +462,18 @@ def _merge_game(existing: 'GameEntry', imported_dict: dict,
                 existing.save_paths.append(sp)
         existing.save_paths_confirmed = False
     # "keep_local": don't touch paths
+
+
+def _drop_foreign_paths(entry: 'GameEntry') -> None:
+    """A game that comes in from another PC keeps only what exists on this one: the versions of its executable that are
+    here, the unticked and chained save folders that survived _clear_invalid_paths, and none of the other PC's records
+    about its providers (bar whom the game absorbed)."""
+    entry.exe_path_versions = {p: lbl for p, lbl in (entry.exe_path_versions or {}).items() if p and Path(p).exists()}
+    kept = set(entry.save_paths or [])
+    entry.excluded_save_paths = [p for p in (entry.excluded_save_paths or []) if p in kept]
+    entry.save_path_chains = {p: c for p, c in (entry.save_path_chains or {}).items() if p in kept}
+    merged_from = [i for i in ((entry.cloud_metadata or {}).get("merged_from") or []) if i]
+    entry.cloud_metadata = {"merged_from": merged_from} if merged_from else {}
 
 
 def _clear_invalid_paths(entry: 'GameEntry') -> bool:
@@ -805,10 +841,13 @@ def upload_config_to_cloud(provider,
             logger.info("Config upload skipped — no changes")
             return None
         encoded = base64.b64encode(encrypted)
-        tmp = USER_DATA_DIR / "savesync_config_upload.tmp"
+        tmp = _unique_tmp("savesync_config_upload")
         try:
             tmp.write_bytes(encoded)
-            ok = provider.upload(tmp, CLOUD_CONFIG_PATH)
+            from core.config_sync import cloud_config_path, note_pushed
+            ok = provider.upload(tmp, cloud_config_path())
+            if ok:
+                note_pushed(provider)
             return ok
         finally:
             if tmp.exists():
@@ -827,7 +866,8 @@ def check_cloud_config(provider) -> Optional[dict]:
     try:
         if not provider.is_connected:
             return None
-        meta = provider.get_remote_metadata(CLOUD_CONFIG_PATH)
+        from core.config_sync import cloud_config_path
+        meta = provider.get_remote_metadata(cloud_config_path())
         if meta is not None:
             return {"exists": True, "remote_meta": meta}
     except Exception as e:
@@ -840,9 +880,10 @@ def download_and_parse_cloud_config(provider) -> dict:
 
     Raises ValueError on corrupt data.
     """
-    tmp = USER_DATA_DIR / "savesync_config_download.tmp"
+    tmp = _unique_tmp("savesync_config_download")
     try:
-        ok = provider.download(CLOUD_CONFIG_PATH, tmp)
+        from core.config_sync import cloud_config_path
+        ok = provider.download(cloud_config_path(), tmp)
         if not ok:
             raise RuntimeError("Download failed")
         encoded = tmp.read_bytes()
@@ -854,6 +895,28 @@ def download_and_parse_cloud_config(provider) -> dict:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def _unique_tmp(stem: str) -> Path:
+    """A temp file of its own: syncs of several games look at the configuration file at the same moment, and one
+    deleting the file the other is reading made a good file look damaged."""
+    import tempfile
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=stem + "_", suffix=".tmp", dir=str(USER_DATA_DIR))
+    import os
+    os.close(fd)
+    return Path(name)
+
+
+def remote_fingerprint(remote_meta) -> str:
+    """Which version of the cloud file this is: its size and modification time (to the second, so providers
+    that keep finer times do not look like a change)."""
+    if remote_meta is None:
+        return ""
+    mod_str = ""
+    if remote_meta.modified_at:
+        mod_str = remote_meta.modified_at.replace(microsecond=0).isoformat()
+    return f"{remote_meta.size_bytes}_{mod_str}"
 
 
 def should_prompt_cloud_import(remote_meta) -> bool:
@@ -868,16 +931,11 @@ def should_prompt_cloud_import(remote_meta) -> bool:
     if config.get("suppress_cloud_config_prompt", False):
         return False
 
-    # Build a stable fingerprint from remote metadata.
-    # Normalise modified_at to ISO string truncated to seconds to avoid
-    # precision differences between providers causing repeated prompts.
+    # Build a stable fingerprint from remote metadata (see remote_fingerprint).
     if remote_meta is None:
         return False
 
-    mod_str = ""
-    if remote_meta.modified_at:
-        mod_str = remote_meta.modified_at.replace(microsecond=0).isoformat()
-    fingerprint = f"{remote_meta.size_bytes}_{mod_str}"
+    fingerprint = remote_fingerprint(remote_meta)
     last_hash = config.get("last_cloud_config_hash")
     if last_hash == fingerprint:
         return False  # already imported this version
@@ -891,10 +949,7 @@ def mark_cloud_config_imported(remote_meta) -> None:
         return
     from core.config_manager import get_config
     config = get_config()
-    mod_str = ""
-    if remote_meta.modified_at:
-        mod_str = remote_meta.modified_at.replace(microsecond=0).isoformat()
-    fingerprint = f"{remote_meta.size_bytes}_{mod_str}"
+    fingerprint = remote_fingerprint(remote_meta)
     config.set("last_cloud_config_hash", fingerprint)
     config.set("last_cloud_config_import", datetime.now(timezone.utc).isoformat())
     config.save()

@@ -17,6 +17,20 @@ choice, you can also edit the save the integrated save editor
 Saves can also go straight to a friend, P2P, with no server or cloud provider
 involved at all.
 
+## Quick start
+
+1. **Install** — a Windows build, a Linux AppImage, or run it from source: [Installation](#installation).
+2. **Play something.** SaveSync notices the running game; if it doesn't know it yet, the overlay offers **Add to
+   library** (or add one by hand from the Library page). The first session lists the folders it thinks are the
+   saves — confirm them once.
+3. **Backups start by themselves** — when the game closes (and on a timer while you play, if you switch that on), or
+   on demand from the overlay. Any of them can be restored from the **Backups** page.
+4. **Keep them somewhere else** (optional) — on the **Sync** page connect Google Drive, OneDrive, Dropbox, WebDAV,
+   rclone or a plain folder. *Sync after backup* and *Automatic sync* are on by default and wake up as soon as a
+   provider is connected.
+5. **A second PC?** Connect the same provider there: [Using more than one PC](#using-more-than-one-pc).
+6. **Change a save, or send one** — [Save editor](#save-editor) · [P2P save transfer](#p2p-save-transfer).
+
 ---
 
 ## Contents
@@ -26,6 +40,7 @@ involved at all.
 | I want to… | Go to |
 |---|---|
 | Keep my saves safe: backups, cloud, restore | [Backups & sync](#backups--sync) · [Sync providers](#sync-providers) · [Conflict resolution](#conflict-resolution) |
+| Keep two PCs in step, or merge two cards of one game | [Using more than one PC](#using-more-than-one-pc) · [Programs, versions and merging](#programs-versions-and-merging) |
 | Send a save, a file or a folder to a friend | [P2P save transfer](#p2p-save-transfer) → [Sending](#sending) · [Receiving](#receiving) · [Friends](#friends) |
 | Chat with several friends at once | [Group chats](#group-chats) |
 | Hide my address when I send | [Hiding your address](#hiding-your-address) · [Private mode (Tor)](#private-mode-tor) |
@@ -36,7 +51,8 @@ involved at all.
 | Read how it works inside | [Architecture](#architecture) · [How the P2P transfer works](#how-it-works) · [Privacy: what the network sees](#privacy-what-the-network-sees) |
 | Fix something | [If it doesn't connect](#if-it-doesnt-connect) · [Data-integrity checks](#data-integrity-checks) · [Offline repair](#offline-repair) · [Diagnostics](#diagnostics) |
 
-**Every section:**
+<details>
+<summary><strong>Every section</strong></summary>
 
 | Section | What's in it |
 |---|---|
@@ -45,12 +61,16 @@ involved at all.
 | [Architecture](#architecture) | The project layout |
 | [Sync providers](#sync-providers) | Google Drive, OneDrive, Dropbox, WebDAV, rclone and a local folder - and how to add one |
 | [Conflict resolution](#conflict-resolution) | What happens when the cloud and this PC disagree |
+| [Using more than one PC](#using-more-than-one-pc) | Automatic sync of the library and settings, what it asks, keeping a library apart |
+| [Programs, versions and merging](#programs-versions-and-merging) | Several programs on one card, the questions, merging and splitting cards, launch URLs |
 | [P2P save transfer](#p2p-save-transfer) | Sending, receiving, settings, friends, group chats, speed, TLS, hiding your address, how it works, privacy |
 | [Save detection](#save-detection) | How candidate folders are scored |
 | [Save editor](#save-editor) | Editing the values inside a save, and the formats it understands |
 | [Hotkeys](#hotkeys) | The global shortcuts |
 | [Configuration](#configuration) | Adaptive limits, the settings reference, export, integrity checks, offline repair, diagnostics |
 | [License](#license) | PolyForm Noncommercial 1.0.0 |
+
+</details>
 
 > Long sections open with the short version and keep the detail in **collapsible blocks**: click a block's title to open it.
 
@@ -69,10 +89,10 @@ Four groups. Each one lists what it covers; open it for the details.
 
 ### Detection & tracking
 
-**In this group:** Auto-detection of running games · Cheap process-exit watchdog · Heuristic save-folder detection · Real-time filesystem watcher · Unknown-game queue · Proton/Wine on Linux · Launcher URL support · Playtime tracking · Multiple exe-path versions per game
+**In this group:** Auto-detection of running games · Cheap process-exit watchdog · Heuristic save-folder detection · Real-time filesystem watcher · Unknown-game queue · Proton/Wine on Linux · Launcher URL support · Playtime tracking · Multiple exe-path versions per game · Launch URL capture · Ren'Py's second copy of the saves
 
 <details>
-<summary><strong>Show all 9 features</strong></summary>
+<summary><strong>Show all 11 features</strong></summary>
 
 - **Auto-detection of running games** via process monitoring, with a cached
   process snapshot (per-process verdicts memoized across polls) and gentler
@@ -144,14 +164,23 @@ Four groups. Each one lists what it covers; open it for the details.
   unticked folder is never carried. Adding a version beside the current one seeds
   its empty folder
 
+- **Launch URL capture** — when a game is added, the URL its launcher used to start it is recorded with it
+  (caught on its way to the launcher, or read from Steam's or Epic's log and manifests), so **Play** starts
+  the game through its launcher. Verified with Steam and Epic. See [Programs, versions and merging](#programs-versions-and-merging)
+
+- **Ren'Py's second copy of the saves** — Ren'Py writes every save twice, beside the game (`game/saves`) and in its own
+  data folder (`AppData/Roaming/RenPy/<game>`, `~/.renpy/<game>`). Both are shown in the Add/Edit panel (Detect and
+  Extended scan) and in the save-confirmation panel live tracking opens, the second under a **Duplicate** heading and
+  unticked. See [Save detection](#save-detection)
+
 </details>
 
 ### Backups & sync
 
-**In this group:** Versioned local backups · Mtime preflight · Adaptive batch queues · Pre-restore safety backups · Verified on arrival · Duplicates view · Integrity checks · Interference alerts · Periodic in-game backups · Provisional backups · Multi-provider cloud sync · Renames and edited notes reach the provider · Conflict resolution · Quick restore from the overlay · Direct P2P transfer
+**In this group:** Versioned local backups · Mtime preflight · Adaptive batch queues · Pre-restore safety backups · Verified on arrival · Duplicates view · Integrity checks · Interference alerts · Periodic in-game backups · Provisional backups · Multi-provider cloud sync · Renames and edited notes reach the provider · Conflict resolution · Quick restore from the overlay · Direct P2P transfer · Automatic sync between PCs · Several cloud copies of one name
 
 <details>
-<summary><strong>Show all 15 features</strong></summary>
+<summary><strong>Show all 17 features</strong></summary>
 
 - **Versioned local backups** with retention (max count, days, minimum kept,
   size cap) and content-dedup (unchanged saves are skipped)
@@ -215,14 +244,24 @@ Four groups. Each one lists what it covers; open it for the details.
   transfer (see
   [P2P save transfer](#p2p-save-transfer))
 
+- **Automatic sync between PCs** — with a provider connected, the library and your rules (ignored processes,
+  save-folder hints, which process is which game…) are kept in step too, with a copy of the preferences beside
+  them: pushed at every change, checked after every game sync, titles another PC added come in on their own.
+  It asks only for a conflict (a merge made on another PC, a damaged file, a first meeting), and never changes
+  where a game lives on *this* PC. On by default; see [Using more than one PC](#using-more-than-one-pc)
+- **Several cloud copies of one name** — a fork or a homonym makes `Alpha` and `Alpha~…` side by side. A game
+  with no backups of its own is not handed one by guess: a picker with dates and what each copy holds (compared
+  with this disk off the interface thread), or keep local / fork. A copy that is exactly what the disk already
+  holds is taken without a question, and its save paths are registered
+
 </details>
 
 ### Library
 
-**In this group:** Card and list views · Paged lists · Smart tag merging · Web metadata search · More pictures · Languages · Per-game context menu
+**In this group:** Card and list views · Paged lists · Smart tag merging · Web metadata search · More pictures · Languages · Per-game context menu · Programs, versions, splitting and merging
 
 <details>
-<summary><strong>Show all 7 features</strong></summary>
+<summary><strong>Show all 8 features</strong></summary>
 
 - **Card and list views** with search (by title or developer), folder tree with
   colors, star ratings from reviews, and three-state filters (include /
@@ -267,6 +306,11 @@ Four groups. Each one lists what it covers; open it for the details.
 - **Per-game context menu** — backup, restore, sync, open save folder, edit,
   web search, remove
 
+- **Programs, versions, splitting and merging** — a card keeps several programs of a game (asked about only
+  when it matters, filed only by your answer), a version can be split into a card of its own, and two cards
+  of one game can be merged — backups, folders, details and the cloud copy included.
+  See [Programs, versions and merging](#programs-versions-and-merging)
+
 </details>
 
 ### Experience
@@ -277,8 +321,17 @@ Four groups. Each one lists what it covers; open it for the details.
 <summary><strong>Show all 8 features</strong></summary>
 
 - **In-game overlay** — frameless always-on-top card with fade animations,
-  notification carousel, cloud-save prompts, running game with engine label,
-  and exclusive-fullscreen protection (never breaks a game's display mode)
+  notification carousel, cloud-save prompts, running game with engine label.
+  Over a game in **exclusive fullscreen** on Windows (where an ordinary window
+  takes the game back to the desktop) it is shown as a window of the kind that
+  does not; on Linux (X11 and XWayland) it and the pins stay above a fullscreen
+  game, and a note can still be typed into. On Windows the app, its dialogs and
+  menus, pinned notes and typing into them follow it into such a game: a dialog
+  is dimmed behind with the same backdrop as the app, a combo box's list and a right-click
+  menu are windows that never take the focus, typing goes through a keyboard
+  hook that exists only while a text field is selected (the field gets a caret
+  of its own, and a completer that completes inside the box), and a question the
+  overlay asks brings the pointer with it when the game has hidden its own
 - **Save editor** — open a game's save and change the values in it, with the
   original kept aside first; reachable from the sidebar, the library's context
   menu, straight to the running game, or by dropping a save file on it. Kept
@@ -287,7 +340,14 @@ Four groups. Each one lists what it covers; open it for the details.
   state first, so it can be undone from the same list)
 - **Pinned notes and images** — keep a text file, a map, or a piece of the
   screen on top of the game, drag it anywhere, edit the text in place; each
-  game's pins come back when it starts
+  game's pins come back when it starts. A bar down the right side of a pin
+  (while the pointer is on it) zooms a picture or a note from 50 % to 400 % —
+  **+** and **−**, or drag the slider; a click on the percentage under it goes
+  back to 100 % — and once it is zoomed, dragging inside moves the picture or
+  scrolls the text; the zoom is remembered per pin. Over a
+  game in exclusive fullscreen a pin takes the mouse only where the player has a
+  pointer (the game's own, or the one the hotkey brings), and stays under the
+  dimmed backdrop while the app or a dialog is open
 - **Global hotkeys** via pynput (no root needed on Linux) — default
   `Ctrl+Alt+S` toggles the overlay
 - **Live language switching** (English / Italian, no restart)
@@ -638,6 +698,13 @@ savesync/
     ├── main_window_cloud.py       # Cloud prompts and sync flows of the main window
     ├── overlay.py                 # In-game overlay (notifications, prompts, restore)
     ├── unknown_history.py         # Pending unknown-game queue (persistence)
+    ├── win_band_hook.py           # Windows: Qt windows that can be shown over a game in exclusive fullscreen
+    ├── exclusive_session.py       # What the app's dialogs, menus, combo lists and tooltips need while such a game is in front
+    ├── exclusive_keys.py          # Typing into our windows over that game (keyboard hook on its own thread)
+    ├── exclusive_app.py           # The app window and its dimmed backdrop over that game
+    ├── exclusive_presenter.py     # The overlay as a click-through picture (fallback) and the "was the game kicked?" watch
+    ├── pin_mirror.py              # Pinned notes as pictures over that game (fallback)
+    ├── x11_fullscreen.py          # Linux (X11 / XWayland): staying above a fullscreen window
     ├── blur_modal.py              # Fullscreen blur backdrop for modal flows
     ├── modal_helpers.py           # Window-modal message boxes with the app's chrome
     ├── helpers.py                 # Elided labels/checkboxes, file manager, window flags
@@ -744,6 +811,171 @@ Closing it unanswered leaves the game on temporary backups until you choose.
 
 ---
 
+## Using more than one PC
+
+Connect the **same sync provider** on every PC. Backups travel through it as ever, and with **Automatic sync** on
+(Settings; on by default, and available once a provider is connected) the library and your **rules** travel too - and a copy of
+your preferences is kept beside them - so the PCs stay in step without you doing anything. You are asked only when two PCs disagree in a way SaveSync
+cannot settle by itself.
+
+| | Automatic sync **on** | Automatic sync **off** |
+|---|---|---|
+| Library and rules (and a copy of the preferences) reach the provider | At every change, about twenty seconds after the last one (playtime and window positions don't count) | Only on request |
+| The file there is looked at | After every game sync | Only on request |
+| Titles and rules another PC added | Come in on their own | Not imported |
+
+*On request* means: manually (**Settings → Transfer**), when you first connect the provider, when you download
+saves (that only looks — it never uploads), or when a sync runs into a conflict with another PC's library.
+
+<details>
+<summary><strong>What Automatic sync touches — and what it never does</strong></summary>
+
+- It carries the library (titles, details, tags, reviews) and your **rules**: save-folder hints, the processes and
+  overlays to ignore, which process is which game (confirmed or rejected), the games that never offer a download,
+  what you deleted or unticked in a game's folders, the library's folders. Rules are **joined** with this PC's own
+  - this PC's first; nothing is replaced or removed - and a rule about a game follows it **by title**, because game
+  ids differ from PC to PC. A rule about a card the other PC merged ends up on the surviving card.
+- Your **preferences** - theme, language, hotkeys, ports, folders, polling - go up in the pack but are never
+  applied by Automatic sync: another PC's stay its own until you import them (**Settings → Transfer**, or the
+  question the first time you connect).
+- **Where a game lives is that PC's own business**: the same games may sit on `D:` on one PC and `C:` on another, so
+  the save paths, programs and provider records of a game this library already has are never changed by it - not
+  even a folder that doesn't exist right now (an unplugged drive, a game not started yet). A title that is new here
+  arrives with only the paths that exist on this PC.
+- How often a game is backed up on this PC (its own interval and switch) stays this PC's.
+- The pack is encrypted; the credentials export in it can only be applied on the PC that wrote it.
+- Before anything is uploaded the file on the provider is looked at. If it is not the one this PC last wrote or read
+  — someone else wrote it — nothing is uploaded until the library has caught up or you have decided.
+- A sync of many games looks at the file once, a few seconds after the last one.
+
+</details>
+
+<details>
+<summary><strong>When it asks you, and what each answer does</strong></summary>
+
+It asks when there is a **conflict**:
+
+- another PC **merged cards** that this one still has apart (“*Old* was merged into *New* there”). The sync of
+  those two games — and a download of their saves — waits for your answer;
+- the configuration file on the provider is **damaged** or was written by a **newer SaveSync**, or this library is
+  **much smaller** than the last one uploaded (uploading would replace the cloud copy with it) — asked only when
+  there is something to upload;
+- it is the **first time** this PC meets a configuration that already exists.
+
+| Answer | What happens |
+|---|---|
+| **Import and merge here** | The titles this library lacks are added and the merges you leave ticked are made here too, so the backups of both titles end up under one folder |
+| **Keep this library apart** | This PC's configuration goes to a file of its own, and only the titles in conflict get cloud folders of their own — see below |
+| **Not now** | Nothing changes; the sync that was waiting is let go and the question comes back at a later sync (not for ten minutes) |
+| **Replace it with this PC's** / **Upload anyway** | For a damaged file or a much smaller library: you choose to overwrite the cloud copy |
+
+A game that is running is never interrupted by the question: it waits for the next sync.
+
+</details>
+
+<details>
+<summary><strong>Keeping a library apart (fork)</strong></summary>
+
+*Keep this library apart* gives this PC its own configuration file on the provider (`savesync_config.<id>`) and forks
+**only the titles in conflict** — both the card that absorbed and the card that was absorbed: each gets a cloud
+folder of its own (`Name~tag`), its local backups follow it, and its next upload creates the folder.
+
+- Nothing is copied, moved or deleted in the cloud, and the folder the other PC uses is never touched.
+- A title that was already forked (you declined to download the saves earlier) is not forked twice.
+- The cards can still be merged later on this PC. The folder each was forked away from is remembered, so a later
+  sync never takes backups out of the folder the other PC shares.
+
+</details>
+
+<details>
+<summary><strong>Download first, then upload</strong></summary>
+
+A merged card's first complete sync downloads the provider's backups **before** it makes a new one. Every save
+folder of the card is then completed from the newest backup that has it: the files that backup holds and the
+folder lacks are written; **a file that is already there is never replaced** (it is the one you are about to push),
+and a file you unticked does not come back. The new backup is cut at once — the 30-second pause between two
+backups does not apply to it — and uploaded, so the zip in the cloud is *your* versions plus the rest, and moving
+from one PC to the other feels the same. When you go back to the first PC it offers to download the new saves, as
+it always does.
+
+</details>
+
+---
+
+## Programs, versions and merging
+
+A card in the library can know more than one program: a reinstall in another folder, a 32- and a 64-bit build, a
+second storefront copy. It keeps one **primary** program and any number of **versions**; the Add/Edit dialog's
+**Browse +** button and the ▾ picker beside it manage them.
+
+<details>
+<summary><strong>How a program gets onto a card</strong></summary>
+
+- **The game, running from somewhere else** (recognised by its name): SaveSync asks once — *Add to this game*,
+  *Overwrite path* or *Different game* — and files it **only by your answer**. Left unanswered, nothing is added.
+- **Another file of an install the card already has** (a 64-bit build beside the 32-bit one): the same kind of
+  question, worded as “a different program from its folder”.
+- **A wrapper is the same program**, not a version: an Unreal launcher stub beside its packaged binary, or a
+  launcher and the game it starts. It is never asked about and never added.
+- **A program found only by where it sits** (a tool of the same package) stays an ordinary detection in the queue,
+  with *Add to library* as always.
+- The unknown-game queue shows the install folder's name beside the detected name when they differ, for engine
+  players the known list doesn't have.
+
+</details>
+
+<details>
+<summary><strong>The Browse + menu and the ▾ picker</strong></summary>
+
+With a program already set, **Browse +** offers:
+
+- **Add a new path** — track another version of this game;
+- **Overwrite** — replace the primary program (asks first when the new location already has saves of its own);
+- **Merge another card into this one** — see below.
+
+The ▾ beside the program lists every version: click one to make it primary, **🔀** to split it off into a card of
+its own on Save, **🗑** to drop it.
+
+</details>
+
+<details>
+<summary><strong>Merging two cards</strong></summary>
+
+Open the card that should **survive**, press **Browse +** → **Merge another card into this one**, and tick the cards
+to absorb from the searchable list (a card a game is running for can't be picked). Nothing happens until you press
+**Save**; Cancel leaves everything as it was.
+
+- **Programs** — the other card's program and versions become versions of this one (a wrapper still isn't a version).
+- **Save folders** — joined, without doubles. A folder the other card had not confirmed arrives **unticked** on a
+  confirmed card, so a confirmed card never starts backing up a folder nobody has looked at.
+- **Backups** — re-filed under the surviving card, zips included. They move first: if one can't, the other card is
+  kept as it was and nothing else is stored.
+- **Details** — tags, languages and reviews are joined; description, developer, year, links, category, engine,
+  launcher id and cover are taken from the other card only where this one has none.
+- **Numbers** — playtime is added up; last played and last backed up are the later of the two, added the earlier.
+- **Settings kept per game** (ignored paths, unticked files, confirmed processes…) move to the surviving card.
+- **The cloud** follows with the card's next sync: the other card's copy is uploaded under this card's folder, the
+  index is published, a fresh listing has to confirm it, and only then is the old folder removed. Backups in that
+  folder that SaveSync can't vouch for (another PC's) stay, and so does the folder.
+- With Automatic sync, other PCs hear of the merge as a [conflict](#using-more-than-one-pc) the next time they sync.
+
+</details>
+
+<details>
+<summary><strong>Launch URLs</strong></summary>
+
+When a game is added, SaveSync records the URL its launcher used to start it: caught on its way to the launcher
+(any program registered for that URL scheme, found in the registry), else read from Steam's or Epic's log, else
+from their install manifests. **Play** then starts the game through its launcher instead of the bare program.
+A card that has none learns it the next time a launch shows one — a desktop icon after the Play button, or the
+reverse — and an existing URL is never replaced.
+
+Verified with Steam and Epic.
+
+</details>
+
+---
+
 ## P2P save transfer
 
 Sends a save — or any file or folder — straight to another SaveSync install,
@@ -759,7 +991,8 @@ There are two things you can send, and they end up in different places:
 | **A backup** — ➡️ on a row of the Backups page | In the receiver's **Backups** page, as an archive with a `📥 P2P` badge, ready to restore | Yes, like any other backup, including the retention below |
 | **A file or folder** — **Send a file…** in the Receive panel | Straight into a folder the receiver picks in Settings | No. Never in Backups, never listed, never deleted by SaveSync |
 
-**In this section:**
+<details>
+<summary><strong>Everything in this section</strong></summary>
 
 | Part | What it covers |
 |---|---|
@@ -775,6 +1008,8 @@ There are two things you can send, and they end up in different places:
 | [Private mode (Tor)](#private-mode-tor) | Going through Tor, so nobody sees your address |
 | [How it works](#how-it-works) | The mailbox, the meeting point, the connection |
 | [Privacy: what the network sees](#privacy-what-the-network-sees) | What stays hidden and what does not |
+
+</details>
 
 ### Sending
 
@@ -795,13 +1030,18 @@ many peers are connected, the upload speed (MB/s, with Mbps on hover) and a
 percentage where 100% means one full copy has gone out. Closing it before then
 asks "Close anyway?", and closing it ends the transfer.
 
-**Nothing is copied to be sent.** The file is *hard-linked* under a temporary
+<details>
+<summary><strong>Nothing is copied to be sent</strong> - hard links, and the one catch</summary>
+
+The file is *hard-linked* under a temporary
 name, not duplicated, so sending 50 GB doesn't need another 50 GB of disk. That
 needs a drive that supports links (NTFS, ext4, APFS…); on one that doesn't
 (exFAT, a network share) SaveSync says so rather than quietly making a copy. The
 one catch: a link is not a snapshot, so a file that is still being written
 *while* it's sent can fail the receiver's integrity check. A backup archive
 never changes; for your own files, send ones that are at rest.
+
+</details>
 
 ### Receiving
 
@@ -862,6 +1102,11 @@ never deletes them.
 
 ### Settings
 
+The P2P settings, each with where to find it and what it does.
+
+<details>
+<summary><strong>Every P2P setting, where it lives and its default</strong></summary>
+
 | Setting | Where | Default | What it does |
 |---|---|---|---|
 | `p2p_username` | P2P → *P2P display name* | empty | The name the receiver sees in your offer |
@@ -889,6 +1134,8 @@ backups. It is shared across whoever sends that game rather than counted per
 sender, and runs on the same scheduled sweep the regular backup retention does.
 It only ever touches received *saves* — files and folders sent by hand are
 outside it.
+
+</details>
 
 ### Friends
 
@@ -1251,6 +1498,11 @@ end the same way a direct message is.
 
 ### If it doesn't connect
 
+If the sender sits at 0 peers the two machines haven't found each other yet. They meet through the public BitTorrent network and then connect directly, which usually takes a few seconds (longer on a slow network).
+
+<details>
+<summary><strong>What to check, in order</strong></summary>
+
 The two machines find each other through the public BitTorrent network — at a
 meeting point only they know, see below — and then connect directly. That
 usually takes a few seconds, longer on a slow network. If the sender sits at 0
@@ -1278,7 +1530,14 @@ peers:
 - Both sides need the same generation of SaveSync: an older build can't read the
   offer, and the sender just keeps waiting.
 
+</details>
+
 ### Speed
+
+A transfer is meant to use all of your line. TCP is tried first, received data goes through the system's cache, and the two PCs find each other within seconds; the measurements are below.
+
+<details>
+<summary><strong>What decides the speed</strong></summary>
 
 A transfer is meant to use all of your line. What decides that, measured on this PC
 (one gigabyte, both ends on loopback, so the line itself is not in it):
@@ -1305,6 +1564,8 @@ A transfer is meant to use all of your line. What decides that, measured on this
 - **What cannot be measured here:** your real line. A real internet path has
   slow-start and other traffic of its own, and a file goes the speed of the slower of
   the two PCs' lines.
+
+</details>
 
 ### TLS (optional)
 
@@ -1754,6 +2015,11 @@ closed, files the archive, does the move), `ui/dialogs/p2p_send_dialog.py`,
 
 ## Save detection
 
+Candidate folders are scored from several signals: keywords in the folder name, the game's name in the path (in any script), the shape of the files, engine-specific locations, the registry, and the process's working directory.
+
+<details>
+<summary><strong>The signals, the custom keywords and the engine rules</strong></summary>
+
 Candidate folders are scored from multiple signals:
 
 - Keyword match in the folder name (`save`, `savegame`, `checkpoint`, `userdata`, …)
@@ -1765,6 +2031,20 @@ Candidate folders are scored from multiple signals:
 - Engine-specific locations (RenPy, RPG Maker, Unity, Unreal, Godot, …)
 - Windows registry save locations
 - Process working directory and known install roots
+
+Some places are never a save, whatever they hold, and are recognised by where they are rather than by their name: SaveSync's own data, Ren'Py's `sync` mirror, the Steam client's caches, Wine's and Proton's files inside a prefix, and **the files Unity keeps for itself in a game's data folder** (`AppData/LocalLow/<company>/<game>`): the player log, Addressables catalogs, Analytics, the asset cache, crash reports and the I2 Localization cache. A game's own saves in the same folder are still found.
+
+**One set of saves in two places.** Ren'Py writes each save beside the game (`game/saves`) *and* in its own data folder
+(`AppData/Roaming/RenPy/<game>` on Windows, `~/.renpy/<game>` on Linux, `~/Library/RenPy/<game>` on macOS). When both are found
+and hold the same files — a save of the same name with the very same bytes, not just the same file names, which every Ren'Py game
+shares — they are one set of saves, and the panels (Add/Edit Game, and the save-confirmation panel at game exit) show them as such:
+
+- one of the two is proposed and ticked, as any found folder is;
+- the other sits under a **Duplicate** heading, **unticked**. Unticked is not rejected: it stays on the game's list, so a later scan
+  does not offer it again as something new, and ticking it later moves the backup there, or backs up both. Removing it with the
+  bin is a rejection like any other;
+- folders whose slots differ (an older set, a different game's) are not copies and are proposed as they always were, as are all other
+  engines. A game that already has one of the two saved gets the other as a duplicate, once.
 
 Custom keywords can be added in **Settings → Save Folder Hints**.
 
@@ -1801,6 +2081,8 @@ A game added with only a save folder has no executable to read, so it is
 treated as unknown: the conservative side, where a save that is merely not
 proposed can still be added by hand.
 
+</details>
+
 ## Save editor
 
 Open a game's save and change what is inside it — money, stats, flags. Reach it
@@ -1823,6 +2105,34 @@ Two rules it is built around:
   or pick one, and it opens on its own. Some games are not worth adding — a
   RAGS game needs a pile of scripts around it just to start — and the save is
   the only part anyone wanted.
+
+<details>
+<summary><strong>Values the save keeps in more than one place (🔗)</strong></summary>
+
+Games like to keep the same number twice: the list the screen shows, and a lookup built from it for speed. Edit the
+one the game doesn't read and nothing changes — and which one that is stays the game's secret. When SaveSync can
+tell, a **🔗** button appears beside the number.
+
+- Its menu opens with **what the thing is** (`Item A · k1` — a bag of ids is unreadable without it), then lists
+  the **other** places that keep it (the value you clicked isn't repeated), each with what it holds now, unsaved
+  edits included. Choose one to jump to its row.
+- **From the name to the quantity and back.** The rows that say what a thing is (`name`, `id`…) carry a 🔗 too: it
+  lists where its quantity is kept, so searching for a name leads to the numbers. A quantity's menu ends with
+  **Where its name is written**. From any of the three — the name, the lookup, the list — the menu shows the
+  other two together.
+- **Every copy sees all the others**, from whichever one you click — the lookup, the list, a saved copy of the list.
+- **Probably the same thing** — a list that covers only part of the lookup (a snapshot, a stash) is offered under
+  a heading of its own, and only when most of the shared numbers agree. Loot tables, shops and an item's own
+  attributes (price, rarity) are never offered as a quantity.
+- It reads only the names and numbers the editor already shows and decides nothing: it names candidates, you pick.
+  If a change doesn't stick, change both.
+- It needs **names** in the save — a record with an id or name beside its quantity. A save that holds only numbers
+  and ids (RPG Maker MV/MZ keeps no names) gives it nothing to match on, so no 🔗 appears there.
+
+</details>
+
+<details>
+<summary><strong>The formats it opens</strong></summary>
 
 | Editable now | Recognised, not editable yet |
 |---|---|
@@ -1850,7 +2160,14 @@ Two rules it is built around:
 | TADS record (`system.rec`) — whitespace tokens, NUL-padded | Classic MJR TADS 3 VM state (`.t3v`) — a snapshot, not a named value list |
 | SQLite (`.db`, `.sqlite`) — Room / Compose Desktop Java progress | |
 
+</details>
+
 ### Where the format knowledge comes from
+
+Two things keep the table above from needing a hand-written parser per engine: **the game is the schema** (a key or a layout that lives in the game is read out of it when the save is opened), and **detection is layered**, not a lookup by extension - and a game update must not take your saves away.
+
+<details>
+<summary><strong>The five ideas behind it, with the engines as examples</strong></summary>
 
 Two things keep that table from turning into a maintenance treadmill, and both
 are worth stating because they are what a hand-written parser per engine would
@@ -2345,6 +2662,8 @@ a search that finds nothing changes nothing.
 
 </details>
 
+</details>
+
 ## Hotkeys
 
 | Key | Action |
@@ -2488,6 +2807,11 @@ Other automatic I/O habits worth knowing:
 
 ### Settings reference
 
+Every setting that has a default, by name.
+
+<details>
+<summary><strong>All the settings with a default</strong></summary>
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `max_local_backups` | 6 | Max backups per game |
@@ -2502,15 +2826,14 @@ Other automatic I/O habits worth knowing:
 | `backup_on_exit` | true | Auto-backup when a game closes |
 | `backup_during_game` | false | Periodic in-game backups while playing (interval in Settings) |
 | `auto_scan_on_exit` | true | Scan for save paths when a game exits |
-| `auto_sync_after_backup` | false | Sync to cloud after each backup |
+| `auto_sync_after_backup` | true | Sync to cloud after each backup (greyed out in Settings, still showing its value, until a sync provider is connected) |
 | `save_correlation_enabled` | false | Claim saves by write-time correlation (see above) |
 | `save_correlation_window_ms` | 1000 | How far apart the two writes may be. Weaker candidates get 40% of it |
 | `backup_verify_enabled` | true | Check backup archives on a schedule |
 | `backup_verify_interval_days` | 7 | How often that check runs |
 | `self_checks` | true | Run the data-integrity checks automatically |
 | `self_checks_frequency` | 7 | Days between automatic runs (the manual ⚕️ on the Backups page runs the same list on demand) |
-| `auto_export_config_enabled` | false | Periodically upload an encrypted config pack to the connected sync provider |
-| `auto_export_config_interval_days` | 7 | How often that cloud config export runs |
+| `auto_export_config_enabled` | true | "Automatic sync" of the library and settings. On (greyed out in Settings until a sync provider is connected): the encrypted config pack on the sync provider is pushed whenever the library or the settings change (no timer), and the file there is checked after every game sync, so the PCs stay in step; titles another PC added are brought in without a question, and only a conflict asks. Off: nothing runs by itself; the config is exchanged on request - manually, on first connecting the provider, when saves are downloaded (that only looks), or when a sync runs into a conflict with another PC's. Either way, before a push or before syncing a game another PC merged, the file there is looked at, and if it is not the one this PC last wrote or read you choose: import it (its merges are made here too; the paths of games you already have are never touched), keep this library apart (a config file of its own, cloud folders of their own for the titles in conflict), or not now |
 | `page_sizes` | per list | Items per page for library, backups, save editor, reviews (presets 10 / 20 / 50, or custom) |
 | `backup_archives_too` | true | Include archives — save folders added by hand, with no game in the library — in Backup All and Sync All |
 | `sync_timeout` | 120s | How long a single cloud operation may take before it is abandoned (10–600) |
@@ -2534,6 +2857,8 @@ timestamps that say when a scheduled job last ran. It is listed by
 shape-checked on load, and one that fails goes back to its default
 instead of taking a page down with it.
 
+</details>
+
 ### Config export & history
 
 From **Settings → Transfer** you can export / import an encrypted
@@ -2543,6 +2868,11 @@ local snapshot; at most five are kept. Restoring or importing first snapshots
 the current state (`pre_restore` / `pre_import`) so you can undo.
 
 ### Data-integrity checks
+
+One ordered list of six checks, run on a schedule (every 7 days by default) and on demand from the ⚕️ button on the Backups page.
+
+<details>
+<summary><strong>The six checks and how they run</strong></summary>
 
 One ordered list of checks, run from exactly two places — automatically on
 the schedule you set (`self_checks_frequency`, default 7 days) and on demand
@@ -2566,12 +2896,17 @@ backup row gets its colour.
 The sweep does **not** run at startup on its own — it is scheduled work, so a
 launch never pays for it.
 
+</details>
+
 ### Offline repair
 
 `maintenance/repair_archives.py` is the one thing that can rewrite an archive
 index, and it is deliberately outside the app: nothing in SaveSync repairs
 these on its own, because each finding has more than one plausible repair and
 the wrong one deletes the only path an archive can be read from.
+
+<details>
+<summary><strong>The command, the findings and what is repaired</strong></summary>
 
 It is **read-only by default** — `--apply` is the only way to write anything,
 `--fix` names which kinds to touch, and every write is preceded by a
@@ -2596,11 +2931,16 @@ python maintenance/repair_archives.py --apply --fix injected-source,lost-chain
 Only `injected-source`, `lost-chain` and `empty-folder` have a repair; the
 rest are reported so the decision stays with you.
 
+</details>
+
 ### Diagnostics
 
 Run with `SAVESYNC_TRACE=1` to log every spawned child process and every
 top-level window shown, each with its call site — useful for hunting startup
 flashes or stray console windows. Off by default (zero overhead).
+
+<details>
+<summary><strong>The trace switches and the environment variables</strong></summary>
 
 The same switch makes the pins report their z-order: every time one is put
 back on top, the log says why it was tried, whether the pin still carries the
@@ -2608,8 +2948,19 @@ always-on-top flag, whether it really ended up above the window in front, and
 what that window is. That distinguishes "nothing tried to raise it" from "it
 was raised and something put it back down".
 
+`SAVESYNC_DEBUG=1` adds SaveSync's own DEBUG lines to the log, which is written
+at INFO otherwise. What the windows made for a game did — each dialog adopted,
+how the system sees it, which field the typing goes to, the menus — is DEBUG;
+only what is wrong is INFO or above (a dialog with see-through zones, a window
+that is not in the higher band, and, when a game has lost the front, the list of
+the app's windows at that moment). Both are environment variables, set before
+starting:
+
 $env:SAVESYNC_TRACE = "1"
+$env:SAVESYNC_DEBUG = "1"
 python main.py
+
+</details>
 
 ---
 

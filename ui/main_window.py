@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from i18n import t, get_engine
 from ui.styles.theme import palette
-from ui.modal_helpers import question_window_modal, warning_window_modal
+from ui.modal_helpers import information_window_modal, question_window_modal, warning_window_modal
 from ui.overlay import OverlayWidget
 from ui.main_window_cloud import CloudFlowsMixin
 from ui.blur_modal import BlurModalWidget
@@ -238,6 +238,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     launcher_exe_resolved = Signal(str, str, str)  # game_id, url, exe_path ("" if none)
     # GitHub Releases check finished off the GUI thread.
     update_available = Signal(object)  # ReleaseInfo
+    # The look at the configuration on the provider found it is not the one this PC last read (core.config_sync):
+    # raised from a worker thread, answered on the GUI thread. (Preflight, "push" | "sync", game id)
+    config_conflict = Signal(object, str, str)
     # A scheduled archive re-backup wrote something. Same reason as the two
     # above: the archive scheduler works on its own thread and the
     # notification has to be raised on the GUI one.
@@ -292,6 +295,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overlay: Optional[OverlayWidget] = None
         self._blur_modal: Optional[BlurModalWidget] = None
         self._is_modal_mode = False  # Track if window is in modal mode
+        self.setProperty("xs_keep", True)  # its band-16 window is managed by ui.exclusive_app, not swept
+        self._yielded_game = 0       # a game in exclusive fullscreen the app made room for (see _note_exclusive_yield)
         self._hidden_for_game = False  # True while minimised to tray for a running game
         # True once the user has manually brought the window back (tray,
         # hotkey, overlay) while _hidden_for_game was still set — i.e. mid
@@ -782,6 +787,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overview_page.open_sync.connect(lambda: self._switch_page(2))
         self._overview_page.unknown_add_requested.connect(self._on_overview_unknown_add)
         self._overview_page.unknown_dismiss_requested.connect(self._on_suppress_overlay)
+        self._overview_page.unknown_remove_requested.connect(self._on_unknown_trash)
         self._overview_page.refresh_all_requested.connect(self._on_refresh_all_pages)
 
         # Wire backups page signals
@@ -808,8 +814,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         # Settings
         self._settings_page.hotkey_changed.connect(self._update_hotkey)
+        self._settings_page.settings_saved.connect(self._export_config_soon)
         self._settings_page.hotkeys_reload.connect(self._setup_hotkeys)
         self._settings_page.theme_changed.connect(self._on_theme_changed)
+        get_config().config_changed.connect(self._on_live_tracking_setting)
 
         # Status bar
         self._status_bar = QStatusBar()
@@ -908,6 +916,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self, "_wired_screen_ids"):          # the start-up wiring has run
+            self._wire_host_window()
         # (every show: out of the tray, back from minimised. The first one, right after start-up,
         # is too soon after the start-up's own look for a request to be answered)
         from ui import data_guard
@@ -1046,7 +1056,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._overlay.show_backup_done(name)
         except RuntimeError:
             pass
-        if game_id and get_config().get("auto_sync_after_backup", False):
+        if game_id and get_config().get("auto_sync_after_backup", True):
             try:
                 logger.info("Auto-syncing after the scheduled backup of %s", name)
                 self._sync_archive(game_id)
@@ -1636,14 +1646,22 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             app.primaryScreenChanged.connect(self._on_primary_screen_changed)
         except Exception:
             logger.debug("primaryScreenChanged unavailable", exc_info=True)
+        self._wire_host_window()
+
+    def _wire_host_window(self):
+        """Connect the main window's OWN screen / DPI signals. Keyed on the QWindow: the native window is dropped and made
+        again when the app is shown over a game in exclusive fullscreen and put back (ui.exclusive_app), and the signals of
+        the old one die with it - so this runs again from every show."""
         wh = self.windowHandle()
-        if wh is not None:
-            wh.screenChanged.connect(self._on_host_screen_changed)
-            try:
-                if hasattr(wh, "devicePixelRatioChanged"):
-                    wh.devicePixelRatioChanged.connect(self._on_screen_dpi_changed)
-            except Exception:
-                pass
+        if wh is None or getattr(self, "_host_window_wired", None) is wh:
+            return
+        self._host_window_wired = wh
+        wh.screenChanged.connect(self._on_host_screen_changed)
+        try:
+            if hasattr(wh, "devicePixelRatioChanged"):
+                wh.devicePixelRatioChanged.connect(self._on_screen_dpi_changed)
+        except Exception:
+            pass
 
     def _wire_dpi_screens(self, screens):
         # PySide6 6.9 does not expose QScreen.devicePixelRatioChanged — the
@@ -1948,15 +1966,31 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._p2p_panel_open = False
             self._refresh_p2p_receive_shelf()
 
+    def _bring_up_for_overlay_button(self) -> bool:
+        """A notification's button wants the application window. Over a game in exclusive fullscreen it comes up the way Open App
+        brings it (frameless, in the higher band, over the dimmed backdrop) - shown as an ordinary window and given the foreground it
+        takes the game to the desktop. True when the overlay is such a window: the app is up that way (or already was), and the caller
+        must not show, raise or activate it again."""
+        try:
+            ov = self._overlay
+            if platform.system() == "Windows" and ov is not None and getattr(ov, "_rw_exclusive", False):
+                if not self._is_modal_mode:
+                    self._show_modal_app(from_user_action=True)
+                return True
+        except Exception:
+            logger.debug("could not open the app over the game for a notification's button", exc_info=True)
+        return False
+
     def _open_p2p_receive_with_window(self):
         """Open the page on the person's say-so (a notification's button): the window comes
         up if it was away, since they asked for it."""
-        if self.isMinimized():
-            self.showNormal()
-        elif not self.isVisible():
-            self.show()
-        self.raise_()
-        self.activateWindow()
+        if not self._bring_up_for_overlay_button():
+            if self.isMinimized():
+                self.showNormal()
+            elif not self.isVisible():
+                self.show()
+            self.raise_()
+            self.activateWindow()
         self._open_p2p_receive_dialog()
 
     def _refresh_p2p_receive_shelf(self):
@@ -2103,12 +2137,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if friend_id or group_id or bring_up:
             # (also when the panel is already up: it may be behind other windows, or
             # the window put away, and the chat switching there would look like nothing)
-            if self.isMinimized():
-                self.showNormal()
-            elif not self.isVisible():
-                self.show()
-            self.raise_()
-            self.activateWindow()
+            if not self._bring_up_for_overlay_button():
+                if self.isMinimized():
+                    self.showNormal()
+                elif not self.isVisible():
+                    self.show()
+                self.raise_()
+                self.activateWindow()
         if panel is not None:
             if panel.closing:
                 # On its way out: a click on the button is ignored, a request to open
@@ -3118,6 +3153,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         self._overlay.action_requested.connect(self._on_overlay_action)
         self._overlay.dont_show_again.connect(self._on_suppress_overlay)
         self._overlay.exclusive_blocked.connect(self._on_overlay_blocked_by_fullscreen)
+        self._overlay.unknown_trashed.connect(self._on_unknown_trash)
         self._overlay.path_changed_expired.connect(self._on_path_changed_expired)
         self._overlay.friend_silenced.connect(
             lambda fid: self._p2p_friends_service().set_silenced(fid, True))
@@ -3125,17 +3161,21 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             lambda gid: self._p2p_friends_service().set_group_silenced(gid, True))
 
     def _on_overlay_blocked_by_fullscreen(self, title: str, message: str):
-        """Overlay could not show because a game is in exclusive fullscreen.
+        """Overlay could not show - not even as the picture over the game
+        (OverlayWidget._present_over_exclusive) - because a game is in
+        exclusive fullscreen: a game on the deny-list, the setting off, the
+        window API refused.
 
         In exclusive fullscreen no window can appear without destroying the
-        game's display mode — the only feedback we can give is an audio cue.
+        game's display mode, so nothing is shown - and nothing is played.
+        This used to sound the Windows "asterisk" chime, once per skipped
+        notification: automatic ones too ("Backup created"), so a session
+        produced a ding for every backup and, on a burst, seven in six
+        seconds - which reads as an error, not as a notification. It was
+        also Windows-only. The slot stays connected: it is where any other
+        channel for these notifications belongs.
         """
-        try:
-            import winsound
-            # Play the system "notification" sound (async, non-blocking)
-            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
-        except Exception:
-            pass
+        logger.debug("Overlay skipped in exclusive fullscreen: %s", title)
 
     def _setup_blur_modal(self):
         """Setup the blur modal background widget."""
@@ -3274,6 +3314,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._pending_cloud_notification.pop(entry.id, None)
                 get_orchestrator().sync_game(entry.id, entry.name, entry.save_paths, direction="down", exe_path=entry.exe_path, computed_folder_name=entry.computed_folder_name, name_history=list(entry.name_history))
                 self._show_tracking_toast_if_playing(entry.id)
+        elif action == "continue_local_cloud_available":
+            # "Continue with local saves / fork" on the plain "download your saves?" prompt: the player is NOT taking that cloud copy - a
+            # different game with the same name, or a new playthrough - so the game gets a cloud folder of its own and never uploads into
+            # (and mixes with) the existing one. With no same-name cloud folder to step aside from, nothing changes (as "later" did).
+            entry = get_library().get_by_exe(context)
+            if entry:
+                self._pending_cloud_notification.pop(entry.id, None)
+                try:
+                    self._claim_unique_cloud_folder(entry)
+                except Exception:
+                    logger.debug("Could not give the game its own cloud folder", exc_info=True)
+                self._show_tracking_toast_if_playing(entry.id)
         elif action == "dismiss":
             # "Later" on a cloud prompt (sync_prompt kind): the prompt
             # suppressed the launch toast, so hand over to it now.
@@ -3318,7 +3370,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if stash and stash.get("folders"):
                 _folder = stash["folders"][0].get("folder", "")
             self._add_and_download_unknown(context, force_folder_name=_folder)
-        elif action in ("verify_details_unknown_game", "verify_conflicts_unknown_game"):
+        elif action in ("verify_details_unknown_game", "verify_conflicts_unknown_game",
+                        "verify_conflicts_known_game", "verify_details_known_game"):
             # Show what the cloud copy/copies are registered as and let the user
             # download the right one or declare a same-name different game.
             self._open_cloud_verify_dialog(context)
@@ -3401,13 +3454,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             # (parent → child notification order).
             entry = get_library().get_by_exe(context)
             if entry:
-                self._pending_cloud_notification.pop(entry.id, None)
-                getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
-                # Persist the "use local saves" choice so the download prompt is
-                # not re-shown on every restart (reversible from Settings →
-                # suppressed-games list).
-                self._persist_cloud_no_local_decline(entry.id, entry.name)
-                self._show_tracking_toast_if_playing(entry.id)
+                # (persisted so the prompt is not re-shown on every restart - reversible from Settings; and, where the destination already
+                # holds a same-name copy that is not this game's, its own folder, so the next sync does not upload into - and mix with - it)
+                self._keep_local_no_local(entry)
 
         elif action == "add_game_no_download":
             # Dropdown choice on the unknown-game cloud notification (State A
@@ -3432,6 +3481,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if entry:
                 self._pending_cloud_notification.pop(entry.id, None)
                 getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
+                self._pending_cloud_verify.pop(context, None)
+                self.__dict__.get("_pending_orphan_folder", {}).pop(entry.id, None)
                 self._persist_cloud_no_local_decline(entry.id, entry.name)
                 self._show_tracking_toast_if_playing(entry.id)
 
@@ -3481,11 +3532,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._show_tracking_toast_if_playing(entry.id)
 
         elif action == "decline_cloud_different_machine":
-            # "Keep Local" — don't re-prompt for this same cloud version again
+            # "Keep Local / fork" - don't re-prompt for this same cloud version again, and the game takes a cloud folder of its own
             entry = get_library().get_by_exe(context)
             if entry:
-                self._pending_cloud_notification.pop(entry.id, None)
-                self._mark_cloud_machine_confirmed(entry.id)
+                self._decline_other_pc_saves(entry)
                 self._show_tracking_toast_if_playing(entry.id)
 
         elif action == "open_app":
@@ -3514,12 +3564,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 with self._bg_scan_lock:
                     pending = list(self._pending_auto_scans.get(gid, []))
                 pre_scanned = pending or None
+            self._note_exclusive_yield()       # before the dialog exists: see _show_modal_app
+            if self._overlay is not None and getattr(self._overlay, "_rw_exclusive", False):
+                self._yielded_game = 0         # the dialog is made for such a game (ui.exclusive_session): nothing is owed to it
             try:
                 # Do not auto-start scan: display live tracking discoveries or open idle
-                dlg = show_auto_scan_dialog(self, pre_scanned, game_id=gid,
+                # (Over a game in exclusive fullscreen the panel has no owner: a window with an owner is made by the system in the
+                # owner's band, and the owner here is the main window, hidden in the tray, in the ordinary one.)
+                _owner = None if (self._overlay is not None and getattr(self._overlay, "_rw_exclusive", False)) else self
+                dlg = show_auto_scan_dialog(_owner, pre_scanned, game_id=gid,
                                             user_initiated=True, auto_scan=False)
                 if not dlg:
-                    dlg = show_auto_scan_dialog(self, None, game_id=gid,
+                    dlg = show_auto_scan_dialog(_owner, None, game_id=gid,
                                                 user_initiated=True, auto_scan=False)
                 if dlg:
                     self._track_scan_dialog(dlg)
@@ -3594,6 +3650,14 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             if self._is_modal_mode:
                 self._hide_modal_app()
 
+            # The dimmed backdrop - and a window that is always on top and never takes the focus - exist so that the app can be opened OVER
+            # A GAME without taking the game away. With no game being played there is nothing to protect and the backdrop only gets in the
+            # way: the app opens as the ordinary window it is.
+            if not self._game_in_front():
+                self.show_and_raise()
+                logger.debug("Open App: no game is being played - the app opens as an ordinary window, without the backdrop")
+                return
+
             self._is_modal_mode = True
 
             # Save game foreground before we touch anything
@@ -3605,8 +3669,27 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 except Exception:
                     pass
 
-            # Show blur modal background
-            if self._blur_modal:
+            # A game in exclusive fullscreen cannot share the screen with the app: any window shown over it
+            # takes it back to the desktop. So unlike the borderless case the game is not handed the front
+            # again below - the app opens in front, the game waits, and is put back when the app closes.
+            exclusive = self._note_exclusive_yield()
+
+            # A game in exclusive fullscreen is in front and the overlay is up as a real window over it: the app opens the
+            # one way that does not take the game out of exclusive mode (ui.exclusive_app) - frameless, in the higher
+            # band, over the real dimmed backdrop. The game is never taken out of exclusive mode, so there is nothing to
+            # give back afterwards.
+            if exclusive and self._overlay is not None and getattr(self._overlay, "_rw_exclusive", False):
+                from ui import exclusive_app
+                state = exclusive_app.enter(self, self._blur_modal, self._yielded_game, on_close=self._hide_modal_app)
+                if state:
+                    self._rw_modal_state = state
+                    self._yielded_game = 0
+                    logger.debug("SaveSync shown over exclusive fullscreen as a window (frameless, in the higher band)")
+                    return
+
+            # Show blur modal background (X11: after the window and directly UNDER it - see _show_backdrop_placed)
+            x11_backdrop = self._x11_backdrop()
+            if self._blur_modal and not x11_backdrop:
                 self._blur_modal.show_animated()
 
             # Make main window visible without activating (overlay-like)
@@ -3621,11 +3704,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             else:
                 self.show()  # re-apply flags
 
+            if x11_backdrop and self._blur_modal:
+                self._show_backdrop_placed(self)
+
             # Force topmost without stealing focus (same as overlay)
             self._ensure_modal_topmost()
+            if platform.system() != "Windows":
+                self._start_backdrop_keeper()
+
+            if exclusive:
+                self.raise_()
+                self.activateWindow()
 
             # Restore game foreground if we stole it
-            if _saved_fg and platform.system() == "Windows":
+            if _saved_fg and not exclusive and platform.system() == "Windows":
                 try:
                     import ctypes
                     current = ctypes.windll.user32.GetForegroundWindow()
@@ -3649,6 +3741,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         try:
             self._is_modal_mode = False
 
+            state = getattr(self, "_rw_modal_state", None)
+            if state is not None:
+                self._rw_modal_state = None
+                from ui import exclusive_app
+                exclusive_app.leave(self, self._blur_modal, state)
+                self._release_idle_documents(force_all=True)
+                logger.debug("SaveSync modal mode ended (it was open over exclusive fullscreen)")
+                return
+
             # Force-hide blur immediately (no async animation that can linger)
             if self._blur_modal:
                 self._blur_modal.force_hide()
@@ -3664,6 +3765,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             QTimer.singleShot(200, lambda: trim_process_memory(full=True))
 
             logger.info("SaveSync modal mode ended - minimized to tray")
+            self._return_to_exclusive_game()
 
         except Exception as e:
             logger.error(f"Failed to hide modal app: {e}")
@@ -3694,8 +3796,193 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     0, 0, 0, 0,
                     SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
                 )
+            else:
+                self._keep_backdrop_under_app()
         except Exception as e:
             logger.debug(f"Failed to ensure modal topmost: {e}")
+
+    @staticmethod
+    def _x11_backdrop() -> bool:
+        """The dimmed backdrop is an X11 window that has to be PLACED (it is override-redirect: the window manager leaves it where it is put)."""
+        if platform.system() == "Windows":
+            return False
+        try:
+            from PySide6.QtGui import QGuiApplication
+            return QGuiApplication.platformName() == "xcb"
+        except Exception:
+            return False
+
+    def _show_backdrop_placed(self, target, tries: int = 0) -> None:
+        """X11: show the dimmed backdrop already UNDER *target* (the app, or a dialog), never over it. It used to be shown first and raised over
+        everything - show_animated ends with a raise - and put under the window a moment later: the dim over the panel "for a moment" (it
+        fades in over 200 ms, about half there after 40). Now it is created without being shown, put directly under the window's frame, and
+        only then shown, without the raise. A window the manager has not framed yet is waited for (a few beats); the keeper (below) holds
+        the order from there."""
+        blur = self._blur_modal
+        try:
+            if blur is None or not ((self._is_modal_mode and target is self) or self._blur_dialog is target):
+                return                                   # (the modal ended, or another dialog took over, meanwhile)
+            from ui.x11_fullscreen import stack_below, stack_index, x11_id
+            from PySide6.QtGui import QGuiApplication
+            blur.create()                                # (the native window, not shown)
+            QGuiApplication.sync()
+            target_id, blur_id = x11_id(target), x11_id(blur)
+            _framed = target.isVisible() and target_id in stack_index([target_id])
+            logger.debug("backdrop placement try %d: target %s %#x visible=%s framed=%s", tries, type(target).__name__, target_id,
+                         target.isVisible(), _framed)
+            if _framed and stack_below(blur_id, target_id):
+                self._backdrop_good_beats, self._backdrop_hold_since = 0, time.monotonic()
+                # Mapped as a 1 px window off-screen: showing a full-screen translucent window for the first time takes ~100 ms (measured: 105),
+                # and for all of that it sat on TOP of the stack, over the panel. A 1 px window shows at once and nobody can see it; it is
+                # grown to the screens only once it is under the window.
+                # restrict_to, not setGeometry: showing the window makes Qt report its screen, and the screen-changed handler stretches it over
+                # the monitors (_update_geometry) in the middle of show() - the full-size window on top, measured, for the whole of those ~130 ms.
+                from PySide6.QtCore import QRect
+                prev_rect = blur._only_rect
+                blur.restrict_to(QRect(-6000, -6000, 1, 1))
+                blur.show_animated(raise_after_show=False, hold_fade=True, keep_geometry=True)   # (invisible until its place has stayed right)
+                # Mapping the window puts it back on TOP of the stack (measured: placed at 1, 38 after show()). Under the window again before the
+                # event loop runs, i.e. before anything has been painted into it: a mapped window with nothing in it shows nothing.
+                QGuiApplication.sync()
+                _again = stack_below(blur_id, target_id)
+                blur.restrict_to(prev_rect)              # (the full size again - already under the window)
+                logger.debug("backdrop shown under %#x after try %d (restacked after show: %s)", target_id, tries, _again)
+                self._start_backdrop_keeper()
+                # The fade-in is held (opacity 0) until the keeper has seen the place stay right. Whatever the keeper does - it stops when it cannot
+                # find the windows, or fails - a backdrop must never be left invisible: released after 0.9 s in any case.
+                QTimer.singleShot(900, lambda b=blur: self._release_backdrop_fade(b))
+                return
+            if tries < 14:                               # (about 600 ms: the window manager frames a window within a few ms)
+                QTimer.singleShot(8 if tries < 4 else 50, lambda: self._show_backdrop_placed(target, tries + 1))
+                return
+            logger.debug("backdrop could not be placed before showing it (target %#x): shown as before", target_id)
+            blur.show_animated()                         # (could not be placed: shown as before - the keeper puts it right)
+            self._start_backdrop_keeper()
+        except RuntimeError:
+            pass                                         # (a window was deleted in the meantime)
+        except Exception:
+            logger.debug("could not place the backdrop before showing it", exc_info=True)
+            try:
+                blur.restrict_to(None)                   # (X11 only: it was never restricted to a monitor)
+                blur.show_animated()
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _release_backdrop_fade(blur) -> None:
+        try:
+            blur.release_fade()
+        except RuntimeError:
+            pass                                         # (the widget was deleted in the meantime)
+
+    def _backdrop_fade_check(self, blur, good: bool) -> None:
+        """The backdrop is shown at opacity 0 and fades in only when its place has been right for two beats in a row (the window manager
+        re-stacks a window a few milliseconds AFTER it was shown - the dialog's own raise - and a dim fading in over it was the flash),
+        or after 0.7 s whatever happens, so that a place that cannot be got right never leaves the screen undimmed."""
+        try:
+            if not blur.fade_held():
+                return
+            self._backdrop_good_beats = (getattr(self, "_backdrop_good_beats", 0) + 1) if good else 0
+            if self._backdrop_good_beats >= 2 or time.monotonic() - getattr(self, "_backdrop_hold_since", 0.0) > 0.7:
+                blur.release_fade()
+        except RuntimeError:
+            pass
+
+    def _start_backdrop_keeper(self) -> None:
+        """X11: while the dimmed backdrop is up, its place in the stacking order is kept (_keep_backdrop_order)."""
+        if platform.system() == "Windows":
+            return
+        timer = getattr(self, "_backdrop_keeper", None)
+        if timer is None:
+            timer = self._backdrop_keeper = QTimer(self)
+            timer.setInterval(250)
+            timer.timeout.connect(self._keep_backdrop_order)
+        if not timer.isActive():
+            timer.start()
+        # At once, and again while the window manager frames what was just shown. The backdrop fades in over 200 ms (about half there after
+        # 40) and is ABOVE the panel until it is placed under it: a dim over the panel "for a moment".
+        self._keep_backdrop_order()
+        for delay in (8, 20, 45, 90):
+            QTimer.singleShot(delay, self._keep_backdrop_order)
+
+    def _keep_backdrop_under_app(self) -> None:
+        self._start_backdrop_keeper()
+
+    def _keep_backdrop_under_dialog(self, dlg) -> None:
+        self._start_backdrop_keeper()
+
+    def _keep_backdrop_order(self) -> None:
+        """X11, while the dimmed backdrop is up. From the top: the window of ours it is for (the app, or the topmost dialog), the backdrop,
+        the pins, the game. The backdrop is an override-redirect window, and a window manager restacks ITS frames - when one is clicked or
+        raised - and leaves such a window where it was: the app opened beneath its own vignette, the extended scan sank it under the
+        game (the dim was gone), and a pin that was clicked was raised over the dialog. So it is asserted four times a second, and
+        only while the backdrop is on screen."""
+        blur = self._blur_modal
+        timer = getattr(self, "_backdrop_keeper", None)
+        try:
+            from PySide6.QtGui import QGuiApplication
+            if blur is None or not blur.isVisible() or QGuiApplication.platformName() != "xcb":
+                if timer is not None:
+                    timer.stop()
+                return
+            from PySide6.QtWidgets import QDialog, QMainWindow
+            from ui.x11_fullscreen import stack_below, stack_index, x11_id
+            QGuiApplication.sync()                       # (what Qt has just shown reaches the server before ours asks about it)
+            ours = [w for w in QApplication.topLevelWidgets()
+                    if w is not blur and w.isVisible() and isinstance(w, (QMainWindow, QDialog))]
+            if not ours:
+                return
+            ids = [x11_id(w) for w in ours]
+            blur_id = x11_id(blur)
+            pins = []
+            try:
+                from ui.widgets.pins import get_pin_manager
+                pins = [p for p in get_pin_manager().all_items() if p.isVisible()]
+            except Exception:
+                pass
+            pin_ids = [x11_id(p) for p in pins]
+            order = stack_index(ids + pin_ids + [blur_id])
+            placed = [(w, wid) for w, wid in zip(ours, ids) if wid in order]
+            if not placed:
+                return
+            target, target_id = max(placed, key=lambda pair: order[pair[1]])
+            # A pin the window manager manages and has raised over that window (it was clicked): the window goes back over it.
+            if any(not p._x11_bypass and order.get(pid, -1) > order[target_id] for p, pid in zip(pins, pin_ids)):
+                self._backdrop_fade_check(blur, False)
+                target.raise_()
+                return                                   # (the next beat puts the backdrop under it)
+            blur_idx = order.get(blur_id, -1)
+            correct = (order[target_id] - blur_idx == 1
+                       and all(order.get(pid, -1) < blur_idx for p, pid in zip(pins, pin_ids) if p._x11_bypass))
+            if not correct:
+                stack_below(blur_id, target_id)
+                for p, pid in zip(pins, pin_ids):
+                    if p._x11_bypass:
+                        stack_below(pid, blur_id)        # (an override-redirect pin can be placed: under the backdrop, over the game)
+            self._backdrop_fade_check(blur, correct)
+        except RuntimeError:
+            pass                                         # (a window was deleted in the meantime)
+        except Exception:
+            logger.debug("could not keep the backdrop in order", exc_info=True)
+
+    def _game_in_front(self) -> bool:
+        """Is a game being played? SaveSync tracks one, or the overlay is up over one, or a fullscreen window is in front (a game that is
+        not in the library is a game all the same - the one the queue asks about)."""
+        try:
+            if self._is_game_running():
+                return True
+            ov = self._overlay
+            if ov is not None and (ov.presented_game() or ov._fullscreen_game_in_front()):
+                return True
+        except Exception:
+            logger.debug("could not tell whether a game is being played", exc_info=True)
+        if platform.system() != "Windows":
+            try:
+                from ui.x11_fullscreen import fullscreen_window_in_front
+                return bool(fullscreen_window_in_front())
+            except Exception:
+                return False
+        return False
 
     def _show_blur_for_dialog(self, dlg):
         """Back a game-friendly dialog with the same blur vignette used when
@@ -3706,11 +3993,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """
         if dlg is None or not self._blur_modal:
             return
+        if not self._game_in_front():
+            return                                       # (no game: an ordinary dialog, nothing dimmed)
         self._blur_dialog = dlg
-        self._blur_modal.show_animated()
+        self._blur_exclusive = False
+        if self._overlay is not None and getattr(self._overlay, "_rw_exclusive", False):
+            from ui import exclusive_app
+            self._blur_exclusive = exclusive_app.show_backdrop(self._blur_modal, self._overlay.presented_game())
+        if not self._blur_exclusive:
+            if self._x11_backdrop():
+                self._show_backdrop_placed(dlg)
+            else:
+                self._blur_modal.show_animated()
         # Both the blur and the dialog live in the topmost band — re-raise
         # the dialog so it sits above the vignette, not under it.
-        dlg.raise_()
+        # (Not on X11: the backdrop was placed directly under the dialog, and asking the window manager to raise the dialog's frame re-stacks
+        # its frames against the override-redirect backdrop - the dim over the panel for a moment.)
+        if not self._x11_backdrop():
+            dlg.raise_()
+        if platform.system() != "Windows":
+            self._start_backdrop_keeper()                 # (X11: the backdrop goes under the dialog now, not a moment later)
         dlg.destroyed.connect(lambda *_, d=dlg: self._on_blur_dialog_gone(d))
 
     def _on_blur_dialog_gone(self, dlg=None):
@@ -3724,6 +4026,56 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Leave the backdrop alone if the full modal app owns it.
         if self._blur_modal and not self._is_modal_mode:
             self._blur_modal.force_hide()
+            if getattr(self, "_blur_exclusive", False):
+                from ui import exclusive_app
+                exclusive_app.hide_backdrop(self._blur_modal)
+                self._blur_exclusive = False
+            self._return_to_exclusive_game()
+
+    def _note_exclusive_yield(self) -> bool:
+        """An overlay button is about to show a window of the app. If the click came from the picture
+        over a game in exclusive fullscreen, that window will take the game out of exclusive mode (it
+        cannot share the screen); remember the game so it can be put back in front when the app is
+        done (_return_to_exclusive_game). True when that is the case."""
+        game = self._overlay.presented_game() if self._overlay is not None else 0
+        if game:
+            self._yielded_game = game
+            logger.debug("The app is opened over a game in exclusive fullscreen: the game makes room, "
+                         "and is put back in front when the app closes")
+        return bool(game)
+
+    def _return_to_exclusive_game(self) -> None:
+        """The app (or its dialog) that was opened over a game in exclusive fullscreen is closed: give
+        the screen back to the game. Only if the player is still looking at SaveSync, or at nothing in
+        particular: if they have gone to another program in the meantime they are not dragged back."""
+        game, self._yielded_game = self._yielded_game, 0
+        if not game or platform.system() != "Windows":
+            return
+        try:
+            import ctypes
+            import os
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32")
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            for fn in (user32.IsWindow, user32.IsIconic, user32.SetForegroundWindow):
+                fn.argtypes = [wintypes.HWND]
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            if not user32.IsWindow(game):
+                return
+            front = user32.GetForegroundWindow()
+            if front:
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(front, ctypes.byref(pid))
+                if pid.value != os.getpid():
+                    logger.info("The app closed, but the player is in another program: the game is not brought back")
+                    return
+            if user32.IsIconic(game):
+                user32.ShowWindow(game, 9)                  # SW_RESTORE
+            user32.SetForegroundWindow(game)
+            logger.debug("The app closed: the game is back in front")
+        except Exception:
+            logger.debug("Could not return to the game after the app closed", exc_info=True)
 
     def _on_blur_background_clicked(self):
         """Handle clicks on the blur modal background."""
@@ -3747,6 +4099,8 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         SetForegroundWindow re-emitting the focus change."""
         if not self._is_modal_mode:
             return
+        if getattr(self, "_rw_modal_state", None) is not None:
+            return          # opened over a game in exclusive fullscreen: it never has the focus, by design
         # Only react if the main window is actually visible (i.e. open_app was
         # clicked and the app was brought to foreground).  If the window is
         # hidden we are NOT in a visible modal session, so ignore focus events.
@@ -3918,6 +4272,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from core.monitor import get_monitor, get_pending_appid
         from core.resolvers import get_appid_from_url, is_launcher_url
 
+        # An Unreal game is a small launcher and the packaged game binary it starts. The one added is the game binary: it
+        # owns the window and the saves and stays running for the whole session (a launcher that exits right after
+        # starting the game would end the session at once). The launcher is still recognised afterwards: its name is
+        # recorded as a hint, and it is one of the same game's programs.
+        if exe_path and not is_launcher_url(exe_path):
+            chosen = self._program_to_add(exe_path)
+            if chosen != exe_path:
+                logger.info(f"{exe_path} is one of the programs of a game: {chosen} is added (it owns the game)")
+                exe_path = chosen
+
         # Launcher URL: keep it in appid for launching; leave exe_path empty
         # until the background fuzzy search finds the real file. Never store
         # steam://… (etc.) as exe_path.
@@ -3948,6 +4312,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # Try to get appid from pending (detected from parent process)
         if not appid:
             appid = get_pending_appid(exe_path) if exe_path else None
+        if not appid and exe_path:
+            # Nothing was remembered at detection (the app was restarted since, or the game is added from the queue later): Steam's log still
+            # holds the URL it started this program with, and a Steam game says which one it is by where it sits.
+            from core.launch_urls import url_for_exe
+            from core.resolvers import launcher_url_for_exe
+            appid = url_for_exe(exe_path) or launcher_url_for_exe(exe_path)
 
         # Create new game entry
         entry = GameEntry(
@@ -4010,9 +4380,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # neither the overlay's carousel nor the Overview's banner keeps
         # offering a game that is in the library now.
         if pending_key:
-            self._pending_unknown.pop(pending_key, None)
             from ui.unknown_history import remove_entry
-            remove_entry(pending_key)
+            for exe in self._install_siblings(pending_key):
+                self._pending_unknown.pop(exe, None)
+                remove_entry(exe)
         if original_url:
             self._pending_unknown.pop(original_url, None)
 
@@ -4061,21 +4432,97 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self._status_bar.showMessage(
                 t("unknown_history.banner_added", name=entry.name), 5000)
 
+    def _on_unknown_trash(self, exe_path: str):
+        """The bin on the unknown-game queue (the overlay's and the Overview's): this game leaves the queue
+        WITHOUT being banned. Nothing is added to the suppress list, and nothing that makes the next launch
+        be announced is touched - the session guard clears itself when the process exits - so the next time
+        it runs the player is asked again.
+
+        An Unreal game that is two programs (see same_unreal_install) leaves as one: the sibling is also
+        dropped from the queue and from the session map the hotkey offers from, or the game just binned
+        would be offered again by its other half. Nothing else in the queue is touched."""
+        from ui.unknown_history import remove_entry
+        siblings = self._install_siblings(exe_path)
+        for exe in siblings:
+            self._pending_unknown.pop(exe, None)
+            remove_entry(exe)
+        logger.info(f"Removed from the unknown-game queue (not banned): {exe_path}"
+                    + (f" (and {len(siblings) - 1} other program(s) of the same install)" if len(siblings) > 1 else ""))
+
+    def _install_siblings(self, exe_path: str) -> set:
+        """*exe_path* and every other program of the same Unreal game that is waiting - in the session map
+        the hotkey offers from, or in the queue. One game, however many programs it starts."""
+        from core.exe_stems import same_unreal_install
+        from ui.unknown_history import pending_entries
+        found = {exe_path}
+        found.update(k for k in list(self._pending_unknown) if same_unreal_install(k, exe_path))
+        found.update(e["exe"] for e in pending_entries() if e.get("exe") and same_unreal_install(e["exe"], exe_path))
+        try:
+            from core.monitor import get_monitor
+            found.update(get_monitor().related_programs(exe_path))
+        except Exception:
+            pass
+        return found
+
+    def _foreground_exe(self) -> str:
+        """The program that owns the window in front right now ("" when it cannot be told)."""
+        try:
+            import ctypes
+            import psutil
+            from ctypes import wintypes
+            if platform.system() != "Windows":
+                return ""
+            user32 = ctypes.WinDLL("user32")
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+            return psutil.Process(pid.value).exe() if pid.value else ""
+        except Exception:
+            return ""
+
+    def _program_to_add(self, exe_path: str) -> str:
+        """Of the programs that make up one game, the one to put in the library. The game binary of an Unreal install; for any
+        other pair, the related program that owns the window in front (a launcher that exits after starting the game, or sits
+        idle, owns none); otherwise the one that was announced."""
+        from core.exe_stems import unreal_install_root
+        group = self._install_siblings(exe_path)
+        if len(group) < 2:
+            return exe_path
+        if unreal_install_root(exe_path) is not None:
+            return exe_path
+        binary = next((e for e in group if unreal_install_root(e) is not None), None)
+        if binary:
+            return binary
+        front = self._foreground_exe()
+        if front:
+            norm = lambda p: str(p).replace("\\", "/").casefold()
+            owner = next((e for e in group if norm(e) == norm(front)), None)
+            if owner:
+                return owner
+        return exe_path
+
     def _on_suppress_overlay(self, exe_path: str):
         config = get_config()
         suppressed = config.get("suppressed_overlay_apps", [])
-        if exe_path not in suppressed:
-            suppressed.append(exe_path)
+        # An Unreal game is two programs that start together: answering for one answers for the game.
+        changed = False
+        for exe in self._install_siblings(exe_path):
+            if exe not in suppressed:
+                suppressed.append(exe)
+                changed = True
+        if changed:
             config.set("suppressed_overlay_apps", suppressed)
-        # Also remove from pending so post-exit dialog never fires
-        self._pending_unknown.pop(exe_path, None)
-        self._session_shown_exes.discard(exe_path)
-        # Drop it from the persisted unknown-game queue too: a suppressed
-        # app must stop counting on the overlay badge and disappear from
-        # every view of the queue — the overlay's carousel and the Overview's
-        # banner both hear about it from here.
         from ui.unknown_history import remove_entry
-        remove_entry(exe_path)
+        for exe in self._install_siblings(exe_path) | {exe_path}:
+            # Also remove from pending so post-exit dialog never fires
+            self._pending_unknown.pop(exe, None)
+            self._session_shown_exes.discard(exe)
+            # Drop it from the persisted unknown-game queue too: a suppressed
+            # app must stop counting on the overlay badge and disappear from
+            # every view of the queue — the overlay's carousel and the Overview's
+            # banner both hear about it from here.
+            remove_entry(exe)
 
     # ── Hotkeys ───────────────────────────────────────────────────────────────
 
@@ -4101,6 +4548,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """
         if not self._overlay:
             return
+        logger.info("Overlay hotkey pressed")
+        # Whatever this shows was asked for by the player: it gets the pointer (an automatic notice does not).
+        self._overlay.note_user_summon()
 
         # Ahead of everything else: an unanswered warning that something
         # is putting older saves back. It stays re-summonable for as long as
@@ -4154,6 +4604,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         entry.name, gid, _newest_id, unbacked=True)
                 elif notif_type == "no_local":
                     self._overlay.show_cloud_saves_no_local(entry.name, entry.exe_path)
+                elif notif_type == "no_local_copies":
+                    if not self._pending_cloud_verify.get(entry.exe_path or ""):
+                        continue       # the candidates are gone: nothing to pick from
+                    self._overlay.show_cloud_saves_no_local_copies(
+                        entry.name, entry.exe_path,
+                        several=len(self._pending_cloud_verify[entry.exe_path]["folders"]) > 1)
                 elif notif_type == "remote_renamed":
                     info = self._pending_remote_rename.get(gid) or {}
                     if not info:
@@ -4161,9 +4617,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     self._overlay.show_remote_renamed(
                         entry.name, entry.exe_path, info.get("name") or info.get("folder", ""))
                 elif notif_type == "different_machine":
-                    self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path)
+                    self._overlay.show_cloud_saves_different_machine(
+                        entry.name, entry.exe_path, compare=self._entry_has_live_saves_on_disk(entry))
                 elif notif_type == "sync_prompt":
-                    self._overlay.show_cloud_saves(entry.name, entry.exe_path)
+                    self._overlay.show_cloud_saves(entry.name, entry.exe_path, compare=True)
                 elif notif_type in ("conflict_diverged", "conflict_unreconciled"):
                     self._overlay.show_cloud_conflict_resolve(
                         entry.name, entry.exe_path,
@@ -4210,19 +4667,25 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # ones above, but still worth bringing back on request.
         if self._pending_path_changed:
             (game_id, new_exe_path), (game_name, alternates) = next(iter(self._pending_path_changed.items()))
-            self._overlay.show_path_changed(game_name, game_id, new_exe_path, alternates)
+            _e = get_library().get_by_id(game_id)
+            self._overlay.show_path_changed(
+                game_name, game_id, new_exe_path, alternates,
+                same_install=bool(_e and self._same_install_as_card(_e, new_exe_path)))
             return
 
         # Check if overlay is currently showing a tracking popup for a known game.
         # NOTE: use the module-level get_library — a function-local re-import
         # here would shadow it for the WHOLE method and crash the earlier use
         # in the pending-cloud branch above (UnboundLocalError).
-        if self._overlay.isVisible() and hasattr(self._overlay, '_context_exe') and self._overlay._context_exe:
-            known_game = get_library().get_by_exe(self._overlay._context_exe)
-            
-            if known_game:
+        if self._overlay.isVisible():
+            known_game = (get_library().get_by_exe(self._overlay._context_exe)
+                          if getattr(self._overlay, '_context_exe', '') else None)
+            # (The overlay says itself what it is showing: a tracking notice is one whether or not its program is found in the
+            # library by path - it was not, in a real game, and the press then only closed the notice.)
+            if known_game or getattr(self._overlay, '_overlay_mode', '') == 'tracking':
                 # Known-game tracking popup: close it, then open the manual
                 # overlay once the hide has started.
+                logger.debug("Overlay hotkey: a tracking notice is up - closing it and opening the manual overlay")
                 self._overlay.hide_animated()
                 self._overlay._auto_hide_timer.stop()
                 self._overlay._auto_hide_ms = 0
@@ -4258,6 +4721,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
 
         # Default behavior: show manual overlay
+        logger.debug("Overlay hotkey: the manual overlay is %s (showing: %r, program %r)",
+                     "up - closing it" if self._overlay.isVisible() and self._overlay.windowOpacity() > 0.3 else "opening",
+                     getattr(self._overlay, '_overlay_mode', '?'), getattr(self._overlay, '_context_exe', '?'))
         stats = self._overview_page.get_stats_for_overlay()
         self._overlay.show_manual(stats)
 
@@ -4868,7 +5334,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.debug("Data guard run failed", exc_info=True)
 
     def _setup_auto_export_config(self):
-        """Schedule encrypted config uploads to the sync provider."""
+        """Keep the configuration on the sync provider in step with the library and the settings: it is
+        pushed when they CHANGE (a few seconds after the last change), never on a timer. The hourly look
+        only retries what could not go out (a game was running, the provider was offline)."""
         self._auto_export_timer = QTimer(self)
         self._auto_export_timer.setInterval(self._VERIFY_RECHECK_MS)
         self._auto_export_timer.timeout.connect(self._maybe_run_auto_export_config)
@@ -4876,31 +5344,41 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         QTimer.singleShot(self._VERIFY_FIRST_DELAY_MS,
                           self._maybe_run_auto_export_config)
         self._auto_export_thread = None
+        self._config_dialog_open = False
+        self._config_snoozed: dict = {}         # kind -> (what was found, when): "not now"
+        self._config_held_games: set = set()    # games whose sync waited for the answer
+        self.config_conflict.connect(self._show_config_conflict)
+        get_orchestrator().config_held.connect(lambda gid, pre: self.config_conflict.emit(pre, "sync", gid))
+        get_orchestrator().sync_finished.connect(self._config_sync_point)
+        lib = get_library()
+        lib.game_added.connect(lambda *_: self._export_config_soon())
+        lib.game_removed.connect(lambda *_: self._export_config_soon())
+        lib.game_updated.connect(lambda *_: self._export_config_soon())
 
-    def _maybe_run_auto_export_config(self, force: bool = False):
-        """Upload config to the sync provider if enabled and due. *force*: an edit brought it
-        forward (see _export_config_soon), so the interval is not waited for."""
+    def _maybe_run_auto_export_config(self, force: bool = False, look: bool = False, pull_only: bool = False):
+        """Keep the configuration on the sync provider in step: look at what is there (core.config_sync.preflight)
+        and, if the library or the settings changed since the last push, push - unless the file is not the one
+        this PC last wrote or read: then nothing is uploaded until the player has decided.
+
+        With the switch on, this runs on every change and as a sync point (*look*: after a game's sync the file is
+        looked at even when this PC has nothing to push, which is how it hears of the other PC's changes). With it
+        off, nothing runs by itself: the configuration goes up only as the outcome of a conflict the player has just
+        answered (*force*), and a download of saves only LOOKS (*pull_only*: never uploads)."""
         cfg = get_config()
-        if not cfg.get("auto_export_config_enabled", False):
+        if not (force or pull_only or cfg.get("auto_export_config_enabled", True)):
             return
         if self._auto_export_thread is not None and self._auto_export_thread.is_alive():
             return
         if get_monitor().currently_playing():
-            logger.debug("Auto config export postponed — a game is running")
-            if force:
-                # (the edit is not forgotten: the next hourly look finds the export due)
-                cfg.set("auto_export_config_last", "")
+            logger.debug("Auto config export postponed - a game is running")
             return
-
-        days = max(1, int(cfg.get("auto_export_config_interval_days", 7)))
-        last = "" if force else (cfg.get("auto_export_config_last", "") or "")
-        if last:
-            try:
-                from datetime import datetime, timedelta
-                if datetime.utcnow() - datetime.fromisoformat(last) < timedelta(days=days):
-                    return
-            except (ValueError, TypeError):
-                pass
+        from core.config_sync import is_push_due
+        due = (not pull_only) and is_push_due()
+        if not (due or look or pull_only):
+            return
+        # Titles another PC added are no conflict: with the switch on, and once this PC has read or written the file
+        # (the first meeting with an existing configuration is asked about), they are brought in without a question.
+        quiet = bool(cfg.get("auto_export_config_enabled", True)) and bool(cfg.get("last_cloud_config_hash", ""))
 
         import threading
         from datetime import datetime
@@ -4910,31 +5388,173 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 from sync import get_orchestrator
                 orch = get_orchestrator()
                 if not orch.is_online() or not orch.provider:
-                    logger.debug("Auto config export postponed — provider offline")
+                    logger.debug("Auto config export postponed - provider offline")
                     return
-                from core.config_transfer import (
-                    upload_config_to_cloud, save_config_snapshot,
-                )
-                result = upload_config_to_cloud(
-                    orch.provider, skip_if_unchanged=True)
+                from core import config_sync
+                from core.config_transfer import upload_config_to_cloud, save_config_snapshot
+                provider = orch.provider
+                pre = config_sync.preflight(provider, fresh=due)
+                if pre.kind == "unavailable":
+                    logger.info(f"Config sync postponed: the file on the provider could not be looked at ({pre.detail})")
+                    return
+                if not due and pre.kind in ("shrunk", "unreadable"):
+                    return      # (nothing to write, so nothing to ask: those questions are about overwriting)
+                if pre.kind == "foreign" and not pre.merges:
+                    # titles the other PC added, and no merge: no conflict
+                    if quiet:
+                        self.config_conflict.emit(pre, "auto-import", "")
+                    elif not pull_only:
+                        self.config_conflict.emit(pre, "push", "")      # (the first meeting with an existing configuration)
+                    return
+                if pre.kind != "clear":
+                    logger.info(f"Config sync held: {pre.kind}")
+                    self.config_conflict.emit(pre, "push", "")
+                    return
+                if not due:
+                    return
+                result = upload_config_to_cloud(provider, skip_if_unchanged=True)
                 if result is True:
                     save_config_snapshot("auto_upload")
-                    get_config().set(
-                        "auto_export_config_last",
-                        datetime.utcnow().isoformat())
-                    logger.info("Scheduled config export uploaded to cloud")
+                    get_config().set("auto_export_config_last", datetime.utcnow().isoformat())
+                    logger.info("Config pushed to the cloud")
                 elif result is None:
-                    get_config().set(
-                        "auto_export_config_last",
-                        datetime.utcnow().isoformat())
-                    logger.info("Scheduled config export skipped — unchanged")
+                    config_sync.note_pushed(provider)
+                    logger.info("Config push skipped - unchanged")
                 else:
-                    logger.warning("Scheduled config export failed")
+                    logger.warning("Config push failed")
             except Exception as e:
-                logger.debug(f"Scheduled config export error: {e}")
+                logger.debug(f"Config sync error: {e}")
 
         self._auto_export_thread = threading.Thread(target=_run, daemon=True)
         self._auto_export_thread.start()
+
+    # The wait after a game's sync before the configuration is looked at: a sync of everything is one look.
+    _CONFIG_POINT_MS = 5000
+
+    def _config_sync_point(self, game_id: str = "", result=None):
+        """A game's sync has finished: a point where the configuration is kept in step too. With the switch on,
+        every one is (the file is looked at, and pushed if something changed); with it off, only a download of saves
+        is - on request - and it only looks. A sync that failed, was let go, or is still waiting is not."""
+        if result is not None and (not getattr(result, "success", False) or getattr(result, "config_declined", False)):
+            return
+        on = bool(get_config().get("auto_export_config_enabled", True))
+        download = getattr(result, "direction", "") == "down"
+        if not (on or download):
+            return
+        timer = getattr(self, "_config_point_timer", None)
+        if timer is None:
+            timer = self._config_point_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._config_point_run)
+        timer.start(self._CONFIG_POINT_MS)
+
+    def _config_point_run(self):
+        """Switch on: look, and push what changed. Off (a download of saves got us here): only look."""
+        if get_config().get("auto_export_config_enabled", True):
+            self._maybe_run_auto_export_config(look=True)
+        else:
+            self._maybe_run_auto_export_config(pull_only=True)
+
+    # ── When the configuration on the provider is not the one this PC last read ──
+
+    _CONFIG_SNOOZE_S = 600
+
+    def _show_config_conflict(self, pre, source: str, game_id: str = ""):
+        """Ask what to do (see ui.dialogs.config_conflict_dialog), on the GUI thread. *game_id*: a sync of that
+        game - a download of its saves included - is waiting in the orchestrator for the answer (config_held).
+        A game is never interrupted: while one is running, or after "not now", the waiting sync is dropped
+        (the question comes back at the next sync) and the status bar says so."""
+        import time
+        if source == "auto-import":
+            self._auto_import_library(pre)
+            return
+        if self._config_dialog_open:
+            if game_id:
+                self._config_held_games.add(game_id)        # (it is answered with the question that is open)
+            return
+        key = pre.fingerprint or pre.kind
+        snoozed = self._config_snoozed.get(pre.kind)
+        postponed = bool(snoozed and snoozed[0] == key and time.monotonic() - snoozed[1] < self._CONFIG_SNOOZE_S)
+        playing = bool(get_monitor().currently_playing())
+        if postponed or playing:
+            if game_id:
+                get_orchestrator().release_held(game_id, run=False)
+            if playing:
+                self._status_bar.showMessage(t("sync.config_differs", game=""), 8000)
+            return
+        if game_id:
+            self._config_held_games.add(game_id)
+        self._config_dialog_open = True
+        try:
+            from ui.dialogs.config_conflict_dialog import ConfigConflictDialog
+            dlg = ConfigConflictDialog(pre, self)
+            dlg.exec()
+            choice, pairs = dlg.choice, dlg.merge_pairs
+        finally:
+            self._config_dialog_open = False
+        self._resolve_config_conflict(pre, choice, pairs, key)
+
+    def _auto_import_library(self, pre):
+        """The other PC added titles and made no merge: they are brought in without a question (no path, program or
+        provider record of a game this library already has is touched), and what is due goes up afterwards."""
+        from core import config_sync
+        summary = config_sync.import_library(pre, [])
+        self._status_bar.showMessage(t("config_sync.status_synced", machine=pre.machine_name or "?",
+                                       added=summary.get("games_added", 0)), 8000)
+        QTimer.singleShot(500, lambda: self._maybe_run_auto_export_config(look=True))
+
+    def _resolve_config_conflict(self, pre, choice: str, pairs: list, key: str = ""):
+        import time
+        from core import config_sync
+        orch = get_orchestrator()
+        held = list(self._config_held_games)
+        self._config_held_games.clear()
+        if choice == "later":
+            self._config_snoozed[pre.kind] = (key, time.monotonic())
+            for gid in held:
+                orch.release_held(gid, run=False)
+            return
+        ids = set()
+        if choice == "import":
+            summary = config_sync.import_library(pre, pairs)
+            self._status_bar.showMessage(t("config_sync.status_imported", machine=pre.machine_name or "?",
+                                           added=summary.get("games_added", 0), merged=len(summary.get("merged", []))), 10000)
+            if summary.get("merge_skipped"):
+                information_window_modal(self, t("app.name"), t("config_sync.merge_skipped"))
+            for m in pre.merges:
+                ids.update((m["keep_id"], m["absorb_id"]))
+        elif choice == "separate":
+            res = config_sync.keep_separate(pre)
+            self._status_bar.showMessage(t("config_sync.status_separate"), 10000)
+            ids.update(res.get("forked", {}))
+        elif choice == "overwrite":
+            self._overwrite_cloud_config()
+            self._status_bar.showMessage(t("config_sync.status_overwritten"), 8000)
+        self._config_snoozed.pop(pre.kind, None)
+        QTimer.singleShot(500, lambda: self._maybe_run_auto_export_config(force=True))
+        # What waited goes on as it was asked (a download stays a download, and restores afterwards), with the game as
+        # it is now. Keeping the library apart does not take the other PC's saves: a download that waited is dropped.
+        for gid in held:
+            orch.release_held(gid, run=True, skip_downloads=(choice == "separate"))
+        for gid in ids - set(held):
+            if get_library().get_by_id(gid) is not None:
+                self._sync_game(gid)
+
+    def _overwrite_cloud_config(self):
+        """The player chose to replace what is on the provider with this PC's configuration."""
+        import threading
+
+        def _run():
+            try:
+                from sync import get_orchestrator
+                orch = get_orchestrator()
+                if orch.is_online() and orch.provider:
+                    from core.config_transfer import upload_config_to_cloud
+                    upload_config_to_cloud(orch.provider, skip_if_unchanged=False)
+            except Exception as e:
+                logger.debug(f"Config overwrite error: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── GitHub Releases check ─────────────────────────────────────────────────
 
@@ -5191,6 +5811,18 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 self._watcher.update_game_paths(e.id, e.save_paths)
         lib.game_updated.connect(_on_game_updated)
 
+        # A program that has just become part of a game - added as a new game, or as another version on a card (the
+        # path-changed prompt's choice) - is no longer unknown: the queue forgets it at once.
+        def _prune_unknown_queue(_entry=None):
+            try:
+                from ui.unknown_history import pending_entries
+                pending_entries()
+            except Exception:
+                logger.debug("Could not refresh the unknown-game queue", exc_info=True)
+
+        lib.game_added.connect(_prune_unknown_queue)
+        lib.game_updated.connect(_prune_unknown_queue)
+
         def _on_game_removed(gid: str):
             self._watcher.unwatch_game(gid)
             self._last_known_paths.pop(gid, None)
@@ -5299,13 +5931,17 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             return
 
         # 1) Discovery — surface actually-modified folders for confirmation.
-        exe_dir = ""
-        if entry.exe_path:
-            try:
-                exe_dir = str(Path(entry.exe_path).parent)
-            except Exception:
-                exe_dir = ""
-        self._discover_pending_paths_for(entry, exe_dir)
+        # "Auto-scan save paths" (settings) is the switch of live detection, and this is the half of it that actually sees saves: the
+        # open-file poll and the panel at exit obeyed it, the watcher did not - unticked, it went on proposing folders and starting
+        # provisional backups. (Reactive backups, below, are another option: backup_during_game.)
+        if get_config().get("auto_scan_on_exit", True):
+            exe_dir = ""
+            if entry.exe_path:
+                try:
+                    exe_dir = str(Path(entry.exe_path).parent)
+                except Exception:
+                    exe_dir = ""
+            self._discover_pending_paths_for(entry, exe_dir)
 
         # Backup from here is OFF by default and stays that way for polling-only
         # setups. The scheduled _ingame_backup_tick runs on the configured
@@ -5342,6 +5978,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """
         if not entry:
             return
+        try:
+            get_hotkey_manager().restart_listener("a game started")
+        except Exception:
+            logger.debug("Could not restart the hotkey listener", exc_info=True)
 
         # Bring back the notes and images that were pinned for THIS game.
         try:
@@ -5449,6 +6089,34 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from ui.helpers import trim_process_memory
         QTimer.singleShot(600, lambda: trim_process_memory(full=True))
 
+    def _on_live_tracking_setting(self, key: str, value) -> None:
+        """"Auto-scan save paths" (live detection of saves while a game runs) was switched in Settings: it takes effect NOW, for the games
+        being played. It was read only when a game started, and - to stop - on the loop's next 60-second beat: switched on in the middle
+        of a game it did nothing until the next launch, and nothing said so either way."""
+        if key != "auto_scan_on_exit":
+            return
+        try:
+            if value:
+                started = []
+                for game in get_monitor().currently_playing():
+                    if game.id not in self._live_tracking_timers:
+                        self._start_live_tracking_loop(game)
+                        started.append(game.name)
+                logger.info("Live tracking switched ON in Settings%s",
+                            f" - started for: {', '.join(started)}" if started else " (no game is running; it starts with the next one)")
+            else:
+                stopped = 0
+                for game_id in list(self._live_tracking_timers):
+                    timer = self._live_tracking_timers.pop(game_id, None)
+                    if timer is not None:
+                        timer.stop()
+                        timer.deleteLater()
+                        stopped += 1
+                logger.info("Live tracking switched OFF in Settings%s",
+                            f" - stopped for {stopped} running game(s)" if stopped else " (no game is running)")
+        except Exception:
+            logger.debug("could not apply the live-tracking setting", exc_info=True)
+
     def _start_live_tracking_loop(self, entry: GameEntry):
         """Poll open files every 60 s while game is running.
 
@@ -5540,6 +6208,11 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         return
 
                     from core.save_detector import detect_save_paths
+                    # A Wine/Proton game: the prefix it runs in is read from its own process (wherever the player keeps it).
+                    try:
+                        self._watcher.refresh_game_prefix(game_id, pid)
+                    except Exception:
+                        logger.debug("could not watch the game's prefix", exc_info=True)
                     # Known paths feed the temporal-correlation stage: a
                     # container folder written in the same instant as one of
                     # these is claimed even without any name linkage.
@@ -5602,6 +6275,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         timer.timeout.connect(_poll)
         timer.start()
         self._live_tracking_timers[game_id] = timer
+        logger.info("Live tracking started for %s: open files checked every 60 s, and the file watcher on its save folders", entry.name)
 
         # Also fire immediately (after a short delay so the process settles)
         QTimer.singleShot(1000, _poll)
@@ -6103,6 +6777,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         if self._overlay:
             self._overlay.dismiss_unverified_match(proc_name, game_id)
 
+    @staticmethod
+    def _same_install_as_card(entry, exe_path: str) -> bool:
+        """Is *exe_path* a program of the install the card already holds (a 64-bit build beside the 32-bit one) rather than the game from somewhere else? Decides
+        what the question says: 'a different program of its folder', or 'a different location'."""
+        from core.exe_stems import shares_install
+        try:
+            return any(held and shares_install(held, exe_path) for held, _lbl in entry.all_exe_paths())
+        except Exception:
+            return False
+
     def _on_game_path_changed(self, entry, new_exe_path: str, alt_ids=None):
         """*entry* was matched by name/stem but is running from a path that
         differs from the one on record — offer to track it, overwrite the
@@ -6129,29 +6813,16 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # "it's actually …" corrections the live prompt did, not a version
         # that silently lost them.
         self._pending_path_changed[(entry.id, new_exe_path)] = (entry.name, alternates)
-        self._overlay.show_path_changed(entry.name, entry.id, new_exe_path, alternates)
+        self._overlay.show_path_changed(entry.name, entry.id, new_exe_path, alternates,
+                                        same_install=self._same_install_as_card(entry, new_exe_path))
 
     def _on_path_changed_expired(self, context: str):
-        """show_path_changed timed out with nobody clicking anything —
-        applies the same safe default a click on "Add to this game" would,
-        EXCEPT the actual save-data copy: that waits for the match to be
-        unambiguous (see show_path_changed's own docstring), so it only
-        runs here when there were no alternates to begin with. The pending
-        entry is deliberately left in _pending_path_changed — this default
-        taking effect is not the same as the question being answered, and
-        the hotkey must still be able to bring it back and correct it."""
-        game_id, _, new_exe_path = context.partition("|")
-        entry = get_library().get_by_id(game_id)
-        if not entry:
-            return
-        pending = self._pending_path_changed.get((game_id, new_exe_path))
-        has_alternates = bool(pending[1]) if pending else False
-        moved = self._rebase_save_paths_to_new_exe(entry, new_exe_path)
-        if not moved:
-            return
-        get_library().update_game(entry)
-        if not has_alternates:
-            self._carry_rebased_save_data(entry, new_exe_path, moved)
+        """show_path_changed timed out with nobody clicking anything. Nothing is
+        done: a path is added to a game only by the answer, never by silence.
+        (The prompt no longer expires on its own; this stays for anything that
+        still raises the signal.) The pending entry is left in
+        _pending_path_changed, so the hotkey can bring the question back."""
+        return
 
     def _identity_still_ambiguous(self, game_id: str) -> list:
         """The (game_id, name) alternates still on offer for *game_id*'s
@@ -6267,9 +6938,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 entry.name, entry.id, new_exe_path, is_data_copy=True)
 
     def _apply_path_add_version(self, entry, new_exe_path: str):
-        """"Add to this game" — the version itself is already registered by
-        the monitor the moment it was first seen (core/monitor.py's
-        game_path_changed docstring). The rest is the "transfer": rebase
+        """"Add to this game" — the version is registered HERE, by the answer: the
+        monitor only tracks the process as it arrives and raises the question
+        (core/monitor.py's _settle_path_change); nothing is added before the
+        player says so. Then the "transfer": rebase
         install-folder-relative save paths onto the new location, same as
         a restore does, then carry the actual save DATA across too (see
         _carry_rebased_save_data) — nothing here asks the user anything
@@ -6280,6 +6952,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         (the primary button's own click, whatever the dropdown also
         held) — any backup taken while that was still a mystery gets
         promoted out of temporary status right here, same game_id."""
+        entry = get_library().get_by_id(entry.id) or entry
+        entry.record_exe_version(new_exe_path)
+        get_library().update_game(entry)
         moved = self._rebase_save_paths_to_new_exe(entry, new_exe_path)
         if moved:
             get_library().update_game(entry)
@@ -6292,10 +6967,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             self.on_game_config_changed(entry.id, "save paths (new version)")
 
     def _apply_path_overwrite(self, entry, new_exe_path: str):
-        """Replace the primary path outright — the auto-registered version
-        entry is removed rather than kept, per the "overwrite discards it"
-        rule (add-a-version and overwrite would otherwise do the same
-        thing). The primary always swaps immediately; whether save_paths
+        """Replace the primary path outright — a version entry for it (one an
+        older build registered on its own) is removed rather than kept, per the
+        "overwrite discards it" rule (add-a-version and overwrite would
+        otherwise do the same thing). The primary always swaps immediately; whether save_paths
         get rebased onto it depends on what's already there:
 
         - the ordinary case (a plain reinstall/update — nothing of its own
@@ -6440,10 +7115,38 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _on_unknown_game(self, name: str, exe_path: str):
         """Unknown process started: check for cloud saves first; fall back to add-to-library."""
-        if get_library().get_by_exe(exe_path) is not None:
+        if get_library().knows_exe(exe_path):
             return
         config = get_config()
-        if exe_path in config.get("suppressed_overlay_apps", []):
+        suppressed_apps = config.get("suppressed_overlay_apps", [])
+        if exe_path in suppressed_apps:
+            return
+        from core.exe_stems import same_unreal_install
+        if any(same_unreal_install(exe_path, s) for s in suppressed_apps):
+            logger.info(f"{exe_path} belongs to a game that was answered \"don't show again\" - not announced")
+            return
+        # An Unreal Engine game is two programs - the launcher in its install folder and the packaged
+        # binary three folders down - that start together, and each used to be announced as a game of
+        # its own. If the library already has one of them, this is that game; if one was announced this
+        # session, it speaks for the install, and this one is only remembered (the hotkey can still add
+        # the one that owns the window).
+        if any(g.exe_path and same_unreal_install(exe_path, g.exe_path) for g in get_library().all_games()):
+            logger.info(f"{exe_path} belongs to a game already in the library - not announced separately")
+            return
+        if any(same_unreal_install(exe_path, other) for other in self._session_shown_exes):
+            self._pending_unknown[exe_path] = name
+            logger.info(f"{exe_path} belongs to an install already announced - not announced separately")
+            return
+        # Any other game that is a launcher and the program it starts: related by the process tree and the install folder
+        # (core.monitor.ProcessMonitor._related_program). The one announced first speaks for the game.
+        try:
+            from core.monitor import get_monitor
+            related = get_monitor().related_programs(exe_path)
+        except Exception:
+            related = set()
+        if related and any(r in self._session_shown_exes or get_library().knows_exe(r) for r in related):
+            self._pending_unknown[exe_path] = name
+            logger.info(f"{exe_path} is another program of a game already announced or in the library - not announced separately")
             return
         # Session map first: even with the live popup off, the hotkey must
         # still be able to offer "add this" for the unknown process in the
@@ -6495,15 +7198,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         if not get_library().folder_name_in_use_by_other(folder, ""):
                             # Every cloud folder sharing this base name (Alpha,
                             # Alpha_2, …). 1 → normal prompt; 2+ → a real conflict.
-                            cloud_folders = orch.cloud_name_folders(folder)
-                            if not cloud_folders and provider.list_cloud_backups(folder):
-                                cloud_folders = [folder]   # enumeration unsupported; base has saves
-                            candidates = []
-                            for cf in cloud_folders:
-                                reg_name, reg_path = self._cloud_folder_registration(provider, cf)
-                                candidates.append(
-                                    {"folder": cf, "name": reg_name or name, "path": reg_path}
-                                )
+                            candidates = self._same_name_cloud_copies(orch, folder, name)
                             if candidates:
                                 cloud_meta = {"folders": candidates}
             except Exception:
@@ -6897,6 +7592,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
     def _on_sync_finished(self, game_id: str, result):
         from datetime import datetime
+        if getattr(result, "config_declined", False):
+            # Not a failure: the other PC merged this game, the player said "not now" (or the card is gone).
+            return
         entry = get_library().get_by_id(game_id)
         name = entry.name if entry else ""
         if not name:
@@ -7851,27 +8549,44 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         logger.debug("Could not mark the renamed game as pending sync", exc_info=True)
                     entry = get_library().get_by_id(game_id) or entry
                 if (entry.sync_status == "pending" and entry.save_paths
-                        and get_config().get("auto_sync_after_backup", False)):
+                        and get_config().get("auto_sync_after_backup", True)):
                     logger.info(f"Auto-syncing {entry.name} after it was renamed")
                     self._sync_game(game_id)
+        if "merged" in parts:
+            self._sync_after_merge(game_id)
         if "details" in parts:
             self._export_config_soon()
+
+    def _sync_after_merge(self, game_id: str) -> None:
+        """Cards that had been in the cloud were merged into this one: send it now, whatever "sync
+        after backup" says - the person asked for the merge, and the provider still holds the other
+        card's copy under its own folder. The sync is what copies it under this card's folder and,
+        once that is confirmed, removes the old one (see core.merge_cards). Offline, or with a sync
+        already running for the game, the card is left "pending" (the merge itself sets it) and the next sync
+        does the same."""
+        entry = get_library().get_by_id(game_id)
+        if entry is None:
+            return
+        if not get_orchestrator().is_online():
+            logger.info(f"{entry.name} was merged; it is synced when a provider is connected")
+            return
+        logger.info(f"Syncing {entry.name} after cards were merged into it")
+        self._sync_game(game_id)
 
     # The wait before an edit's configuration export, so that several edits in a row make one.
     _EXPORT_SOON_MS = 20_000
 
     def _export_config_soon(self) -> None:
-        """Bring the scheduled configuration export forward, shortly: the library's descriptions
-        of the games changed, and that upload is how another PC hears of it. Only when the person
-        switched the export on, and the export itself still skips an upload that would change
-        nothing."""
-        if not get_config().get("auto_export_config_enabled", False):
+        """The library or the settings changed: push the configuration once things have been quiet for a
+        moment. Only when the person switched the export on; whether anything that matters changed is
+        decided by the push itself (core.config_sync.is_push_due)."""
+        if not get_config().get("auto_export_config_enabled", True):
             return
         timer = getattr(self, "_export_soon_timer", None)
         if timer is None:
             timer = self._export_soon_timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self._maybe_run_auto_export_config(force=True))
+            timer.timeout.connect(self._maybe_run_auto_export_config)
         timer.start(self._EXPORT_SOON_MS)
 
     def on_game_config_changed(self, game_id: str, what: str = "") -> None:
@@ -7997,7 +8712,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 #
                 # Deferred a turn so the completion notice for the backup
                 # half is on screen before the sync half takes it over.
-                if then_sync or get_config().get("auto_sync_after_backup", False):
+                if then_sync or get_config().get("auto_sync_after_backup", True):
                     QTimer.singleShot(0, self._sync_all_after_backup)
         if not batch:
             with self._backup_lock:
@@ -8351,7 +9066,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     # did. The sweep syncs ONCE when it finishes — see
                     # _finish_backup_job — so the setting is still honoured.
                     if (not batch and not _is_provisional
-                            and config.get("auto_sync_after_backup", False)
+                            and config.get("auto_sync_after_backup", True)
                             and entry.save_paths):
                         # Not while THIS game is still the one playing: the
                         # periodic in-game backup timer (see
@@ -8429,7 +9144,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     )
                     if (not batch and not _is_provisional
                             and _needs_reconcile
-                            and config.get("auto_sync_after_backup", False)
+                            and config.get("auto_sync_after_backup", True)
                             and entry.save_paths):
                         orch = get_orchestrator()
                         if orch.is_online():
@@ -8497,7 +9212,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     self._overlay.show_backup_done(name, skipped=True)
         # Not per item inside a sweep, for the same reason the library path
         # is not: the sweep syncs once at the end instead.
-        if created and not batch and config.get("auto_sync_after_backup", False):
+        if created and not batch and config.get("auto_sync_after_backup", True):
             logger.info("Auto-syncing after the backup of archive %s", name)
             self._sync_archive(game_id)
 
@@ -8854,7 +9569,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # "xdg-open" — a Linux command macOS does not have, so launching by
         # launcher URL simply failed there — and to exec the exe path
         # directly, which cannot work for a macOS .app (a directory).
-        from core.resolvers import launch_executable, launch_with_url
+        from core.resolvers import NoWindowsRunnerError, launch_executable, launch_with_url
         launched_via_url = False
         if entry.appid:
             if launch_with_url(entry.appid):
@@ -8865,8 +9580,20 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         if not launched_via_url:
             try:
-                launch_executable(entry.exe_path)
-                self._status_bar.showMessage(f"{t('core.launching')} {entry.name}…", 3000)
+                note = launch_executable(entry.exe_path)
+                if note == "fetching_proton":
+                    # umu has no Proton to use yet and downloads one: minutes in which nothing shows on screen unless the player is told.
+                    self._status_bar.showMessage(t("core.launch_fetching_proton", name=entry.name), 20000)
+                else:
+                    self._status_bar.showMessage(f"{t('core.launching')} {entry.name}…", 3000)
+            except NoWindowsRunnerError as e:
+                # Not a failure to start but nothing to start it WITH: said clearly, on screen until it is read - a status-bar line is gone in 5 s.
+                logger.warning(f"Launch failed for {entry.exe_path}: {e}")
+                self._status_bar.showMessage(f"{t('core.launch_failed')}: {entry.name}", 5000)
+                warning_window_modal(
+                    self, t("core.launch_no_runner_title"),
+                    t("core.launch_no_runner_macos" if e.platform == "macos" else "core.launch_no_runner_linux", name=entry.name))
+                return
             except Exception as e:
                 self._status_bar.showMessage(f"{t('core.launch_failed')}: {e}", 5000)
                 logger.warning(f"Launch failed for {entry.exe_path}: {e}")

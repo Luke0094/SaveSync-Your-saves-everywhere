@@ -20,17 +20,15 @@ from typing import Optional, Union, List, Set, Dict
 
 from core.constants import (
     SAVE_FOLDER_HINTS, WATCH_PATHS_TEMPLATES, SKIP_EXTENSIONS,
-    DETECTION_SKIP_EXTENSIONS, SKIP_FILENAME_STEMS, USER_DATA_DIR,
+    DETECTION_SKIP_EXTENSIONS, SKIP_FILENAME_STEMS,
     is_chromium_internal_dir, strip_version_tokens, extract_version_token,
+    locate_version_token,
     CAMEL_SPLIT_RE, match_slug, slug_weight,
 )
 from core.config_manager import get_config
 from core import is_relative_to as _is_relative_to
 from core import win_open_files
 import i18n
-
-# Resolve SaveSync's own data dir once — never detect it as a game save path
-_OWN_DATA_DIR = str(USER_DATA_DIR.resolve()).lower()
 
 # _is_valid_save_context's strict gate: a folder's OWN NAME must be an EXACT
 # match against this (not just contain one of these words, the way the
@@ -137,6 +135,8 @@ _SAVE_EXTENSIONS = frozenset({
 # _BACKUP_SKIP_DIRS; the scan set adds OS/system/browser/AV/app folders.
 from core.skip_dirs import SCAN_SKIP_DIRS as _SKIP_DIRS
 from core.skip_dirs import is_renpy_sync_mirror, renpy_sync_between  # noqa: F401  (re-exported)
+from core.skip_dirs import engine_data_between, is_unity_runtime_data  # noqa: F401  (re-exported)
+from core.skip_dirs import is_own_data_path, is_os_virtual_location, is_steam_client_data, is_wine_internal_path
 
 # Generic exe stems that are meaningless as search terms or context.
 # Shared across save detection and API search.
@@ -155,6 +155,7 @@ from core.exe_stems import (
     UPDATER_STEMS as _UPDATER_STEMS,
     HELPER_TOOL_STEMS as _HELPER_TOOL_STEMS,
     AMBIGUOUS_TOOL_STEMS as _AMBIGUOUS_TOOL_STEMS,
+    unreal_install_root as _unreal_install_root,
 )
 
 GENERIC_EXE_STEMS = (
@@ -346,7 +347,16 @@ def _clean_ancestor_folder_name(n: str) -> str:
     v1.2 - Win" reduces to just "Game"). Shared by derive_display_name's
     main match and its one-level-up "fuller name" check.
     """
-    cleaned = strip_version_tokens(n)
+    # The whole version marker first ("v0_7_1EA" - strip_version_tokens alone stops at
+    # "v0_7" and would leave "_1EA" on the title), then the generic strip for
+    # everything it knows. strip_version_tokens itself is untouched: it also builds
+    # the cloud-folder identity of a game, which must not change.
+    span = locate_version_token(n)
+    if span:
+        n_for_strip = n[:span[0]].rstrip(' ._-([') + ' ' + n[span[1]:].lstrip(')] ')
+    else:
+        n_for_strip = n
+    cleaned = strip_version_tokens(n_for_strip)
     cleaned = re.sub(r'[\[\]\(\)\{\}]', ' ', cleaned)
     cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(' ._-')
     try:
@@ -384,10 +394,32 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
     try:
         p = Path(exe_path)
         stem = p.stem.strip()
-        if stem and stem.lower() not in _GENERIC_EXE_STEMS:
+        # An Unreal Engine game's binary is named after the engine PROJECT ("Project-Win64-Shipping"),
+        # which is not the title: its title is the install folder, three levels above it.
+        unreal_root = _unreal_install_root(exe_path)
+        if stem and stem.lower() not in _GENERIC_EXE_STEMS and unreal_root is None:
             return stem
         # Generic stem → nearest meaningful ancestor folder name
-        cur = p.parent
+        return install_folder_title(exe_path) or fallback or stem
+    except (OSError, ValueError):
+        return fallback or Path(exe_path).stem
+
+
+def install_folder_title(exe_path: str, past_containers: bool = True) -> str:
+    """The install folder's name as a title - the nearest folder above the executable that is neither generic (``data``, ``bin``, ``win64``,
+    ``game``…: where an engine keeps its runtime, or what a build is called) nor a container (``steamapps``, ``common``, ``Games``,
+    ``Program Files``, ``Downloads``, ``Users``…), with version and release decoration taken off. "" when there is none. Pure string work.
+
+    What derive_display_name falls back to when the executable's own name says nothing; and, kept beside the detected name, a reference that
+    needs no list of engines to be right - for the programs a list of known player names has not met yet.
+
+    *past_containers*: a name has to come from SOMEWHERE, so derive_display_name goes on up past a container to whatever is above it. A
+    reference does not: once the walk reaches ``Games`` or ``Downloads`` the folder it came from was no install at all, and what lies above
+    (a user's name, a drive) is not the game's title - nothing is better than that."""
+    try:
+        p = Path(exe_path)
+        unreal_root = _unreal_install_root(exe_path)
+        cur = unreal_root if unreal_root is not None else p.parent
         while cur != cur.parent:
             n = cur.name.strip()
             nl = n.lower()
@@ -404,10 +436,12 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
                                 and not fuller[len(best):len(best) + 1].isalnum()):
                             best = fuller
                 return best
+            if nl in _CONTAINER_DIR_NAMES and not past_containers:
+                return ""
             cur = cur.parent
-        return fallback or stem
-    except (OSError, ValueError):
-        return fallback or Path(exe_path).stem
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
 
 
 def find_version_near(exe_path: str) -> str:
@@ -686,11 +720,24 @@ def is_skipped_save_location(path_str: str, exe_path: str = "", depth: Optional[
 
 def is_never_save_location(path_str: str) -> bool:
     """True when *path_str* is in, or under, a folder that is never a save location whatever
-    the engine: Ren'Py's own ``sync`` mirror, ``<Ren'Py data folder>/<game>/sync`` - recognised by
-    where it is, never by its name (see core.skip_dirs). The narrow question the file watcher
-    asks of every write: it has no engine exceptions and does not need to know the game, so it
-    is cheap enough to run on each event."""
-    return is_renpy_sync_mirror(path_str)
+    the engine - each recognised by where it is, never by its name (see core.skip_dirs):
+
+    - SaveSync's own data folder (backups, logs, cache, library). SaveSync names a game's backup
+      folder after the game, so without this a backup written there reads as the game's own
+      write and the folder is proposed in the save-confirmation panel.
+    - Ren'Py's own ``sync`` mirror, ``<Ren'Py data folder>/<game>/sync``.
+    - The kernel's virtual folders (/dev, /proc, /sys): /dev/shm holds the shared-memory file Wine and
+      Proton keep open while a Windows game runs, which read as the game saving.
+    - What Wine and Proton keep for themselves inside a prefix (registry files, update stamps, dosdevices,
+      drive_c/windows).
+    - The Steam client's own data (its interface's Chromium profile, caches, logs): written all the while a game runs.
+    - Unity's own files in a game's data folder (`LocalLow/<company>/<game>`): player logs, Addressables catalogs, Analytics, the asset cache, crash
+      reports, the I2 Localization cache.
+
+    The narrow question the file watcher asks of every write: it has no engine exceptions and
+    does not need to know the game, so it is cheap enough to run on each event."""
+    return (is_own_data_path(path_str) or is_renpy_sync_mirror(path_str) or is_os_virtual_location(path_str)
+            or is_wine_internal_path(path_str) or is_steam_client_data(path_str) or is_unity_runtime_data(path_str))
 
 
 def _renpy_install_root(exe_dir: Path) -> Optional[Path]:
@@ -912,7 +959,12 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
     # ── Bakin ────────────────────────────────────────────────────────────────
     # Bakin keeps the runtime in data/ and the player's saves beside it, so
     # this one is under the install rather than the user's profile.
+    # The tracked executable is the title's own launcher beside data/, or - when
+    # the process monitor caught the player a launcher starts - bakinplayer.exe
+    # inside data/ itself, where the saves are one level down, not two.
     bakin_saves = exe_dir / "data" / "savedata"
+    if not bakin_saves.is_dir() and exe_dir.name.lower() == "data":
+        bakin_saves = exe_dir / "savedata"
     if bakin_saves.is_dir():
         results.append((92, str(bakin_saves)))
 
@@ -1018,7 +1070,8 @@ def _engine_paths(exe_path: str, game_name: str, appid: Optional[str] = None,
                             remote = appid_folder / "remote"
                             if remote.exists():
                                 results.append((90, str(remote)))
-                            else:
+                            elif not any(part.lower() == "steam" for part in userdata_root.parts):
+                                # (Steam's own app folder holds only its Cloud bookkeeping, remotecache.vdf: never proposed. Another launcher's may hold saves.)
                                 results.append((85, str(appid_folder)))
                 except OSError:
                     pass
@@ -1243,7 +1296,17 @@ def _dir_has_recent_activity(path_str: str, since_ts: float, slack: float = 2.0,
 # whenever it finishes. One check per pid: the handle set is largest and
 # most active right after launch, so a first-poll match is the signal that
 # matters, and each check still costs one ~1s psutil call (off-thread).
-_OPEN_FILES_VERIFY_POLLS = 1
+#
+# OFF by default since a real game's logs: "off the critical path" is not off the GUI. psutil holds the GIL for the whole call, so a
+# detached thread freezes the entire process, the GUI included, for as long as the call lasts - 1 s on a small game, and 8 s to 38 s
+# (log: "no tick for 38s", the freeze ending the instant the [DIAG] line was written) on a game with a tree of processes and
+# hundreds of pipe handles. Meanwhile the tracking notice could not be clicked or painted, the hotkey did nothing, and a window
+# shown in that time stayed empty and still took the mouse. Parity was logged on many games (identical sets; the only differences
+# were language-pack .mui files) - that is the check this was for. Set SAVESYNC_VERIFY_OPEN_FILES=1 to run it again.
+try:
+    _OPEN_FILES_VERIFY_POLLS = int(os.environ.get("SAVESYNC_VERIFY_OPEN_FILES", "0") or 0)
+except ValueError:
+    _OPEN_FILES_VERIFY_POLLS = 0
 _open_files_verify_lock = _threading.Lock()
 _open_files_verify_counts: dict = {}
 
@@ -1409,6 +1472,13 @@ def _live_save_paths(pid: int) -> list[str]:
             # exit, unexpected ctypes failure). Fall back to psutil, which
             # sometimes has access the fast path doesn't — and if that
             # also fails, this process just contributes no fds this poll.
+            # psutil holds the GIL for the whole call, which freezes the GUI for as long as it lasts (tens of seconds on a
+            # process with hundreds of handles - see _OPEN_FILES_VERIFY_POLLS): only for a process with few handles.
+            try:
+                if win_open_files.AVAILABLE and proc_obj.num_handles() > 300:
+                    return proc_obj.pid, []
+            except Exception:
+                pass
             try:
                 return proc_obj.pid, proc_obj.open_files()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -1485,8 +1555,9 @@ def _live_save_paths(pid: int) -> list[str]:
             f_parts = {part.lower() for part in fp.parts}
             if f_parts & _SKIP_DIRS:
                 continue
-            # Ren'Py's own mirror of its save folder (by place, not by name)
-            if is_renpy_sync_mirror(fp):
+            # Ren'Py's own mirror of its save folder, and SaveSync's own data
+            # folder (backups, cache, logs) - both by place, not by name
+            if is_never_save_location(fp):
                 continue
 
             # Chromium/NW.js/CEF player-profile tree: keep a game's own
@@ -1760,6 +1831,7 @@ def _wine_prefix_dirs() -> list[Path]:
                    home / "Games" / "Heroic" / "Prefixes",
                    home / ".config" / "heroic" / "tools" / "wine",
                    home / ".local" / "share" / "lutris" / "runners" / "winesteam" / "prefix",
+                   home / "Games" / "umu",                  # umu-launcher's own default: ~/Games/umu/<game id>
                    home / "Games"):
         if not parent.is_dir():
             continue
@@ -1768,23 +1840,75 @@ def _wine_prefix_dirs() -> list[Path]:
         except OSError:
             continue
     for entry in _recent_dirs(managed):
-        out.extend(_prefix_user_dirs(entry))
+        out.extend(_prefix_user_dirs(entry) or _prefix_user_dirs(entry / "pfx"))      # (a Proton-style folder keeps the prefix in pfx/)
     return out
 
 
-def compat_prefix_roots(appid: str = "") -> list[Path]:
+def game_prefix_dirs(pid: int = 0, exe_path: str = "") -> list[Path]:
+    """The save-bearing directories of THE Wine/Proton prefix one game runs in, wherever the player put it.
+
+    Players keep prefixes anywhere (umu, Lutris, Bottles, Heroic, a hand-made WINEPREFIX, a Steam library on another disk), and a list of known
+    places will always miss one. The game itself knows: Wine and Proton both set WINEPREFIX - and Proton STEAM_COMPAT_DATA_PATH - in the
+    environment of the whole process tree, and an exe that sits inside a prefix names it by its path. Empty on Windows, or when nothing says
+    this game runs in a prefix.
+    """
+    if _SYSTEM == "Windows":
+        return []
+    candidates: list[Path] = []
+    if pid:
+        try:
+            import psutil
+            proc = psutil.Process(int(pid))
+            for p in [proc] + proc.children(recursive=True):
+                try:
+                    env = p.environ()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    continue
+                for key in ("WINEPREFIX", "STEAM_COMPAT_DATA_PATH"):
+                    if env.get(key):
+                        candidates.append(Path(env[key]))
+        except Exception as e:
+            logger.debug(f"Could not read the prefix of process {pid}: {e}")
+    if exe_path:
+        try:
+            from core.resolvers import wine_prefix_for
+            inside = wine_prefix_for(exe_path)
+            if inside:
+                candidates.append(Path(inside))
+        except Exception as e:
+            logger.debug(f"Could not tell whether {exe_path!r} is inside a prefix: {e}")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for c in candidates:
+        key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        # the prefix itself (<c>/drive_c), or a Proton compat folder that keeps it in pfx/
+        dirs = _prefix_user_dirs(c) or _prefix_user_dirs(c / "pfx")
+        for d in dirs:
+            if d not in out:
+                out.append(d)
+    return out
+
+
+def compat_prefix_roots(appid: str = "", pid: int = 0, exe_path: str = "", own_only: bool = False) -> list[Path]:
     """Save roots inside Wine/Proton prefixes. Empty on Windows.
 
     With *appid* this answers one question only — "where does THIS Steam game
     save under Proton" — and leaves the standalone Wine prefixes out: they
     belong to other games, and the caller adds them anyway through the
     no-appid call that builds the general watch list.
+
+    *pid* / *exe_path*: the same question for a game that has no appid (umu, Lutris, Bottles, a hand-made prefix): its own prefix is read from the
+    running process or from where its exe sits (game_prefix_dirs), wherever it is. *own_only*: never the general list of every prefix.
     """
     if _SYSTEM == "Windows":
         return []
     try:
-        found = _proton_prefix_dirs(appid)
-        if not appid:
+        own = game_prefix_dirs(pid, exe_path) if (pid or exe_path) else []
+        found = own + _proton_prefix_dirs(appid)
+        if not appid and not own and not own_only:
             found += _wine_prefix_dirs()
     except Exception as e:
         logger.debug(f"Wine/Proton prefix lookup failed: {e}")
@@ -1952,11 +2076,8 @@ def _score_folder(folder: Path, game_name: str, hints: list[str], exe_path: Opti
     path_str = str(folder).lower().replace("\\", "/")
 
     # Never score SaveSync's own data directory
-    try:
-        if str(folder.resolve()).lower().startswith(_OWN_DATA_DIR):
-            return 0
-    except (OSError, ValueError):
-        pass
+    if is_own_data_path(folder):
+        return 0
     # ...nor Ren'Py's own mirror of a save folder
     if is_renpy_sync_mirror(folder):
         return 0
@@ -2417,13 +2538,10 @@ def detect_save_paths(
                 logger.debug(f"Added registry save entry: {path_str}")
             return
 
-        # Never detect SaveSync's own data directory as a game save path
-        try:
-            if str(Path(path_str).resolve()).lower().startswith(_OWN_DATA_DIR):
-                logger.debug(f"Skipping own data dir: {path_str}")
-                return
-        except (OSError, ValueError):
-            pass
+        # Never detect SaveSync's own data directory, or any other folder that is never a save location, as a game save path
+        if is_never_save_location(path_str):
+            logger.debug(f"Skipping a folder that is never a save location: {path_str}")
+            return
 
         # Skip paths whose components match _SKIP_DIRS (lib, savesync, etc.),
         # unless the engine this game was built with is one that genuinely
@@ -2799,8 +2917,8 @@ def path_has_backup_content(path_str, include_detection_excluded: bool = True,
                 rel_parts = f.relative_to(p).parts
                 if any(part.lower() in skip_dirs for part in rel_parts[:-1]):
                     continue
-                if renpy_sync_between(p, rel_parts):
-                    continue            # (Ren'Py's mirror of this folder: a copy, not content)
+                if engine_data_between(p, rel_parts):
+                    continue            # (Ren'Py's mirror of this folder, Unity's own files: not content)
             except ValueError:
                 pass
             return True

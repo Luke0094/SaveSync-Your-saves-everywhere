@@ -8,7 +8,7 @@ the text overflows.
 """
 import time
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QPainter, QPalette
 from PySide6.QtWidgets import QSizePolicy, QStyle, QStyleOption, QWidget
 
@@ -30,6 +30,7 @@ class MarqueeLabel(QWidget):
         if self._flexible:
             self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._text = ""
+        self._wanted = False                    # fit() asked for it to be shown, and it had no parent to be shown in yet
         self._pad = max(0, int(pad))
         self._hover = False
         self._offset = 0.0
@@ -74,13 +75,27 @@ class MarqueeLabel(QWidget):
         Shown only when there is text."""
         self.set_text(text)
         if not self._text:
+            self._wanted = False
             self.setVisible(False)
             return 0
         self.ensurePolished()
         width = min(self.text_width() + 2 * self._pad + 2, max(2 * self._pad + 8, int(max_width)))
         self.setFixedSize(width, self.fontMetrics().height() + 2)
-        self.setVisible(True)
+        # A label that has no parent yet (a card builds its chips before it lays them out) is not shown: shown, it is a window of its
+        # own - a flash on the desktop, and over a game in exclusive fullscreen a real window, dozens of them while a page is built,
+        # right before the game was taken to the desktop (the log of a real game). It is shown when it gets its parent.
+        if self.parentWidget() is not None:
+            self._wanted = False
+            self.setVisible(True)
+        else:
+            self._wanted = True
         return width
+
+    def event(self, e):
+        if e.type() == QEvent.Type.ParentChange and self._wanted and self.parentWidget() is not None:
+            self._wanted = False
+            self.setVisible(True)
+        return super().event(e)
 
     def overflows(self) -> bool:
         return self.text_width() > self._avail()

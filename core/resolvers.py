@@ -814,7 +814,7 @@ def launch_with_url(url: str) -> bool:
         elif sys.platform == 'darwin':
             subprocess.Popen(["open", url])
         else:
-            subprocess.Popen(["xdg-open", url])
+            subprocess.Popen(["xdg-open", url], env=_unbundled_env(os.environ))
         logger.info(f"Launched via URL: {url}")
         return True
     except Exception as e:
@@ -822,8 +822,20 @@ def launch_with_url(url: str) -> bool:
         return False
 
 
-def launch_executable(exe_path: str) -> None:
+class NoWindowsRunnerError(RuntimeError):
+    """A Windows program was asked to run on a system with nothing to run it: no Wine and no Proton (through umu-launcher). The message is for the
+    log; the caller tells the player in their own language. *platform* ("linux" / "macos") says which advice applies."""
+
+    def __init__(self, message: str, platform: str = "linux"):
+        super().__init__(message)
+        self.platform = platform
+
+
+def launch_executable(exe_path: str) -> str:
     """Start the game at *exe_path*, the way THIS platform starts things.
+
+    Returns "" - or "fetching_proton" when umu-launcher has no Proton to use yet and downloads one first (minutes in which nothing shows on screen,
+    so the caller says so).
 
     The counterpart of launch_with_url, and platform-split for the same
     reason: the three systems do not agree on what "run this file" means.
@@ -836,13 +848,13 @@ def launch_executable(exe_path: str) -> None:
     """
     if _IS_WINDOWS:
         os.startfile(exe_path)          # type: ignore[attr-defined]
-        return
+        return ""
     if _IS_MACOS and Path(exe_path).suffix.lower() == _MACOS_BUNDLE_SUFFIX:
         try:
             subprocess.Popen(["open", exe_path])
         except OSError as e:
             logger.warning("Failed to open macOS bundle %s: %s", exe_path, e)
-        return
+        return ""
     # A .exe is not something this kernel can run. Off Windows it goes
     # through Wine or Proton, in the prefix it belongs to.
     if Path(exe_path).suffix.lower() == ".exe":
@@ -855,16 +867,20 @@ def launch_executable(exe_path: str) -> None:
                                  cwd=str(Path(exe_path).parent))
             except OSError as e:
                 logger.warning("Failed to launch %s: %s", exe_path, e)
-            return
-        raise RuntimeError(
+                return ""
+            return "fetching_proton" if (Path(command[0]).name == "umu-run" and env.get("PROTONPATH") == "GE-Proton") else ""
+        raise NoWindowsRunnerError(
             "This is a Windows executable and there is no Wine or Proton "
-            "on this system to run it with. Install wine, or launch the "
-            "game through Steam so its own Proton is used."
+            "on this system to run it with. Install umu-launcher (umu-run: "
+            "it fetches Proton by itself) or wine, or launch the game "
+            "through Steam so its own Proton is used.",
+            "macos" if _IS_MACOS else "linux",
         )
     try:
-        subprocess.Popen([exe_path])
+        subprocess.Popen([exe_path], env=None if _IS_WINDOWS else _unbundled_env(os.environ))
     except OSError as e:
         logger.warning("Failed to launch %s: %s", exe_path, e)
+    return ""
 
 
 def wine_prefix_for(exe_path) -> str:
@@ -922,6 +938,97 @@ def _proton_for_prefix(prefix: str) -> str:
     return str(builds[-1])
 
 
+def _inside(path: str, roots) -> bool:
+    p = os.path.normpath(path)
+    for r in roots:
+        if r:
+            r = os.path.normpath(r)
+            if p == r or p.startswith(r.rstrip(os.sep) + os.sep):
+                return True
+    return False
+
+
+_BUNDLE_PATH_VARS = ("LD_LIBRARY_PATH", "QT_PLUGIN_PATH", "QML2_IMPORT_PATH", "XDG_DATA_DIRS", "PYTHONPATH")
+
+
+def _unbundled_env(env) -> dict:
+    """A copy of *env* for a program that is NOT part of this app: a system python, Wine or Proton, a file manager, a native game.
+
+    A frozen build / an AppImage points the loader at the libraries it carries - LD_LIBRARY_PATH, and Qt's plugin paths - and a program that
+    inherited them loads those instead of its own (a file manager built on Qt would take SaveSync's Qt plugins). PyInstaller keeps the
+    original LD_LIBRARY_PATH in LD_LIBRARY_PATH_ORIG, but an AppImage's AppRun has already put its own folder in front of it, so what is restored
+    still names the bundle: every entry inside the bundle (sys._MEIPASS, $APPDIR) is dropped as well. A copy of *env* otherwise unchanged when
+    this is not a bundled run."""
+    env = dict(env)
+    frozen = bool(getattr(sys, "frozen", False))
+    if not (frozen or env.get("APPDIR")):
+        return env
+    bundle = [getattr(sys, "_MEIPASS", ""), env.get("APPDIR", "")]
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
+    elif frozen:
+        env.pop("LD_LIBRARY_PATH", None)
+    for var in _BUNDLE_PATH_VARS:
+        value = env.get(var)
+        if not value:
+            continue
+        kept = [p for p in value.split(os.pathsep) if p and not _inside(p, bundle)]
+        if kept:
+            env[var] = os.pathsep.join(kept)
+        else:
+            env.pop(var, None)
+    if env.get("PYTHONHOME") and _inside(env["PYTHONHOME"], bundle):
+        env.pop("PYTHONHOME")
+    return env
+
+
+def find_umu_run() -> str:
+    """umu-launcher's ``umu-run``, or "". Looked for beyond $PATH: a desktop session often has no ~/.local/bin on it, which is where an
+    install without root puts it."""
+    found = shutil.which("umu-run")
+    if found:
+        return found
+    for location in ("~/.local/bin/umu-run", "/usr/local/bin/umu-run", "/usr/bin/umu-run"):
+        candidate = Path(location).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def find_proton_build() -> str:
+    """The newest Proton installed outside any one prefix, as the folder PROTONPATH wants (the one holding the ``proton`` script), or "".
+    Custom builds (GE-Proton) live in a Steam ``compatibilitytools.d``, Steam's own Proton in ``steamapps/common``."""
+    home = Path.home()
+    steam_roots = (home / ".local" / "share" / "Steam", home / ".steam" / "root", home / ".steam" / "steam",
+                   home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam")
+    folders = [Path("/usr/share/steam/compatibilitytools.d")]
+    for root in steam_roots:
+        folders += [root / "compatibilitytools.d", root / "steamapps" / "common"]
+    builds, seen = [], set()
+    for folder in folders:
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not (entry.is_dir() and (entry / "proton").is_file()):
+                    continue
+                real = str(entry.resolve())
+            except OSError:
+                continue
+            if real not in seen:
+                seen.add(real)
+                builds.append(entry)
+    if not builds:
+        return ""
+
+    def rank(build: Path):
+        numbers = tuple(int(n) for n in re.findall(r"\d+", build.name))
+        return (numbers or (-1,), build.name.lower().startswith("ge-"))      # "Proton - Experimental" has no number: last resort
+    return str(max(builds, key=rank))
+
+
 def windows_runner_command(exe_path) -> tuple:
     """``(argv, env)`` that runs *exe_path*, or ``(None, None)``.
 
@@ -930,10 +1037,15 @@ def windows_runner_command(exe_path) -> tuple:
     already holds its registry. Wine otherwise, with WINEPREFIX pointed at
     whatever prefix the executable sits in, so a game keeps writing its
     saves where it has always written them.
+
+    With no Wine at all, umu-launcher (``umu-run``): Proton without Steam, which fetches the Steam runtime itself, and a standalone game
+    gets umu's own standard prefix (~/Games/umu/umu-default) - the same one a hand-run ``umu-run`` uses, whatever the entry is called.
+    Wine stays ahead of it: the runner decides which prefix a game uses, so changing it for someone who already launches through Wine
+    would send their saves to a new place.
     """
     if _IS_WINDOWS:
         return None, None
-    env = dict(os.environ)
+    env = _unbundled_env(os.environ)
     prefix = wine_prefix_for(exe_path)
 
     proton = _proton_for_prefix(prefix) if prefix else ""
@@ -951,11 +1063,150 @@ def windows_runner_command(exe_path) -> tuple:
         return [proton, "run", str(exe_path)], env
 
     runner = env.get("WINE") or shutil.which("wine") or shutil.which("wine64")
-    if not runner:
+    if runner:
+        if prefix:
+            env["WINEPREFIX"] = prefix
+        return [runner, str(exe_path)], env
+    umu = find_umu_run()
+    if not umu or prefix or _IS_MACOS:
+        # (a prefix somebody else's runner made is left to that runner: Proton upgrades a prefix in place)
         return None, None
-    if prefix:
-        env["WINEPREFIX"] = prefix
-    return [runner, str(exe_path)], env
+    env.setdefault("GAMEID", "umu-default")
+    if not env.get("PROTONPATH"):
+        build = find_proton_build()
+        if not build:
+            logger.warning("No Proton build is installed: umu-launcher will download GE-Proton on the first launch (several hundred MB)")
+        env["PROTONPATH"] = build or "GE-Proton"
+    return [umu, str(exe_path)], env
+
+
+_WINE_LOADERS = frozenset({"wine", "wine64", "wine32", "wine-preloader", "wine64-preloader", "wine32-preloader"})
+
+
+def is_wine_loader(exe) -> bool:
+    """True for the executable the OS reports for a Windows program running under Wine/Proton - the loader, not the program."""
+    return Path(str(exe or "")).name.lower() in _WINE_LOADERS
+
+
+def _wine_prefix_of_process(proc) -> str:
+    """The prefix a Wine process runs in, read from its own environment or its parents'."""
+    chain = [proc]
+    try:
+        chain += list(proc.parents())[:6]
+    except Exception:
+        pass
+    for p in chain:
+        try:
+            env = p.environ()
+        except Exception:
+            continue
+        if env.get("WINEPREFIX"):
+            return env["WINEPREFIX"]
+        if env.get("STEAM_COMPAT_DATA_PATH"):
+            return os.path.join(env["STEAM_COMPAT_DATA_PATH"], "pfx")
+    return ""
+
+
+def wine_program_path(proc) -> str:
+    """The Unix path of the Windows program a Wine/Proton process *proc* runs, or "" when that cannot be told.
+
+    The OS names a Wine process by its LOADER (wine64-preloader), which says nothing about which program it is. The program is in its command
+    line as a Windows path - ``X:\\Games\\My Game\\Game.exe``, padded with spaces - and the Unix folder a drive letter stands for is in the
+    prefix's own ``dosdevices``. Never the loader: matching a game to that path would register the loader as the game's executable."""
+    try:
+        argv = proc.cmdline()
+    except Exception:
+        return ""
+    command = (argv[0] if argv else "").strip()
+    if not command:
+        return ""
+    if command.startswith('"'):
+        end = command.find('"', 1)
+        program = command[1:end] if end > 0 else command[1:]
+    else:
+        m = re.match(r"(.+?\.(?:exe|com|bat|cmd|scr))(?:\s|$)", command, re.IGNORECASE)
+        program = m.group(1) if m else command
+    drive = re.match(r"^([A-Za-z]):[\\/](.*)$", program)
+    if not drive:
+        return program if program.startswith("/") and os.path.isfile(program) else ""
+    letter, rest = drive.group(1).lower(), drive.group(2)
+    base = ""
+    prefix = _wine_prefix_of_process(proc)
+    for folder in ((Path(prefix), Path(prefix) / "pfx") if prefix else ()):
+        link = folder / "dosdevices" / f"{letter}:"
+        if link.exists():
+            base = os.path.realpath(link)
+            break
+    if not base and letter == "z":
+        base = "/"                                  # (Wine always maps Z: to the root)
+    if not base:
+        return ""
+    current = base
+    for part in [p for p in re.split(r"[\\/]+", rest) if p]:
+        nxt = os.path.join(current, part)
+        if not os.path.exists(nxt):
+            try:
+                same = next((n for n in os.listdir(current) if n.casefold() == part.casefold()), None)    # (Windows paths are not case-sensitive)
+            except OSError:
+                return ""
+            if same is None:
+                return ""
+            nxt = os.path.join(current, same)
+        current = nxt
+    return current if os.path.isfile(current) else ""
+
+
+def _epic_manifests_dir() -> Optional[Path]:
+    """Where the Epic Games Launcher keeps one ``.item`` file per installed game (Windows)."""
+    base = os.environ.get("ProgramData") or ("C:\\ProgramData" if os.name == "nt" else "")
+    return Path(base) / "Epic" / "EpicGamesLauncher" / "Data" / "Manifests" if base else None
+
+
+def epic_manifest_for_exe(exe_path) -> Optional[dict]:
+    """The Epic manifest of the game *exe_path* belongs to - ``{"ns", "item", "app", "url"}`` - found by where the program sits: the launcher's
+    ``.item`` file for each installed game names its ``InstallLocation``, and the three ids that make up its launch URL
+    (``com.epicgames.launcher://apps/<CatalogNamespace>%3A<CatalogItemId>%3A<AppName>?action=launch&silent=true``, the one an Epic desktop icon
+    holds). The deepest install folder containing the program wins; two different games at the same depth give None (a wrong URL starts the wrong game)."""
+    try:
+        import json
+        folder = _epic_manifests_dir()
+        if folder is None or not folder.is_dir():
+            return None
+        exe = os.path.normcase(os.path.normpath(str(exe_path)))
+        best, best_len, ambiguous = None, -1, False
+        for item in folder.glob("*.item"):
+            try:
+                d = json.loads(item.read_text(encoding="utf-8-sig", errors="replace"))
+            except (OSError, ValueError):
+                continue
+            loc = os.path.normcase(os.path.normpath(str(d.get("InstallLocation") or "")))
+            if not loc or loc in (".", os.sep) or not (exe == loc or exe.startswith(loc + os.sep)):
+                continue
+            ns, cat, app = d.get("CatalogNamespace"), d.get("CatalogItemId"), d.get("AppName")
+            if not (ns and cat and app):
+                continue
+            if len(loc) > best_len:
+                best, best_len, ambiguous = (ns, cat, app), len(loc), False
+            elif len(loc) == best_len and best != (ns, cat, app):
+                ambiguous = True
+        if best is None or ambiguous:
+            return None
+        ns, cat, app = best
+        return {"ns": ns, "item": cat, "app": app,
+                "url": f"com.epicgames.launcher://apps/{ns}%3A{cat}%3A{app}?action=launch&silent=true"}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def epic_launch_url_for_exe(exe_path) -> Optional[str]:
+    """The Epic Games Launcher URL that starts the game *exe_path* belongs to, or None - see epic_manifest_for_exe."""
+    m = epic_manifest_for_exe(exe_path)
+    return m["url"] if m else None
+
+
+def launcher_url_for_exe(exe_path) -> Optional[str]:
+    """The launch URL of a game from where its files sit, for any launcher that keeps a manifest per installed game: Steam, then Epic."""
+    return steam_launch_url_for_exe(exe_path) or epic_launch_url_for_exe(exe_path)
 
 
 def get_appid_from_url(url: str) -> Optional[str]:
@@ -963,6 +1214,46 @@ def get_appid_from_url(url: str) -> Optional[str]:
     parsed = parse_launcher_url(url)
     if parsed:
         return parsed.get("appid")
+    return None
+
+
+_ACF_INSTALLDIR_RE = re.compile(r'"installdir"\s+"([^"]*)"', re.IGNORECASE)
+_ACF_NAME_RE = re.compile(r'appmanifest_(\d+)\.acf$', re.IGNORECASE)
+
+
+def steam_launch_url_for_exe(exe_path) -> Optional[str]:
+    """``steam://rungameid/<appid>`` for a game Steam installed, read off WHERE its program sits: ``<library>/steamapps/common/<installdir>/...``.
+    The same ``steamapps`` folder holds ``appmanifest_<appid>.acf`` for each installed game, and that file names the install folder - so the
+    program's place says which game it is, with Steam running or not, launched by Steam or by hand, and long after the process is gone.
+
+    The process's parent is no help for this: a game started from the Steam window is a child of the already-running client, whose command
+    line has no app id in it. None when the program is not under a Steam library, no manifest names that folder, or two do (a wrong URL starts
+    the wrong game, which is worse than none). Reads a handful of small files; never called per poll."""
+    try:
+        p = Path(str(exe_path))
+        parts = p.parts
+        low = [x.lower() for x in parts]
+        i = next((k for k in range(1, len(low) - 1) if low[k] == "common" and low[k - 1] == "steamapps"), -1)
+        if i < 0 or i + 2 >= len(parts):          # (an install folder, and a program inside it)
+            return None
+        installdir = parts[i + 1].casefold()
+        steamapps = Path(*parts[:i])
+        ids = set()
+        for mf in steamapps.glob("appmanifest_*.acf"):
+            m_id = _ACF_NAME_RE.search(mf.name)
+            if not m_id:
+                continue
+            try:
+                text = mf.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            m = _ACF_INSTALLDIR_RE.search(text)
+            if m and m.group(1).casefold() == installdir:
+                ids.add(m_id.group(1))
+        if len(ids) == 1:
+            return f"steam://rungameid/{next(iter(ids))}"
+    except (OSError, ValueError, TypeError, StopIteration):
+        pass
     return None
 
 

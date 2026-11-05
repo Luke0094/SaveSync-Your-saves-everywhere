@@ -6,7 +6,7 @@ Provides a dark blur background effect for modal dialogs and windows.
 - Supports transparency and blur effects
 """
 import logging
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, Signal
 from PySide6.QtGui import QPainter, QColor, QBrush
 from PySide6.QtWidgets import QWidget, QApplication
 
@@ -19,8 +19,34 @@ _FADE_OUT_MS = 280
 from ui.helpers import force_topmost, ScreenSignalMixin
 
 
+def backdrop_visible() -> bool:
+    """Is a dimming backdrop on screen (the application's, the [i] panel's, a picker's)? The pins stay under it: they put themselves back
+    above everything on a timer, which left them over the picker, the save panel and the conflict panel."""
+    try:
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, BlurModalWidget) and w.isVisible():
+                return True
+    except RuntimeError:
+        pass
+    return False
+
+
+def _pins_back() -> None:
+    """The backdrop has gone: the pins climb back on top at once, not on the next beat of their timer."""
+    try:
+        from ui.widgets import pins
+        if pins._manager is not None and not backdrop_visible():
+            pins._manager.assert_topmost_all("the backdrop went away")
+    except Exception:
+        logger.debug("backdrop: could not put the pins back", exc_info=True)
+
+
 class BlurModalWidget(QWidget, ScreenSignalMixin):
     """Fullscreen blur modal background widget."""
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        QTimer.singleShot(80, _pins_back)
 
     # Signal emitted when the modal is clicked (optional - can be used to close)
     background_clicked = Signal()
@@ -28,6 +54,8 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._fade_out_cb = None
+        self.setProperty("xs_keep", True)  # its band-16 window is managed by ui.exclusive_app, not swept
+        self._only_rect = None            # when set, the backdrop covers just this rectangle (the game's monitor)
         self._setup_window()
         self._setup_animation()
         self._connect_screen_changes()
@@ -88,6 +116,9 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
             return
         # Union of all screen geometries — works for multi-monitor and resolution changes
         from PySide6.QtCore import QRect
+        if self._only_rect is not None:
+            self.setGeometry(self._only_rect)
+            return
         union = QRect()
         for screen in app.screens():
             union = union.united(screen.geometry())
@@ -109,8 +140,30 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         self.cleanup()
         super().deleteLater()
 
-    def show_animated(self):
-        """Show the blur modal with fade-in animation — never steals game focus."""
+    def restrict_to(self, rect) -> None:
+        """Cover only *rect* (None: every screen again). A translucent window the size of all the monitors together is
+        costly to keep up, and over a game only the game's monitor matters."""
+        self._only_rect = rect
+        self._update_geometry()
+
+    def fade_held(self) -> bool:
+        return bool(getattr(self, "_fade_held", False))
+
+    def release_fade(self) -> None:
+        """Start the fade-in that show_animated(hold_fade=True) held back (until then the window is at opacity 0)."""
+        if self.fade_held():
+            self._fade_held = False
+            self._fade_anim.start()
+
+    def show_animated(self, raise_after_show: bool = True, hold_fade: bool = False, keep_geometry: bool = False):
+        """Show the blur modal with fade-in animation — never steals game focus.
+
+        *raise_after_show*: False where the caller has already put the window where it belongs in the stacking order (X11: directly under
+        the window it dims, MainWindow._show_backdrop_placed) - raising it would put it over that window again.
+        *hold_fade*: shown at opacity 0 and faded in only at release_fade() - once the caller has seen its place stay right.
+        *keep_geometry*: shown as it is (a 1 px window off-screen, MainWindow._show_backdrop_placed), not stretched over the screens first: the
+        caller grows it (_update_geometry) once it is in its place."""
+        self._fade_held = False
         self._fade_anim.stop()
         self._disconnect_fade_finished()
 
@@ -118,17 +171,22 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         self.setWindowOpacity(0.0)
 
         # Update geometry before showing (handles resolution changes)
-        self._update_geometry()
+        if not keep_geometry:
+            self._update_geometry()
 
         self.show()
 
         # Force topmost without activating (overlay-like, no raise_())
-        self._force_topmost()
+        if raise_after_show:
+            self._force_topmost()
 
         # Fade in
         self._fade_anim.setDuration(_FADE_IN_MS)
         self._fade_anim.setStartValue(0.0)
         self._fade_anim.setEndValue(1.0)
+        if hold_fade:
+            self._fade_held = True
+            return
         self._fade_anim.start()
 
     def force_hide(self):
@@ -137,6 +195,7 @@ class BlurModalWidget(QWidget, ScreenSignalMixin):
         Use this when the game closes or the app needs guaranteed cleanup
         (hide_animated is async and may leave the overlay visible on fast exits).
         """
+        self._fade_held = False
         try:
             self._fade_anim.stop()
             self._disconnect_fade_finished()

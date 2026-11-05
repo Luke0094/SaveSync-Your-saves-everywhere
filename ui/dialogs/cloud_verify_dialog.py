@@ -24,6 +24,11 @@ from i18n import t
 from ui.helpers import finalize_adaptive_dialog_size
 
 
+# A candidate that is a backup ON THIS PC rather than a cloud folder carries this in front of its id. No cloud folder can: ':' never
+# survives a folder name (it becomes '_'), so the two cannot be mistaken for each other.
+LOCAL_PREFIX = "local:"
+
+
 def _esc(s: str) -> str:
     return html.escape(s or "")
 
@@ -127,7 +132,11 @@ class CloudVerifyDialog(QDialog):
             rb = QRadioButton()
             self._radios.addButton(rb, idx)
             head.addWidget(rb)
-        name_lbl = QLabel(f"☁  <b>{_esc(c.get('name') or c.get('folder', ''))}</b>")
+        title = _esc(c.get('name') or c.get('folder', ''))
+        if c.get("local"):
+            name_lbl = QLabel(f"💾  <b>{title}</b> - {_esc(t('cloud_verify.local_archive'))}")
+        else:
+            name_lbl = QLabel(f"☁  <b>{title}</b>")
         head.addWidget(name_lbl)
         head.addStretch()
         rl.addLayout(head)
@@ -136,6 +145,12 @@ class CloudVerifyDialog(QDialog):
         path_lbl.setWordWrap(True)
         path_lbl.setObjectName("dialog_desc")
         rl.addWidget(path_lbl)
+        when = (c.get("when") or "")[:16].replace("T", " ")
+        if when:
+            # the date is what tells two same-named versions apart
+            when_lbl = QLabel(f"{t('cloud_verify.last_backup')}: {_esc(when)}")
+            when_lbl.setObjectName("dialog_desc")
+            rl.addWidget(when_lbl)
         return row
 
     def _on_download_selected(self):

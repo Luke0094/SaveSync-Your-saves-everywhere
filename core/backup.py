@@ -177,10 +177,11 @@ def _is_in_skipped_subdir(f: Path, root: Path, keep: frozenset = frozenset()) ->
            for part in rel_parts[:-1]):
         return True
     # Ren'Py's own mirror of the folder (<Ren'Py data folder>/<game>/sync) is a copy of what is
-    # beside it: backing it up doubled every save. By place, not by name - a "sync" folder in
-    # any other game's saves is data.
-    from core.skip_dirs import renpy_sync_between
-    return renpy_sync_between(root, rel_parts)
+    # beside it: backing it up doubled every save. Unity's own files in a game's data folder
+    # (Addressables catalogs, Analytics, caches, the I2 localization cache) are not saves at all.
+    # By place, not by name - a "sync" or "Analytics" folder in any other game's saves is data.
+    from core.skip_dirs import engine_data_between
+    return engine_data_between(root, rel_parts)
 
 
 def _library_entry(game_id: str):
@@ -6058,6 +6059,42 @@ class BackupManager(QObject):
         except Exception as e:
             logger.debug(f"Could not hash current save state for {game_id}: {e}")
             return ""
+
+    def archive_already_on_disk(self, row: "BackupEntry", dest_paths: list) -> bool:
+        """True when this machine already holds everything archive *row* would restore, byte for byte: every file of its manifest is present
+        under *dest_paths* (where a restore would put them) with the same content hash.
+
+        It answers "is there anything to download?" - NOT "is this the same game?": a backup is matched to a game by its name (see
+        find_orphan_backups_for_game) and the player is the one asked. An archive that also recorded a place that is never a save location (a Wine
+        runtime's /dev/shm, from before that was excluded) is judged by the rest: nothing there is worth restoring. False whenever the comparison
+        cannot be made (no content hashes, a registry key, nothing on disk yet): the offer stands."""
+        try:
+            manifest = (row.cloud_metadata or {}).get("file_manifest") or {}
+            if not manifest or not self._manifest_is_comparable(manifest):
+                return False
+            from core.registry_saves import is_registry_path
+            from core.save_detector import is_never_save_location
+            recorded_never = any(is_never_save_location(p) for p in (row.save_paths or []) if p and not is_registry_path(p))
+            existing = [Path(p) for p in dest_paths
+                        if p and not is_registry_path(p) and not is_never_save_location(p) and Path(p).exists()]
+            if not existing:
+                return False
+            files = self._collect_save_files(existing, frozenset())
+            local, _rf, _re, _changed, _state = self._build_manifest(files, [], {})
+            if not local:
+                return False
+            for arc, fp in manifest.items():
+                mine = local.get(arc)
+                if mine is None:
+                    if recorded_never:
+                        continue                      # (it came from that place)
+                    return False
+                if self._fp_content(mine) != self._fp_content(fp):
+                    return False
+            return True
+        except Exception:
+            logger.debug("Could not compare an archive with the disk", exc_info=True)
+            return False
 
     @staticmethod
     def _manifest_is_comparable(manifest: dict) -> bool:

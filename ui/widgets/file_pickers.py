@@ -281,6 +281,9 @@ class _LnkAwareDialog(QFileDialog):
     _FILENAME_LABEL_KEY = "file_picker.file_name"
     # The label of the "Files of type" box, with the same reason for being a class attribute.
     _FILETYPE_LABEL_KEY = "file_picker.file_type"
+    # A SAVE picker: its name box is the name of a file to be made, not a mirror of the folder. A class attribute because the
+    # accept mode is set only after the base constructor has run (and has connected the folder-to-box copy).
+    _IS_SAVE_PICKER = False
 
     # Shared across every subclass on purpose, not per-class: two of these
     # open at once — even two of the exact same subclass — hit a real Qt
@@ -438,6 +441,10 @@ class _LnkAwareDialog(QFileDialog):
     def _sync_path_field(self, path: str):
         try:
             from PySide6.QtWidgets import QLineEdit
+            # (In a SAVE picker the box is the name of the file to be made: it starts empty - or with the default name - and the
+            # folder is not written into it. A path there is taken for the name, and a file is "saved" with a folder's path in it.)
+            if self._IS_SAVE_PICKER:
+                return
             edit = self.findChild(QLineEdit, "fileNameEdit")
             if edit is None:
                 return
@@ -824,6 +831,12 @@ class _LnkAwareDialog(QFileDialog):
                 if v.objectName() in ("listView", "treeView"):
                     self._pins_views.append(v)
                     v.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                    # Qt's own handler of this signal shows its own menu (rename, delete, new folder, hidden files) - the entries ours has -
+                    # so a right-click made TWO menus (the log: two QMenus 30 ms apart). Ours is the one that stays.
+                    try:
+                        v.customContextMenuRequested.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
                     v.customContextMenuRequested.connect(
                         lambda pos, target=v: self._on_file_view_context_menu(pos, target))
         self._sidebar_view = self.findChild(QListView, "sidebar")
@@ -1001,6 +1014,30 @@ class _LnkAwareDialog(QFileDialog):
         if hidden_act:
             hidden_act.setText(t("file_picker.show_hidden"))
             hidden_act.setToolTip(t("file_picker.show_hidden"))
+
+        # Qt's own handler of this signal enables and disables these actions before it shows its menu (rename and delete only for a row the
+        # user may change, new folder unless the model is read-only) - and is disconnected in _hook_folder_context_menu, because it showed a
+        # second menu. Without it Rename and Delete stayed as the dialog made them: disabled, for good (folders could be made, not removed).
+        # Delete acts on the SELECTED rows, so the row that was right-clicked is the selection.
+        try:
+            from PySide6.QtCore import QDir, QFile, QItemSelectionModel
+            read_only = bool(model is not None and model.isReadOnly())
+            if idx.isValid() and model is not None:
+                perms = idx.parent().data(QFileSystemModel.Roles.FilePermissions)
+                may_change = bool(int(perms or 0) & int(QFile.Permission.WriteUser.value))
+                for act in (rename_act, delete_act):
+                    if act:
+                        act.setEnabled(not read_only and may_change)
+                sel = view.selectionModel()
+                if sel is not None and not sel.isSelected(idx):
+                    sel.select(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+                view.setCurrentIndex(idx)
+            if new_folder_act:
+                new_folder_act.setEnabled(not read_only)
+            if hidden_act and model is not None:
+                hidden_act.setChecked(bool(model.filter() & QDir.Filter.Hidden))
+        except Exception:
+            logger.debug("file picker: could not set the state of the menu's actions", exc_info=True)
 
         menu = QMenu(view)
 
@@ -1280,9 +1317,48 @@ class SavePickerDialog(_LnkAwareDialog):
     """Choose where to save a new file."""
 
     _ACCEPT_LABEL_KEY = "file_picker.save"
+    _IS_SAVE_PICKER = True
 
     def __init__(self, parent, caption: str, name_filter: str):
         super().__init__(parent, caption)
+        # What the name box went through, for the log when the picker is accepted: the box is typed into by a keyboard hook over a game,
+        # and a name that is replaced by another one has to be traceable to what replaced it.
+        self._name_trace = []
+        try:
+            from PySide6.QtWidgets import QLineEdit
+            edit = self.findChild(QLineEdit, "fileNameEdit")
+            if edit is not None:
+                edit.textEdited.connect(lambda s: self._name_trace.append(("typed", s)))
+                edit.textChanged.connect(lambda s: self._name_trace.append(("now", s)))
+                # A typed name that, with the default extension, is the name of a file that exists makes the dialog select that file in
+                # its list - and a selection is copied into the name box whenever the box does not really have the focus, which over a
+                # game it never has: the name under the typist's hands turned into the file's. While keys are being typed (textEdited
+                # comes before the dialog looks at the text) the list's selection does not report; it does again once the typing has
+                # been handled, so a click on a file in the list fills the box as ever.
+                from PySide6.QtWidgets import QListView
+                view = self.findChild(QListView, "listView")
+                model = view.selectionModel() if view is not None else None
+                if model is not None:
+                    def _hold_selection(_text, m=model, v=view):
+                        try:
+                            m.blockSignals(True)
+                            # Cleared as well: a file the dialog selected for an earlier state of the name stays selected, and a
+                            # selection beats the typed text when Save is pressed (it would save "tekken.png" for "tekken2").
+                            # The dialog selects again, by itself, a file that is exactly what is typed.
+                            m.clearSelection()
+                            QTimer.singleShot(0, lambda: _release_selection(m, v))
+                        except RuntimeError:
+                            pass
+
+                    def _release_selection(m, v):
+                        try:
+                            m.blockSignals(False)
+                            v.viewport().update()
+                        except RuntimeError:
+                            pass
+                    edit.textEdited.connect(_hold_selection)
+        except Exception:
+            pass
         self.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         self.setFileMode(QFileDialog.FileMode.AnyFile)
         # Explicit rather than relying on the default: picking a name that
@@ -1290,6 +1366,15 @@ class SavePickerDialog(_LnkAwareDialog):
         self.setOption(QFileDialog.Option.DontConfirmOverwrite, False)
         if name_filter:
             self.setNameFilter(name_filter)
+
+
+def _log_name_trace(dialog) -> None:
+    try:
+        trace = list(getattr(dialog, "_name_trace", []))[-16:]
+        logger.debug("Save picker accepted %r; the name box went through: %s", dialog.selectedFiles(),
+                     " | ".join(f"{k} {v!r}" for k, v in trace) or "(nothing typed)")
+    except Exception:
+        pass
 
 
 def _run_picker(dialog, start_dir: str) -> str:
@@ -1301,6 +1386,7 @@ def _run_picker(dialog, start_dir: str) -> str:
             pass
     if dialog.exec() != QFileDialog.DialogCode.Accepted:
         return ""
+    _log_name_trace(dialog)
     selected = dialog.selectedFiles()
     return selected[0] if selected else ""
 
@@ -1411,14 +1497,22 @@ def pick_files_or_folder(parent, caption: str, start_dir: str = "") -> list:
 
 
 def pick_save_path(parent, caption: str, name_filter: str = "",
-                   default_name: str = "", start_dir: str = "") -> str:
-    """Shared "save as" picker. Returns "" when cancelled."""
+                   default_name: str = "", start_dir: str = "", default_suffix: str = "") -> str:
+    """Shared "save as" picker. Returns "" when cancelled. *default_name* fills the name box; without one it starts empty.
+    *default_suffix* ("txt") is what a bare name typed gets."""
     dialog = SavePickerDialog(parent, caption, name_filter)
+    # The folder first: a bare name is worked out against the folder the picker is in when it is selected.
+    try:
+        if start_dir and Path(start_dir).is_dir():
+            dialog.setDirectory(start_dir)
+    except OSError:
+        pass
+    suffix = default_suffix.lstrip(".")
     if default_name:
         dialog.selectFile(default_name)
         # Typing a bare name must not produce an extension-less file: it would
         # then be filtered out of the very dialog used to open it again.
-        suffix = Path(default_name).suffix.lstrip(".")
-        if suffix:
-            dialog.setDefaultSuffix(suffix)
+        suffix = suffix or Path(default_name).suffix.lstrip(".")
+    if suffix:
+        dialog.setDefaultSuffix(suffix)
     return _run_picker(dialog, start_dir)

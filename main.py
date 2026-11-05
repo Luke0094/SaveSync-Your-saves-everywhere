@@ -52,6 +52,12 @@ def setup_logging():
         ],
     )
     logging.info(f"=== {APP_NAME} v{APP_VERSION} starting ===")
+    # SAVESYNC_DEBUG=1: SaveSync's own DEBUG lines too (INFO is what is written otherwise). The detail of what the windows made for a game
+    # did - each dialog adopted, how the system sees it, the typing, the menus - is DEBUG; only what is wrong is INFO or above.
+    if os.environ.get("SAVESYNC_DEBUG") == "1":
+        for _name in ("ui", "core", "hotkeys", "sync", "intel", "maintenance"):
+            logging.getLogger(_name).setLevel(logging.DEBUG)
+        logging.info("SAVESYNC_DEBUG=1: SaveSync's DEBUG lines are written too")
     if _tracing_enabled():
         _install_spawn_tracer()
 
@@ -123,10 +129,11 @@ def _acquire_lock() -> bool:
         _lock_handle = handle
         return True
 
-    # Unix: flock
-    lock_path = USER_DATA_DIR / ".savesync.lock"
+    # Unix: flock on a per-user file in the temp directory - the counterpart of the Windows mutex, and in the same place as the socket a
+    # second launch pings. It used to live INSIDE the data directory, so two launches whose data directories differ (XDG_DATA_HOME set
+    # in one shell and not in another, an AppImage with its own HOME, a sandbox) did not see each other: two instances.
+    lock_path = Path(_unix_lock_path())
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
         _lock_handle = open(lock_path, "a+")
         if fcntl is not None:
             fcntl.flock(_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -196,12 +203,18 @@ def _release_lock():
     for attr in ('_savesync_lockfh', '_savesync_lockpath'):
         if hasattr(sys, attr):
             delattr(sys, attr)
-    if _lock_file:
-        try:
-            _lock_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        _lock_file = None
+    # The lock FILE is left where it is: deleting it on the way out lets a launch that already opened it lock the deleted file while the
+    # next one creates a new one - two instances. The kernel drops the lock itself when the process ends.
+    _lock_file = None
+
+
+def _unix_lock_path() -> str:
+    """The Unix single-instance lock file: per user, in the temp directory (as the show socket is). Must stay in sync with the copy in
+    runtime_splash_hook.py."""
+    import re
+    import tempfile
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    return os.path.join(tempfile.gettempdir(), "SaveSyncLock-" + re.sub(r"\W+", "_", user))
 
 
 def _instance_show_name() -> str:
@@ -922,6 +935,14 @@ def main():
         # Apply theme
         theme = config.get("theme", "dark")
         get_theme_manager().apply(theme, app)
+
+        # Windows: lets the overlay (and its menus) be real Qt windows that can be shown over a game in exclusive
+        # fullscreen - see ui/win_band_hook.py. Harmless where it cannot be done.
+        try:
+            from ui import win_band_hook
+            win_band_hook.install()
+        except Exception:
+            logging.getLogger(__name__).debug("Band hook not installed", exc_info=True)
 
         # Release the single-instance lock early in the shutdown sequence
         # so that a quick relaunch doesn't see "already running" while

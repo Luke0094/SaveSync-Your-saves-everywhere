@@ -101,6 +101,8 @@ hiddenimports += [
     # names; SecretService is what a desktop keyring answers on.
     'pynput', 'pynput.keyboard._xorg', 'pynput.mouse._xorg',
     'pynput.keyboard._uinput',
+    # asked at run time, inside a function, whether a fullscreen window is in front (X11); and the module that asks
+    'Xlib', 'Xlib.display', 'Xlib.X', 'ui.x11_fullscreen',
     'keyring.backends', 'keyring.backends.SecretService',
     'keyring.backends.chainer', 'keyring.backends.fail',
     'secretstorage', 'jeepney',

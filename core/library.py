@@ -168,6 +168,29 @@ def normalize_languages(values) -> list:
     return out
 
 
+# Folders an engine keeps its runtime in, one level below the install: Bakin's
+# player is "<install>/data/bakinplayer.exe". The folder that NAMES the release
+# is the one above them.
+_RUNTIME_SUBDIRS = frozenset({"data", "bin", "lib", "lib64"})
+
+
+def install_folder_of(exe_path: str):
+    """The folder that names the release an executable belongs to: its own
+    folder, or the one above when it sits in an engine's runtime subfolder
+    ("<install>/data/bakinplayer.exe"). A Path, or None for an empty/odd path."""
+    try:
+        from core.exe_stems import unreal_install_root
+        root = unreal_install_root(exe_path)             # (<install>/<Project>/Binaries/Win64/<Project>-Win64-Shipping.exe: the install is three levels up)
+        if root is not None:
+            return root
+        folder = Path(exe_path).parent
+        if folder.name.lower() in _RUNTIME_SUBDIRS and folder.parent != folder                 and folder.parent.name:
+            folder = folder.parent
+        return folder if folder.name else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def derive_exe_version_label(path: str) -> str:
     """A short label for an exe *path* — the install folder's name with
     release noise stripped but the version kept, e.g. "Some Title v1.2.3"
@@ -177,10 +200,8 @@ def derive_exe_version_label(path: str) -> str:
     clean-but-keep-the-version helper so it reads like a version, not a raw
     folder name. Module-level (not a GameEntry method) so the Add/Edit Game
     dialog can preview a label before an entry even exists yet."""
-    try:
-        raw = Path(path).parent.name
-    except (OSError, ValueError):
-        return ""
+    folder = install_folder_of(path)
+    raw = folder.name if folder is not None else ""
     if not raw:
         return ""
     try:
@@ -190,7 +211,15 @@ def derive_exe_version_label(path: str) -> str:
         # on its own only catches a BRACKETED one ("[RJ123456]"); a bare
         # leading "RJ123456 Some Title v1.0" would otherwise sail through
         # whole, unlike every other game whose code happens to be bracketed.
-        return _strip_release_noise(strip_dlsite_code(raw), drop_version=False)
+        label = _strip_release_noise(strip_dlsite_code(raw), drop_version=False)
+        # _strip_release_noise reads "-" and "_" as word breaks, so "v0_7_1EA" comes out
+        # as "v0 7 1EA" - a different-looking version. Put the marker back as written.
+        from core.constants import extract_version_token
+        import re as _re
+        token = extract_version_token(raw)
+        if token and _re.search(r"[-_]", token):
+            label = label.replace(_re.sub(r"[-_]", " ", token), token)
+        return label
     except Exception:
         return raw
 
@@ -811,8 +840,12 @@ class GameEntry:
 
     def record_exe_version(self, path: str, label: str = ""):
         """Register *path* as an additional (non-primary) exe path this game
-        is also known to run from."""
+        is also known to run from. Not the wrapper of the game it already runs from (an Unreal game's launcher stub beside its packaged binary): that is the
+        same program started through another, not another version. A 32-bit and a 64-bit build in one folder ARE versions, and are kept."""
         if not path or str(path).casefold() == (self.exe_path or "").casefold():
+            return
+        from core.exe_stems import is_unreal_wrapper_pair
+        if self.exe_path and is_unreal_wrapper_pair(self.exe_path, path):
             return
         self.exe_path_versions = dict(self.exe_path_versions or {})
         # Reuse a case-variant key already stored here (same match rule as
@@ -823,6 +856,26 @@ class GameEntry:
         key = next((p for p in self.exe_path_versions if str(p).casefold() == wanted),
                   str(path))
         self.exe_path_versions[key] = label or derive_exe_version_label(path)
+
+    # Folder names that name no title: where a platform build lives. A hint like that matches every game built the same way.
+    _GENERIC_HINTS = frozenset({"win64", "win32", "wingdk", "x64", "x86", "binaries", "bin"})
+
+    def tidy_wrapper_versions(self) -> bool:
+        """Take off the card what an earlier build recorded wrongly: extra "versions" that are only the wrapper of the game (an Unreal game's launcher stub beside
+        its packaged binary), and name hints that are a platform folder (``Win64``). True when anything changed."""
+        from core.exe_stems import is_unreal_wrapper_pair
+        changed = False
+        if self.exe_path and self.exe_path_versions:
+            keep = {p: lbl for p, lbl in self.exe_path_versions.items() if not is_unreal_wrapper_pair(self.exe_path, p)}
+            if len(keep) != len(self.exe_path_versions):
+                self.exe_path_versions = keep
+                changed = True
+        if self.name_hints:
+            keep_h = [h for h in self.name_hints if str(h).strip().casefold() not in self._GENERIC_HINTS]
+            if len(keep_h) != len(self.name_hints):
+                self.name_hints = keep_h
+                changed = True
+        return changed
 
     def remove_exe_version(self, path: str):
         """Drop *path* from the extra-versions list. Never touches the
@@ -867,7 +920,8 @@ class GameEntry:
             exe = Path(exe_path)
         except (OSError, ValueError):
             return
-        self.record_name_hint(exe.parent.name)
+        folder = install_folder_of(exe_path)
+        self.record_name_hint(folder.name if folder is not None else exe.parent.name)
         try:
             from core.save_detector import GENERIC_EXE_STEMS
             if exe.stem.strip().lower() not in GENERIC_EXE_STEMS:
@@ -1315,6 +1369,30 @@ class LibraryManager(QObject):
                     except OSError:
                         continue
         return None
+
+    def knows_exe(self, exe_path: str) -> bool:
+        """True when *exe_path* is one of the programs of ANY game in the library: its main one, or one of the extra
+        versions kept on the same card (see GameEntry.record_exe_version). get_by_exe only looks at the main one."""
+        if not exe_path:
+            return False
+        try:
+            exe = Path(exe_path).resolve()
+        except OSError:
+            return False
+        with self._lock:
+            for g in self._games.values():
+                for p, _label in g.all_exe_paths():
+                    try:
+                        if Path(p).resolve() == exe:
+                            return True
+                    except OSError:
+                        continue
+        return False
+
+    def all_known_exe_paths(self) -> list:
+        """Every program path of every game: the main one and each extra version."""
+        with self._lock:
+            return [p for g in self._games.values() for p, _label in g.all_exe_paths()]
 
 
     def _resolved_folder_names(self, exclude_id: str = "") -> set:

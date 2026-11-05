@@ -244,6 +244,10 @@ a = Analysis(
         'sync.google_drive', 'sync.onedrive_provider', 'sync.dropbox_provider',
         'sync.webdav_provider', 'sync.rclone_provider', 'sync.app_credentials',
         'ui.main_window', 'ui.overlay', 'ui.dialogs.add_game_dialog',
+        # exclusive-fullscreen support (Windows): the presenter is imported by the overlay and the pins; the pin
+        # mirror is imported inside a function, only when a game is in exclusive fullscreen
+        'ui.exclusive_presenter', 'ui.pin_mirror', 'ui.exclusive_app', 'ui.win_band_hook',
+        'ui.exclusive_session', 'ui.exclusive_keys',
         'ui.dialogs.auto_scan_dialog', 'ui.dialogs.conflict_dialog',
         'ui.dialogs.cloud_verify_dialog', 'ui.dialogs.restore_dialog',
         'ui.dialogs.config_import_dialog', 'ui.dialogs.credits_dialog',

@@ -338,6 +338,16 @@ def _get_launcher_appid(pid: int) -> Optional[str]:
 
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+
+        # Started from the Steam window (its Play button, or a desktop icon): the parent is the already-running client, whose command line
+        # holds no app id - but Steam puts it in the environment of every game it starts.
+        try:
+            # (Windows keeps the names of environment variables in capitals or not as they were set, and treats them alike: so does this)
+            app_id = next((str(v).strip() for k, v in proc.environ().items() if k.lower() == "steamappid"), "")
+            if app_id.isdigit() and app_id != "0":
+                return f"steam://rungameid/{app_id}"
+        except Exception:
+            pass       # (not readable for a process we may not inspect: the install folder is the next source)
         
     except Exception:
         pass
@@ -371,6 +381,14 @@ def get_pending_appid(exe_path: str) -> Optional[str]:
     """Get and clear pending appid for an exe path."""
     with _pending_appids_lock:
         return _pending_launcher_appids.pop(exe_path, None)
+
+
+def _is_wine_helper(exe: str) -> bool:
+    """A program of the machinery that runs a Windows game on Linux - Wine's own (wineserver, winedevice, plugplay, xalia, …), the Steam Linux
+    Runtime container's tools (pressure-vessel-wrap, srt-bwrap, pv-verify, …), the Proton builds' programs. Never a game; by place - see
+    core.skip_dirs.is_wine_runtime_program."""
+    from core.skip_dirs import is_wine_runtime_program
+    return is_wine_runtime_program(exe)
 
 
 class ProcessMonitor(QObject):
@@ -430,6 +448,9 @@ class ProcessMonitor(QObject):
         # game_path_changed this session, so a moved/reinstalled game is
         # asked about once, not on every poll it's seen running.
         self._path_changed_prompted: set = set()
+        # (game id, exe) -> alt ids: a program matched to a game by name but from a path the game does not list. Whether it is ANOTHER path, or only the
+        # wrapper of the game (a launcher above it, a game below it), is told by the process tree - which is there once the process is confirmed.
+        self._pending_path_changes: dict = {}
         self._suppressed_raw: set = set()
         self._suppressed_resolved: set = set()
         # Cross-poll snapshot cache: (pid, create_time) → verdict dict
@@ -441,6 +462,7 @@ class ProcessMonitor(QObject):
         # by _refresh_ignored_cache (the filter's inputs changed);
         # _snap_gen discards a snapshot raced by such a refresh.
         self._snap_verdicts: dict = {}
+        self._wine_unresolved: dict = {}      # process key → polls a Wine process's program could not be told yet (see _snapshot)
         self._snap_gen = 0
         try:
             lib = get_library()
@@ -471,6 +493,9 @@ class ProcessMonitor(QObject):
         self._first_seen: dict[ProcessKey, float] = {}
         # Exes already shown overlay for (per session)
         self._seen_unknown_exes: set[str] = set()
+        # exe -> the other programs of the SAME game the monitor has seen (a launcher and the program it starts: related by
+        # the process tree AND the install folder). Both directions; see _related_program.
+        self._unknown_related: dict[str, set[str]] = {}
         # Candidate exe (lowercased, resolved) → time.time() it last got a
         # confirmation timer scheduled (see _candidate_on_cooldown). A
         # process that never lives long enough to confirm as a game — the
@@ -831,6 +856,7 @@ class ProcessMonitor(QObject):
                     # New process: run the full (expensive) pipeline once.
                     name = (proc.info.get("name") or "").strip()
                     verdict = None
+                    retry = False
                     if name and not (_IS_WINDOWS
                                      and not name.lower().endswith(".exe")):
                         # Cheap stem-level rejection BEFORE the exe fetch.
@@ -840,11 +866,27 @@ class ProcessMonitor(QObject):
                                 exe = (proc.exe() or "").strip()
                             except (psutil.AccessDenied, psutil.ZombieProcess):
                                 exe = ""   # unreadable → cached as filtered-out
+                            if exe and not _IS_WINDOWS:
+                                from core.resolvers import is_wine_loader, wine_program_path
+                                if is_wine_loader(exe):
+                                    # A Windows program under Wine/Proton: the OS names its LOADER. The program is what matters, and when
+                                    # it cannot be told the process is left out - the loader's path matched to a game registers that path
+                                    # as the game's executable.
+                                    exe = wine_program_path(proc)
+                                    if not exe:
+                                        # Its loader may not have written the program's command line yet; the verdict is cached for good,
+                                        # so a process that is only starting is looked at again on the next polls (a few, not forever).
+                                        tries = self._wine_unresolved.get(key, 0) + 1
+                                        if len(self._wine_unresolved) > 256:
+                                            self._wine_unresolved.clear()
+                                        self._wine_unresolved[key] = tries
+                                        retry = tries < 6
                             # Only skip known system processes — never skip
                             # unknown ones.
                             if exe and not self._is_system_process(name, exe):
                                 verdict = {"name": name, "exe": exe}
-                    fresh[key] = verdict
+                    if not retry:
+                        fresh[key] = verdict
                     if verdict is not None:
                         result[key] = verdict
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -873,6 +915,8 @@ class ProcessMonitor(QObject):
             return True
         if not exe:
             return False
+        if not _IS_WINDOWS and _is_wine_helper(exe):
+            return True
         if exe in self._suppressed_raw:
             return True
         resolved_exe = self._resolve_proc_exe(exe)
@@ -881,6 +925,109 @@ class ProcessMonitor(QObject):
         if resolved_exe in self._suppressed_resolved:
             return True
         return resolved_exe == self._own_exe
+
+    def _related_program(self, pid: int, exe: str):
+        """(exe, entry) of another program of the same game as the process (*pid*, *exe*), or ("", None).
+
+        Another program of the same game is one that is ALREADY announced as an unknown game or tracked as a game of the
+        library, is an ancestor or a descendant of this process in the process tree (checked by process id and creation
+        time, so a reused id cannot pass for a parent), and lives in the same install folder or below it. Both conditions are
+        needed: the tree alone would join a game to the launcher that merely started it (Steam, a shell), the folder alone
+        would join two programs that happen to sit side by side. *entry* is the library game when the relative is a tracked
+        one, so the caller can join this process to its session."""
+        if not PSUTIL_AVAILABLE or not exe:
+            return "", None
+        from core.exe_stems import in_install_tree
+        with self._data_lock:
+            seen = set(self._seen_unknown_exes)
+            running = list(self._running.items())
+            tracked = dict(self._tracked)
+        exe_by_pid = {k[0]: (k[1], (info or {}).get("exe", "")) for k, info in running}
+
+        def known(rel_pid: int):
+            """(exe, entry) when the process rel_pid is a relative worth naming, checked against its creation time."""
+            created, rel_exe = exe_by_pid.get(rel_pid, (None, ""))
+            if not rel_exe or rel_exe == exe:
+                return None
+            try:
+                if created is not None and abs(psutil.Process(rel_pid).create_time() - float(created)) > 2.0:
+                    return None                                       # that id belongs to another process now
+            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+                return None
+            entry = next((e for (p, _c), e in tracked.items() if p == rel_pid and e is not None), None)
+            if entry is None and rel_exe not in seen:
+                return None
+            return rel_exe, entry
+
+        try:
+            me = psutil.Process(pid)
+            proc = me
+            for _ in range(6):                                            # ancestors (bounded)
+                parent = proc.parent()
+                if parent is None:
+                    break
+                hit = known(parent.pid)
+                if hit and in_install_tree(hit[0], exe):
+                    return hit
+                proc = parent
+            for child in me.children(recursive=True):                      # descendants
+                hit = known(child.pid)
+                if hit and in_install_tree(exe, hit[0]):
+                    return hit
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return "", None
+
+    def related_programs(self, exe_path: str) -> set:
+        """The other programs of the same game the monitor has seen (see _related_program), transitively; empty when none."""
+        with self._data_lock:
+            graph = {k: set(v) for k, v in self._unknown_related.items()}
+        out, todo = set(), [exe_path]
+        while todo:
+            cur = todo.pop()
+            for nxt in graph.get(cur, ()):
+                if nxt != exe_path and nxt not in out:
+                    out.add(nxt)
+                    todo.append(nxt)
+        return out
+
+    def _note_related(self, a: str, b: str) -> None:
+        with self._data_lock:
+            self._unknown_related.setdefault(a, set()).add(b)
+            self._unknown_related.setdefault(b, set()).add(a)
+
+    def _prune_wrapper_versions(self, game_id: str, pid: int) -> None:
+        """A program the card lists as another VERSION of the game that is in fact its wrapper: the launcher the running game was started by, or the game that the
+        running launcher started - found in the process tree of the process now confirmed (*pid*), in the same install as it. Taken off the card: at that
+        point one program is running, and only one belongs on it. The tree is what tells it from a 32-bit and a 64-bit build in one folder, which never run
+        one under the other and stay versions."""
+        if not PSUTIL_AVAILABLE:
+            return
+        try:
+            entry = get_library().get_by_id(game_id)
+            if entry is None or not entry.exe_path_versions:
+                return
+            from core.exe_stems import in_install_tree
+            me = psutil.Process(pid)
+            mine = me.exe()
+            relatives = {}
+            for p in list(me.parents())[:6] + list(me.children(recursive=True)):
+                try:
+                    relatives[os.path.normcase(p.exe())] = p.exe()
+                except (psutil.Error, OSError):
+                    continue
+            drop = []
+            for v in entry.exe_path_versions:
+                key = os.path.normcase(str(v))
+                if key in relatives and key != os.path.normcase(mine) and (in_install_tree(relatives[key], mine) or in_install_tree(mine, relatives[key])):
+                    drop.append(v)
+            if drop:
+                for v in drop:
+                    entry.remove_exe_version(v)
+                get_library().update_game(entry)
+                logger.info(f"{entry.name!r}: {len(drop)} program(s) of its process tree were listed as versions - taken off the card (a wrapper is not a version)")
+        except (psutil.Error, OSError, ValueError):
+            pass
 
     def _has_tracked_ancestor(self, pid: int, game_id: str) -> bool:
         """True if any ancestor (parent, grandparent, ...) of *pid* is
@@ -985,13 +1132,16 @@ class ProcessMonitor(QObject):
                 continue
             exe_lookup.setdefault(g.exe_path.lower(), g.id)
             try:
-                resolved = str(Path(g.exe_path).resolve()).lower()
+                real = str(Path(g.exe_path).resolve())
             except OSError:
-                resolved = g.exe_path.lower()
+                real = g.exe_path
+            resolved = real.lower()
             exe_lookup.setdefault(resolved, g.id)
             stem = _slug(Path(g.exe_path).stem)
             if stem:
-                stem_lookup.setdefault(stem, []).append((g.id, resolved))
+                # (as written, not lowercased: is_different_program asks the disk whether it exists, and on a case-sensitive one a
+                # lowercased path never does - so two games sharing an exe name could not be told apart)
+                stem_lookup.setdefault(stem, []).append((g.id, real))
         self._exe_lookup = exe_lookup
         self._stem_lookup = stem_lookup
         self._name_lookup = name_lookup
@@ -1179,15 +1329,13 @@ class ProcessMonitor(QObject):
         version) — an already-answered or already-tracked path stays quiet
         on every subsequent poll.
 
-        The path is registered as a tracked version RIGHT HERE, before the
-        overlay even shows — so "add it as another path" is what happens by
-        default whether or not the prompt is ever answered (leaving a game
-        untracked just because nobody clicked a button mid-session is worse
-        than a label the user didn't ask for). The overlay's explicit
-        choices refine this afterward: Overwrite drops it back out in favour
-        of the new primary, and "different game" moves it onto its own
-        entry instead. Both are corrections to a safe default, not races
-        against a default that hasn't happened yet.
+        Nothing is registered here, and nothing is asked yet: the process is
+        tracked as the game as it arrives (the caller returns the match), and
+        whether it is ANOTHER path is decided when the process is confirmed
+        (_settle_path_change), where its tree can be read. Even then the path
+        is not added by itself: the question is raised, and the answer files
+        it (ui.main_window's _apply_path_add_version / _apply_path_overwrite /
+        _apply_path_new_game). Unanswered, nothing is added.
 
         *alt_ids* are OTHER library entries whose name also matched — the
         auto-tracked *game_id* is only the first one found, not necessarily
@@ -1199,6 +1347,12 @@ class ProcessMonitor(QObject):
         entry = get_library().get_by_id(game_id)
         if entry is None:
             return
+        # An Unreal game's launcher stub and its packaged binary are one program started through a wrapper, not a game found at another path: nothing to register
+        # and nothing to ask. The process is still tracked as the game (the caller returns the match). Two builds in one folder (32-bit and 64-bit) are not this:
+        # either one runs alone, and each is a version.
+        from core.exe_stems import is_unreal_wrapper_pair
+        if entry.exe_path and is_unreal_wrapper_pair(entry.exe_path, new_exe_path):
+            return
         key = (game_id, new_exe_path.casefold())
         if key in self._path_changed_prompted:
             return
@@ -1207,10 +1361,54 @@ class ProcessMonitor(QObject):
             known.add(entry.exe_path.casefold())
         if new_exe_path.casefold() in known:
             return
+        # Not decided here: a launcher that comes up before the game it starts has no child to be recognised by yet. It is decided when the process is
+        # confirmed (_settle_path_change), the moment every other prompt waits for as well; the process is tracked as the game all the while.
+        self._pending_path_changes[key] = tuple(alt_ids)
+
+    def _settle_path_change(self, game_id: str, exe: str, pid: int) -> None:
+        """Decide a pending "this game runs from another path" now that the process *pid* is confirmed and its tree can be read: the wrapper of the game (the
+        program that started it, or one it started, in the same install) is not asked about; a program that runs alone is a different location of the game, and the
+        question is raised. It is NOT added: the process is already tracked as it arrives, and the path is filed only by the answer."""
+        # (the key is lowercased - that is how the lookups are keyed; what is REGISTERED is the path as it is on disk, which on a case-sensitive one is the only
+        # spelling that exists)
+        folded = self._resolve_proc_exe(exe) if exe else ""
+        try:
+            new_exe_path = str(Path(exe).resolve()) if exe else ""
+        except OSError:
+            new_exe_path = exe or ""
+        key = (game_id, folded.casefold())
+        alt_ids = self._pending_path_changes.pop(key, None)
+        if alt_ids is None or not new_exe_path or key in self._path_changed_prompted:
+            return
+        entry = get_library().get_by_id(game_id)
+        if entry is None:
+            return
+        if self._is_wrapper_of(entry, new_exe_path, pid):
+            logger.info(f"{entry.name!r}: {new_exe_path} is the wrapper of the game (its launcher or what it starts), not another path - not registered")
+            return
         self._path_changed_prompted.add(key)
-        entry.record_exe_version(new_exe_path)
-        get_library().update_game(entry)
         self.game_path_changed.emit(entry, new_exe_path, list(alt_ids))
+
+    def _is_wrapper_of(self, entry, exe_path: str, pid: int) -> bool:
+        """True when the running process *pid* (of *exe_path*) has, among its parents or descendants, a program the card already holds (its main one or a
+        version) from the same install - the launcher above the game, or the game below the launcher."""
+        if not PSUTIL_AVAILABLE or not pid:
+            return False
+        try:
+            from core.exe_stems import in_install_tree
+            held = {os.path.normcase(str(p)) for p in [entry.exe_path, *(entry.exe_path_versions or {})] if p}
+            me = psutil.Process(pid)
+            for rel in list(me.parents())[:6] + list(me.children(recursive=True)):
+                try:
+                    rexe = rel.exe()
+                except (psutil.Error, OSError):
+                    continue
+                if (os.path.normcase(rexe) in held and os.path.normcase(rexe) != os.path.normcase(exe_path)
+                        and (in_install_tree(rexe, exe_path) or in_install_tree(exe_path, rexe))):
+                    return True
+        except (psutil.Error, OSError, ValueError):
+            pass
+        return False
 
     def _prompt_unverified_match(self, entry: GameEntry, proc_name: str,
                                  proc_key: Optional[tuple] = None):
@@ -1324,6 +1522,9 @@ class ProcessMonitor(QObject):
         self._watchdog.setInterval(_watchdog_interval_ms())
         self._watchdog_last = time.time()       # (a monitor started late is not a resume)
         self._watchdog.start()
+        # The URL a game is started with lives a fraction of a second, in a program the poll above would never meet (see core.launch_urls)
+        from core import launch_urls
+        launch_urls.start()
         self._active = True
         logger.info(f"Process monitor started ({interval}ms interval with adaptive polling)")
 
@@ -1379,6 +1580,11 @@ class ProcessMonitor(QObject):
     def stop(self):
         self._timer.stop()
         self._watchdog.stop()
+        try:
+            from core import launch_urls
+            launch_urls.stop()
+        except Exception:
+            pass
         self._active = False
 
     def restart_with_new_interval(self):
@@ -1669,8 +1875,15 @@ class ProcessMonitor(QObject):
                         runtime = time.time() - actual_create_time
 
                         if runtime >= _MIN_RUNTIME_SECONDS:
+                            # A launch that shows the URL its card lacks completes the card (see core.launch_urls.learn_launch_url)
+                            from core.launch_urls import learn_launch_url
+                            learn_launch_url(_game_id, _pid, _exe)
                             # Re-fetch fresh entry from library
                             fresh = get_library().get_by_id(_game_id)
+                            if fresh is not None and fresh.tidy_wrapper_versions():
+                                get_library().update_game(fresh)         # (a card an earlier build left with its launcher stub as a second program)
+                            self._prune_wrapper_versions(_game_id, _pid)
+                            self._settle_path_change(_game_id, _exe, _pid)
                             if fresh and not self._has_tracked_ancestor(_pid, fresh.id):
                                 self.game_launched.emit(fresh, _exe)
                                 logger.info(f"Known game launched after {runtime:.1f}s: {fresh.name} (pid={_pid})")
@@ -1684,6 +1897,15 @@ class ProcessMonitor(QObject):
             else:
                 # Unknown process - check if it could be a game
                 if self._is_plausible_game(exe):
+                    rel_exe, rel_entry = self._related_program(key[0], exe)
+                    if rel_entry is not None:
+                        # A program of a game that is already being tracked (the game's own child, or its launcher):
+                        # one game, one session - the same rule as for a child that matches the library itself.
+                        self._note_related(exe, rel_exe)
+                        with self._data_lock:
+                            self._register_tracked_locked(key, rel_entry)
+                        logger.info(f"{exe} is a program of {rel_entry.name} ({rel_exe}) - part of its session, not announced")
+                        continue
                     # Deliberately does NOT reset the adaptive-polling
                     # activity clock. _is_plausible_game excludes only
                     # system directories — "everything else is fair game" —
@@ -1709,8 +1931,19 @@ class ProcessMonitor(QObject):
                                     if not already_seen:
                                         self._seen_unknown_exes.add(_runtime_check_exe)
                                 if not already_seen:
+                                    rel_exe, _rel_entry = self._related_program(_key[0], _runtime_check_exe)
+                                    if rel_exe:
+                                        self._note_related(_runtime_check_exe, rel_exe)
+                                        logger.info(f"{_runtime_check_exe} is part of the same game as {rel_exe}")
                                     # Try to get appid from parent process (launcher)
-                                    appid = _get_launcher_appid(_key[0])
+                                    # In order of how real the reference is: the URL the game was started with, caught on its way to the launcher
+                                    # (a desktop icon, a link: core.launch_urls); what the launcher process itself shows; and, for a game started from the
+                                    # launcher's own Play button - which hands over no URL at all - the game its install folder belongs to.
+                                    from core.launch_urls import url_for_process
+                                    appid = url_for_process(_key[0], _runtime_check_exe) or _get_launcher_appid(_key[0])
+                                    if not appid:
+                                        from core.resolvers import launcher_url_for_exe
+                                        appid = launcher_url_for_exe(_runtime_check_exe)
                                     if appid:
                                         _remember_pending_appid(_runtime_check_exe, appid)
                                         logger.info(f"Detected launcher appid={appid} for {_runtime_check_exe}")
@@ -2208,6 +2441,18 @@ class ProcessMonitor(QObject):
                 if entry is not None and entry.id == game_id:
                     return key[1]
         return 0.0
+
+    def session_start_time(self, game_id: str) -> float:
+        """When the current session of *game_id* started (epoch seconds), or 0 if it has none.
+
+        The very start the exit handler measures the session it records from (``session_seconds``), so a
+        live counter built on this agrees with what ends up in the library afterwards - and a session
+        of several processes (a launcher and the game) is one session, not one per process."""
+        if not game_id:
+            return 0.0
+        with self._data_lock:
+            sess = self._game_sessions.get(game_id)
+            return float(sess["start"]) if sess else 0.0
 
     def start_tracking(self, entry, exe_path: str):
         """Add a game to tracked processes (thread-safe public API).

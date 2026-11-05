@@ -353,11 +353,15 @@ class ScanWorkerThread(QThread):
 class SavePathItem(QWidget):
     """Widget for displaying a single save path option"""
     
-    def __init__(self, game_name: str, game_id: str, paths: List[str], parent=None):
+    def __init__(self, game_name: str, game_id: str, paths: List[str], parent=None, duplicates=()):
         super().__init__(parent)
         self.game_name = game_name
         self.game_id = game_id
         self.paths = paths
+        # The second copy of the same saves (Ren'Py writes them twice): listed under its own heading, unticked.
+        from core.save_detector import path_identity as _pid
+        self._duplicate_keys = {_pid(p) for p in (duplicates or ())}
+        self._dup_header = None
         self._all_detected_paths = paths.copy()  # Store all detected paths for tracking
         self._locally_deleted_paths: List[str] = []  # Deletions pending Save (NOT persisted yet)
         self.checkboxes = []
@@ -436,7 +440,11 @@ class SavePathItem(QWidget):
         produce identical rows.
         """
         from functools import partial
+        from core.save_detector import path_identity as _pid
         layout = self.layout()
+        duplicate = _pid(path) in self._duplicate_keys
+        if duplicate:
+            self._ensure_dup_header()
         path_layout = QHBoxLayout()
         path_layout.setContentsMargins(20, 2, 2, 2)
 
@@ -454,7 +462,7 @@ class SavePathItem(QWidget):
             checkbox.setFullText(f"\U0001f5dd {registry_display(path)}")
         else:
             checkbox.setFullText(f"\U0001f4c1 {path}")
-        checkbox.setChecked(True)
+        checkbox.setChecked(not duplicate)
         self.checkboxes.append(checkbox)
         path_layout.addWidget(checkbox, 1)
 
@@ -482,7 +490,9 @@ class SavePathItem(QWidget):
         # Insert at the end-of-rows anchor if it already exists (i.e. this
         # call came from add_paths() after init_ui() already ran); otherwise
         # just append (still building the initial rows).
-        insert_at = layout.indexOf(self._rows_end_anchor) if getattr(self, '_rows_end_anchor', None) else -1
+        # (a row that is not a duplicate goes ABOVE the duplicates' heading, so the two groups stay apart)
+        anchor = self._dup_header if (not duplicate and self._dup_header is not None) else getattr(self, '_rows_end_anchor', None)
+        insert_at = layout.indexOf(anchor) if anchor is not None else -1
         if insert_at >= 0:
             layout.insertLayout(insert_at, path_layout)
         else:
@@ -497,7 +507,30 @@ class SavePathItem(QWidget):
         else:
             layout.addWidget(file_list)
 
-    def add_paths(self, new_paths: List[str]):
+    def _ensure_dup_header(self):
+        """The heading above the duplicate copies, made on first need and shown while there are any."""
+        if self._dup_header is None:
+            lbl = QLabel(t('auto_scan.duplicate_header'))
+            lbl.setObjectName("auto_scan_muted")
+            lbl.setToolTip(t('auto_scan.duplicate_tip'))
+            lbl.setContentsMargins(20, 6, 2, 0)
+            layout = self.layout()
+            anchor = getattr(self, '_rows_end_anchor', None)
+            at = layout.indexOf(anchor) if anchor is not None else -1
+            if at >= 0:
+                layout.insertWidget(at, lbl)
+            else:
+                layout.addWidget(lbl)
+            self._dup_header = lbl
+        self._dup_header.setVisible(True)
+
+    def _sync_dup_header(self):
+        """Hide the duplicates' heading when the last duplicate has gone."""
+        if self._dup_header is not None:
+            from core.save_detector import path_identity as _pid
+            self._dup_header.setVisible(any(_pid(p) in self._duplicate_keys for p in self.paths))
+
+    def add_paths(self, new_paths: List[str], duplicates=()):
         """Merge additional paths (found by a later scan pass — e.g. a
         fast heuristic scan completing after the instant live-tracking
         pre-fill already displayed something) into this already-built item.
@@ -511,12 +544,15 @@ class SavePathItem(QWidget):
         _shown = {_pid(p) for p in self.paths}
         _dropped = {_pid(p) for p in self._locally_deleted_paths}
         _all_known = {_pid(p) for p in self._all_detected_paths}
+        _dups = {_pid(p) for p in (duplicates or ())}
         added = []
         for path in new_paths:
             _key = _pid(path)
             if _key in _shown or _key in _dropped:
                 continue
             _shown.add(_key)
+            if _key in _dups:
+                self._duplicate_keys.add(_key)
             self.paths.append(path)
             # Guarded: a RESTORED path is already in _all_detected_paths
             # (delete_path() drops it from self.paths only). apply_changes()
@@ -586,6 +622,7 @@ class SavePathItem(QWidget):
 
             logger.info(f"User deleted path for {self.game_name}: {path_to_delete} (pending Apply)")
             self._refresh_ignored_count()
+            self._sync_dup_header()
 
     def _open_path(self, path_str: str, checked=False):
         """Open a proposed path for inspection."""
@@ -917,6 +954,16 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         if _game is not None and _game.save_paths:
             filtered_paths = filter_uncovered_paths(filtered_paths, _game.save_paths or [])
 
+        # The second copy of the same saves (Ren'Py writes them beside the game AND in its own data folder) is
+        # shown too, under its own heading and unticked: on the game's list afterwards, so a scan does not
+        # offer it again as something new, and still there to tick if the backup should move to it.
+        _item0 = next((it for it in self.path_items if it.game_id == game_id), None)
+        _listed = list(_game.save_paths or []) if _game is not None else []
+        _listed += list(_item0.paths) if _item0 is not None else []
+        from core.save_twins import split_twin_copies
+        filtered_paths, _dups = split_twin_copies(filtered_paths, _listed)
+        filtered_paths = list(filtered_paths) + list(_dups)
+
         if not filtered_paths:
             logger.info(f"All paths for {game_name} were previously deselected, deleted or already covered")
             return
@@ -928,7 +975,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         # heuristic scan pass completes shortly after and finds more.
         existing_item = next((it for it in self.path_items if it.game_id == game_id), None)
         if existing_item is not None:
-            newly_added = existing_item.add_paths(filtered_paths)
+            newly_added = existing_item.add_paths(filtered_paths, duplicates=_dups)
             if newly_added:
                 self._apply_saved_path_state(game_id, existing_item, newly_added)
             return
@@ -940,7 +987,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
         # nothing selectable, or already covered by a confirmed path) kept
         # in it would be silently re-added on Apply without ever having
         # been shown.
-        item = SavePathItem(game_name, game_id, filtered_paths)
+        item = SavePathItem(game_name, game_id, filtered_paths, duplicates=_dups)
         self._apply_saved_path_state(game_id, item, filtered_paths)
 
         self.path_items.append(item)
@@ -1643,7 +1690,7 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
                             logger.info(f"Auto-backup completed for {game.name}")
                             
                             # Auto-sync if enabled
-                            if config.get("auto_sync_after_backup", False):
+                            if config.get("auto_sync_after_backup", True):
                                 from sync import get_orchestrator
                                 orch = get_orchestrator()
                                 if orch.is_online():

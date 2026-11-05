@@ -24,6 +24,7 @@ from ui.styles.theme import palette, ThemedMixin
 class UnknownGamesBanner(QFrame, ThemedMixin):
     add_requested = Signal(str)        # the entry's exe path
     dismiss_requested = Signal(str)    # "don't show again" for it
+    remove_requested = Signal(str)     # the bin: out of the queue, NOT banned
     entries_changed = Signal()         # the queue's size or content moved
 
     def __init__(self, parent=None):
@@ -76,6 +77,18 @@ class UnknownGamesBanner(QFrame, ThemedMixin):
         self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._add_btn.clicked.connect(self._on_add)
 
+        # The bin: this game leaves the queue without a ban - it is asked about again the next time it runs.
+        # Same look as the other trash buttons of the app: a background swap on hover, because the glyph is a
+        # full-colour emoji that ignores a text colour.
+        self._trash_btn = QPushButton("\U0001f5d1")
+        self._trash_btn.setFlat(True)
+        self._trash_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._trash_btn.setToolTip(t("unknown_history.trash_tooltip"))
+        self._trash_btn.clicked.connect(self._on_trash)
+        self._sty(self._trash_btn, lambda: (
+            "QPushButton{border:none;background:transparent;border-radius:4px;padding:2px 6px;}"
+            f"QPushButton:hover{{background:{palette('error')};}}"))
+
         self._never_btn = QPushButton(t("overlay.dont_show_again"))
         self._never_btn.setFlat(True)
         self._never_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -91,6 +104,7 @@ class UnknownGamesBanner(QFrame, ThemedMixin):
         lay.addWidget(self._counter)
         lay.addWidget(self._next)
         lay.addWidget(self._add_btn)
+        lay.addWidget(self._trash_btn)
         lay.addWidget(self._never_btn)
 
     # ── the queue ────────────────────────────────────────────────────────────
@@ -127,7 +141,8 @@ class UnknownGamesBanner(QFrame, ThemedMixin):
         if not n:
             return
         entry = self._entries[self._index]
-        self._name.setFullText(entry.get("name") or "?")
+        ref = unknown_history.folder_reference(entry)
+        self._name.setFullText((entry.get("name") or "?") + (f"  ({ref})" if ref else ""))
         self._name.setToolTip(entry.get("exe", ""))
         # The program's own icon; the controller when it has none to show.
         # Set on every render, so stepping to the next entry never leaves the
@@ -155,6 +170,11 @@ class UnknownGamesBanner(QFrame, ThemedMixin):
         if exe:
             self.add_requested.emit(exe)
 
+    def _on_trash(self):
+        exe = self.current_exe()
+        if exe:
+            self.remove_requested.emit(exe)
+
     def _on_never(self):
         exe = self.current_exe()
         if exe:
@@ -164,6 +184,7 @@ class UnknownGamesBanner(QFrame, ThemedMixin):
         self._sub.setText(t("overlay.save_detected"))
         self._add_btn.setText(t("overlay.add_to_library"))
         self._never_btn.setText(t("overlay.dont_show_again"))
+        self._trash_btn.setToolTip(t("unknown_history.trash_tooltip"))
         self._prev.setToolTip(t("add_game.candidate_prev"))
         self._next.setToolTip(t("add_game.candidate_next"))
 

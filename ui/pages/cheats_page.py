@@ -32,7 +32,7 @@ from core.save_editor import (KIND_PRE_RESTORE, SaveEditorError, backup_kind,
                               backup_taken_at, delete_backup, describe,
                               explain, list_backups, open_save,
                               prune_backups, restore_backup)
-from core.save_editor.links import FieldLinks
+from core.save_editor.links import FieldLinks, menu_rows
 from i18n import t
 from ui.helpers import ElidedLabel, PageScrollMixin, scaled
 from ui.modal_helpers import warning_window_modal
@@ -2836,28 +2836,57 @@ class CheatsPage(PageScrollMixin, QWidget, ThemedMixin):
         btn.setObjectName("cheats_hold_btn")          # the padlock's look, beside it
         btn.setFixedSize(scaled(24, self), scaled(24, self))
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setToolTip(t("cheats.linked_tip"))
+        btn.setToolTip(t("cheats.linked_tip_name" if f.kind == "str" else "cheats.linked_tip"))
         btn.clicked.connect(
             lambda _=False, fld=f, b=btn, ps=partners: self._show_links(b, fld, ps))
         return btn
 
     def _show_links(self, btn, f, partners):
-        """The values *f* is connected with, each a way to jump to its row."""
-        who = self._links.identity(f) if self._links is not None else ""
+        """The OTHER places that keep this value, each a way to jump to its row, under a heading that says WHAT it
+        is (``Item A · k1``) - a bag of ids is unreadable without it. The row that was clicked is not listed:
+        the person is looking at it. The likely copies come first; the ones recognised only by their numbers (a
+        partial copy) are listed apart, under a heading that says so. A number also lists the rows that name the
+        thing; a row that names a thing lists the numbers that hold how many of it there are."""
+        links = getattr(self, "_links", None)
+        rows = menu_rows(partners, self._pending)
+        strong = [r for r in rows if r["tier"] == "strong"]
+        weak = [r for r in rows if r["tier"] != "strong"]
+        who = ""
+        named = []
+        if links is not None:
+            try:
+                who = links.who_is(f)
+                if f.kind != "str":
+                    named = menu_rows(links.names_of(f), self._pending)
+            except Exception:
+                who, named = "", []
+        by_name = f.kind == "str"
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
-        head = menu.addAction(t("cheats.linked_title_who", who=who) if who
-                              else t("cheats.linked_title"))
-        head.setEnabled(False)
-        menu.addSeparator()
-        for link in partners:
-            pf = link.field
-            label = pf.label if len(pf.label) <= 70 else "…" + pf.label[-69:]
-            shown = self._pending.get(pf.path, pf.value)
-            act = menu.addAction(f"{label}   =   {shown}")
-            act.setToolTip(pf.label)
-            act.triggered.connect(
-                lambda _=False, tgt=pf, src=f: self._goto_field(tgt, src))
+
+        def add(group, heading):
+            menu.addAction(heading).setEnabled(False)
+            menu.addSeparator()
+            for r in group:
+                act = menu.addAction(f"{r['label']}   =   {r['value']}")
+                act.setToolTip(r["tip"])
+                act.triggered.connect(
+                    lambda _=False, tgt=r["field"], src=f: self._goto_field(tgt, src))
+
+        if strong:
+            if by_name:
+                head = t("cheats.linked_qty_who", who=who) if who else t("cheats.linked_qty")
+            else:
+                head = t("cheats.linked_title_who", who=who) if who else t("cheats.linked_title")
+            add(strong, head)
+        if weak:
+            if strong:
+                menu.addSeparator()
+            add(weak, t("cheats.linked_maybe"))
+        if named:
+            if strong or weak:
+                menu.addSeparator()
+            add(named, t("cheats.linked_names"))
         menu.addSeparator()
         menu.addAction(t("cheats.linked_hint")).setEnabled(False)
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))

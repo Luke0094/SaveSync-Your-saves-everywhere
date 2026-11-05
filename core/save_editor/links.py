@@ -7,9 +7,14 @@ list and the lookup catches up. Which of the two is the real one is the game's
 secret, and a save editor listing both side by side leaves the player to find
 out the hard way.
 
-This finds those pairs, so the editor can say "this value is connected with
-that one". It reads nothing but the labels and values the editor already has,
-and it decides nothing: it names candidates, the person picks.
+This finds those copies, so the editor can say "this value is also kept
+there". It reads nothing but the labels and values the editor already has, and
+it decides nothing: it names candidates, the person picks.
+
+A thing can be kept in more than two places (the lookup, a saved copy of the
+list, an older snapshot): every place that holds it is a member of ONE group,
+and each member points at all the others - so the answer is the same from
+whichever copy the person clicks, and none is left out.
 
 What counts as a copy. A thing in a save usually carries a name of its own
 inside it, under a key like ``id`` or ``name`` (``Item A``, ``k1``). A
@@ -25,8 +30,21 @@ Matching on the name alone links the two; asking that a whole lookup agree
 with a whole list does not, because a loot table holds a handful of the items
 a bag holds, not nearly all of them.
 
+The record that holds a thing's name (``name``, ``id``…) is tied to the numbers that hold its quantity, and
+back: a bag of ids is unreadable until something says what each id is.
+
 Precision matters more than reach: a wrong suggestion costs the person's
-trust in the right ones. So:
+trust in the right ones. So there are two tiers, and they are shown apart:
+
+- STRONG: the list covers most of the lookup (the rule above). Values are not
+  looked at, only used to order the answer.
+- WEAK: a list that covers only PART of the lookup (a snapshot, a stash). Few
+  names are not enough to tell a copy from a loot table, so here the numbers
+  have to speak: at least ``_WEAK_NAMES`` shared names, and most of them holding
+  the same number as the save was opened. A loot table's numbers are chances
+  and prices; they do not match the bag.
+
+And, in either tier:
 
 - an object's own attributes (``value``, ``rarity``…) are never offered as its
   quantity — the search for the number beside a named object starts above it;
@@ -59,7 +77,14 @@ _MAX_GROUP = 4
 _MIN_KEYS = 2
 # The share of a lookup's keys that must be names of the list's records.
 _AGREE = 0.6
-_MAX_LINKS = 6
+# A list covering only part of a lookup: at least this many shared names...
+_WEAK_NAMES = 5
+# ...and at least this share of them holding the number the lookup holds.
+_WEAK_AGREE = 0.6
+_MAX_LINKS = 8
+# What a plain record calls its quantity: with one of these beside a name, the number is the quantity
+# whatever it is equal to now.
+_QTY_NAMES = frozenset({"qty", "quantity", "count", "amount", "num", "number", "stack", "owned", "have", "quant", "n"})
 # Past this the index costs more memory than the answer is worth.
 _MAX_FIELDS = 150_000
 _REPEAT = re.compile(r"\s#\d+$")
@@ -99,6 +124,8 @@ class Link:
     field: object        # the SaveField it points at
     how: str             # "keyed": stored under the name | "beside": next to the thing
     same_value: bool     # equal to the value asked about, as the save was opened
+    tier: str = "strong"  # "strong" | "weak" (a partial copy, recognised by its numbers)
+    who: str = ""        # what the thing is called, for a tooltip: ``Item A · k1``
 
 
 class FieldLinks:
@@ -125,8 +152,13 @@ class FieldLinks:
         self._seen_ids = set()
         self._by_parent = {}      # parent label -> [numeric field index]
         self._v0 = []
-        self._links = {}          # field index -> {partner field index: how}
+        self._links = {}          # field index -> {partner field index: (how, tier)}
         self._who = {}            # field index -> [names]
+        self._ident_idx = {}      # label of a real identifying row -> its field index
+        self._things = []         # (every name a thing goes by, {member field index: (how, tier, id row)})
+        self._name_links = {}     # identifying row's field index -> its thing's members (shared dict)
+        self._thing_of = {}       # member field index -> index into _things
+        self._thing_rows = {}     # thing index -> [identifying rows' field indexes], best first
         if not self.enabled:
             return
         self._v0 = [f.value for f in fields]
@@ -138,6 +170,7 @@ class FieldLinks:
                         and "\n" not in v
                         and _last(f.label).lower() in _IDENT_RANK):
                     self._add_ident(f.label, v)
+                    self._ident_idx[f.label] = i
             elif f.kind in ("int", "float"):
                 self._by_parent.setdefault(_parent(f.label), []).append(i)
         try:
@@ -147,6 +180,8 @@ class FieldLinks:
             # A hint must never be the thing that breaks opening a save.
             self._links = {}
             self._who = {}
+            self._name_links = {}
+            self._thing_rows = {}
 
     # ── building ─────────────────────────────────────────────────────────────
 
@@ -231,8 +266,11 @@ class FieldLinks:
                         continue
                     by_list.setdefault(_parent(rec[0]), {}).setdefault(
                         name, []).append((k, rec))
+            # name -> every (place, how, tier) the lookup's entry is kept in
+            places = {}
             for per_name in by_list.values():
-                if len(per_name) < _MIN_KEYS or len(per_name) < _AGREE * len(keys):
+                tier = self._tier(keys, per_name)
+                if tier is None:
                     continue
                 for name, recs in per_name.items():
                     e = keys[name]
@@ -240,32 +278,148 @@ class FieldLinks:
                         for j in group:
                             if j == e:
                                 continue
-                            if plain and self._v0[j] != self._v0[e]:
+                            if plain and self._v0[j] != self._v0[e] \
+                                    and _last(fields[j].label).lower() not in _QTY_NAMES:
                                 continue
-                            self._links.setdefault(e, {}).setdefault(j, "beside")
-                            self._links.setdefault(j, {}).setdefault(e, "keyed")
-                            self._who.setdefault(e, self._names(k))
-                            self._who.setdefault(j, self._names(k))
+                            places.setdefault(name, {}).setdefault(j, ("beside", tier, k))
+            for name, copies in places.items():
+                e = keys[name]
+                # member field index -> (how it is kept, tier, id row that names the thing)
+                members = {e: ("keyed", "strong", None)}
+                members.update({j: (how, tier, k) for j, (how, tier, k) in copies.items()})
+                # Call the thing by the richest name any copy gives it ("Item A", not just the id k1).
+                named_by = max((m[2] for m in members.values() if m[2] is not None),
+                               key=lambda k: len(self._names(k)), default=None)
+                if named_by is not None:
+                    t = len(self._things)
+                    self._things.append((frozenset(self._names(named_by)), members))
+                    for m in members:
+                        self._thing_of.setdefault(m, t)
+                # Every member points at every other: from whichever copy the person clicks, the
+                # answer is the same set of places.
+                for i in members:
+                    for j, (how_j, tier_j, _k) in members.items():
+                        if i == j:
+                            continue
+                        # A weak member makes the link weak, seen from either side.
+                        tier = "weak" if "weak" in (members[i][1], tier_j) else "strong"
+                        old = self._links.setdefault(i, {}).get(j)
+                        if old is None or (old[1] == "weak" and tier == "strong"):
+                            self._links[i][j] = (how_j, tier)
+                    if named_by is not None:
+                        self._who.setdefault(i, self._names(named_by))
+        self._index_names()
+
+    def _index_names(self) -> None:
+        """Tie the rows that SAY what a thing is (``name``, ``id``…) to the numbers that hold it.
+
+        The numbers point at each other, but a bag of ``k1 = 166`` tells the person nothing: the name
+        of the thing sits in its own record, far from the quantity. A row whose record goes by a subset of
+        the names of a thing found above is that thing's name row: it points at the places its quantity
+        is kept in, and they at it."""
+        for t, (names, members) in enumerate(self._things):
+            rows = {}                                 # record -> (names it gives, rank, label length, field index)
+            for v in names:
+                for kk in self._ident_rows.get(v, ()):
+                    label = self._ids[kk][0]
+                    idx = self._ident_idx.get(label)
+                    given = self._names(kk)
+                    if idx is None or not set(given) <= names:
+                        continue
+                    self._name_links.setdefault(idx, members)
+                    rec = _parent(label)
+                    cand = (-len(given), _IDENT_RANK.get(_last(label).lower(), 99), len(label), idx)
+                    if rec not in rows or cand < rows[rec]:
+                        rows[rec] = cand
+            # Back from a quantity only the records that say the most about the thing (a record that holds just
+            # its id adds nothing beside one that holds its name too).
+            best = min((c[0] for c in rows.values()), default=0)
+            self._thing_rows[t] = [c[3] for c in sorted(rows.values()) if c[0] == best]
+
+    def _tier(self, keys: dict, per_name: dict):
+        """"strong", "weak" or None: how well this list's records match a lookup's keys."""
+        n = len(per_name)
+        if n >= _MIN_KEYS and n >= _AGREE * len(keys):
+            return "strong"
+        if n < _WEAK_NAMES:
+            return None
+        agree = 0
+        for name, recs in per_name.items():
+            mine = self._v0[keys[name]]
+            if any(self._v0[j] == mine for _k, (_l, group, _p) in recs for j in group):
+                agree += 1
+        return "weak" if agree >= _WEAK_AGREE * n else None
 
     # ── asking ───────────────────────────────────────────────────────────────
 
     def for_field(self, f) -> list:
-        """Links for *f*, best first; [] when it has none or is not a number."""
-        if not self.enabled or f.kind not in ("int", "float"):
+        """Links for *f*, best first; [] when it has none or is not a number.
+
+        Every other place that keeps the same thing, strong ones before weak ones, then equal
+        values (the likeliest mirror), then the shortest label: a stable, explainable order."""
+        if not self.enabled:
+            return []
+        if f.kind == "str":
+            return self._quantities_of_name(f)
+        if f.kind not in ("int", "float"):
             return []
         i = self._pos.get(f.path)
         partners = self._links.get(i)
         if not partners:
             return []
         mine = self._v0[i]
-        out = [Link(self._fields[j], how, self._v0[j] == mine)
-               for j, how in partners.items()]
-        # Equal values first (the likeliest mirror), then the shortest label:
-        # a stable, explainable order.
-        out.sort(key=lambda l: (not l.same_value, len(l.field.label)))
+        out = []
+        for j, (how, tier) in partners.items():
+            who = " · ".join(self._who.get(j, ())[:2])
+            out.append(Link(self._fields[j], how, self._v0[j] == mine, tier, who))
+        out.sort(key=lambda l: (l.tier != "strong", not l.same_value, len(l.field.label)))
         return out[:_MAX_LINKS]
 
-    def identity(self, f) -> str:
-        """What *f* is about, for a heading: ``Item A · k1``."""
+    def _quantities_of_name(self, f) -> list:
+        """For a row that names a thing (``name``, ``id``…): the numbers that hold how many of it there are."""
+        members = self._name_links.get(self._pos.get(f.path))
+        if not members:
+            return []
+        out = []
+        for j, (how, tier, _k) in members.items():
+            who = " · ".join(self._who.get(j, ())[:2])
+            out.append(Link(self._fields[j], how, False, tier, who))
+        out.sort(key=lambda l: (l.tier != "strong", len(l.field.label)))
+        return out[:_MAX_LINKS]
+
+    def names_of(self, f, limit: int = 1) -> list:
+        """For a number: the row that says what it is - the record that says the most about the thing, ``name`` before ``id``.
+
+        A bag of ``k1 = 166`` is unreadable on its own; this is the way to the row that says what it is."""
+        if not self.enabled or f.kind not in ("int", "float"):
+            return []
         i = self._pos.get(f.path)
+        t = self._thing_of.get(i)
+        if t is None:
+            return []
+        who = " · ".join(self._who.get(i, ())[:2])
+        return [Link(self._fields[j], "named", False, "strong", who) for j in self._thing_rows.get(t, ())[:limit]]
+
+    def who_is(self, f) -> str:
+        """What *f*'s thing is called (``Item A · k1``), '' when it has no name to give."""
+        i = self._pos.get(f.path)
+        if f.kind == "str":
+            members = self._name_links.get(i)
+            i = next(iter(members), None) if members else None
         return " · ".join(self._who.get(i, ())[:2]) if i is not None else ""
+
+
+def menu_rows(partners, pending=None, max_label: int = 70) -> list:
+    """What the links menu shows, as rows: ``{"label", "value", "tip", "tier", "field"}``.
+
+    The menu never names the value that was clicked: the person is looking at its row. It lists the OTHER
+    places, each with where it is and what it holds now (*pending*: edits made and not yet saved, by path),
+    and the thing's name goes into the tooltip, so a row of ids can be read as what it is."""
+    rows = []
+    for link in partners:
+        pf = link.field
+        label = pf.label if len(pf.label) <= max_label else "\u2026" + pf.label[-(max_label - 1):]
+        shown = (pending or {}).get(pf.path, pf.value)
+        tip = pf.label + (f"\n{link.who}" if link.who else "")
+        rows.append({"label": label, "value": shown, "tip": tip, "tier": link.tier, "field": pf})
+    return rows

@@ -106,19 +106,22 @@ class SyncWorker(QThread):
         game_id = self._game_id
         names = list(self._name_history)
         folders: list[str] = []
+        forked_from: set = set()
         try:
             from core.library import get_library as _gl
             _entry = _gl().get_by_id(game_id)
             if _entry is not None:
                 names += list(_entry.name_history or [])
                 folders += list(_entry.folder_history or [])
+                # a folder this game was forked away from is shared with another game's card: never a past home
+                forked_from = set((_entry.cloud_metadata or {}).get("forked_from") or [])
         except Exception:
             pass
         candidates = [get_folder_name_for_save(n, self._exe_path, game_id)
                       for n in names] + folders
         out: list[str] = []
         for old_folder in candidates:
-            if not old_folder or old_folder == current_folder or old_folder in out:
+            if not old_folder or old_folder == current_folder or old_folder in out or old_folder in forked_from:
                 continue
             try:
                 from core.library import get_library
@@ -128,6 +131,124 @@ class SyncWorker(QThread):
                 pass
             out.append(old_folder)
         return out
+
+    def _own_game_ids(self) -> set:
+        """The ids whose backups are this game's: its own, and those of the cards merged into it
+        (GameEntry.cloud_metadata["merged_from"]). A backup's file name starts with the id of the
+        card it was made under, which is how a zip that only the provider holds is recognised."""
+        ids = {self._game_id}
+        try:
+            from core.library import get_library
+            e = get_library().get_by_id(self._game_id)
+            if e is not None:
+                ids.update(i for i in ((e.cloud_metadata or {}).get("merged_from") or []) if i)
+        except Exception:
+            pass
+        return ids
+
+    def _housekeeping(self, active: list, game_folder: str, bm) -> dict:
+        """What a sync does before it moves any backup: gather the local zips in the game's folder, put the
+        current title on the rows, and move the remote folder of any old name into the current one. Returns
+        the report of the remote moves."""
+        try:
+            bm.consolidate_game_folder(self._game_id, game_folder)
+        except Exception:
+            logger.debug("Sync: local folder consolidation failed", exc_info=True)
+        # The index is published from these rows: they carry the
+        # game's current title, whatever it was called when each was made.
+        try:
+            bm.retitle_rows(self._game_id, self._game_name)
+        except Exception:
+            logger.debug("Sync: retitling the backup rows failed", exc_info=True)
+
+        # Move the remote folder of any old name into the current one
+        # BEFORE syncing, so the index under the new name exists
+        # (see SyncProvider.sync_backups' failed-fetch guard).
+        try:
+            return self._migrate_remote_folders(active, game_folder, bm)
+        except Exception:
+            logger.warning("Sync: remote folder migration failed", exc_info=True)
+            return {}
+
+    def _merge_sync_pending(self) -> bool:
+        """True while this game's card has absorbed another and has not completed a sync since."""
+        try:
+            from core.library import get_library
+            e = get_library().get_by_id(self._game_id)
+            return bool(e is not None and (e.cloud_metadata or {}).get("merge_sync_pending"))
+        except Exception:
+            return False
+
+    def _download_before_backup(self, providers: list, game_folder: str, bm) -> None:
+        """Download first, then upload. The new backup of a merged card is cut from the save folders on THIS
+        disk, so a file that only the other PC has would be missing from it - and the new zip would be the
+        latest. So the provider's zips come down, and every save folder of the card is completed from the
+        newest backup that has it: the files that zip holds and this folder lacks are written; the files that
+        are here are never touched, so what the zip pushed holds is this PC's version, plus the rest."""
+        for p in providers:
+            try:
+                p.sync_backups(self._game_id, game_folder, bm, direction="down")
+            except Exception:
+                logger.warning(f"[{p.PROVIDER_ID}] Download before the merged backup failed", exc_info=True)
+        try:
+            self._fill_missing_save_files(bm)
+        except Exception:
+            logger.warning("Completing the save folders of a merged card failed", exc_info=True)
+
+    def _fill_missing_save_files(self, bm) -> None:
+        """Each save folder of the card is completed from the newest backup that has a folder of that name (a
+        zip is rooted on the name of the folder it was cut from): the files that backup holds and the folder
+        lacks are written straight into this PC's own folder. A file that exists is NEVER replaced, whatever
+        it holds - it is the one that will be pushed - and a file the player unticked is not brought back. A
+        folder whose name another save folder of the card shares is skipped (it could not be told which is
+        which)."""
+        import os
+        import zipfile
+        from pathlib import Path
+        from core.library import get_library
+        from core.registry_saves import is_registry_path
+        e = get_library().get_by_id(self._game_id)
+        if e is None:
+            return
+        excluded = {os.path.normcase(p) for p in (e.excluded_save_paths or [])}
+        paths = [p for p in (e.save_paths or []) if p and not is_registry_path(p) and os.path.normcase(p) not in excluded]
+        roots = [Path(p).name for p in paths]
+        unticked = bm._excluded_files_for(e.id)
+        rows = [r for r in bm.get_backups_for_game(self._game_id) if not bm.is_side_backup(r)]
+        for p in paths:
+            root = Path(p).name
+            if roots.count(root) != 1:
+                continue
+            dest_root = Path(p).resolve()
+            skip = unticked.get(str(p).casefold(), set())
+            for r in rows:                      # newest first
+                zp = Path(r.zip_path or "")
+                if not zp.exists():
+                    continue
+                try:
+                    with zipfile.ZipFile(zp) as z:
+                        members = [n for n in z.namelist()
+                                   if n.split("/", 1)[0] == root and "/" in n and not n.endswith("/")]
+                        if not members:
+                            continue
+                        written = 0
+                        for n in members:
+                            rel = n.split("/", 1)[1]
+                            if rel.replace("\\", "/").casefold() in skip:
+                                continue
+                            target = (dest_root / rel).resolve()
+                            if dest_root not in target.parents or target.exists():
+                                continue        # (outside the folder, or already there: left alone)
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            tmp = target.with_name(target.name + ".restore_tmp")
+                            tmp.write_bytes(z.read(n))
+                            tmp.replace(target)
+                            written += 1
+                except (OSError, zipfile.BadZipFile, KeyError):
+                    logger.warning(f"Could not complete {p!r} from backup {r.backup_id}", exc_info=True)
+                    continue
+                logger.info(f"Completed the save folder {p!r} of '{e.name}' from backup {r.backup_id}: {written} file(s) it lacked")
+                break
 
     def _recorded_moves(self) -> dict:
         """``{provider_id: ["old→new", ...]}`` of remote moves already made for
@@ -251,6 +372,7 @@ class SyncWorker(QThread):
 
         own = {e.backup_id: e for e in bm.get_backups_for_game(self._game_id)}
         game_id = self._game_id
+        ids = self._own_game_ids()
 
         def _name(rf) -> str:
             return rf.path.replace("\\", "/").split("/")[-1]
@@ -262,7 +384,7 @@ class SyncWorker(QThread):
             if not fname.lower().endswith(".zip"):
                 continue
             stem = fname[:-4]
-            if stem not in own and game_id not in fname:
+            if stem not in own and not any(i in fname for i in ids):
                 continue
             candidates = []
             if stem in own and own[stem].zip_path:
@@ -284,7 +406,7 @@ class SyncWorker(QThread):
         old_idx_entries = provider.list_cloud_backups(old_folder)
         mine_in_index = [d for d in old_idx_entries
                          if d.get("backup_id")
-                         and (d["backup_id"] in own or game_id in d["backup_id"])]
+                         and (d["backup_id"] in own or any(i in d["backup_id"] for i in ids))]
         if not to_move and not mine_in_index:
             return None
 
@@ -377,6 +499,21 @@ class SyncWorker(QThread):
         finally:
             if idx_tmp is not None:
                 idx_tmp.unlink(missing_ok=True)
+
+        # 2b. Nothing comes off the old folder on an upload's say-so alone: a fresh listing of the new
+        # one has to show every zip that moved and the index. When it cannot, or does not, the old
+        # folder stays whole and the move is tried again at the next sync (None: not recorded as done).
+        confirmed = provider.list_files(new_base)
+        if not confirmed and getattr(provider, "last_list_error", None):
+            logger.warning(f"[{provider.PROVIDER_ID}] Could not confirm {current_folder} after the move; "
+                           f"{old_folder} left as it was")
+            return None
+        have = {_name(rf) for rf in confirmed}
+        missing = [fname for _stem, fname in moved if fname not in have]
+        if missing or "index.json" not in have:
+            logger.warning(f"[{provider.PROVIDER_ID}] {current_folder} does not show {missing or 'its index'} yet; "
+                           f"{old_folder} left as it was")
+            return None
 
         # 3. Off the old folder — the zips that were there; the ones already under
         # the new name were never in it.
@@ -524,6 +661,19 @@ class SyncWorker(QThread):
             return
 
         self.progress.emit(f"Syncing {self._game_name}...")
+        # A merge the other PC made that concerns this game and has not been made here: syncing now would send
+        # its backups to a folder that PC no longer has. The player is asked first (see core.config_sync).
+        if not self._orphan and self._direction in ("auto", "up", "down"):
+            try:
+                from core.config_sync import hold_for_game
+                hold = hold_for_game(active[0], self._game_id)
+            except Exception:
+                hold = None
+            if hold is not None:
+                held = SyncResult(success=False, message=i18n.t('sync.config_differs', game=self._game_name))
+                held.config_hold = hold
+                self.finished.emit(held)
+                return
         try:
             from core.backup import get_backup_manager
             from core.constants import get_install_folder_name
@@ -534,6 +684,17 @@ class SyncWorker(QThread):
             if self.isInterruptionRequested():
                 self.finished.emit(SyncResult(success=False, message=i18n.t('sync.cancelled')))
                 return
+
+            # A card that absorbed another holds the history of both, and the provider may hold zips of it this PC
+            # has not seen: they come DOWN before the next backup is cut from this disk, so it is complete.
+            # (the provider's copy of the absorbed card has to be under this card's folder first, so the
+            # remote folders are moved before the download, and the backup comes after both)
+            rehomed: dict = {}
+            housekeeping_done = False
+            if not self._orphan and self._direction in ("auto", "up") and self._merge_sync_pending():
+                rehomed = self._housekeeping(active, game_folder, bm)
+                housekeeping_done = True
+                self._download_before_backup(active, game_folder, bm)
 
             # Ensure a fresh backup exists before uploading. Prefer a single
             # mtime preflight here; if already current, skip create_backup
@@ -586,32 +747,18 @@ class SyncWorker(QThread):
                             name_history=self._name_history,
                             excluded_paths=self._excluded_paths,
                             skip_mtime_preflight=True,
+                            # After the download of a merged card the backup follows at once, and the zip that was
+                            # just brought down can be seconds old (saves of a few KB or MB): the 30 s debounce
+                            # between two backups would hold this PC's own files back from the push.
+                            bypass_debounce=housekeeping_done,
                         )
 
             # A rename that never produced a backup left the zips in the old
             # local folder — create_backup is what moves them, and a sync that
             # finds the saves unchanged never gets that far. Same for the
             # remote side below, which only a sync can do.
-            rehomed: dict = {}
-            if not self._orphan and self._direction in ("auto", "up"):
-                try:
-                    bm.consolidate_game_folder(self._game_id, game_folder)
-                except Exception:
-                    logger.debug("Sync: local folder consolidation failed", exc_info=True)
-                # The index is published from these rows: they carry the
-                # game's current title, whatever it was called when each was made.
-                try:
-                    bm.retitle_rows(self._game_id, self._game_name)
-                except Exception:
-                    logger.debug("Sync: retitling the backup rows failed", exc_info=True)
-
-                # Move the remote folder of any old name into the current one
-                # BEFORE syncing, so the index under the new name exists
-                # (see SyncProvider.sync_backups' failed-fetch guard).
-                try:
-                    rehomed = self._migrate_remote_folders(active, game_folder, bm)
-                except Exception:
-                    logger.warning("Sync: remote folder migration failed", exc_info=True)
+            if not self._orphan and self._direction in ("auto", "up") and not housekeeping_done:
+                rehomed = self._housekeeping(active, game_folder, bm)
 
             if self.isInterruptionRequested():
                 self.finished.emit(SyncResult(success=False, message=i18n.t('sync.cancelled')))
@@ -708,6 +855,10 @@ class SyncOrchestrator(QObject):
     providers_updated = Signal()             # emitted after any provider connect/disconnect
     batch_progress    = Signal(int, int, str)  # done, total, current name
     batch_finished    = Signal(int, str)       # done count, last synced name
+    # A sync (a download of the saves included) is waiting for the player: the other PC merged this game, and the
+    # configuration is looked at together with the saves (core.config_sync). game_id, the Preflight. No sync_finished
+    # is emitted for it: whoever waits for the saves keeps waiting, until release_held.
+    config_held       = Signal(str, object)
 
     def __init__(self):
         super().__init__()
@@ -723,6 +874,7 @@ class SyncOrchestrator(QObject):
         self._sync_history: list[dict] = self._load_history()
         from collections import deque
         self._sync_job_queue: deque = deque()
+        self._held_jobs: dict = {}       # game id -> the sync job that waits for the player's answer
         self._sync_batch: dict | None = None
         self._sync_max_inflight: int = 1
 
@@ -1092,7 +1244,7 @@ class SyncOrchestrator(QObject):
                 _worker.progress.disconnect()
             except (RuntimeError, TypeError):
                 pass
-            self._on_sync_done(_gid, result, batch=_batch, game_name=_name)
+            self._on_sync_done(_gid, result, batch=_batch, game_name=_name, job=job)
 
         from PySide6.QtCore import Qt
         worker.finished.connect(_on_done, Qt.ConnectionType.QueuedConnection)
@@ -1179,7 +1331,23 @@ class SyncOrchestrator(QObject):
             self._workers = alive
 
     def _on_sync_done(self, game_id: str, result: SyncResult,
-                      batch: bool = False, game_name: str = ""):
+                      batch: bool = False, game_name: str = "", job: dict | None = None):
+        hold = getattr(result, "config_hold", None)
+        if hold is not None:
+            # Not a failure and not a finish: the job waits for the player's answer (see release_held).
+            with self._sync_lock:
+                self._syncing_games.discard(game_id)
+                if job is not None:
+                    self._held_jobs[game_id] = dict(job)
+            logger.info(f"Sync of {game_name or game_id} waits: the other PC merged this game")
+            self.config_held.emit(game_id, hold)
+            self._cleanup_workers()
+            if batch or self._sync_batch:
+                self._mark_sync_batch_done(game_id, game_name)
+            self._pump_sync_queue()
+            return
+        if job is not None:
+            result.direction = job.get("direction") or "auto"       # (a download of saves is a point where the configuration is looked at)
         # Resolve the display name now so history rows survive a game being
         # renamed/removed later.
         if not game_name:
@@ -1221,6 +1389,17 @@ class SyncOrchestrator(QObject):
         # Not gated on result.success — see the matching comment on the local
         # index refresh above: a partial batch failure still moved real bytes
         # for the files that succeeded, and that bookkeeping should reflect it.
+        # A merged card's first complete sync is done: "download first" is not needed again.
+        if result.success:
+            try:
+                from core.library import get_library as _gl
+                _em = _gl().get_by_id(game_id)
+                if _em is not None and (_em.cloud_metadata or {}).get("merge_sync_pending"):
+                    _mm = dict(_em.cloud_metadata)
+                    _mm.pop("merge_sync_pending", None)
+                    _gl().update_game_fields(game_id, cloud_metadata=_mm)
+            except Exception:
+                pass
         if result.files_uploaded > 0 or result.files_downloaded > 0:
             try:
                 from core.library import get_library as _gl
@@ -1288,6 +1467,30 @@ class SyncOrchestrator(QObject):
         if batch or self._sync_batch:
             self._mark_sync_batch_done(game_id, game_name)
         self._pump_sync_queue()
+
+    def release_held(self, game_id: str, run: bool = True, skip_downloads: bool = False) -> bool:
+        """The player has answered for a sync that waited (config_held). *run*: the same job goes again, with the
+        game as it is NOW (folder, paths, names: the answer may have changed them); a download is left out when
+        *skip_downloads* (the player keeps the library apart, so the saves are not taken). Otherwise - or when
+        the card is gone, merged into another - whoever waits for it is told it did not happen (sync_finished,
+        flagged ``config_declined``). True when the job was run again."""
+        with self._sync_lock:
+            job = self._held_jobs.pop(game_id, None)
+        if job is None:
+            return False
+        from core.library import get_library
+        entry = get_library().get_by_id(game_id)
+        if run and entry is not None and not (skip_downloads and job.get("direction") == "down"):
+            self.sync_game(
+                entry.id, entry.name, list(entry.save_paths or []), direction=job.get("direction") or "auto",
+                exe_path=entry.exe_path or "", computed_folder_name=entry.computed_folder_name or None,
+                name_history=list(entry.name_history or []), excluded_paths=list(entry.excluded_save_paths or []),
+                orphan=bool(job.get("orphan")))
+            return True
+        declined = SyncResult(success=False, message=i18n.t('sync.config_differs', game=job.get("game_name") or ""))
+        declined.config_declined = True
+        self.sync_finished.emit(game_id, declined)
+        return False
 
     # ── Per-provider reconnect ───────────────────────────────────────────────
 
@@ -1527,7 +1730,10 @@ class SyncOrchestrator(QObject):
         cloud folders sharing *base*'s name.
 
         Used ONLY when the user explicitly confirms a same-name game is a
-        different one (homonymy), so the new game gets its own cloud folder
+        different one (homonymy) - or keeps their local saves on a "download your
+        saves?" prompt while a same-name copy is already there (a different
+        game, or a new playthrough; see CloudFlowsMixin._fork_cloud_folder_if_shared
+        and the "continue_local_cloud_available" and "decline_cloud_different_machine" actions) - so the game gets its own cloud folder
         (``Alpha~7f31c0``) instead of syncing into — and contaminating — the
         other game's ``Alpha``. Never call this automatically: a legitimately
         identical game on a second machine must keep ``Alpha`` to find its own

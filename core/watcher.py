@@ -199,6 +199,9 @@ _MAX_PATTERN_ENTRIES = 500
 _SEED_PATTERNS: Dict[str, Set[str]] = {}  # directory_path → set of patterns
 # Files discovered as save files through movement/creation
 _DISCOVERED_SAVE_FILES = _BoundedSet()
+# Of those, the ones that LOOK like saves (a save name, a save-like folder, a learned pattern): the PRIORITY of a proposal, not a condition
+# of it - see _SaveHandler.on_created.
+_SAVE_LIKE_FILES = _BoundedSet()
 
 # ── Temporal correlation (unattributed → claimed) ───────────────────────────
 # A game may write a save to a profile folder whose name shares NOTHING with
@@ -277,6 +280,7 @@ def prune_watcher_caches() -> int:
         _KNOWN_FILES.clear()
         _BACKED_UP_FILES.clear()
         _DISCOVERED_SAVE_FILES.clear()
+        _SAVE_LIKE_FILES.clear()
         _CLAIMED_EVENTS.clear()
         _SEED_PATTERNS.clear()
         _SAVE_PATTERNS.clear()
@@ -346,6 +350,13 @@ def _is_write_event(event) -> bool:
     Excludes deletions and the read-only open/close events inotify emits.
     """
     return getattr(event, "event_type", "") in _CORR_WRITE_EVENT_TYPES
+
+
+def _as_write_of_destination(event):
+    """A rename into place - an atomic save: write a temp file, rename it over the save - is a write of the file that got the FINAL name. The
+    handler only ever looked at an event's old path, which for a rename is the temp file that is already gone."""
+    from types import SimpleNamespace
+    return SimpleNamespace(src_path=event.dest_path, is_directory=False, event_type="modified")
 
 
 def _has_fresh_write(src_path: str, now: float) -> bool:
@@ -954,6 +965,8 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
             super().__init__()
         self._game_id   = game_id
         self._on_change = on_change
+        import time as _time
+        self._session_start = _time.time()        # a handler is made for each game session (SaveWatcher._watch_game_inner)
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
         # cancel() cannot stop a Timer that has already begun _fire_all_pending;
@@ -978,6 +991,15 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
     def on_any_event(self, event: "FileSystemEvent"):
         if event.is_directory:
             return
+        # The trigger is a WRITE: a file created, modified or renamed into place - nothing else. Not a read (the game loading its save, a
+        # backup tool, a virus scanner: inotify reports opens and closes-without-writing, and they were treated as the game saving - the
+        # proposal and its provisional backups started at the first LOAD), and not a deletion.
+        _kind = getattr(event, "event_type", "")
+        if _kind not in _CORR_WRITE_EVENT_TYPES:
+            return
+        _polled = bool(getattr(event, "polled", False))              # seen by a poll of a mount inotify is blind to (_PollingFallback)
+        if _kind == "moved" and getattr(event, "dest_path", ""):
+            event = _as_write_of_destination(event)
 
         # Reject anything under a path the user has explicitly excluded,
         # before any other processing. This is the one place every watch
@@ -1124,6 +1146,22 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                     logger.debug(f"File {file_path.name} already backed up, skipping")
                     return
             
+            # TIME is the evidence, and it is the time of a WRITE: the file's modification time has just moved, and not before this session began.
+            # Not a read, an access, a permission change, nor an old file an event brought up (a move, a restore, a sync tool): none of those is
+            # the game saving. Without it, nothing - whatever the file is called. (The name only ever tied the event to the game.)
+            import time as _time
+            try:
+                _mtime = file_path.stat().st_mtime
+            except OSError:
+                return
+            # (A polled event arrives seconds after the write, so "just now" cannot hold; what the poll saw is that the modification time or
+            # size CHANGED since its last look, which a read never does. What is left to rule out is a file that was already old.)
+            _stale = (_mtime < self._session_start - _CORR_MTIME_TOLERANCE_S) if _polled else \
+                     ((_time.time() - _mtime) > _CORR_MTIME_TOLERANCE_S or _mtime < self._session_start - _CORR_MTIME_TOLERANCE_S)
+            if _stale:
+                logger.debug(f"File {file_path.name} was not written just now, during this session: ignored")
+                return
+
             # Enhanced detection: Check if this looks like a save file
             is_save_file = False
             
@@ -1198,16 +1236,21 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                     is_save_file = True
                     logger.debug(f"File {file_path.name} has save-like extension: {file_ext}")
             
-            if not is_save_file:
-                logger.debug(f"File {file_path.name} does not appear to be a save file")
-                return
+            # What the filters above let through counts: they ARE the exclusions (logs, temp files, caches, media, browser internals...). Looking
+            # like a save (the tests above) is a PRIORITY - such files seed the patterns and their folders are proposed first - not a condition:
+            # a game that writes a settings file ("config", "options.xml") in its own data folder has shown where that folder is, as the scan
+            # (Auto Detect) would find it, and live tracking has to as well. The proposal is only a proposal: the panel asks.
+            save_like = is_save_file
+            if not save_like:
+                logger.debug(f"File {file_path.name} is not save-named, but written just now: proposed with a lower priority")
             
             # NEW: Add to seed patterns and scan for similar files
             directory_path = _norm_key(file_path.parent)
-            _add_seed_pattern(directory_path, file_path)
+            if save_like:
+                _add_seed_pattern(directory_path, file_path)       # (only what looks like a save teaches the patterns)
             
             # Scan for additional similar files in the same directory
-            additional_saves = _scan_directory_for_seeded_saves(directory_path, file_path)
+            additional_saves = _scan_directory_for_seeded_saves(directory_path, file_path) if save_like else []
             
             # Add the original file and any discovered files to pending
             # Note: files are added to _BACKED_UP_FILES only after backup succeeds
@@ -1229,8 +1272,10 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 # happened and the periodic backup timer owns the rest.
                 first_sight = file_key not in _DISCOVERED_SAVE_FILES
                 _DISCOVERED_SAVE_FILES.add(file_key)
+                if save_like:
+                    _SAVE_LIKE_FILES.add(file_key)
                 if first_sight:
-                    logger.info(f"Save file detected: {file_path.name}")
+                    logger.info(f"Save file detected: {file_path.name}" + ("" if save_like else " (not save-named: lower priority)"))
                 else:
                     logger.debug(f"Save file touched again: {file_path.name}")
 
@@ -1503,7 +1548,7 @@ def _log_watch_schedule_failure(path: Path, err: BaseException, *, kind: str) ->
         logger.debug("Could not watch %s (%s): %s", path, kind, err)
 
 
-def _get_common_save_roots(appid: str = "") -> list[Path]:
+def _get_common_save_roots(appid: str = "", pid: int = 0, exe_path: str = "") -> list[Path]:
     """Return OS-specific common save-data roots to watch for games with no
     configured save_paths. These cover engines (Godot, Unity, etc.) that write
     saves to AppData or similar locations without leaving persistent file handles
@@ -1538,12 +1583,13 @@ def _get_common_save_roots(appid: str = "") -> list[Path]:
         for p in (_linux_xdg_data_home(), _linux_xdg_config_home(), home / ".renpy"):
             if p.exists():
                 roots.append(p)
-        if appid:
+        if appid or pid or exe_path:
             try:
                 from core.save_detector import compat_prefix_roots
-                roots.extend(compat_prefix_roots(str(appid)))
+                # This game's own prefix only: from its appid, or - for a game with none - from the running process / the place its exe sits.
+                roots.extend(compat_prefix_roots(str(appid or ""), pid=pid, exe_path=exe_path, own_only=True))
             except Exception as e:
-                logger.debug(f"Could not add the Proton prefix for {appid}: {e}")
+                logger.debug(f"Could not add the Wine/Proton prefix of {appid or pid or exe_path}: {e}")
     elif system == "Darwin":
         home = Path.home()
         # macOS Ren'Py uses ~/.renpy and/or ~/Library/RenPy — neither is under
@@ -1622,10 +1668,24 @@ class _CommonRootSaveHandler:
             for part in game_name.replace("-", " ").replace("_", " ").split():
                 if len(part) > 2:
                     parts.add(part.lower())
+        # The exe stem and install folder are identity terms too - unless they say
+        # nothing about WHICH game ("electron", "bakinplayer", "RPG_RT", "game"):
+        # every game built on that engine would then accept any AppData path that
+        # contains the word. The shared generic-stem vocabulary is the one that
+        # already decides this for titles, so it decides here as well - for the
+        # term as written and for each word of it.
+        try:
+            from core.exe_stems import stem_in
+            from core.save_detector import GENERIC_EXE_STEMS as _generic_stems
+        except Exception:
+            stem_in, _generic_stems = None, frozenset()
         for term in (extra_terms or []):
+            if stem_in is not None and stem_in(str(term), _generic_stems):
+                continue
             for part in str(term).replace("-", " ").replace("_", " ").split():
                 pl = part.lower()
-                if len(pl) > 3 and pl not in _GENERIC_IDENTITY_TERMS:
+                if len(pl) > 3 and pl not in _GENERIC_IDENTITY_TERMS \
+                        and not (stem_in is not None and stem_in(pl, _generic_stems)):
                     parts.add(pl)
         self._game_name_parts: list[str] = list(parts)
 
@@ -1656,6 +1716,222 @@ class _CommonRootSaveHandler:
         return getattr(self._inner, name)
 
 
+# ── Mounts whose changes inotify never reports ───────────────────────────────────────────────────────────────────────────────────────────
+# WSL2's Windows drives (/mnt/c) are a 9p mount. An inotify watch on them is ACCEPTED and then stays silent - not even for a write made by a
+# Linux process (measured: on ext4 watchdog sees the create, modify and close of a file; on /mnt/c, nothing at all). A game folder there would be
+# "watched" without ever reporting, and nobody should have to move their game to make SaveSync see it. Only 9p has been measured; another mount
+# type does not belong in this list until it has been.
+_INOTIFY_BLIND_FSTYPES = frozenset({"9p"})
+_MOUNTS_CACHE: dict = {"ts": -1e9, "mounts": []}
+
+
+def _mount_table() -> list:
+    """[(mount point, fs type)] from /proc/self/mountinfo, longest mount point first; empty off Linux or when it cannot be read. Cached 30 s."""
+    import time as _time
+    now = _time.monotonic()
+    if now - _MOUNTS_CACHE["ts"] < 30.0:
+        return _MOUNTS_CACHE["mounts"]
+    mounts: list = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as fh:
+            for line in fh:
+                head, sep, tail = line.partition(" - ")
+                fields = head.split()
+                if not sep or len(fields) < 5:
+                    continue
+                raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), os.fsencode(fields[4]))      # (" " is written \040)
+                mounts.append((os.fsdecode(raw), tail.split(" ", 1)[0]))
+    except (OSError, ValueError):
+        mounts = []
+    mounts.sort(key=lambda m: len(m[0]), reverse=True)
+    _MOUNTS_CACHE.update({"ts": now, "mounts": mounts})
+    return mounts
+
+
+def _fs_type_of(path: str) -> str:
+    """The file-system type of the mount that holds *path* ("" when unknown)."""
+    mounts = _mount_table()
+    if not mounts:
+        return ""
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return ""
+    for mount_point, fs_type in mounts:
+        if mount_point == "/" or real == mount_point or real.startswith(mount_point.rstrip("/") + "/"):
+            return fs_type
+    return ""
+
+
+def _inotify_blind(path) -> bool:
+    """True when *path* is on a mount that never reports file changes to inotify (_INOTIFY_BLIND_FSTYPES). Always False off Linux."""
+    return _fs_type_of(str(path)) in _INOTIFY_BLIND_FSTYPES
+
+
+class _PolledWatch:
+    """One folder tree - or one folder that has yet to appear - looked at by _PollingFallback. Stands in for watchdog's ObservedWatch."""
+    __slots__ = ("path", "recursive", "handler", "target", "snapshot", "dirs", "since", "due", "alive", "capped")
+
+    def __init__(self, path: str, recursive: bool, handler, target: Optional[str] = None):
+        import time as _time
+        self.path, self.recursive, self.handler, self.target = path, recursive, handler, target
+        self.snapshot: Optional[dict] = None      # {file path: (mtime_ns, size)} as of the last sweep; None until the first
+        self.dirs: set = set()
+        self.since = _time.time()                 # when the watch was asked for: a file written since then is a change even in the first sweep
+        self.due = 0.0
+        self.alive = True
+        self.capped = False
+
+
+class _PollingFallback:
+    """Looks at the watched trees by hand - listing them and comparing each file's modification time and size with the last time - for the
+    mounts inotify is blind to. Hands the SAME handlers the same kind of event (created / modified, a directory created), flagged
+    ``polled``: a change is noticed seconds after it happened, so the handler judges its time differently (see _SaveHandler.on_any_event).
+
+    Cost is bounded because a stat on such a mount is slow (about 1 ms on WSL2's, some 200 times a local disk): names the handler would
+    ignore are never stat'ed, a sweep covers at most MAX_ENTRIES (shallowest folders first), and the next sweep waits DUTY times as long as
+    the last one took, so the polling never holds more than about a quarter of one thread."""
+    MIN_INTERVAL_S = 3.0
+    DUTY = 3.0
+    MAX_ENTRIES = 20000
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._watches: list = []
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def schedule(self, handler, path: str, recursive: bool = True) -> "_PolledWatch":
+        w = _PolledWatch(str(path), recursive, handler)
+        self._add(w)
+        return w
+
+    def wait_for_folder(self, handler, target) -> "_PolledWatch":
+        """A watch that fires ONE 'folder created' event when *target* exists (the polled counterpart of watching its nearest parent)."""
+        w = _PolledWatch(str(target), False, handler, target=str(target))
+        self._add(w)
+        return w
+
+    def _add(self, w: "_PolledWatch") -> None:
+        with self._lock:
+            self._watches.append(w)
+            if self._thread is None or not self._thread.is_alive():
+                self._stop.clear()
+                self._thread = threading.Thread(target=self._run, name="SaveSync-poll", daemon=True)
+                self._thread.start()
+        self._wake.set()
+
+    def unschedule(self, w: "_PolledWatch") -> None:
+        w.alive = False
+        with self._lock:
+            try:
+                self._watches.remove(w)
+            except ValueError:
+                pass
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._watches)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        with self._lock:
+            for w in self._watches:
+                w.alive = False
+            self._watches.clear()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=3)
+
+    def _run(self) -> None:
+        import time as _time
+        while not self._stop.is_set():
+            now = _time.monotonic()
+            with self._lock:
+                todo = [w for w in self._watches if w.due <= now]
+            for w in todo:
+                if self._stop.is_set():
+                    break
+                started = _time.monotonic()
+                try:
+                    if w.target is not None:
+                        self._check_folder(w)
+                    else:
+                        self._sweep(w)
+                except Exception:
+                    logger.debug("Polling %s failed", w.path, exc_info=True)
+                took = _time.monotonic() - started
+                w.due = _time.monotonic() + max(self.MIN_INTERVAL_S, self.DUTY * took)
+            self._wake.wait(0.5)
+            self._wake.clear()
+
+    @staticmethod
+    def _emit(w: "_PolledWatch", kind: str, path: str, is_directory: bool = False) -> None:
+        from types import SimpleNamespace
+        try:
+            w.handler.dispatch(SimpleNamespace(event_type=kind, src_path=path, dest_path="", is_directory=is_directory, polled=True))
+        except Exception:
+            logger.debug("A polled event for %s was not handled", path, exc_info=True)
+
+    def _check_folder(self, w: "_PolledWatch") -> None:
+        if os.path.isdir(w.target):
+            self.unschedule(w)
+            self._emit(w, "created", w.target, is_directory=True)
+
+    def _sweep(self, w: "_PolledWatch") -> None:
+        import time as _time
+        from collections import deque
+        first = w.snapshot is None
+        t0 = _time.monotonic()
+        snap: dict = {}
+        dirs: set = set()
+        queue = deque([w.path])
+        listed = 0
+        while queue and w.alive and not self._stop.is_set():
+            try:
+                it = os.scandir(queue.popleft())
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    listed += 1
+                    if listed > self.MAX_ENTRIES:
+                        if not w.capped:
+                            w.capped = True
+                            logger.info("Polling %s: more than %d entries - only the shallowest folders are looked at", w.path, self.MAX_ENTRIES)
+                        queue.clear()
+                        break
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            dirs.add(e.path)
+                            if w.recursive:
+                                queue.append(e.path)
+                            continue
+                        if _is_ignored_file(Path(e.name)):
+                            continue                              # (the handler would drop it: not worth a slow stat)
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    snap[e.path] = (st.st_mtime_ns, st.st_size)
+        if not w.alive or self._stop.is_set():
+            return
+        old, old_dirs, w.snapshot, w.dirs = (w.snapshot or {}), w.dirs, snap, dirs
+        if first:
+            logger.info("Polling %s: %d files looked at in %.1f s (every %.0f s or more)", w.path, len(snap), _time.monotonic() - t0, self.MIN_INTERVAL_S)
+            floor_ns = int((w.since - _CORR_MTIME_TOLERANCE_S) * 1e9)
+            changed = [(p, "modified") for p, sig in snap.items() if sig[0] >= floor_ns]       # (written since the watch was asked for)
+        else:
+            for d in sorted(dirs - old_dirs):
+                self._emit(w, "created", d, is_directory=True)
+            changed = [(p, "created" if p not in old else "modified") for p, sig in snap.items() if old.get(p) != sig]
+        for p, kind in changed:
+            if not w.alive:
+                break
+            self._emit(w, kind, p)
+
+
 class SaveWatcher(QObject):
     save_changed     = Signal(str)   # game_id — save file modified
     folder_appeared  = Signal(str)   # game_id — watched folder now exists
@@ -1664,6 +1940,9 @@ class SaveWatcher(QObject):
         super().__init__(parent)
         self._observer: "Observer | None" = None
         self._handlers:  dict[str, _SaveHandler]         = {}  # game_id → handler
+        self._root_ctx: dict[str, tuple] = {}          # game_id → (the common-root handler, identity words, growth handler)
+        self._poller: Optional[_PollingFallback] = None  # for the mounts inotify is blind to (made when the first one is asked for)
+        self._polled_roots_logged: set = set()
         self._watches:   dict[str, object]               = {}  # "game_id:path" → watch
         self._pending:   dict[str, dict[str, _PendingPathHandler]]  = {}  # game_id → {path: handler}
         self._pnd_watches: dict[str, dict[str, object]]             = {}  # game_id → {path: watch}
@@ -1677,7 +1956,31 @@ class SaveWatcher(QObject):
         self._observer.start()
         logger.info("Filesystem watcher started")
 
+    def _schedule(self, handler, path, recursive: bool):
+        """The one place a watch is made: inotify, or - on a mount inotify never reports for - the polling fallback."""
+        path = str(path)
+        if _inotify_blind(path):
+            if self._poller is None:
+                self._poller = _PollingFallback()
+            if path not in self._polled_roots_logged:
+                self._polled_roots_logged.add(path)
+                logger.info("Watching %s by polling: its mount (%s) never reports file changes, so changes show up a few seconds late",
+                            path, _fs_type_of(path) or "?")
+            return self._poller.schedule(handler, path, recursive)
+        return self._observer.schedule(handler, path, recursive=recursive)
+
+    def _unschedule(self, w) -> None:
+        if isinstance(w, _PolledWatch):
+            if self._poller is not None:
+                self._poller.unschedule(w)
+        elif self._observer is not None:
+            self._observer.unschedule(w)
+
     def stop(self):
+        if self._poller is not None:
+            self._poller.stop()
+            self._poller = None
+            self._polled_roots_logged.clear()
         if self._observer:
             for h in list(self._handlers.values()):
                 h.cancel()
@@ -1698,6 +2001,7 @@ class SaveWatcher(QObject):
             _PENDING_FILES.clear()
             _SEED_PATTERNS.clear()
             _DISCOVERED_SAVE_FILES.clear()
+            _SAVE_LIKE_FILES.clear()
             _SAVE_PATTERNS.clear()
             _SaveHandler._hints_cache = None
             _SaveHandler._hints_initialized = False
@@ -1742,9 +2046,9 @@ class SaveWatcher(QObject):
                     # a directory, and recursing an install root would sweep
                     # the whole installation into event handling.
                     if path.is_file():
-                        w = self._observer.schedule(handler, str(path.parent), recursive=False)
+                        w = self._schedule(handler, path.parent, False)
                     else:
-                        w = self._observer.schedule(handler, str(path), recursive=True)
+                        w = self._schedule(handler, path, True)
                     self._watches[f"{game_id}:{path_str}"] = w
                     watched_any = True
                     logger.debug(f"Watching: {path}")
@@ -1804,7 +2108,14 @@ class SaveWatcher(QObject):
             if _entry is not None and getattr(_entry, "exe_path", ""):
                 _identity_extra.append(strip_version_tokens(Path(_entry.exe_path).stem))
             _appid = getattr(_entry, "appid", "") if _entry is not None else ""
-            common_roots = _get_common_save_roots(_appid or "")
+            _pid = 0
+            try:
+                from core.monitor import get_monitor
+                _pid = int(get_monitor().tracked_pid_for(game_id) or 0)
+            except Exception:
+                pass
+            common_roots = _get_common_save_roots(
+                _appid or "", pid=_pid, exe_path=(getattr(_entry, "exe_path", "") if _entry is not None else ""))
             root_handler = _CommonRootSaveHandler(
                 game_id, game_name, self._on_save_changed, extra_terms=_identity_extra)
             identity_parts = list(root_handler._game_name_parts)
@@ -1816,6 +2127,7 @@ class SaveWatcher(QObject):
                     )
                 ),
             )
+            self._root_ctx[game_id] = (root_handler, identity_parts, growth)        # (for refresh_game_prefix)
             for root in common_roots:
                 for target, recursive in _linux_scoped_common_watch_specs(
                     root, identity_parts,
@@ -1851,7 +2163,7 @@ class SaveWatcher(QObject):
                 key = f"{game_id}:__install__:{_install_str}"
                 if key not in self._watches and not already_covered:
                     try:
-                        w = self._observer.schedule(handler, _install_str, recursive=True)
+                        w = self._schedule(handler, _install_str, True)
                         self._watches[key] = w
                         watched_any = True
                         logger.debug(f"Install-root watching {_install_dir} for {game_name!r}")
@@ -1940,7 +2252,13 @@ class SaveWatcher(QObject):
             self._pending[game_id] = {}
         self._pending[game_id][str(target)] = pnd_handler
         try:
-            w = self._observer.schedule(pnd_handler, str(parent), recursive=True)
+            if _inotify_blind(parent):
+                # (no events to wait on: look for the folder itself - one stat - instead of listing its nearest parent, which may be a whole install)
+                if self._poller is None:
+                    self._poller = _PollingFallback()
+                w = self._poller.wait_for_folder(pnd_handler, target)
+            else:
+                w = self._observer.schedule(pnd_handler, str(parent), recursive=True)
             if game_id not in self._pnd_watches:
                 self._pnd_watches[game_id] = {}
             self._pnd_watches[game_id][str(target)] = w
@@ -2046,9 +2364,7 @@ class SaveWatcher(QObject):
         if key in self._watches:
             return False
         try:
-            w = self._observer.schedule(
-                handler, str(target), recursive=recursive,
-            )
+            w = self._schedule(handler, target, recursive)
             self._watches[key] = w
             return True
         except Exception as e:
@@ -2057,22 +2373,40 @@ class SaveWatcher(QObject):
             )
             return False
 
+    def refresh_game_prefix(self, game_id: str, pid: int) -> None:
+        """Watch the Wine/Proton prefix a RUNNING game uses, read from its own process. The process may not have been known when the watch was
+        set up (watch_game runs at launch), and a game that has no Steam appid names its prefix in no other way. Safe to call again and again:
+        a root already watched is not watched twice."""
+        ctx = self._root_ctx.get(game_id)
+        if ctx is None or not pid or not self._observer:
+            return
+        root_handler, identity_parts, growth = ctx
+        try:
+            from core.save_detector import game_prefix_dirs
+            for root in game_prefix_dirs(pid=pid):
+                for target, recursive in _linux_scoped_common_watch_specs(root, identity_parts):
+                    if self._schedule_common_root_target(game_id, target, root_handler if recursive else growth, recursive=recursive):
+                        logger.info("Watching %s: the Wine/Proton prefix of %s, read from the running game", target, game_id)
+        except Exception:
+            logger.debug("could not watch the game's Wine/Proton prefix", exc_info=True)
+
     def unwatch_game(self, game_id: str):
         if not self._observer:
             return
+        self._root_ctx.pop(game_id, None)
         h = self._handlers.pop(game_id, None)
         if h:
             h.cancel()
         for k in [k for k in self._watches if k.startswith(f"{game_id}:")]:
             try:
-                self._observer.unschedule(self._watches.pop(k))
+                self._unschedule(self._watches.pop(k))
             except Exception:
                 pass
         self._pending.pop(game_id, {})
         pnd_w_dict = self._pnd_watches.pop(game_id, {})
         for pnd_w in pnd_w_dict.values():
             try:
-                self._observer.unschedule(pnd_w)
+                self._unschedule(pnd_w)
             except Exception:
                 pass
         
@@ -2172,15 +2506,20 @@ def get_pending_save_paths(game_id: str, exe_dir: str = "") -> list[str]:
         files = list(_PENDING_FILES.get(game_id, set()))
     out: list[str] = []
     seen: set[str] = set()
+    save_like: set[str] = set()                  # the candidates that hold a file that looks like a save
     for fp in files:
         parent = os.path.dirname(fp)
         # Normal case → the containing save folder; folder is a watched root
         # → keep the individual file (never propose a whole root as a save dir).
         cand = parent if (parent and os.path.normcase(os.path.normpath(parent)) not in roots) else fp
         key = os.path.normcase(os.path.normpath(cand))
+        if _norm_key(fp) in _SAVE_LIKE_FILES:
+            save_like.add(key)
         if key not in seen:
             seen.add(key)
             out.append(cand)
+    # PRIORITY: folders that hold something that looks like a save come first (the sort is stable: the rest keep the order they came in).
+    out.sort(key=lambda p: os.path.normcase(os.path.normpath(p)) not in save_like)
     # Files queued before the user rejected their folder (it can happen
     # mid-session) are still in the pending set; they must not be proposed.
     try:

@@ -3,7 +3,7 @@ PyInstaller runtime hook — runs AFTER extraction, BEFORE main.py.
 
 Single-instance enforcement via OS-native guards:
   - Windows: Named Mutex
-  - Linux/macOS: flock on a lock file
+  - Linux/macOS: flock on a per-user lock file in the temp directory
 
 Also exposes close_bootloader_splash() for main.py.
 
@@ -177,8 +177,13 @@ def _check_single_instance():
         except ImportError:
             return  # platform without flock — rely on Tcl level only
 
+        # Per user, in the temp directory (as the show socket is) - NOT inside the data directory, where two launches whose data directories
+        # differ did not see each other. Must stay in sync with main._unix_lock_path.
+        import re
+        import tempfile
         data_dir = os.path.dirname(_get_config_path())
-        lock_path = os.path.join(data_dir, ".savesync.lock")
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+        lock_path = os.path.join(tempfile.gettempdir(), "SaveSyncLock-" + re.sub(r"\W+", "_", user))
         try:
             os.makedirs(data_dir, exist_ok=True)
             fh = open(lock_path, "a+")

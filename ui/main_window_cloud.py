@@ -167,6 +167,10 @@ class CloudFlowsMixin:
         from core.backup import get_backup_manager as _gbm
         _expected_backup_id = (_gbm().get_last_restored_backup_id(game_id)
                                or self._last_restored.get(game_id, ""))
+        # A game with a history of its own has a cloud folder that is its own; the question "which of the same-name copies is mine?" is only
+        # for one that has none (decided here, on the GUI thread, so a game with a history costs nothing extra).
+        _has_own_history = self._entry_has_local_backups(entry)
+        _entry_snapshot = entry
 
         def _do_check():
             has_cloud = False
@@ -179,6 +183,18 @@ class CloudFlowsMixin:
                 except Exception as e:
                     logger.debug(f"_check_cloud_on_launch: check_cloud_saves failed: {e}")
                     has_cloud = False
+            # Cloud folders that share this game's name (a fork, or a homonym, makes `Alpha`, `Alpha~7f31c0`, ...) when the game has nothing of
+            # its own there: which is hers is not for the app to guess. Each copy comes with what it holds, compared with this disk HERE (file
+            # hashing never on the GUI thread): the decision (see _on_cloud_check_result) adopts the one that is the same data, or asks.
+            # Counted whether or not the game's own folder is one of them.
+            copies = []
+            if online and not _has_own_history:
+                try:
+                    copies = self._same_name_cloud_copies(orch, _current_folder, _name, _game_id, entry=_entry_snapshot)
+                except Exception as e:
+                    logger.debug(f"_check_cloud_on_launch: same-name copies lookup failed: {e}")
+                if copies and (len(copies) >= 2 or copies[0]["folder"] != _current_folder):
+                    has_cloud = True
             renamed = None
             if online and not _rename_never:
                 try:
@@ -200,6 +216,7 @@ class CloudFlowsMixin:
                     "regressed_to": regressed_to,
                     "is_unbacked": is_unbacked,
                     "renamed": renamed,
+                    "copies": copies,
                 }
             from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
             try:
@@ -238,8 +255,71 @@ class CloudFlowsMixin:
             logger.debug("Orphan match failed", exc_info=True)
             return False
 
-    def _apply_orphan_backup_to_game(self, entry) -> bool:
-        """Adopt matching orphan index + restore to the chain destination.
+    def _fork_cloud_folder_if_shared(self, entry) -> bool:
+        """"Keep local" on the download offer, where the destination already holds a same-name copy (a cloud folder, or an archive of the same
+        name): the player is NOT taking those saves - a different game with the same name, or a new playthrough - so the game gets its OWN cloud
+        folder, as the "different game" choice does, and never uploads into (and mixes with) the existing one. The game's own backups, if it has
+        any, follow it to the new folder. Not done when nothing is there to share, or when the cloud cannot be asked (the folder is then the
+        name's, as before). True when the folder was changed."""
+        ctx = self.__dict__.get("_no_local_context", {}).pop(entry.id, None)
+        if not ctx or not (ctx.get("cloud") or ctx.get("orphan")):
+            return False
+        try:
+            # The library's own "it is a homonym" move (see MainWindow._claim_unique_cloud_folder): local backups follow to the new folder, the old
+            # one is NOT put in folder_history (it never was this game's), and the first upload goes to the new, empty folder.
+            return bool(self._claim_unique_cloud_folder(entry))
+        except Exception:
+            logger.debug("Could not give the game its own cloud folder", exc_info=True)
+            return False
+
+    def _row_destinations(self, entry, row) -> list:
+        """For each save path *row* recorded: ``(path, chain, dest, from_origin)`` - *dest* being where its files belong on THIS machine
+        ("" when that cannot be said). The ONE answer for "where would these files go": the comparison with the disk and the registration of
+        the game's save paths both read it, so they cannot disagree.
+
+        The chain says where first. Without one, the place the row was taken from is the destination only for a removed game's own backups -
+        that is where its saves lived. A hand-added archive (ORPHAN_SOURCES_KEY on its row) was taken from a COLLECTION copy, which is the
+        source of the zip and never a place the game reads: for it no chain means no known destination."""
+        from core.backup import chain_destination, BackupManager
+        origin_ok = BackupManager.ORPHAN_SOURCES_KEY not in (row.cloud_metadata or {})
+        out = []
+        for p in row.save_paths or []:
+            chain = (row.content_chain_for(p) or row.chain_for(p) or "").strip()
+            resolved = chain_destination(chain, entry.id) if chain else None
+            if resolved is not None:
+                out.append((p, chain, str(resolved), False))
+            elif origin_ok and p:
+                out.append((p, chain, p, True))
+            else:
+                out.append((p, chain, "", False))
+        return out
+
+    def _orphan_adds_nothing(self, entry) -> bool:
+        """True when the orphan archive about to be offered for *entry* holds nothing this machine does not already have, byte for byte.
+
+        A game added again (or auto-added at its first launch) has no save paths yet, so "no saves on disk" is only what the entry knows, not
+        what is true: the archive's own record says where its files go (the same destinations an accepted offer would restore to), and when
+        those files are all there and identical there is nothing to download - asking is noise."""
+        try:
+            from core.backup import get_backup_manager
+            bm = get_backup_manager()
+            gid = getattr(self, "_pending_orphan_adopt", {}).get(entry.id)
+            rows = bm.get_backups_for_game(gid) if gid else bm.find_orphan_backups_for_game(entry)
+            newest = (bm.newest_archive_row(rows) if rows else None) or (rows[0] if rows else None)
+            if newest is None:
+                return False
+            dests = []
+            for _p, _chain, dest, _origin in self._row_destinations(entry, newest):
+                if dest and dest not in dests:
+                    dests.append(dest)
+            return bm.archive_already_on_disk(newest, dests)
+        except Exception:
+            logger.debug("Could not compare the orphan archive with the disk", exc_info=True)
+            return False
+
+    def _apply_orphan_backup_to_game(self, entry, restore: bool = True) -> bool:
+        """Adopt matching orphan index + restore to the chain destination. With *restore* False the archive is only LINKED to the game (its
+        history and save paths become the game's) and no file on disk is touched.
 
         The archive folder (collection copy under e.g. D:\\Games\\Saves) is
         only the zip *source*. Live game save_paths must come from the recorded
@@ -248,9 +328,16 @@ class CloudFlowsMixin:
         if entry is None:
             return False
         try:
-            from core.backup import get_backup_manager, chain_destination
+            from pathlib import Path
+            from core.backup import get_backup_manager
             bm = get_backup_manager()
             orphan_gid = getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
+            pin = self.__dict__.get("_pending_orphan_folder", {}).pop(entry.id, None)
+            if pin:
+                from core.constants import get_install_folder_name
+                if pin != get_install_folder_name(entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name):
+                    # the archive is the same data as THAT cloud copy: the game takes its folder, so the history goes up beside it
+                    entry = get_library().update_game_fields(entry.id, computed_folder_name=pin) or entry
             orphans = bm.get_backups_for_game(orphan_gid) if orphan_gid else []
             if not orphans:
                 orphans = bm.find_orphan_backups_for_game(entry)
@@ -269,17 +356,13 @@ class CloudFlowsMixin:
                 # destination would be rebuilt from whatever it happened to
                 # hold rather than from what the archive recorded.
                 newest = bm.newest_archive_row(backs) or backs[0]
-                for p in (newest.save_paths or []):
-                    chain = (
-                        newest.content_chain_for(p)
-                        or newest.chain_for(p)
-                        or ""
-                    ).strip()
-                    dest = ""
-                    if chain:
-                        resolved = chain_destination(chain, entry.id)
-                        if resolved is not None:
-                            dest = str(resolved)
+                for p, chain, dest, from_origin in self._row_destinations(entry, newest):
+                    if from_origin:
+                        # No chain: the place a removed game's own backup was taken from. Only LINKING (nothing is restored, so nothing else
+                        # will say where the saves are) registers it, and only where the files really are - the comparison that allowed the
+                        # link looked right there. A restore finds its own place, as it always did.
+                        from core.registry_saves import is_registry_path
+                        dest = p if (not restore and (is_registry_path(p) or Path(p).exists())) else ""
                     if not dest:
                         # Keep the chain for later rebases / restore; do NOT
                         # register the archive copy as the live save folder.
@@ -312,7 +395,7 @@ class CloudFlowsMixin:
                 get_library().update_game(entry)
 
             owned = bm.get_backups_for_game(entry.id)
-            if owned:
+            if owned and restore:
                 bm.restore_backup(owned[0].backup_id, lib_game_id=entry.id)
             logger.info(
                 f"Applied orphan archive to {entry.name!r} "
@@ -336,6 +419,7 @@ class CloudFlowsMixin:
             regressed_to = _result.get("regressed_to")
             is_unbacked = bool(_result.get("is_unbacked"))
             renamed_info = _result.get("renamed")
+            copies = list(_result.get("copies") or [])
             on_resolved = self._cloud_check_on_resolved.pop(game_id, None)
 
         # One-shot suppression: the user already answered the cloud question
@@ -344,6 +428,7 @@ class CloudFlowsMixin:
         if game_id in self._suppress_cloud_prompt_once:
             self._suppress_cloud_prompt_once.discard(game_id)
             has_cloud = False
+            copies = []
 
         entry = get_library().get_by_id(game_id)
 
@@ -361,6 +446,52 @@ class CloudFlowsMixin:
 
         # Hand-added orphan archives: same notification as cloud no_local.
         has_orphan = self._stash_orphan_match(entry) if entry is not None else False
+        if has_orphan and self._orphan_adds_nothing(entry):
+            # The same bytes are already here, so it is the same game and there is nothing to download - but the backup history is still
+            # hers: linked WITHOUT restoring, so what is on disk counts as already backed up and is not uploaded a second time.
+            linked = self._apply_orphan_backup_to_game(entry, restore=False)
+            logger.info(f"Orphan archive for {entry.name!r} holds nothing this machine does not already have: "
+                        f"{'its history is linked to the game' if linked else 'not offered'}")
+            has_orphan = False
+
+        # The cloud copies that share this game's name (see _check_cloud_on_launch) are a question only for a game with NO history of its own -
+        # and the orphan link just above may have given it one.
+        if copies and (entry is None or self._entry_has_local_backups(entry)):
+            copies = []
+        copy_choices: list = []                 # what the player is asked to pick from, when the data itself cannot say
+        if copies and entry is not None:
+            from core.constants import get_install_folder_name
+            own_folder = get_install_folder_name(entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
+            if not has_orphan:
+                # The same rule as the archive that is already on this disk: when a copy IS the data this machine has (byte for byte), it is
+                # the same game and there is nothing to ask. Her own folder first; otherwise the one copy that matches. A game the player
+                # told to stop asking about the cloud is left alone.
+                same = [c for c in copies if c.get("identical")]
+                pick = next((c for c in same if c["folder"] == own_folder), None) or (same[0] if len(same) == 1 else None)
+                if pick is not None and entry.id not in get_config().get("suppressed_cloud_no_local", []):
+                    entry = self._adopt_identical_copy(entry, pick) or entry
+                    copies, has_cloud = [], False
+                elif len(copies) == 1 and copies[0]["folder"] == own_folder:
+                    copies = []                 # her own folder alone, and it holds something new: the plain offer
+                else:
+                    copy_choices = copies
+            elif len(copies) >= 2:
+                # An archive on this disk AND several cloud copies: equal data -> the archive wins, as it always did (and the game follows the
+                # copy it IS, so its history is not uploaded into another game's folder); different -> the player says which version is hers.
+                units = self._orphan_units(entry)
+                offered = getattr(self, "_pending_orphan_adopt", {}).get(entry.id)
+                unit = next((u for u in units if offered and u["folder"].endswith(offered)), units[0] if units else None)
+                ohash = (unit or {}).get("hash", "")
+                match = [c for c in copies if ohash and c.get("hash") == ohash]
+                if match:
+                    pin = next((c["folder"] for c in match if c["folder"] == own_folder), match[0]["folder"])
+                    if pin != own_folder:
+                        self.__dict__.setdefault("_pending_orphan_folder", {})[entry.id] = pin
+                    copies = []
+                else:
+                    copy_choices = copies + units
+            else:
+                copies = []                     # one cloud copy next to the archive: the archive is offered, as before
 
         # Decide FIRST whether a cloud notification will actually be shown,
         # before calling on_resolved — that decision is exactly what
@@ -371,7 +502,7 @@ class CloudFlowsMixin:
         # is what caused a visible flicker: two show_animated() calls in the
         # same synchronous pass, each cancelling and restarting the other's
         # fade-in within milliseconds.
-        # "regression" | "unbacked" | "remote_renamed" | "different_machine" | "no_local"
+        # "regression" | "unbacked" | "remote_renamed" | "different_machine" | "no_local" | "no_local_copies"
         # | "conflict_diverged" | "conflict_unreconciled" | "sync_prompt" | None
         notification_kind = None
         if entry is not None and self._overlay is not None:
@@ -500,6 +631,17 @@ class CloudFlowsMixin:
             if notification_kind is None and is_unbacked and "unbacked" not in _notifs_muted:
                 notification_kind = "unbacked"
 
+            if notification_kind == "no_local":
+                # what the offer is ABOUT, for "keep local" (see _fork_cloud_folder_if_shared)
+                self.__dict__.setdefault("_no_local_context", {})[entry.id] = {
+                    "cloud": bool(has_cloud), "orphan": bool(has_orphan), "own_backups": bool(has_local)}
+                if copy_choices and not has_local and entry.exe_path:
+                    # No saves here, nothing of her own in the cloud, and SEVERAL copies under her name (or one that is not hers, or an
+                    # archive that matches none of them) that the data cannot tell apart: a plain "download?" would pick one for her. The
+                    # same question the unknown games are asked (CloudVerifyDialog), with the candidates kept for it.
+                    notification_kind = "no_local_copies"
+                    self._pending_cloud_verify[entry.exe_path] = {
+                        "name": entry.name, "folders": copy_choices, "game_id": entry.id}
             logger.info(
                 f"Cloud launch check for {entry.name!r}: "
                 f"has_cloud={has_cloud}, has_orphan={has_orphan}, "
@@ -543,13 +685,18 @@ class CloudFlowsMixin:
             # appear behind a fullscreen game or never be seen at all, and
             # froze the GUI thread until answered.
             self._pending_cloud_notification[game_id] = "different_machine"
-            self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path)
+            self._overlay.show_cloud_saves_different_machine(entry.name, entry.exe_path, compare=has_live_saves)
         elif notification_kind == "no_local":
             self._pending_cloud_notification[game_id] = "no_local"
             self._overlay.show_cloud_saves_no_local(entry.name, entry.exe_path)
+        elif notification_kind == "no_local_copies":
+            self._pending_cloud_notification[game_id] = "no_local_copies"
+            self._overlay.show_cloud_saves_no_local_copies(
+                entry.name, entry.exe_path, several=len(self._pending_cloud_verify[entry.exe_path]["folders"]) > 1)
         elif notification_kind == "sync_prompt":
             self._pending_cloud_notification[game_id] = "sync_prompt"
-            self._overlay.show_cloud_saves(entry.name, entry.exe_path)
+            # (reached only with backups of its own AND live saves that match none of them: both versions exist, and differ)
+            self._overlay.show_cloud_saves(entry.name, entry.exe_path, compare=True)
         elif notification_kind in ("conflict_diverged", "conflict_unreconciled"):
             self._pending_cloud_notification[game_id] = notification_kind
             # Cheap local date only here (GUI thread). Remote is filled when
@@ -773,6 +920,19 @@ class CloudFlowsMixin:
             self._pending_conflict_info[entry.id] = info
 
 
+    def _decline_other_pc_saves(self, entry) -> bool:
+        """"Keep Local / fork" on "saves uploaded by another PC": the player is not taking that PC's saves - a different game with the same
+        name, a new playthrough, or simply this PC's own - so the question is settled for that cloud version AND the game takes a cloud folder
+        of its own (see _claim_unique_cloud_folder), never uploading into (and mixing with) the other PC's. Whoever wants to carry on with
+        the same game, the local one winning, has "Compare versions". True when the folder was changed."""
+        self._pending_cloud_notification.pop(entry.id, None)
+        self._mark_cloud_machine_confirmed(entry.id)
+        try:
+            return bool(self._claim_unique_cloud_folder(entry))
+        except Exception:
+            logger.debug("Could not give the game its own cloud folder", exc_info=True)
+            return False
+
     def _mark_cloud_machine_confirmed(self, game_id: str):
         """Record that this machine has already been asked about a cloud
         save uploaded elsewhere, so the prompt isn't repeated for the same
@@ -913,18 +1073,92 @@ class CloudFlowsMixin:
             )
 
 
-    def _cloud_folder_registration(self, provider, folder: str):
-        """(registered_name, registered_path) from the most recent backup in a
-        cloud folder — shows the user what a cloud copy actually belongs to."""
-        try:
-            entries = provider.list_cloud_backups(folder)
-            if entries:
-                latest = max(entries, key=lambda e: e.get("created_at", ""))
-                return (latest.get("game_name", ""), latest.get("exe_path", ""))
-        except Exception:
-            pass
-        return ("", "")
+    def _same_name_cloud_copies(self, orch, folder: str, name: str, own_id: str = "", entry=None) -> list:
+        """Every cloud folder that shares *folder*'s base name (``Alpha``, ``Alpha~7f31c0``, ...), as the verify dialog lists them:
+        ``{"folder", "name", "path", "when"}``, the name and install path each copy was registered with and the date of its newest backup.
+        Network - never on the GUI thread. [] when the cloud cannot be asked. Each folder's index is read ONCE.
 
+        With *own_id* (a game already in the library) the game's own folder comes first, and a folder another library game lives in is left
+        out: those saves are that game's, so they are no candidate for this one. With *entry* each copy also says what it HOLDS
+        (see _cloud_copy_facts): the hash of its newest backup, whether this disk already has exactly that, and where its files would go."""
+        provider = orch.provider
+        if not provider:
+            return []
+        folders = orch.cloud_name_folders(folder)
+        base_rows = None
+        if not folders:
+            base_rows = provider.list_cloud_backups(folder)
+            if base_rows:
+                folders = [folder]       # enumeration unsupported; the base name has saves
+        if own_id:
+            lib = get_library()
+            folders = [f for f in folders if f == folder or not lib.folder_name_in_use_by_other(f, own_id)]
+            folders.sort(key=lambda f: f != folder)
+        out = []
+        for cf in folders:
+            rows = base_rows if (base_rows is not None and cf == folder) else provider.list_cloud_backups(cf)
+            rows = [r for r in (rows or []) if isinstance(r, dict)]
+            latest = max(rows, key=lambda e: e.get("created_at", ""), default={})
+            cand = {"folder": cf, "name": latest.get("game_name") or name, "path": latest.get("exe_path", ""),
+                    "when": latest.get("created_at", "")}
+            if entry is not None:
+                cand.update(self._cloud_copy_facts(entry, rows))
+            out.append(cand)
+        return out
+
+    def _cloud_copy_facts(self, entry, rows: list) -> dict:
+        """What a cloud copy (the index rows of one folder) holds, set against *entry*'s disk: ``hash`` (of its newest backup's state),
+        ``identical`` (this machine already has exactly those files, byte for byte - nothing to download) and ``dests`` (where they would go:
+        the chain's destination, or for a removed game's own backups the place they were taken from - see _row_destinations). File hashing:
+        off the GUI thread."""
+        out = {"hash": "", "identical": False, "dests": []}
+        try:
+            from core.backup import get_backup_manager, BackupEntry
+            bm = get_backup_manager()
+            objs = []
+            for d in rows:
+                try:
+                    objs.append(BackupEntry.from_dict(dict(d)))
+                except Exception:
+                    continue
+            main = [o for o in objs if not bm.is_side_backup(o)]
+            newest = bm.newest_archive_row(main) or (max(main, key=lambda o: o.created_dt) if main else None)
+            if newest is None:
+                return out
+            items = self._row_destinations(entry, newest)
+            where = []
+            for _p, _chain, dest, _origin in items:
+                if dest and dest not in where:
+                    where.append(dest)
+            for sp in entry.save_paths or []:
+                if sp and sp not in where:
+                    where.append(sp)
+            out["hash"] = str((newest.cloud_metadata or {}).get("save_hash") or "")
+            out["identical"] = bool(bm.archive_already_on_disk(newest, where))
+            out["dests"] = [{"path": dest, "chain": chain, "origin": origin}
+                            for _p, chain, dest, origin in items if dest]
+        except Exception:
+            logger.debug("Could not compare a cloud copy with the disk", exc_info=True)
+        return out
+
+    def _orphan_units(self, entry) -> list:
+        """The orphan archives that match *entry* by name, one candidate per archive (newest first), shaped for the picker: the folder is
+        ``local:<game id>`` - a marker no cloud folder can carry, since ':' never survives a folder name - and ``hash`` is its newest
+        state's, the thing a cloud copy is compared by."""
+        from core.backup import get_backup_manager
+        from ui.dialogs.cloud_verify_dialog import LOCAL_PREFIX
+        bm = get_backup_manager()
+        by_gid: dict = {}
+        for b in bm.find_orphan_backups_for_game(entry):
+            by_gid.setdefault(b.game_id, []).append(b)
+        units = []
+        for gid, backs in by_gid.items():
+            newest = bm.newest_archive_row(backs) or backs[0]
+            units.append({"folder": LOCAL_PREFIX + gid, "name": newest.game_name or entry.name,
+                          "path": (newest.save_paths or [""])[0], "when": newest.created_at, "local": True,
+                          "hash": str((newest.cloud_metadata or {}).get("save_hash") or "")})
+        units.sort(key=lambda u: u["when"], reverse=True)
+        return units
 
     @Slot()
     def _process_cloud_found_unknown(self):
@@ -966,15 +1200,137 @@ class CloudFlowsMixin:
         if not candidates:
             return
         from ui.dialogs.cloud_verify_dialog import CloudVerifyDialog
-        dlg = CloudVerifyDialog(detected, candidates, self)
+        # (Over a game in exclusive fullscreen a dialog has no owner: the system makes a window with an owner in the owner's band, and
+        # the owner is the main window, hidden in the tray - an ordinary window over the game takes it to the desktop.)
+        _owner = None if getattr(getattr(self, "_overlay", None), "_rw_exclusive", False) else self
+        dlg = CloudVerifyDialog(detected, candidates, _owner)
         dlg.resolution.connect(
             lambda choice, folder: self._on_cloud_verify_result(exe_path, detected, choice, folder)
         )
         dlg.exec()
 
 
+    def _adopt_identical_copy(self, entry, cand: dict):
+        """A cloud copy that is exactly what this machine already has: it IS this game's. Nothing is downloaded over the saves and nobody is
+        asked - the game takes the copy's folder, its save paths are registered (the places the copy's files belong, found by the same
+        rule that judged them identical), and the history comes down (a sync "down" files the backups under this game and writes no save
+        file). Returns the refreshed entry."""
+        from pathlib import Path
+        from core.constants import get_install_folder_name
+        from core.backup import get_backup_manager
+        from core.registry_saves import is_registry_path
+        folder = cand["folder"]
+        own = get_install_folder_name(entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
+        if folder != own:
+            get_backup_manager().relocate_game_backups(entry.id, own, folder)
+            entry = get_library().update_game_fields(entry.id, computed_folder_name=folder) or entry
+        merged = list(entry.save_paths or [])
+        added = 0
+        for d in cand.get("dests") or []:
+            dest = d.get("path") or ""
+            if not dest or (d.get("origin") and not (is_registry_path(dest) or Path(dest).exists())):
+                continue
+            if dest not in merged:
+                merged.append(dest)
+                added += 1
+            if d.get("chain"):
+                entry.record_path_chain(dest, d["chain"])
+        if added:
+            entry.save_paths = merged
+            entry.save_paths_confirmed = True
+        get_library().update_game(entry)
+        logger.info(f"{entry.name!r}: the cloud copy {folder!r} is what this machine already has - adopted, nothing to download "
+                    f"({added} save path(s) registered)")
+        orch = get_orchestrator()
+        orch.sync_game(entry.id, entry.name, entry.save_paths, direction="down", exe_path=entry.exe_path,
+                       computed_folder_name=folder, name_history=list(entry.name_history))
+        return get_library().get_by_id(entry.id) or entry
+
+    def _accept_local_archive(self, entry, orphan_gid: str) -> None:
+        """The player picked the backup on this PC (among cloud copies that are not the same data): it is applied, as the plain offer does."""
+        self._pending_cloud_notification.pop(entry.id, None)
+        self._pending_cloud_verify.pop(entry.exe_path or "", None)
+        self.__dict__.get("_no_local_context", {}).pop(entry.id, None)
+        self._pending_orphan_adopt[entry.id] = orphan_gid
+        self._apply_orphan_backup_to_game(entry)
+        try:
+            page = getattr(self, "_backups_page", None)
+            if page is not None:
+                page._load_games()
+                page._refresh_list()
+        except Exception:
+            logger.debug("Could not refresh the backups page", exc_info=True)
+        self._show_tracking_toast_if_playing(entry.id)
+
+    def _keep_local_no_local(self, entry) -> None:
+        """"Continue with local saves / fork" on the no-saves-here prompt (and "none of these" in the picker): settled for good, and the game
+        takes a cloud folder of its own where a same-name copy is already at the destination (see _fork_cloud_folder_if_shared)."""
+        self._pending_cloud_notification.pop(entry.id, None)
+        getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
+        self.__dict__.get("_pending_orphan_folder", {}).pop(entry.id, None)
+        self._pending_cloud_verify.pop(entry.exe_path or "", None)
+        # Persist the "use local saves" choice so the download prompt is not re-shown on every restart (reversible from Settings).
+        self._persist_cloud_no_local_decline(entry.id, entry.name)
+        self._fork_cloud_folder_if_shared(entry)
+        self._show_tracking_toast_if_playing(entry.id)
+
+    def _adopt_cloud_copy(self, entry, folder: str) -> None:
+        """The player named the cloud copy that IS this game's: it becomes the game's folder, and its saves are downloaded and put in place.
+
+        The game had no backups of its own, so nothing is left behind; any that appeared while the question was open move with it. The
+        folder it leaves is NOT recorded as one that was ever its own (folder_history is "a folder that used to be mine" - see
+        _claim_unique_cloud_folder)."""
+        from core.constants import get_install_folder_name
+        from core.backup import get_backup_manager
+        own = get_install_folder_name(entry.exe_path or "", entry.name, entry.id, entry.computed_folder_name)
+        self._pending_cloud_notification.pop(entry.id, None)
+        self._pending_cloud_verify.pop(entry.exe_path or "", None)
+        getattr(self, "_pending_orphan_adopt", {}).pop(entry.id, None)
+        self.__dict__.get("_pending_orphan_folder", {}).pop(entry.id, None)
+        self.__dict__.get("_no_local_context", {}).pop(entry.id, None)
+        target = folder or own
+        if folder and folder != own:
+            get_backup_manager().relocate_game_backups(entry.id, own, folder)
+            entry = get_library().update_game_fields(entry.id, computed_folder_name=folder) or entry
+            logger.info(f"{entry.name!r}: the cloud copy {folder!r} is this game's (it was {own!r})")
+        orch = get_orchestrator()
+
+        def _on_sync_done(gid: str, result):
+            if gid != entry.id:
+                return
+            try:
+                orch.sync_finished.disconnect(_on_sync_done)
+            except (RuntimeError, TypeError):
+                pass
+
+            def _restore_then_toast():
+                self._restore_after_cloud_download(entry.id)
+                self._show_tracking_toast_if_playing(entry.id)
+
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(300, _restore_then_toast)
+
+        orch.sync_finished.connect(_on_sync_done)
+        orch.sync_game(
+            entry.id, entry.name, entry.save_paths, direction="down", exe_path=entry.exe_path,
+            computed_folder_name=target, name_history=list(entry.name_history))
+
     def _on_cloud_verify_result(self, exe_path: str, detected_name: str, choice: str, folder: str):
         """Act on the cloud-verify choice."""
+        stash = self._pending_cloud_verify.get(exe_path) or {}
+        known = get_library().get_by_id(stash["game_id"]) if stash.get("game_id") else None
+        if known is not None:
+            # A game already in the library (the no-saves-here prompt): "cancel" leaves everything as it was - the stash and the pending
+            # notification stay, so the hotkey can bring the question back.
+            if choice == "download":
+                from ui.dialogs.cloud_verify_dialog import LOCAL_PREFIX
+                if folder.startswith(LOCAL_PREFIX):
+                    self._accept_local_archive(known, folder[len(LOCAL_PREFIX):])
+                else:
+                    self._adopt_cloud_copy(known, folder)
+            elif choice == "homonym":
+                self._keep_local_no_local(known)
+            return
         self._pending_cloud_verify.pop(exe_path, None)
         if choice == "cancel":
             return
@@ -1044,7 +1400,8 @@ class CloudFlowsMixin:
                 remote_time = datetime.fromisoformat(remote_str)
         except (ValueError, TypeError):
             pass
-        dlg = ConflictDialog(entry.name, local_time, remote_time, self)
+        _owner = None if getattr(getattr(self, "_overlay", None), "_rw_exclusive", False) else self    # (see _open_cloud_verify_dialog)
+        dlg = ConflictDialog(entry.name, local_time, remote_time, _owner)
         dlg.resolution.connect(lambda choice: self._handle_conflict_choice(entry, choice))
         # Same in-game backdrop the save-confirmation panel gets: a conflict
         # can appear while a game is running, and the vignette is what makes
