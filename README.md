@@ -1,6 +1,6 @@
 # SaveSync
 
-> **Your saves, everywhere.** — Game save manager with cloud sync, versioned backups, saves editor and an in-game overlay.
+> **Your saves, everywhere.** — Game save manager with cloud sync, versioned backups, p2p file trasfer, library, save editor, and an in-game overlay.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Qt](https://img.shields.io/badge/UI-PySide6%20(Qt6)-41cd52)
