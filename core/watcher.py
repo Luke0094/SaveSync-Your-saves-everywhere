@@ -1236,13 +1236,15 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                     is_save_file = True
                     logger.debug(f"File {file_path.name} has save-like extension: {file_ext}")
             
-            # What the filters above let through counts: they ARE the exclusions (logs, temp files, caches, media, browser internals...). Looking
-            # like a save (the tests above) is a PRIORITY - such files seed the patterns and their folders are proposed first - not a condition:
-            # a game that writes a settings file ("config", "options.xml") in its own data folder has shown where that folder is, as the scan
-            # (Auto Detect) would find it, and live tracking has to as well. The proposal is only a proposal: the panel asks.
-            save_like = is_save_file
-            if not save_like:
-                logger.debug(f"File {file_path.name} is not save-named, but written just now: proposed with a lower priority")
+            # Looking like a save (the tests above: the file's name, its folder's, a pattern learned from this game's own saves) is the
+            # CONDITION. For a while it was only a priority, with "written during the session" as the evidence - and timing alone proposed
+            # whatever else got written: crash-report envelopes, a mod loader's config, lock files, a shader cache. A write tied to a game
+            # by its timing alone is the temporal correlation's job (opt-in, Settings); a file the game's process holds open is the
+            # open-file poll's. This handler goes by names.
+            if not is_save_file:
+                logger.debug(f"File {file_path.name} was written during the session, but nothing about it looks like a save: not proposed")  # i18n-ignore (log text)
+                return
+            save_like = True
             
             # NEW: Add to seed patterns and scan for similar files
             directory_path = _norm_key(file_path.parent)
@@ -1275,7 +1277,7 @@ class _SaveHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
                 if save_like:
                     _SAVE_LIKE_FILES.add(file_key)
                 if first_sight:
-                    logger.info(f"Save file detected: {file_path.name}" + ("" if save_like else " (not save-named: lower priority)"))
+                    logger.info(f"Save file detected: {file_path.name}")
                 else:
                     logger.debug(f"Save file touched again: {file_path.name}")
 
@@ -1644,6 +1646,107 @@ class _XdgRootGrowthHandler:
             self._on_new_dir(path)
 
 
+# ── Which game a path names (the common-root filter) ────────────────────────
+# A name's words used to be looked for as plain SUBSTRINGS of the whole path,
+# down to three letters. "The", "and", "Twin" and "NTR" then matched
+# "Theme6.ogg_", "Wasteland.png_", "MicrosoftWindows" and "sentry" - and a
+# game's live tracking proposed Discord's caches, a RAR extraction and
+# Windows' certificate cache. Words are now compared as WORDS.
+_IDENTITY_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "into", "onto", "over", "under",
+    "you", "your", "our", "his", "her", "its", "their", "are", "was", "not",
+    "but", "all", "any", "off", "out", "per", "via", "von", "der", "die",
+    "das", "les", "des", "del", "una", "uno",
+})
+_IDENTITY_WORD_RE = re.compile(r"[^\W_]+")
+# A word this long names the game on its own ("Yoltina", "Yorutina", "RJ01610188"); a shorter one ("Holy", "Girl")
+# only together with another word of the name.
+_IDENTITY_SINGLE_MIN = 5
+# Consecutive words of the name written together in one folder name ("HolyAvatar", "thebigstep-1234": a Ren'Py
+# save_directory) - at least this long.
+_IDENTITY_COMPOUND_MIN = 6
+
+
+def _identity_words(text: str) -> list:
+    """The words of *text*: runs of letters and digits, lowercased (any script)."""
+    return [w.lower() for w in _IDENTITY_WORD_RE.findall(text or "")]
+
+
+def _path_component_words(component: str) -> set:
+    """A folder or file name as words: split at every separator, and CamelCase split as well ("YoltinaSaves")."""
+    from core.constants import CAMEL_SPLIT_RE
+    out: set = set()
+    for w in _IDENTITY_WORD_RE.findall(component or ""):
+        out.add(w.lower())
+        for sub in re.sub(CAMEL_SPLIT_RE, " ", w).split():
+            out.add(sub.lower())
+    return out
+
+
+class _GameIdentity:
+    """Does a path name THIS game? Asked of the words of its folders, never of letters anywhere in it.
+
+    *sequences* are the ways the game is written: the library name, the install folder, the exe stem. A path names
+    the game when one of its words IS a distinctive word of one (five letters or more, or the only word it has -
+    "Celeste", "Hades"), when two different words of the name are words of the path ("Holy" + "Avatar"), or when
+    consecutive words of the name are written together inside one folder name. A word in a script with no
+    separators (Japanese, Chinese) may stand anywhere inside a folder name, as before. Articles, conjunctions and
+    the words that say nothing about which game it is (*is_generic*) never count.
+    """
+
+    def __init__(self, sequences, is_generic=None):
+        self.single: set = set()
+        self.minor: set = set()
+        self.compounds: set = set()
+        self.loose: set = set()
+        for seq in sequences:
+            words = [w for w in seq if w]
+
+            def _counts(w: str) -> bool:
+                return (w not in _IDENTITY_STOPWORDS and not w.isdigit()
+                        and not (is_generic is not None and is_generic(w)))
+
+            sig = [w for w in words if _counts(w)]
+            for w in sig:
+                if not w.isascii():
+                    self.loose.add(w)
+                elif len(w) >= _IDENTITY_SINGLE_MIN or (len(sig) == 1 and len(w) >= 3):
+                    self.single.add(w)
+                elif len(w) >= 3:
+                    self.minor.add(w)
+            sig_set = set(sig)
+            for i in range(len(words)):
+                acc = words[i]
+                for j in range(i + 1, len(words)):
+                    acc += words[j]
+                    if len(acc) >= _IDENTITY_COMPOUND_MIN and sig_set.intersection(words[i:j + 1]):
+                        self.compounds.add(acc)
+
+    def __bool__(self) -> bool:
+        return bool(self.single or self.minor or self.compounds or self.loose)
+
+    def parts(self) -> list:
+        """The words, for what only needs a hint of the name (choosing which Linux folders to watch)."""
+        return sorted(self.single | self.minor | self.loose)
+
+    def matches(self, components) -> bool:
+        minor_hits: set = set()
+        for comp in components:
+            words = _path_component_words(comp)
+            if words & self.single:
+                return True
+            if self.compounds:
+                compact = "".join(_identity_words(comp))
+                if any(c in compact for c in self.compounds):
+                    return True
+            if self.loose:
+                low = comp.lower()
+                if any(w in low for w in self.loose):
+                    return True
+            minor_hits |= words & self.minor
+        return len(minor_hits) >= 2
+
+
 class _CommonRootSaveHandler:
     """Filesystem-event handler for common save-root directories.
 
@@ -1654,40 +1757,78 @@ class _CommonRootSaveHandler:
     Used when a game has no configured save_paths — the watcher must scan
     broad root directories to find where the game writes its saves.
     """
-    def __init__(self, game_id: str, game_name: str, on_change, extra_terms=None):
+    def __init__(self, game_id: str, game_name: str, on_change, extra_terms=None,
+                 roots=None):
         self._inner = _SaveHandler(game_id, on_change)
-        # Words that identify THIS game in a broad-root event path. The library
-        # display name (words > 2 chars) is used as before; additionally the
-        # install-folder name / exe stem (extra_terms, words > 3 chars and not
-        # generic) are included so a roaming engine folder named after the
-        # install — e.g. Ren'Py's AppData/RenPy/<save_directory> — is accepted
-        # even when its name diverges from the display name (the exact case
-        # where the AppData location used to be silently dropped).
-        parts: set[str] = set()
-        if game_name:
-            for part in game_name.replace("-", " ").replace("_", " ").split():
-                if len(part) > 2:
-                    parts.add(part.lower())
-        # The exe stem and install folder are identity terms too - unless they say
-        # nothing about WHICH game ("electron", "bakinplayer", "RPG_RT", "game"):
-        # every game built on that engine would then accept any AppData path that
-        # contains the word. The shared generic-stem vocabulary is the one that
-        # already decides this for titles, so it decides here as well - for the
-        # term as written and for each word of it.
+        # How THIS game is written in a broad-root event path: the library
+        # display name, and the install-folder name / exe stem (extra_terms) so
+        # a roaming engine folder named after the install — e.g. Ren'Py's
+        # AppData/RenPy/<save_directory> — is accepted even when its name
+        # diverges from the display name (the exact case where the AppData
+        # location used to be silently dropped).
+        #
+        # The exe stem and install folder count - unless they say nothing about
+        # WHICH game ("electron", "bakinplayer", "RPG_RT", "game"): every game
+        # built on that engine would then accept any AppData path holding the
+        # word. The shared generic-stem vocabulary is the one that already
+        # decides this for titles, so it decides here as well - for the term as
+        # written and for each word of it.
         try:
             from core.exe_stems import stem_in
             from core.save_detector import GENERIC_EXE_STEMS as _generic_stems
         except Exception:
             stem_in, _generic_stems = None, frozenset()
+
+        def _generic(word: str) -> bool:
+            return word in _GENERIC_IDENTITY_TERMS or (
+                stem_in is not None and stem_in(word, _generic_stems))
+
+        sequences = []
+        if game_name:
+            sequences.append(_identity_words(game_name))
         for term in (extra_terms or []):
             if stem_in is not None and stem_in(str(term), _generic_stems):
                 continue
-            for part in str(term).replace("-", " ").replace("_", " ").split():
-                pl = part.lower()
-                if len(pl) > 3 and pl not in _GENERIC_IDENTITY_TERMS \
-                        and not (stem_in is not None and stem_in(pl, _generic_stems)):
-                    parts.add(pl)
-        self._game_name_parts: list[str] = list(parts)
+            sequences.append(_identity_words(str(term)))
+        self._identity = _GameIdentity(sequences, is_generic=_generic)
+        # (The words alone, for what only needs a hint: which Linux folders get a watch - see _linux_scoped_common_watch_specs.)
+        self._game_name_parts: list[str] = self._identity.parts()
+        # The roots this handler watches: only what is BELOW one of them names anything ("AppData", "Local",
+        # "Documents" and the user's own folder name are the same for every program).
+        self._roots: list[str] = []
+        for r in (roots or []):
+            self.add_root(r)
+
+    def add_root(self, root) -> None:
+        try:
+            key = _norm_key(root)
+        except (TypeError, ValueError):
+            return
+        if key and key not in self._roots:
+            self._roots.append(key)
+
+    def _components_below_root(self, path: str) -> list:
+        norm = os.path.normpath(path)
+        key = os.path.normcase(norm)
+        best = ""
+        for r in self._roots:
+            if key.startswith(r.rstrip("\\/") + os.sep) and len(r) > len(best):
+                best = r.rstrip("\\/")
+        if best:
+            rel = norm[len(best) + 1:]
+        else:
+            rel = norm
+            try:
+                home = os.path.normcase(os.path.normpath(str(Path.home())))
+                if key.startswith(home + os.sep):
+                    rel = norm[len(home) + 1:]
+            except (RuntimeError, OSError):
+                pass
+            rel = os.path.splitdrive(rel)[1]
+        return [c for c in re.split(r"[\\/]+", rel) if c]
+
+    def names_this_game(self, path: str) -> bool:
+        return bool(self._identity) and self._identity.matches(self._components_below_root(path))
 
     def dispatch(self, event):       # watchdog calls this
         self.on_any_event(event)
@@ -1695,21 +1836,22 @@ class _CommonRootSaveHandler:
     def on_any_event(self, event):
         if event.is_directory:
             return
-        # Fast pre-filter: at least one word from the game name must appear
-        # somewhere in the file path (e.g. "Example Title" → "example"
-        # or "title" must be in the path)
-        if self._game_name_parts:
-            path_lower = event.src_path.lower()
-            if not any(part in path_lower for part in self._game_name_parts):
-                # No nominal link — but don't just discard it: buffer it for
-                # TEMPORAL correlation. If this game saves in the same
-                # instant (double-write engines), the event gets claimed.
-                # Same two guards as the anchor side: opt-in, and only for
-                # events that really are a create/modify/move.
-                if correlation_settings()[0] and _is_write_event(event):
-                    _record_unattributed(event.src_path, self._inner._game_id,
-                                         self._inner)
-                return
+        # The path has to name this game (its folders' WORDS - see _GameIdentity). A rename is judged by where the
+        # file ends up, which is what the inner handler goes on to look at. A game with no name to go by gets nothing
+        # from a broad root: everything there belongs to some program, and without a name nothing says which.
+        _path = event.src_path
+        if getattr(event, "event_type", "") == "moved" and getattr(event, "dest_path", ""):
+            _path = event.dest_path
+        if not self.names_this_game(_path):
+            # No nominal link — but don't just discard it: buffer it for
+            # TEMPORAL correlation. If this game saves in the same
+            # instant (double-write engines), the event gets claimed.
+            # Same two guards as the anchor side: opt-in, and only for
+            # events that really are a create/modify/move.
+            if correlation_settings()[0] and _is_write_event(event):
+                _record_unattributed(event.src_path, self._inner._game_id,
+                                     self._inner)
+            return
         self._inner.on_any_event(event)
 
     def __getattr__(self, name):     # delegate watchdog protocol methods
@@ -2117,7 +2259,8 @@ class SaveWatcher(QObject):
             common_roots = _get_common_save_roots(
                 _appid or "", pid=_pid, exe_path=(getattr(_entry, "exe_path", "") if _entry is not None else ""))
             root_handler = _CommonRootSaveHandler(
-                game_id, game_name, self._on_save_changed, extra_terms=_identity_extra)
+                game_id, game_name, self._on_save_changed, extra_terms=_identity_extra,
+                roots=common_roots)
             identity_parts = list(root_handler._game_name_parts)
             growth = _XdgRootGrowthHandler(
                 identity_parts,
@@ -2384,6 +2527,7 @@ class SaveWatcher(QObject):
         try:
             from core.save_detector import game_prefix_dirs
             for root in game_prefix_dirs(pid=pid):
+                root_handler.add_root(root)
                 for target, recursive in _linux_scoped_common_watch_specs(root, identity_parts):
                     if self._schedule_common_root_target(game_id, target, root_handler if recursive else growth, recursive=recursive):
                         logger.info("Watching %s: the Wine/Proton prefix of %s, read from the running game", target, game_id)
@@ -2422,6 +2566,21 @@ class SaveWatcher(QObject):
         logger.debug(f"Cleaned up patterns for game {game_id}")
 
     def update_game_paths(self, game_id: str, save_paths: list[str]):
+        # A game is watched while it runs: watch_game at launch, unwatch_game at
+        # exit. This is called on every library edit of the game's paths - and
+        # the edit that confirms them is made in the panel that opens AFTER the
+        # game closed, so it re-armed every common-root watch for a game no
+        # longer running, until its next exit. Live tracking then proposed what
+        # the rest of the machine wrote, for hours. Not running: nothing to watch.
+        try:
+            from core.monitor import get_monitor
+            playing = get_monitor().is_playing(game_id)
+        except Exception:
+            playing = game_id in self._handlers
+        if not playing:
+            if game_id in self._handlers:
+                self.unwatch_game(game_id)
+            return
         # Preserve game_name so Linux XDG scoping / name filters stay active
         # when the library updates paths mid-session.
         name = ""

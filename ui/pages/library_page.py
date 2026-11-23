@@ -236,7 +236,8 @@ class LibraryPage(PageScrollMixin, QWidget, ThemedMixin):
             name, exe_path = candidate
             self._dispatch_add_or_edit(name, exe_path)
         else:
-            self._dispatch_add_or_edit(folder.name, "")
+            from core.save_detector import spaced_title
+            self._dispatch_add_or_edit(spaced_title(folder.name), "")
 
     def _dispatch_add_or_edit(self, name: str, exe_path: str):
         """Open Edit Game if the executable is already in the library, otherwise Add Game."""

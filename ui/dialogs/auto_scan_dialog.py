@@ -4,6 +4,7 @@ Shows discovered save paths and asks for confirmation before exit.
 """
 import logging
 import platform
+import weakref
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -76,6 +77,21 @@ def _run_over_pinned_parent(host, dlg, prepared: bool = False) -> int:
             pass
         if hasattr(host, "start_topmost_pin"):
             host.start_topmost_pin()
+
+
+def open_panels(game_id: str = "") -> list:
+    """The save-confirmation panels on screen right now - those confirming *game_id* when one is given."""
+    out = []
+    for dlg in list(AutoScanDialog._open_panels):
+        try:
+            if not dlg.isVisible():
+                continue
+            if game_id and getattr(dlg, "_single_game_mode_id", None) != game_id:
+                continue
+            out.append(dlg)
+        except RuntimeError:        # (deleted on close; the Python side not collected yet)
+            continue
+    return out
 
 
 def open_path_for_inspection(parent, path_str: str) -> None:
@@ -683,8 +699,13 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
     # banner was actually shown.
     identity_choice = Signal(str, str, str)
 
+    # Every panel alive right now, so a second route to the same game's confirmation (the library's provisional
+    # badge, after the one opened at the game's exit) brings that panel back instead of stacking another on it.
+    _open_panels: "weakref.WeakSet" = weakref.WeakSet()
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        AutoScanDialog._open_panels.add(self)
         self.setWindowTitle(t('auto_scan.window_title'))
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
@@ -1716,7 +1737,19 @@ class AutoScanDialog(TopmostPinMixin, QDialog):
             )
         
         self.progress_label.setText(t('auto_scan.games_updated', games=updated_count, paths=len(self.path_items)))
-        
+
+        # Any OTHER panel still open for these games asks what was just answered here. Left open (one at a game's
+        # exit, behind another monitor, while the user confirmed from the library) its Apply would resolve the
+        # pre-confirmation backups a second time. Closed - closing applies nothing.
+        for gid in confirmed_game_ids:
+            for other in open_panels(gid):
+                if other is not self:
+                    logger.info(f"Save-confirmation panel for {gid} closed: answered in another one")  # i18n-ignore (log text)
+                    try:
+                        other.close()       # (its closeEvent stops its scan and its pin, then rejects)
+                    except RuntimeError:
+                        pass
+
         # Auto-close after successful update
         QTimer.singleShot(1500, self.accept)
 
@@ -2169,6 +2202,30 @@ def show_auto_scan_dialog(parent=None, pre_scanned_paths: Optional[list[str]] = 
             once the whole session has been observed. Connect the
             returned dialog's identity_choice signal to act on the answer.
     """
+    # Already confirming this game in a panel that is still open (the one from its exit, perhaps on another
+    # monitor): that panel is brought back, with whatever this request adds, instead of a second one on top. Two
+    # panels for one game was one left behind, still asking, after the other had been answered.
+    if game_id:
+        existing = next(iter(open_panels(game_id)), None)
+        if existing is not None:
+            try:
+                existing._user_initiated = bool(existing._user_initiated or user_initiated)
+                _g = get_library().get_by_id(game_id)
+                if pre_scanned_paths:
+                    existing.push_live_paths(game_id, _g.name if _g else "", list(pre_scanned_paths))
+                if _g and identity_alternates and identity_new_exe_path:
+                    existing.show_identity_confirm(_g.name, game_id, identity_new_exe_path, identity_alternates)
+                from ui.helpers import keep_dialog_on_screen
+                anchor = parent.window() if parent is not None else None
+                keep_dialog_on_screen(existing, anchor, follow_anchor=True)
+                existing.show()
+                existing.raise_()
+                if user_initiated:
+                    existing.activateWindow()
+                logger.info(f"Save-confirmation panel for {game_id} already open: brought back instead of opening another")  # i18n-ignore (log text)
+                return existing
+            except RuntimeError:
+                pass                       # (deleted under us: open a new one)
     dialog = AutoScanDialog(parent)
     dialog._user_initiated = user_initiated
     # Non-modal: use show() so the overlay remains interactive while this dialog is open.

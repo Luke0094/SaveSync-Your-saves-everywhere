@@ -477,6 +477,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # a slot on a QObject is queued back onto the GUI thread — which is
         # where the in-game backup timer may be touched.
         _bm.backup_restored.connect(self._on_backup_restored_reset_timer)
+        # Queued whichever thread restores: emitted INSIDE the restore, and
+        # the box must not open while a frozen game is still suspended.
+        _bm.restore_blocked.connect(self._on_restore_blocked,
+                                    Qt.ConnectionType.QueuedConnection)
         self.launcher_exe_resolved.connect(self._on_launcher_exe_resolved)
         # backup_id SaveSync itself last restored, per game — landing on that
         # state is the intended outcome, not something to warn about.
@@ -1694,13 +1698,49 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_screen_added(self, screen):
         logger.info(f"Screen added: wiring DPI signals for {screen.name()}")
         self._wire_dpi_screens([screen])
+        self._schedule_panels_on_screen()
 
     def _on_screen_removed(self, screen):
         self._wired_screen_ids.discard(id(screen))
+        self._schedule_panels_on_screen()
 
     def _on_screen_dpi_changed(self, _value=None):
         logger.info("DPI change detected via Qt screen signals")
         self._ui_scale_reapply_timer.start()
+        self._schedule_panels_on_screen()
+
+    def _schedule_panels_on_screen(self, *_args, follow: bool = False):
+        """Once the monitors have stopped changing, put the open save-confirmation panels back where they can be
+        seen. Debounced: a switch fires a burst of screen signals (eight in a row is ordinary).
+
+        *follow*: the main window itself went to another screen, and the panels go with it. Any other signal (a
+        resolution or scale change, a screen added or removed) only rescues a panel left on no screen at all - a
+        panel the user put on another monitor stays there when a TV wakes up or a game changes display mode."""
+        self._panels_follow_main = bool(getattr(self, "_panels_follow_main", False) or follow)
+        timer = getattr(self, "_panels_on_screen_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(900)
+            timer.timeout.connect(self._keep_panels_on_screen)
+            self._panels_on_screen_timer = timer
+        timer.start()
+
+    def _keep_panels_on_screen(self):
+        """A panel opened before a monitor switch stayed on the old screen while the main window went to the one
+        in front - found hours later, still open. It follows the main window; with the main window hidden (a game
+        is running) it is only rescued when it sits on no screen at all. See keep_dialog_on_screen."""
+        follow = bool(getattr(self, "_panels_follow_main", False))
+        self._panels_follow_main = False
+        try:
+            from ui.dialogs.auto_scan_dialog import open_panels
+            from ui.helpers import keep_dialog_on_screen
+            for dlg in open_panels():
+                if keep_dialog_on_screen(dlg, self, follow_anchor=follow):
+                    logger.info("Save-confirmation panel moved after a monitor change (%s)",  # i18n-ignore (log text)
+                                "with the main window" if follow else "it was on no screen")  # i18n-ignore (log text)
+        except Exception:
+            logger.debug("could not bring the open panels back on screen", exc_info=True)
 
     def _on_primary_screen_changed(self, screen=None):
         """The desktop's primary monitor changed under us.
@@ -1720,6 +1760,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
     def _on_host_screen_changed(self, _screen=None):
         logger.info(f"Screen changed signal received, triggering DPI reapply")
         self._ui_scale_reapply_timer.start()
+        self._schedule_panels_on_screen(follow=True)
         # Windows can also shrink the window while monitors are settling
         # (a low-res TV plugged in and out). The saved size is still the
         # user's; re-apply it once the new screen is stable.
@@ -4673,6 +4714,12 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 same_install=bool(_e and self._same_install_as_card(_e, new_exe_path)))
             return
 
+        # An in-game notice on screen (a backup was made, a sync ran) over a game that hides its pointer: the press
+        # brings the pointer to THAT notice, to close it or say "don't show again" - it used to swap the notice for
+        # the dashboard, and the notice could never be answered. A second press goes on as below.
+        if self._overlay.bring_pointer_to_notice():
+            return
+
         # Check if overlay is currently showing a tracking popup for a known game.
         # NOTE: use the module-level get_library — a function-local re-import
         # here would shadow it for the WHOLE method and crash the earlier use
@@ -5767,6 +5814,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.debug("Could not raise a tray notice for index validation",
                          exc_info=True)
 
+    @Slot(str, str)
+    def _on_restore_blocked(self, game_name: str, message: str):
+        """A restore refused an archive, or left files of it out, for safety
+        (core.zip_guard). Every route that restores lands here, so the player
+        hears it once whichever one it was: in a box when the window is up,
+        from the tray when it is not (a game in front, say)."""
+        title = t("backup.restore_blocked_title")
+        if game_name:
+            title = f"{title} - {game_name}"
+        self._status_bar.showMessage(message.split("\n", 1)[0], 20000)
+        if self.isVisible() and not self.isMinimized():
+            warning_window_modal(self, title, message)
+            return
+        try:
+            if self._tray is not None:
+                self._tray.showMessage(title, message.split("\n", 1)[0],
+                                       self._tray.icon(), 15000)
+        except Exception:
+            logger.debug("Could not raise a tray notice for a blocked restore", exc_info=True)
+
     @Slot()
     def _on_index_validation_recovered(self):
         msg = t("backups.index_validate_recovered")
@@ -5840,7 +5907,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
 
         lib.game_removed.connect(_on_game_removed)
 
-    def _discover_pending_paths_for(self, entry, exe_dir: str):
+    def _discover_pending_paths_for(self, entry, exe_dir: str, start_backup_timer: bool = True):
         """Scan *exe_dir* for actually-modified save folders and surface
         them for confirmation, exactly like the watchdog-driven discovery in
         _on_save_changed (extracted so a newly detected install location —
@@ -5886,7 +5953,9 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                     # begin. Guarded on "not already running" so repeated save
                     # events don't keep resetting the interval (which would
                     # starve the backup). Internally gated by auto_backup_enabled.
-                    if not entry.save_paths and game_id not in self._ingame_backup_timers:
+                    # (Not at the game's exit: there is no session left to back up during.)
+                    if (start_backup_timer and not entry.save_paths
+                            and game_id not in self._ingame_backup_timers):
                         self._start_ingame_backup_timer(entry)
         except Exception as e:
             logger.debug(f"Discovery bridge failed for {game_id}: {e}")
@@ -5928,6 +5997,13 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         """
         entry = get_library().get_by_id(game_id)
         if not entry:
+            return
+        # Only while the game's process is running. A write is tied to a game by its process and its names, never by
+        # timing alone: with no process there is nothing to tie it to, and a watch left armed after the game closed
+        # (re-armed by a library edit - see SaveWatcher.update_game_paths) proposed whatever the rest of the machine
+        # wrote for hours - Discord's caches, a RAR extraction, Windows' certificate cache.
+        if not get_monitor().is_playing(game_id):
+            logger.debug(f"Watcher event for {entry.name} ignored: the game is not running")  # i18n-ignore (log text)
             return
 
         # 1) Discovery — surface actually-modified folders for confirmation.
@@ -6241,6 +6317,10 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                         existing_pending = self._pending_auto_scans.get(game_id, [])
                         merged = list(existing_pending)
                         known = {_pid(p) for p in merged}
+                        # A path the game already has is not a discovery. It was logged as one at every launch
+                        # (the pending list starts empty each session) - a confirmed registry key "found new"
+                        # each time read as the game making a new key.
+                        known |= {_pid(p) for p in ((_entry_now.save_paths or []) if _entry_now is not None else [])}
                         for p in paths:
                             if _pid(p) not in known:
                                 known.add(_pid(p))
@@ -6666,6 +6746,15 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         # backoff it had already earned before the session started.
         if hasattr(self, "_auto_memory_trim_timer"):
             self._auto_memory_trim_timer.start()
+        # A save made in the last seconds before quitting had not reached the discovery yet (its debounce), and
+        # nothing the watcher reports after the exit is taken (see _on_save_changed). What the watcher holds for
+        # this game is surfaced now, while it still holds it, so the panel shown at exit has it.
+        if get_config().get("auto_scan_on_exit", True):
+            try:
+                _exit_exe_dir = str(Path(entry.exe_path).parent) if entry.exe_path else ""
+            except Exception:
+                _exit_exe_dir = ""
+            self._discover_pending_paths_for(entry, _exit_exe_dir, start_backup_timer=False)
         self._stop_ingame_backup_timer(entry.id)
         # Stop watching save paths for this game — no need to watch when not running
         self._watcher.unwatch_game(entry.id)
@@ -7482,10 +7571,19 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                 identity_alternates=identity_alternates,
             )
             if dlg and identity_alternates:
-                dlg.identity_choice.connect(self._on_identity_choice_from_scan)
+                self._wire_identity_choice(dlg)
             self._track_scan_dialog(dlg)
         except Exception as e:
             logger.error(f"Auto-scan dialog error: {e}")
+
+    def _wire_identity_choice(self, dlg) -> None:
+        """Connect a panel's "is this actually X?" answer, once. A panel already open for the game is brought
+        back by a second route rather than opened again (see show_auto_scan_dialog), and connected twice the
+        answer would be applied twice."""
+        if dlg is None or getattr(dlg, "_identity_wired", False):
+            return
+        dlg.identity_choice.connect(self._on_identity_choice_from_scan)
+        dlg._identity_wired = True
 
     def _on_identity_choice_from_scan(self, game_id: str, new_exe_path: str, choice: str):
         """Answer to the save-confirm panel's "is this actually X?" banner
@@ -8927,7 +9025,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                                     identity_new_exe_path=identity_exe,
                                     identity_alternates=identity_alternates)
         if dlg and identity_alternates:
-            dlg.identity_choice.connect(self._on_identity_choice_from_scan)
+            self._wire_identity_choice(dlg)
         if not dlg:
             # Every candidate turned out non-selectable (e.g. already
             # excluded) once filtered — still open the panel so the click
@@ -8937,7 +9035,7 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
                                         identity_new_exe_path=identity_exe,
                                         identity_alternates=identity_alternates)
             if dlg and identity_alternates:
-                dlg.identity_choice.connect(self._on_identity_choice_from_scan)
+                self._wire_identity_choice(dlg)
         if dlg:
             # Whatever the user does in the panel — confirm (kept paths move to
             # save_paths) or discard everything (provisional backups deleted) —
@@ -9555,6 +9653,34 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
             logger.warning(f"Could not find game PID: {e}")
         return 0
 
+    def _confirm_launch_target(self, entry, target: str) -> bool:
+        """True when Play may start *target* for *entry*: nothing about it to
+        ask, already answered yes on this PC, or answered yes now.
+
+        A card's launch target is data, and a card can arrive from an imported
+        file, another PC or a friend. A plain program or a known launcher's
+        link starts as always; a script, a shortcut, a program on a network
+        share or an unknown kind of link is shown to the player first, once
+        (see core.launch_trust)."""
+        from core.launch_trust import approve, needs_asking, shown
+        concern = needs_asking(entry.id, target)
+        if not concern:
+            return True
+        reply = question_window_modal(
+            self, t("launch_trust.title"),
+            t("launch_trust.text", name=entry.name, target=shown(target),
+              kind=t(f"launch_trust.kind_{concern}")),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+            {QMessageBox.StandardButton.Yes: t("launch_trust.start")},
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            logger.info(f"Launch of {entry.name} cancelled at the question about {target!r} ({concern})")  # i18n-ignore (log text)
+            return False
+        approve(entry.id, target)
+        logger.info(f"Launch target of {entry.name} approved on this PC: {target!r} ({concern})")  # i18n-ignore (log text)
+        return True
+
     def _launch_game(self, game_id: str):
         """Launch the game - via launcher URL if available, otherwise directly.
         
@@ -9572,13 +9698,26 @@ class MainWindow(CloudFlowsMixin, QMainWindow):
         from core.resolvers import NoWindowsRunnerError, launch_executable, launch_with_url
         launched_via_url = False
         if entry.appid:
+            # A link of a kind no game launcher uses is asked about first
+            # (core.launch_trust) - asked, never refused. No means nothing
+            # starts: the executable is not tried behind the player's back.
+            if not self._confirm_launch_target(entry, entry.appid):
+                return
             if launch_with_url(entry.appid):
                 launched_via_url = True
                 self._status_bar.showMessage(t('core.launching_via_launcher', name=entry.name), 3000)
             else:
                 logger.warning(f"Launch via URL failed for {entry.name}: {entry.appid}")
+                if not entry.exe_path:
+                    # Nothing else to start (the launcher is missing): said
+                    # plainly, not as the shell's error for an empty path.
+                    self._status_bar.showMessage(f"{t('core.launch_failed')}: {entry.name}", 5000)
+                    return
 
         if not launched_via_url:
+            # Same for a script, a shortcut or a program on a share.
+            if not self._confirm_launch_target(entry, entry.exe_path):
+                return
             try:
                 note = launch_executable(entry.exe_path)
                 if note == "fetching_proton":

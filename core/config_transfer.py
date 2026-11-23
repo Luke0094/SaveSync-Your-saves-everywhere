@@ -54,6 +54,9 @@ _MACHINE_SPECIFIC_KEYS = frozenset({
     # What THIS PC's display stack did when the overlay was shown over a game in exclusive fullscreen.
     "overlay_exclusive_deny",
     "overlay_window_deny",
+    # Launch targets the player said yes to on THIS PC (core.launch_trust).
+    # Never carried by an import: a file could otherwise approve its own.
+    "launch_approved_targets",
     # Note: suppressed_overlay_apps and ignored_processes ARE exported so the
     # blocklist roams with the user.  On a machine where a path doesn't exist
     # it simply never matches — no harm done.

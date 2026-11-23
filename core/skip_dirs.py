@@ -460,4 +460,9 @@ SCAN_SKIP_DIRS = _COMMON_SKIP_DIRS | frozenset({
     "whatsapp", "signal", "notion", "obsidian",
     # System update / package managers
     "windowsupdate", "windowsstore", "nvidia", "amd", "intel",
+    # Caches a game's own process writes that are never its saves: Direct3D's
+    # shader cache (LOCALAPPDATA/D3DSCache/<hash>, held open by every D3D game
+    # - the open-file poll proposed it) and the native Sentry crash reporter's
+    # database. Plain "Sentry" is left out: a game may be called that.
+    "d3dscache", ".sentry-native",
 })

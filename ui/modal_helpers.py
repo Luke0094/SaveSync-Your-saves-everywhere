@@ -52,7 +52,11 @@ def message_box_window_modal(
         actual_btn = msg.button(btn_enum)
         if actual_btn:
             actual_btn.setText(txt)
-    return msg.exec()
+    # In front of a parent that re-pins itself topmost (the save-confirmation
+    # panel): there, a plain exec() showed the box for a moment and then left
+    # it under the panel.
+    from ui.helpers import exec_over_pinned
+    return exec_over_pinned(msg, parent)
 
 
 def question_window_modal(
@@ -102,7 +106,8 @@ def input_text_window_modal(parent, title: str, label: str, text: str = "") -> t
     dlg.setLabelText(label)
     dlg.setTextValue(text)
     _translate_input_buttons(dlg)
-    ok = dlg.exec() == QDialog.DialogCode.Accepted
+    from ui.helpers import exec_over_pinned
+    ok = exec_over_pinned(dlg, parent) == QDialog.DialogCode.Accepted
     return dlg.textValue(), ok
 
 
@@ -124,5 +129,6 @@ def input_int_window_modal(parent, title: str, label: str, value: int,
     dlg.setIntValue(value)
     dlg.setLabelText(label)
     _translate_input_buttons(dlg)
-    ok = dlg.exec() == QDialog.DialogCode.Accepted
+    from ui.helpers import exec_over_pinned
+    ok = exec_over_pinned(dlg, parent) == QDialog.DialogCode.Accepted
     return dlg.intValue(), ok

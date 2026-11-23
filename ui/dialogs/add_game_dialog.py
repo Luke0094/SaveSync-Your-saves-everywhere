@@ -811,6 +811,11 @@ class AddGameDialog(SearchFlowMixin, QDialog):
 
 
     def _populate_entry_fields(self, entry: GameEntry):
+        # What the card launched as it came in: a target the player sets or
+        # changes here is theirs (see _approve_own_launch_targets); one they
+        # only saw again while editing the tags is not approved by that.
+        self._launch_targets_at_open = {
+            (x or "").strip().casefold() for x in (entry.exe_path, entry.appid) if x}
         self._exe_edit.blockSignals(True)
         self._name_edit.setText(self._clean_tag(entry.name))
         from core.resolvers import is_launcher_url as _is_lurl_edit
@@ -5580,9 +5585,20 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             # old path -> the path it was rebased onto, for the save data that
             # has to follow (see _carry_saves_after_exe_change).
             _moved_paths: dict[str, str] = {}
+            from core.registry_saves import is_registry_path
             for p in raw_all_paths:
                 rebased_p = p
                 is_excl = p in raw_excluded_paths
+                if is_registry_path(p):
+                    # A registry key is not a file path. To pathlib
+                    # "registry:HKCU\..." has no drive, so it read as RELATIVE
+                    # and was joined onto the install folder - every Save of a
+                    # game with a registry save turned it into a folder that
+                    # does not exist, and its backups lost the key.
+                    all_paths.append(p)
+                    if is_excl:
+                        excluded_paths.append(p)
+                    continue
                 if not Path(p).is_absolute() and exe:
                     # User entered a relative path (e.g. saves/ or save/)
                     rebased_p = str(Path(exe).parent / p)
@@ -5789,10 +5805,12 @@ class AddGameDialog(SearchFlowMixin, QDialog):
             raw_all_paths, raw_excluded_paths = self._get_all_and_excluded_paths()
             all_paths = []
             excluded_paths = []
+            from core.registry_saves import is_registry_path
             for p in raw_all_paths:
                 rebased_p = p
                 is_excl = p in raw_excluded_paths
-                if not Path(p).is_absolute() and exe:
+                # (A registry key is not a relative folder: see the edit branch above.)
+                if not is_registry_path(p) and not Path(p).is_absolute() and exe:
                     rebased_p = str(Path(exe).parent / p)
                 all_paths.append(rebased_p)
                 if is_excl:
@@ -5901,5 +5919,19 @@ class AddGameDialog(SearchFlowMixin, QDialog):
                         shortcut_dir=getattr(self, "_shortcut_dir", None) or "",
                     )
 
+        self._approve_own_launch_targets(entry)
         self._detach_pictures(entry)
         self.accept()
+
+    def _approve_own_launch_targets(self, entry) -> None:
+        """The launch targets the player set or changed in this dialog are
+        theirs: Play will not ask about them (core.launch_trust). One the card
+        already had when it was opened is left as it was - answered on Play."""
+        try:
+            from core.launch_trust import approve
+            at_open = getattr(self, "_launch_targets_at_open", set())
+            for target in (entry.exe_path, entry.appid):
+                if target and target.strip().casefold() not in at_open:
+                    approve(entry.id, target)
+        except Exception:
+            logger.debug("Could not record the launch targets set in Add/Edit", exc_info=True)

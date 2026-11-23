@@ -643,10 +643,32 @@ _FAVICON_IMG_RE = re.compile(
 )
 
 
+# A site's OWN logo - its header picture or the one it shares a page with
+# ("/assets/images/logo-sm.png", "logo-sqw192.png"). A forum hands it out as
+# og:image on every thread, and it was taken as the game's cover - the only
+# picture a search downloaded. Recognised by the file name (it begins with
+# "logo"), and only for the site's own pictures: one posted in a thread (an
+# attachment) can be the game's logo, and is the poster's choice to make.
+_SITE_LOGO_FILE_RE = re.compile(r'^(?:site[-_]?)?logo(?:$|[-_.])', re.IGNORECASE)
+
+
+def _is_site_logo(image_url: str) -> bool:
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(image_url or "")
+    except ValueError:
+        return False
+    path = parts.path or ""
+    if "attachment" in (parts.netloc or "").lower() or "/attachments/" in path.lower():
+        return False
+    return bool(_SITE_LOGO_FILE_RE.search(path.rsplit("/", 1)[-1]))
+
+
 def _is_favicon_like(image_url: str) -> bool:
     """True if *image_url* looks like a favicon / site logo / tiny icon rather
     than a real cover image."""
-    return bool(image_url and _FAVICON_IMG_RE.search(image_url))
+    return bool(image_url and (_FAVICON_IMG_RE.search(image_url)
+                               or _is_site_logo(image_url)))
 
 
 # Forum thread pages (game-forum threads in general) cram everything

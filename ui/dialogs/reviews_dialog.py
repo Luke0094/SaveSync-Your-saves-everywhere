@@ -132,6 +132,15 @@ class _ReviewCard(QFrame):
             votes_lbl = QLabel(t("reviews.votes_n", count=votes))
             votes_lbl.setObjectName("review_meta_sm")
             head.addWidget(votes_lbl)
+        # The game version the review was written for, whenever the site gives
+        # one - the current version's too: the copy installed here may be
+        # another, or the reviews may have been imported before an update.
+        version = str(review.get("version") or "").strip()
+        if version:
+            ver_lbl = QLabel(version)
+            ver_lbl.setToolTip(t("reviews.version_tooltip", version=version))
+            ver_lbl.setObjectName("review_meta_sm")
+            head.addWidget(ver_lbl)
         head.addStretch()
 
         edit_btn = QPushButton("✏")
@@ -482,6 +491,8 @@ class ReviewsDialog(QDialog):
                 review["id"] = kept["id"]
             if kept.get("vote_count"):
                 review["vote_count"] = kept["vote_count"]
+            if kept.get("version"):
+                review["version"] = kept["version"]      # (what it was written for: an edit does not change that)
             self._reviews[self._editing_index] = review
         else:
             review["source"] = "user"

@@ -532,6 +532,15 @@ class SystemCursor:
     _last_game_hides = True                  # (until the pointer has been seen over the game: the game keeps its mouse)
 
     @classmethod
+    def pointer_hidden_by_game(cls) -> bool:
+        """The OS cursor is hidden right now, read over a window that is not ours: the game in front plays with no
+        pointer (exclusive or borderless fullscreen, or a window that hides it). False when it cannot be told -
+        off Windows, or with the pointer resting on a window of ours, where the cursor shown is ours."""
+        if platform.system() != "Windows" or cls._pointer_over_our_window():
+            return False
+        return cls._os_cursor_hidden()
+
+    @classmethod
     def _pointer_over_our_window(cls) -> bool:
         if platform.system() != "Windows":
             return False
@@ -2707,6 +2716,47 @@ def center_dialog(dialog: QWidget) -> None:
         pass
 
 
+def keep_dialog_on_screen(dialog: QWidget, anchor: QWidget | None = None,
+                          follow_anchor: bool = False) -> bool:
+    """Put an open *dialog* back where it can be seen once the monitors have changed. True when it was moved.
+
+    A dialog is placed once, when it opens. A monitor switched off, unplugged or made primary afterwards moves
+    the main window (Windows takes it to the screen that is left) and leaves the dialog where it was: on a
+    screen no longer in front of the user, or on none at all - found hours later, still asking.
+
+    *follow_anchor* with a visible *anchor* (the window the dialog belongs to): on another screen than the
+    anchor, the dialog is centred on the anchor again, as it was opened. Otherwise it is only rescued when it
+    sits on NO screen - onto the anchor's when the anchor is visible, else the primary one - and a dialog on a
+    monitor that is still there is left where the user put it.
+    """
+    from PySide6.QtGui import QGuiApplication
+    try:
+        if dialog is None or not dialog.isVisible():
+            return False
+        geo = dialog.frameGeometry()
+        here = QGuiApplication.screenAt(geo.center())
+        anchor_up = anchor is not None and anchor.isVisible()
+        if follow_anchor and anchor_up:
+            target = anchor.screen()
+            if target is None or here == target:
+                return False
+            geo.moveCenter(anchor.frameGeometry().center())
+        else:
+            if here is not None:
+                return False
+            target = (anchor.screen() if anchor_up else None) or QGuiApplication.primaryScreen()
+            if target is None:
+                return False
+            geo.moveCenter(target.availableGeometry().center())
+        avail = target.availableGeometry()
+        geo.moveLeft(max(avail.left(), min(geo.left(), avail.right() - geo.width())))
+        geo.moveTop(max(avail.top(), min(geo.top(), avail.bottom() - geo.height())))
+        dialog.move(geo.topLeft())
+        return True
+    except (RuntimeError, AttributeError):
+        return False
+
+
 def hook_dialog_geometry_save(dialog: QWidget) -> None:
     """Remember size/pos when a QDialog finishes (after manual resize)."""
     if getattr(dialog, "_geom_save_hooked", False):
@@ -3055,7 +3105,72 @@ def pin_window_topmost(widget, interval_ms: int = 1000):
     timer.timeout.connect(_repin)
     timer.start()
     _repin()
+    # Kept on the widget, so a box IT opens can take the pin over (exec_over_pinned).
+    widget._topmost_pin_timer = timer
     return timer
+
+
+def _running_topmost_pin(window):
+    """The timer re-pinning *window* above everything, when one is running: its own (TopmostPinMixin) or one
+    pin_window_topmost started for it. None otherwise. (The overlay and the pins keep timers of the same name
+    with jobs of their own: they are not dialogs, and are left to them.)"""
+    candidates = [getattr(window, "_topmost_pin_timer", None)]
+    if hasattr(window, "start_topmost_pin"):
+        candidates.append(getattr(window, "_topmost_timer", None))
+    for timer in candidates:
+        try:
+            if timer is not None and timer.isActive():
+                return timer
+        except RuntimeError:
+            continue
+    return None
+
+
+def exec_over_pinned(dlg, parent=None) -> int:
+    """exec() *dlg*, kept in front of the windows above it that re-pin themselves topmost.
+
+    The save-confirmation panel, and what it opens, re-assert HWND_TOPMOST once a second. A message box one of them
+    owns - "the folder does not exist", from a row's open button - came up for a moment and then went UNDER the
+    panel, and the panel waited on an answer nobody could see. Two windows both re-pinning do not settle either,
+    they alternate: so while the box is up the pin is the box's, and each window that held one gets it back after.
+    With no such window above *dlg* this is plain exec()."""
+    from PySide6.QtCore import Qt
+    held = []                                       # (window, its timer)
+    seen: set = set()
+    w = parent.window() if parent is not None else None
+    while w is not None and id(w) not in seen:
+        seen.add(id(w))
+        timer = _running_topmost_pin(w)
+        if timer is not None:
+            held.append((w, timer))
+        up = w.parentWidget()
+        w = up.window() if up is not None else None
+    if not held:
+        return dlg.exec()
+    own = None
+    try:
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        for _w, timer in held:
+            timer.stop()
+        own = pin_window_topmost(dlg)
+    except RuntimeError:
+        logger.debug("could not hand the topmost pin to the dialog", exc_info=True)
+    try:
+        return dlg.exec()
+    finally:
+        try:
+            if own is not None:
+                own.stop()
+        except RuntimeError:
+            pass
+        for window, timer in held:
+            try:
+                if hasattr(window, "start_topmost_pin"):
+                    window.start_topmost_pin()          # (re-pins at once, then on its timer)
+                else:
+                    timer.start()
+            except RuntimeError:
+                pass
 
 
 def apply_game_friendly_flags(dialog):

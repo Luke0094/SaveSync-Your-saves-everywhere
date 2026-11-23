@@ -353,6 +353,9 @@
     "restore_err_zip_missing": "Backup zip missing",
     "restore_err_zip_removed": "Backup zip removed",
     "restore_err_zip_corrupt": "Corrupt backup zip",
+    "restore_err_unsafe_archive": "Restore refused: this archive would unpack to far more than any backup can hold (a possible zip bomb)",
+    "restore_left_out": "{count} file(s) of this backup were not restored ({files}).\n\nThey are programs or scripts, which no save is, or they would have landed outside the game's save folders. Your saves were restored without them.\n\nIf this backup came from someone else, do not trust it.",
+    "restore_blocked_title": "Restore safety",
     "restore_err_registry_payload": "{name}: unreadable registry payload",
     "restore_err_registry_import": "{name}: registry import failed",
     "verify_not_zip": "not a zip archive",
@@ -1590,7 +1593,7 @@
     "merge_chip": "Reviews ({count})",
     "from_source": "Source: {source}",
     "votes_n": "{count} votes",
-    "preview": "Reviews",
+    "version_tooltip": "Written for version {version} of the game",    "preview": "Reviews",
     "preview_count": "{count} to import",
     "preview_saved": "{count} already saved",
     "copy_tooltip": "Copy the review text — handy for pasting into an external translator",
@@ -2220,5 +2223,15 @@
     "type_shortcut": "Shortcut",
     "filter_executables": "Executables",
     "filter_any_file": "All files"
+  },
+  "launch_trust": {
+    "title": "Start this?",
+    "start": "Start",
+    "text": "{name} is set to start:\n\n{target}\n\nThat is {kind}.\n\nIf you set this up yourself, go ahead. If the game came from an imported library, another PC or a friend, start it only if you trust where it came from: it runs with your permissions.\n\nYou will not be asked again for this game unless it changes.",
+    "kind_link": "a link of a kind no game launcher known to SaveSync uses",
+    "kind_network": "a program on another computer of the network",
+    "kind_script": "a script, which runs whatever commands it holds",
+    "kind_shortcut": "a shortcut, which can start any program with any command",
+    "kind_program": "a file that runs code but is not a plain program"
   }
 }

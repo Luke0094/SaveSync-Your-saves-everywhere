@@ -374,6 +374,16 @@ def _clean_ancestor_folder_name(n: str) -> str:
     return cleaned or n
 
 
+def spaced_title(name: str) -> str:
+    """A file or folder name read as a title: the underscores standing for spaces in it ("Holy_Avatar",
+    "My_Game") turned back into spaces, runs of spaces made one. A name taken from disk - an exe, a
+    shortcut, an install folder - reached the Name field as written, underscores and all, wherever it
+    came from (dropped in, picked, a folder dropped on the library, a game detected running)."""
+    if not name or "_" not in name:
+        return name
+    return re.sub(r"\s{2,}", " ", name.replace("_", " ")).strip() or name
+
+
 def derive_display_name(exe_path: str, fallback: str = "") -> str:
     """Best human display name for a game executable.
 
@@ -398,11 +408,11 @@ def derive_display_name(exe_path: str, fallback: str = "") -> str:
         # which is not the title: its title is the install folder, three levels above it.
         unreal_root = _unreal_install_root(exe_path)
         if stem and stem.lower() not in _GENERIC_EXE_STEMS and unreal_root is None:
-            return stem
+            return spaced_title(stem)
         # Generic stem → nearest meaningful ancestor folder name
-        return install_folder_title(exe_path) or fallback or stem
+        return spaced_title(install_folder_title(exe_path) or fallback or stem)
     except (OSError, ValueError):
-        return fallback or Path(exe_path).stem
+        return spaced_title(fallback or Path(exe_path).stem)
 
 
 def install_folder_title(exe_path: str, past_containers: bool = True) -> str:
@@ -495,10 +505,10 @@ def display_name_for_added_file(path: str) -> str:
     from core.resolvers import is_executable_file, is_shortcut_file
     p = Path(path)
     if is_shortcut_file(p):
-        return p.stem
+        return spaced_title(p.stem)
     if is_executable_file(p):
         return derive_display_name(path)
-    return p.stem
+    return spaced_title(p.stem)
 
 
 # ── Engine-specific paths ─────────────────────────────────────────────────────

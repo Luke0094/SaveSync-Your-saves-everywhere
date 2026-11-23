@@ -353,6 +353,9 @@
     "restore_err_zip_missing": "File zip del backup mancante",
     "restore_err_zip_removed": "File zip del backup rimosso",
     "restore_err_zip_corrupt": "File zip del backup danneggiato",
+    "restore_err_unsafe_archive": "Ripristino rifiutato: questo archivio si espanderebbe ben oltre quanto un backup può contenere (possibile zip bomb)",
+    "restore_left_out": "{count} file di questo backup non sono stati ripristinati ({files}).\n\nSono programmi o script, che nessun salvataggio è, oppure sarebbero finiti fuori dalle cartelle di salvataggio del gioco. I tuoi salvataggi sono stati ripristinati senza di loro.\n\nSe questo backup viene da qualcun altro, non fidarti.",
+    "restore_blocked_title": "Sicurezza del ripristino",
     "restore_err_registry_payload": "{name}: dati del registro illeggibili",
     "restore_err_registry_import": "{name}: importazione nel registro non riuscita",
     "verify_not_zip": "non è un archivio zip",
@@ -1595,7 +1598,7 @@
     "merge_chip": "Recensioni ({count})",
     "from_source": "Fonte: {source}",
     "votes_n": "{count} voti",
-    "preview": "Recensioni",
+    "version_tooltip": "Scritta per la versione {version} del gioco",    "preview": "Recensioni",
     "preview_count": "{count} da importare",
     "preview_saved": "{count} già salvate",
     "copy_tooltip": "Copia il testo della recensione — utile per tradurlo con un servizio esterno",
@@ -2220,5 +2223,15 @@
     "type_shortcut": "Collegamento",
     "filter_executables": "Eseguibili",
     "filter_any_file": "Tutti i file"
+  },
+  "launch_trust": {
+    "title": "Avviare questo?",
+    "start": "Avvia",
+    "text": "{name} è impostato per avviare:\n\n{target}\n\nÈ {kind}.\n\nSe l'hai impostato tu, procedi pure. Se il gioco viene da una libreria importata, da un altro PC o da un amico, avvialo solo se ti fidi della provenienza: verrà eseguito con i tuoi permessi.\n\nNon ti verrà chiesto di nuovo per questo gioco, a meno che non cambi.",
+    "kind_link": "un link di un tipo che nessun launcher di giochi noto a SaveSync usa",
+    "kind_network": "un programma su un altro computer della rete",
+    "kind_script": "uno script, che esegue qualsiasi comando contenga",
+    "kind_shortcut": "un collegamento, che può avviare qualsiasi programma con qualsiasi comando",
+    "kind_program": "un file che esegue codice ma non è un normale programma"
   }
 }

@@ -43,8 +43,13 @@ def _inspect_url(info) -> str:
 
 def _open_inspect_url(url: str):
     url = (url or "").strip()
-    if url:
+    # A web page, and only that: the address comes off scraped pages, and on
+    # Windows webbrowser hands anything else to the shell as it is (file:,
+    # a share, Windows' own ms- handlers).
+    if url.lower().startswith(("http://", "https://")):
         webbrowser.open(url)
+    elif url:
+        logger.warning(f"Not opening {url!r}: not a web page")  # i18n-ignore (log text)
 
 
 class CandidatePreviewDialog(QDialog):

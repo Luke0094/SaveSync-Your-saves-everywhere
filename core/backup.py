@@ -23,6 +23,7 @@ from core.constants import BACKUP_DIR, USER_DATA_DIR, MAX_LOCAL_BACKUPS, BACKUP_
 from core.constants import RESTORE_QUIET_SECONDS as _RESTORE_QUIET_SECONDS
 from core.config_manager import get_config
 from core.machine import get_machine_id
+from core.zip_guard import NEVER_RESTORED_EXTENSIONS, is_never_restored
 import i18n
 
 # Extensions that should NEVER be in a save backup (game assets, binaries)
@@ -37,7 +38,7 @@ _BACKUP_SKIP_EXTENSIONS = frozenset(SKIP_EXTENSIONS) | frozenset({
     ".webm", ".bik", ".usm",   # game video formats (.webm not in SKIP)
     ".zip", ".rar", ".7z", ".tar", ".gz",  # archives
     ".tmp", ".temp", ".cache",  # temporary files
-})
+}) | NEVER_RESTORED_EXTENSIONS  # programs, scripts, shortcuts: no restore writes them either
 
 # Filenames (stem, case-insensitive, extension irrelevant) that should NEVER
 # be in a save backup — e.g. "log", "log.txt", "log.dat" are engine noise,
@@ -182,6 +183,19 @@ def _is_in_skipped_subdir(f: Path, root: Path, keep: frozenset = frozenset()) ->
     # By place, not by name - a "sync" or "Analytics" folder in any other game's saves is data.
     from core.skip_dirs import engine_data_between
     return engine_data_between(root, rel_parts)
+
+
+def _registry_key_norm(path_str: str) -> str:
+    """A registry save path in one comparable form: no scheme, HKCU for
+    HKEY_CURRENT_USER, backslashes, no trailing one, case folded."""
+    body = path_str or ""
+    if body.lower().startswith("registry:"):
+        body = body[len("registry:"):]
+    body = body.replace("/", "\\").strip().strip("\\")
+    head, _, rest = body.partition("\\")
+    if head.upper() == "HKEY_CURRENT_USER":
+        head = "HKCU"
+    return f"{head}\\{rest}".casefold()
 
 
 def _library_entry(game_id: str):
@@ -851,11 +865,20 @@ class RestoreResult:
     # itself succeeded) — this field is what tells the caller/UI the restore
     # did NOT reach the game and needs the user to fix the save path.
     used_fallback_dir: str = ""
+    # Members left out on purpose: programs and scripts (no save is one), and
+    # files that would land outside the game's save folders. Not "failed" -
+    # a retry would only leave them out again.
+    refused: list[str] = field(default_factory=list)
 
 
 class BackupManager(QObject):
     backup_created = Signal(object)   # BackupEntry
     backup_restored = Signal(str)     # game_id
+    # A restore refused an archive, or left files of it out, for safety:
+    # (game name, what to tell the player - already in their language).
+    # Emitted from the restore's own thread; every route that restores is
+    # covered by the one connection in the main window.
+    restore_blocked = Signal(str, str)
     backup_deleted = Signal(str)      # backup_id
     # Startup zip-existence sweep failed after retries (GUI should notify).
     index_validation_failed = Signal(str)
@@ -1469,6 +1492,12 @@ class BackupManager(QObject):
                     except OSError:
                         pass
             elif sp.is_file():
+                if is_never_restored(sp.name):
+                    # A file picked as the save itself is taken as it is,
+                    # whatever its type - but not a program: no restore would
+                    # ever put it back (core.zip_guard).
+                    logger.warning(f"Not backing up {sp.name}: a program file, not a save")  # i18n-ignore (log text)
+                    continue
                 if recent_file_set is not None:
                     try:
                         if str(sp.resolve()) in recent_file_set:
@@ -1562,6 +1591,13 @@ class BackupManager(QObject):
         import hashlib
         h = hashlib.sha256()
         for arc in sorted(manifest):
+            if is_never_restored(arc):
+                # A program an older backup took and no backup takes now (see
+                # NEVER_RESTORED_EXTENSIONS): with it counted, the saves would
+                # never match that backup again and the game would read as
+                # changed outside SaveSync. A manifest without one hashes as
+                # it always did.
+                continue
             h.update(f"{arc}|{self._fp_content(manifest[arc])}\n".encode())
         return h.hexdigest()
 
@@ -2915,9 +2951,16 @@ class BackupManager(QObject):
 
         result = RestoreResult(success=True)
         frozen = False
+        from core.zip_guard import UnsafeArchive, check_archive, read_member
 
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
+                # Before anything is unpacked: an archive that would unpack to
+                # more than any backup can hold (a zip bomb - from the cloud, a
+                # friend, an archive added by hand) is refused here, whole. Every
+                # member is then read in bounded pieces (read_member), never the
+                # way zf.read takes it: all at once.
+                check_archive(zf)
                 # ── Registry state first (independent of filesystem targets) ──
                 # __registry__/ members are re-imported into HKCU (validated
                 # inside import_registry_tree) and EXCLUDED from the file
@@ -2927,10 +2970,41 @@ class BackupManager(QObject):
                                                  import_registry_tree,
                                                  export_registry_key,
                                                  registry_arc_name)
+                from core.zip_guard import forbidden_destination, member_refusal
+
+                # ── What this restore will not write ──────────────────────
+                # An archive is not always one this PC made: it comes from
+                # another PC, a friend, or by hand, and says itself what it
+                # holds and where it goes. Programs and scripts are never a
+                # save (member_refusal), and nothing lands outside the game's
+                # own save folders (checked where each one is worked out).
+                # Left out one by one and reported: the saves still come back.
+                _refusals = {a: why for a in zf.namelist()
+                             if not a.endswith("/") and not arc_name_is_registry(a)
+                             for why in [member_refusal(a)] if why}
+
+                def _leave_out(arc: str, why: str) -> None:
+                    result.refused.append(arc)
+                    logger.warning(f"Restore of {backup_id}: left out {arc!r}, {why}")  # i18n-ignore (log text)
+
                 reg_members = [a for a in zf.namelist() if arc_name_is_registry(a)]
                 if reg_members:
                     reg_targets = {registry_arc_name(rp): rp
                                    for rp in entry.save_paths if _is_reg(rp)}
+                    # The keys this restore may write: the ones the game keeps
+                    # its saves in as THIS library records it, and the backup's
+                    # own when this PC made it. A key named only by the archive
+                    # (another PC's index, a friend's copy, the payload's own
+                    # "key") is not enough: an import replaces that key's whole
+                    # tree, and every program keeps its settings under
+                    # HKCU\Software.
+                    _lib_for_reg = _library_entry(lib_game_id or entry.game_id)
+                    _own_keys = {_registry_key_norm(rp)
+                                 for rp in ((_lib_for_reg.save_paths or []) if _lib_for_reg else [])
+                                 if _is_reg(rp)}
+                    if entry.machine_id and entry.machine_id == get_machine_id():
+                        _own_keys |= {_registry_key_norm(rp)
+                                      for rp in entry.save_paths if _is_reg(rp)}
                     for arc in reg_members:
                         if only_files is not None and arc not in only_files:
                             continue
@@ -2942,14 +3016,17 @@ class BackupManager(QObject):
                             # HKCU\Software gate either way).
                             try:
                                 import json as _json
-                                _doc = _json.loads(zf.read(arc))
+                                _doc = _json.loads(read_member(zf, arc))
                                 target = "registry:" + str(_doc.get("key", ""))
                             except Exception:
                                 result.failed.append(arc)
                                 result.errors.append(
                                     _say('backup.restore_err_registry_payload', name=arc))
                                 continue
-                        data = zf.read(arc)
+                        if _registry_key_norm(target) not in _own_keys:
+                            _leave_out(arc, f"the registry key {target!r} is not one this game keeps its saves in")  # i18n-ignore (log text)
+                            continue
+                        data = read_member(zf, arc)
                         try:
                             if export_registry_key(target) == data:
                                 result.skipped.append(arc)   # already identical
@@ -3004,14 +3081,20 @@ class BackupManager(QObject):
                                           or (_chain_parts(a)[:1] or [""])[0]
                                           .casefold() in _want)]
                     for arc_name in _target_files:
+                        if arc_name in _refusals:
+                            _leave_out(arc_name, _refusals[arc_name])
+                            continue
                         _parts = _chain_parts(arc_name)
                         _rel = (strip_arc_prefix(arc_name, _prefix_for(_parts[0]))
                                 if len(_parts) > 1 else arc_name)
                         dest = target_path / _rel
                         if not _is_relative_to(dest.resolve(), target_path.resolve()):
                             continue
+                        if forbidden_destination(dest.resolve()):
+                            _leave_out(arc_name, "it would land in Windows' folder or the Start Menu")  # i18n-ignore (log text)
+                            continue
                         dest.parent.mkdir(parents=True, exist_ok=True)
-                        self._write_restore_file(dest, zf.read(arc_name), arc_name, result)
+                        self._write_restore_file(dest, read_member(zf, arc_name), arc_name, result)
                     result.used_fallback_dir = str(target_path)
                     logger.info(f"Orphan backup restored directly to target_dir: {target_path}")
                 elif not fs_save_paths:
@@ -3023,11 +3106,14 @@ class BackupManager(QObject):
                         fallback.mkdir(parents=True, exist_ok=True)
                         result.used_fallback_dir = str(fallback)
                         for arc_name in _fallback_files:
+                            if arc_name in _refusals:
+                                _leave_out(arc_name, _refusals[arc_name])
+                                continue
                             dest = fallback / arc_name
                             if not _is_relative_to(dest.resolve(), fallback.resolve()):
                                 continue
                             dest.parent.mkdir(parents=True, exist_ok=True)
-                            self._write_restore_file(dest, zf.read(arc_name), arc_name, result)
+                            self._write_restore_file(dest, read_member(zf, arc_name), arc_name, result)
                         logger.warning(f"No save_paths — restored to {fallback}")
                 else:
                     # ── Build work list ───────────────────────────────────
@@ -3077,6 +3163,24 @@ class BackupManager(QObject):
 
                     work: list[tuple[Path, bytes, str]] = []
 
+                    # Where a file may land: inside one of the game's save
+                    # folders, at a save path that is a single file, or where
+                    # a chain sends it. Not beside them: a name the archive
+                    # gives that matches no save folder used to land in the
+                    # save folder's PARENT - often the game's own folder, where
+                    # a winmm.dll is loaded at the next launch and RPG Maker
+                    # runs www/js, Ren'Py the .rpy files in game/.
+                    _landing = [Path(sp) for sp in fs_save_paths]
+                    _landing += [_t for _pairs in redirects.values() for _p, _t in _pairs]
+                    if _single_dir_target is not None:
+                        _landing.append(_single_dir_target)
+                    _landing_resolved = []
+                    for _r in _landing:
+                        try:
+                            _landing_resolved.append(_r.resolve())
+                        except (OSError, RuntimeError):
+                            pass
+
                     for arc_name in zf.namelist():
                         if arc_name.endswith('/'):
                             continue
@@ -3084,6 +3188,9 @@ class BackupManager(QObject):
                             continue    # already handled above
                         # If retrying, only process the specified files
                         if only_files is not None and arc_name not in only_files:
+                            continue
+                        if arc_name in _refusals:
+                            _leave_out(arc_name, _refusals[arc_name])
                             continue
 
                         # Sanitize arc_name to prevent zip slip (path traversal)
@@ -3125,8 +3232,16 @@ class BackupManager(QObject):
                             dest = restore_root / arc_path
                         if not _is_relative_to(dest.resolve(), restore_root.resolve()):
                             continue
+                        _dest_res = dest.resolve()
+                        if not any(_dest_res == _r or _is_relative_to(_dest_res, _r)
+                                   for _r in _landing_resolved):
+                            _leave_out(arc_name, "it would land outside the game's save folders")  # i18n-ignore (log text)
+                            continue
+                        if forbidden_destination(_dest_res):
+                            _leave_out(arc_name, "it would land in Windows' folder or the Start Menu")  # i18n-ignore (log text)
+                            continue
 
-                        backup_data = zf.read(arc_name)
+                        backup_data = read_member(zf, arc_name)
 
                         # Skip identical files
                         if dest.exists():
@@ -3144,6 +3259,7 @@ class BackupManager(QObject):
                         if not target_dir:
                             self.note_restore(entry.game_id, lib_game_id)
                         self.backup_restored.emit(entry.game_id)
+                        self._tell_left_out(entry, result)
                         return result
 
                     # ── Freeze if requested ───────────────────────────────
@@ -3178,8 +3294,15 @@ class BackupManager(QObject):
             if not target_dir:
                 self.note_restore(entry.game_id, lib_game_id)
             self.backup_restored.emit(entry.game_id)
+            self._tell_left_out(entry, result)
             return result
 
+        except UnsafeArchive as e:
+            # (Before BadZipFile, which it is a kind of: "corrupt" would hide what it is.)
+            logger.warning(f"Restore of {backup_id} refused, a possible zip bomb: {e}")  # i18n-ignore (log text)
+            _msg = _say('backup.restore_err_unsafe_archive')
+            self._emit_restore_blocked(entry.game_name, _msg)
+            return RestoreResult(success=False, errors=[_msg])
         except zipfile.BadZipFile:
             return RestoreResult(success=False, errors=[_say('backup.restore_err_zip_corrupt')])
         except Exception as e:
@@ -3195,6 +3318,24 @@ class BackupManager(QObject):
                 _restore_tmp_ctx.cleanup()
             except Exception:
                 pass
+
+    def _emit_restore_blocked(self, game_name: str, message: str) -> None:
+        try:
+            self.restore_blocked.emit(game_name or "", message)
+        except Exception:
+            logger.debug("Could not report a blocked restore", exc_info=True)
+
+    def _tell_left_out(self, entry: BackupEntry, result: RestoreResult) -> None:
+        """Tell the player what a restore left out (see RestoreResult.refused):
+        an archive that carries a program, or a file meant for outside the save
+        folders, is not one to trust blindly - and they should hear it."""
+        if not result.refused:
+            return
+        names = [Path(a.replace("\\", "/")).name or a for a in result.refused]
+        shown = ", ".join(names[:3]) + (f" (+{len(names) - 3})" if len(names) > 3 else "")
+        self._emit_restore_blocked(
+            entry.game_name,
+            _say('backup.restore_left_out', count=len(names), files=shown))
 
     def _write_restore_file(self, dest: Path, data: bytes, arc_name: str,
                             result: RestoreResult):
@@ -6014,7 +6155,10 @@ class BackupManager(QObject):
                 cutoff = changes_explained_since - self._PID_TRACKING_LAG_S
                 lenient = None
                 explained = []
-                from core.registry_saves import arc_name_is_registry
+                from core.registry_saves import (arc_name_is_registry,
+                                                 registry_arc_name,
+                                                 registry_last_write)
+                _reg_by_arc = {registry_arc_name(rp): rp for rp in valid_reg}
                 for arc in changed:
                     fp = manifest.get(arc, "")
                     parts = fp.split("|")
@@ -6028,10 +6172,22 @@ class BackupManager(QObject):
                     # accounts for.
                     if arc not in prev and arc_name_is_registry(arc):
                         continue
-                    try:
-                        mtime = float(parts[1])
-                    except ValueError:
-                        continue
+                    if arc_name_is_registry(arc):
+                        # A registry export's fingerprint is "len|reg|sha": it
+                        # carries no time, so float() failed and a key the game
+                        # rewrites on every start (Unity's PlayerPrefs: window
+                        # position, monitor, session count) was never explained
+                        # - each launch read as "changed outside SaveSync". The
+                        # key's own last-write time is its modification time.
+                        _rp = _reg_by_arc.get(arc)
+                        mtime = float(registry_last_write(_rp) or 0.0) if _rp else 0.0
+                        if mtime <= 0:
+                            continue
+                    else:
+                        try:
+                            mtime = float(parts[1])
+                        except ValueError:
+                            continue
                     if mtime >= cutoff:
                         if lenient is None:
                             lenient = dict(manifest)
@@ -6207,7 +6363,6 @@ class BackupManager(QObject):
         and content-hash dedup: Backup Tutti would re-create the game every
         time even though nothing changed (the reported legacy-game symptom).
         """
-        import hashlib
         import zipfile
 
         entry = self.get_backup(backup_id)
@@ -6217,8 +6372,10 @@ class BackupManager(QObject):
         if not zp.exists() or not zipfile.is_zipfile(zp):
             return False
         manifest: dict[str, str] = {}
+        from core.zip_guard import check_archive, hash_member
         try:
             with zipfile.ZipFile(zp) as zf:
+                check_archive(zf)                 # (a zip bomb is refused - see core.zip_guard)
                 for info in zf.infolist():
                     if info.is_dir():
                         continue
@@ -6228,7 +6385,7 @@ class BackupManager(QObject):
                         mtime = datetime(*dt).timestamp()
                     except (ValueError, TypeError, OverflowError):
                         mtime = 0.0
-                    h = hashlib.sha256(zf.read(info.filename)).hexdigest()
+                    h = hash_member(zf, info)
                     manifest[info.filename] = f"{size}|{mtime:.6f}|{h}"
         except (zipfile.BadZipFile, OSError, KeyError) as e:
             logger.warning(f"Legacy repair could not read {backup_id}: {e}")
@@ -6649,7 +6806,6 @@ class BackupManager(QObject):
         flush with ``_save_game_index`` once per game (avoids rewriting the
         same index.json after every zip on a huge library).
         """
-        import hashlib
         import zipfile
 
         entry = self.get_backup(backup_id)
@@ -6665,6 +6821,10 @@ class BackupManager(QObject):
                 state, detail = "corrupt", _say('backup.verify_not_zip')
             else:
                 with zipfile.ZipFile(zp) as zf:
+                    # testzip unpacks every member to check it: a zip bomb is
+                    # refused first, and reads as corrupt (it is a BadZipFile).
+                    from core.zip_guard import check_archive, hash_member
+                    check_archive(zf)
                     bad = zf.testzip()
                     if bad is not None:
                         state, detail = "corrupt", bad
@@ -6688,7 +6848,7 @@ class BackupManager(QObject):
                                 if not want:
                                     continue      # legacy fingerprint, nothing to compare
                                 real = by_norm.get(arc.replace("\\", "/"), arc)
-                                got = hashlib.sha256(zf.read(real)).hexdigest()
+                                got = hash_member(zf, real)
                                 if got != want:
                                     state, detail = "changed", arc
                                     break

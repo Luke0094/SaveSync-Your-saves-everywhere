@@ -207,6 +207,7 @@ class SyncWorker(QThread):
         from pathlib import Path
         from core.library import get_library
         from core.registry_saves import is_registry_path
+        from core.zip_guard import check_archive, member_refusal, write_member
         e = get_library().get_by_id(self._game_id)
         if e is None:
             return
@@ -225,8 +226,13 @@ class SyncWorker(QThread):
                 zp = Path(r.zip_path or "")
                 if not zp.exists():
                     continue
+                tmp = None
                 try:
                     with zipfile.ZipFile(zp) as z:
+                        # Zips that just came down from the cloud: a zip bomb is
+                        # refused before anything is unpacked (core.zip_guard),
+                        # and each file streams to disk in bounded pieces.
+                        check_archive(z)
                         members = [n for n in z.namelist()
                                    if n.split("/", 1)[0] == root and "/" in n and not n.endswith("/")]
                         if not members:
@@ -236,15 +242,28 @@ class SyncWorker(QThread):
                             rel = n.split("/", 1)[1]
                             if rel.replace("\\", "/").casefold() in skip:
                                 continue
+                            why = member_refusal(n)
+                            if why:
+                                # A program or script is no save (as in a restore).
+                                logger.warning(f"Not completing {p!r} with {n!r} from backup {r.backup_id}: {why}")  # i18n-ignore (log text)
+                                continue
                             target = (dest_root / rel).resolve()
                             if dest_root not in target.parents or target.exists():
                                 continue        # (outside the folder, or already there: left alone)
                             target.parent.mkdir(parents=True, exist_ok=True)
                             tmp = target.with_name(target.name + ".restore_tmp")
-                            tmp.write_bytes(z.read(n))
+                            write_member(z, n, tmp)
                             tmp.replace(target)
+                            tmp = None
                             written += 1
                 except (OSError, zipfile.BadZipFile, KeyError):
+                    # (A refused archive is a BadZipFile too.) A file cut short
+                    # is not left behind under its temporary name.
+                    if tmp is not None:
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
                     logger.warning(f"Could not complete {p!r} from backup {r.backup_id}", exc_info=True)
                     continue
                 logger.info(f"Completed the save folder {p!r} of '{e.name}' from backup {r.backup_id}: {written} file(s) it lacked")

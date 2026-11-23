@@ -798,16 +798,20 @@ def parse_launcher_url(url: str) -> Optional[dict]:
 
 def launch_with_url(url: str) -> bool:
     """Launch a game using its launcher URL.
-    
+
+    Whether to is the caller's question: a link of a kind no game launcher
+    uses is asked about first (core.launch_trust), not refused here.
+
     Args:
         url: The launcher URL (steam://, epic://, etc.)
-        
+
     Returns:
         True if launch was successful
     """
     import os
     import sys
 
+    url = (url or "").strip()
     try:
         if os.name == 'nt':
             os.startfile(url)

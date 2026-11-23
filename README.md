@@ -1,6 +1,6 @@
 # SaveSync
 
-> **Your saves, everywhere.** — Game save manager with cloud sync, versioned backups, p2p file trasfer, game library, save editor, and an in-game overlay.
+> **Your saves, everywhere.** —  Game save manager with cloud sync, versioned backups, p2p file trasfer, library, save editor, and an in-game overlay.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Qt](https://img.shields.io/badge/UI-PySide6%20(Qt6)-41cd52)
@@ -12,7 +12,7 @@
 
 SaveSync watches the games you play, finds their save folders on its own, keeps
 versioned local backups, and mirrors everything to the cloud provider of your
-choice, you can also edit your saves with the integrated save editor 
+choice, you can also edit your saves with the integrated save editor
 — with an always-on-top overlay so you never have to leave the game.
 Saves can also go straight to a friend, P2P, with no server or cloud provider
 involved at all.
@@ -62,7 +62,7 @@ involved at all.
 | [Sync providers](#sync-providers) | Google Drive, OneDrive, Dropbox, WebDAV, rclone and a local folder - and how to add one |
 | [Conflict resolution](#conflict-resolution) | What happens when the cloud and this PC disagree |
 | [Using more than one PC](#using-more-than-one-pc) | Automatic sync of the library and settings, what it asks, keeping a library apart |
-| [Programs, versions and merging](#programs-versions-and-merging) | Several programs on one card, the questions, merging and splitting cards, launch URLs |
+| [Programs, versions and merging](#programs-versions-and-merging) | Several programs on one card, the questions, merging and splitting cards, launch URLs and what Play asks about |
 | [P2P save transfer](#p2p-save-transfer) | Sending, receiving, settings, friends, group chats, speed, TLS, hiding your address, how it works, privacy |
 | [Save detection](#save-detection) | How candidate folders are scored |
 | [Save editor](#save-editor) | Editing the values inside a save, and the formats it understands |
@@ -177,10 +177,10 @@ Four groups. Each one lists what it covers; open it for the details.
 
 ### Backups & sync
 
-**In this group:** Versioned local backups · Mtime preflight · Adaptive batch queues · Pre-restore safety backups · Verified on arrival · Duplicates view · Integrity checks · Interference alerts · Periodic in-game backups · Provisional backups · Multi-provider cloud sync · Renames and edited notes reach the provider · Conflict resolution · Quick restore from the overlay · Direct P2P transfer · Automatic sync between PCs · Several cloud copies of one name
+**In this group:** Versioned local backups · Mtime preflight · Adaptive batch queues · Pre-restore safety backups · Safe restores · Verified on arrival · Duplicates view · Integrity checks · Interference alerts · Periodic in-game backups · Provisional backups · Multi-provider cloud sync · Renames and edited notes reach the provider · Conflict resolution · Quick restore from the overlay · Direct P2P transfer · Automatic sync between PCs · Several cloud copies of one name
 
 <details>
-<summary><strong>Show all 17 features</strong></summary>
+<summary><strong>Show all 18 features</strong></summary>
 
 - **Versioned local backups** with retention (max count, days, minimum kept,
   size cap) and content-dedup (unchanged saves are skipped)
@@ -194,6 +194,23 @@ Four groups. Each one lists what it covers; open it for the details.
   provisional (unconfirmed) backups they form a side branch: their own
   retention, never counted against the main history, never picked as the
   newest restore target, never uploaded
+- **Safe restores** — a backup is not always one this PC made (another PC, a friend, an archive added
+  by hand), so a restore trusts nothing it says about itself:
+  - an archive that would unpack to more than any backup can hold (over 4 GB, over 100,000 entries, or
+    expanding far past what saves compress to: a *zip bomb*) is refused before anything is unpacked,
+    and every file is read in bounded pieces, never all at once;
+  - programs and scripts are never written: `.exe .dll .asi .bat .ps1 .vbs .js .lnk .url .rpy .rpyc
+    .pck .msi` and the like, judged by the extension Windows sees (`winmm.dll.` is a DLL), along with names
+    Windows treats specially (`nul.sav`, `save.sav:stream`). Backups no longer take them either;
+  - files land only inside the game's own save folders (or where a folder's recorded chain sends them),
+    never beside them in the game's folder, in Windows' folder or in the Start Menu. Before, a file the
+    archive named outside every save folder went to the save folder's parent: a `winmm.dll` beside the
+    game's exe, a `www/js` plugin RPG Maker runs, an `.rpy` script Ren'Py loads;
+  - a registry key is written only if the game's card keeps its saves there, or the backup was made on
+    this PC.
+
+  What is left out is skipped file by file, so the saves still come back, and the restore says so,
+  naming the files. The same rules apply when a merged card's folders are completed from cloud backups
 - **Verified on arrival** — every new or downloaded backup is integrity-checked
   as it lands (green dot from the start); one scheduled sweep covers the rest,
   skipping archives already verified within its interval
@@ -258,10 +275,10 @@ Four groups. Each one lists what it covers; open it for the details.
 
 ### Library
 
-**In this group:** Card and list views · Paged lists · Smart tag merging · Web metadata search · More pictures · Languages · Per-game context menu · Programs, versions, splitting and merging
+**In this group:** Card and list views · Paged lists · Smart tag merging · Web metadata search · More pictures · Languages · Per-game context menu · Programs, versions, splitting and merging · Play asks before the unusual
 
 <details>
-<summary><strong>Show all 8 features</strong></summary>
+<summary><strong>Show all 9 features</strong></summary>
 
 - **Card and list views** with search (by title or developer), folder tree with
   colors, star ratings from reviews, and three-state filters (include /
@@ -310,6 +327,10 @@ Four groups. Each one lists what it covers; open it for the details.
   when it matters, filed only by your answer), a version can be split into a card of its own, and two cards
   of one game can be merged — backups, folders, details and the cloud copy included.
   See [Programs, versions and merging](#programs-versions-and-merging)
+- **Play asks before the unusual** — a known launcher's link (Steam, Epic, GOG…) or a plain program,
+  Proton/Wine included, starts as always. A script, a shortcut, a program on a network share or a link
+  no known launcher uses is shown first, once per game: nothing is ever refused, and what you set in
+  Add/Edit yourself is never asked about. See [Launch URLs](#programs-versions-and-merging)
 
 </details>
 
@@ -659,6 +680,7 @@ savesync/
 │   ├── registry_saves.py          # Registry save locations (Windows & Wine/Proton on Linux)
 │   ├── skip_dirs.py               # Shared skip-list of noise directories
 │   ├── backup.py                  # Versioned zip backups, retention, dedup
+│   ├── zip_guard.py               # Restore safety: zip bombs, program files, where files may land
 │   ├── pending_batch_jobs.py      # Persisted multi-operation batch queues
 │   ├── p2p/                       # Direct P2P save transfer (BitTorrent + DHT mailbox)
 │   │   ├── __init__.py
@@ -670,6 +692,7 @@ savesync/
 │   │   ├── tls.py                 # Optional TLS for transfers: the certificate authority derived from the token
 │   │   └── paths.py               # Folder received files are downloaded into (Settings)
 │   ├── resolvers.py               # Launcher URLs, executable resolution
+│   ├── launch_trust.py            # What Play asks about before starting, and the answers given
 │   ├── exe_scan.py                # Folder scan for installed game executables
 │   ├── game_api.py                # Web metadata search orchestration
 │   ├── game_sources/              # Steam, VNDB, wikis, store/forum scrapers
@@ -971,6 +994,24 @@ A card that has none learns it the next time a launch shows one — a desktop ic
 reverse — and an existing URL is never replaced.
 
 Verified with Steam and Epic.
+
+**What Play asks about.** A card's launch target is data, and a card can arrive from an imported library
+(the `.savesync` pack's key is the same in every install, so anyone can write one), another PC or a friend.
+Play starts these without a question:
+
+- a link of a launcher SaveSync knows: `steam:`, `com.epicgames.launcher:`, `epic:`, `gog:`, `goggalaxy:`,
+  `ubisoft:`, `uplay:`, `battlenet:`, `origin:`, `ea:`, `rockstar:`, `bethesdanet:`, `amazon-games:`,
+  `heroic:`, `itch:`, `playnite:`, `lutris:`, `legendary:`, and an Xbox / Game Pass title's own `ms-xbl-…:`;
+- a plain program: `.exe` (through Proton or Wine off Windows), a Linux binary, a macOS `.app`.
+
+Anything else is shown before it starts, with the exact target and what kind it is: a script (`.bat`,
+`.ps1`, `.sh`…), a shortcut (`.lnk`, `.url`, `.desktop`, which can hold any command), a program on a
+network share, another kind of code file (`.msi`, `.scr`…), or any other link (`shell:AppsFolder\…`,
+`file:`, Windows' own `ms-`/`search-ms:` handlers, a launcher not listed above). **Start** runs it and is
+remembered for that game until its target changes; **Cancel** starts nothing. Nothing is refused: a
+genuine launch script or an unusual launcher works after one answer. A target you set or change in
+Add/Edit is yours and is never asked about. The answers stay on this PC: they are never exported,
+imported or synced, so a library file cannot arrive with its own approvals.
 
 </details>
 
@@ -2865,7 +2906,9 @@ From **Settings → Transfer** you can export / import an encrypted
 `.savesync` pack (settings, library, optional credentials) and browse
 **Configuration History**. Each successful export or cloud upload also writes a
 local snapshot; at most five are kept. Restoring or importing first snapshots
-the current state (`pre_restore` / `pre_import`) so you can undo.
+the current state (`pre_restore` / `pre_import`) so you can undo. What belongs to this PC alone is never
+taken from a pack or a snapshot - among it, the launch targets you allowed
+(see [What Play asks about](#programs-versions-and-merging)).
 
 ### Data-integrity checks
 
@@ -2882,7 +2925,7 @@ from the ⚕️ button on the Backups page. Both run the same six:
 |-------|--------------|
 | index zip-existence | drops index rows whose archive is gone (deleted outside SaveSync, a failed sync) |
 | legacy metadata repair | rebuilds the manifest / save hash on backups made before per-file manifests, so the dedup preflight stops treating those games as permanently changed |
-| archive verification | opens every zip and CRC-checks its contents — the only check that proves a backup can actually be restored |
+| archive verification | opens every zip and CRC-checks its contents — the only check that proves a backup can actually be restored. An archive that would unpack past any backup's size (a zip bomb) reads as damaged without being unpacked |
 | config snapshots | a sandbox restore over a full rotated history |
 | settings integrity | the OS autostart registration against what `launch_on_startup` wants — repairs a stale entry left by an old build (its path/filename baked in changes every update) or removes one left behind after the setting was turned off |
 | picture cache | deletes the hidden temporary files (`.<hex>.part`) a picture download leaves in a game's icon folder if the app is killed while writing one; a file a download could still own (this run, under 10 minutes old) is left alone |

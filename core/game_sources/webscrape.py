@@ -871,15 +871,34 @@ _FORUM_REVIEWS_TAB_TEXT_RE = re.compile(
 )
 
 
+# The same split as such a forum makes it now: the thread's OWN reviews page,
+# …/threads/<thread>/reviews/ (…/reviews/page-N), a review per
+# <article data-content="review-N"> card, grouped by the game's version (the
+# current one first, then the older versions the page unfolds). Recognised as
+# a THREAD's reviews page, so another site's "/reviews" path is never taken for
+# one. The …/br-reviews/ form above is still read as before.
+_FORUM_THREAD_REVIEWS_PATH_RE = re.compile(
+    r'(/threads/[^/]+)/reviews(?:/page-\d+)?/?$', re.IGNORECASE,
+)
+_FORUM_THREAD_REVIEWS_HREF_RE = re.compile(
+    r'/threads/[^/"\'?#\s]+/reviews/?(?=$|[?#"\'\s])', re.IGNORECASE,
+)
+_FORUM_REVIEW_CARD_RE = re.compile(
+    r'<article\b([^>]*\bdata-content=["\']review-\d+["\'][^>]*)>', re.IGNORECASE,
+)
+
+
 def _is_forum_reviews_url(url: str) -> bool:
     path = urllib.parse.urlsplit(url or "").path or ""
-    return bool(_FORUM_REVIEWS_PATH_RE.search(path))
+    return bool(_FORUM_REVIEWS_PATH_RE.search(path)
+                or _FORUM_THREAD_REVIEWS_PATH_RE.search(path))
 
 
 def _forum_thread_base_url(url: str) -> str:
     """Product-thread URL for a reviews-tab URL, otherwise the URL itself."""
     base = (url or "").split("?")[0]
     trimmed = _FORUM_REVIEWS_PATH_RE.sub("/", base)
+    trimmed = _FORUM_THREAD_REVIEWS_PATH_RE.sub(r"\1/", trimmed)
     if not trimmed.endswith("/"):
         # XenForo thread canonicals keep the trailing slash; without it the
         # reviews-tab join below would produce …/287854br-reviews.
@@ -889,8 +908,9 @@ def _forum_thread_base_url(url: str) -> str:
 
 def _looks_like_forum_reviews_html(html: str) -> bool:
     """Whether *html* is a reviews-tab listing rather than the product post."""
-    return bool(html and re.search(
-        r'class=["\'][^"\']*\bmessage--review\b', html, re.IGNORECASE))
+    return bool(html and (
+        re.search(r'class=["\'][^"\']*\bmessage--review\b', html, re.IGNORECASE)
+        or _FORUM_REVIEW_CARD_RE.search(html)))
 
 
 def _find_forum_reviews_tab(html: str, page_url: str) -> str:
@@ -901,6 +921,10 @@ def _find_forum_reviews_tab(html: str, page_url: str) -> str:
             r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
             html, re.IGNORECASE):
         href = m.group(1).strip()
+        if _FORUM_THREAD_REVIEWS_HREF_RE.search(href):
+            # The thread's own reviews page - as a whole: a link to it can carry a
+            # filter (?version=, ?stars=), and the page unfiltered is what it shows.
+            return urllib.parse.urljoin(page_url, href.split("?")[0].split("#")[0])
         text = re.sub(r'<[^>]+>', '', m.group(2))
         text = re.sub(r'\s+', ' ', text).strip()
         if _FORUM_REVIEWS_HREF_RE.search(href) or (
@@ -1018,6 +1042,215 @@ def _parse_forum_message_reviews(html: str) -> list[dict]:
     return out
 
 
+# Characters that print as nothing. The reviews page sows them through the text
+# (between words, after an entity decode: &zwnj; &ZeroWidthSpace;) - left in,
+# a copied review breaks every search, and they count against the text.
+_INVISIBLE_CHARS_RE = re.compile(r'[\u200b-\u200d\u2060\ufeff]+')
+
+
+def _parse_forum_review_cards(html: str, limit: int = _FORUM_REVIEW_LIMIT,
+                              with_list: bool = False) -> list[dict]:
+    """User reviews from ONE page of a thread's own reviews (…/threads/<thread>/reviews/).
+
+    One ``<article data-content="review-N" data-author="…">`` card per review,
+    whatever the forum names its classes: the score in the card's
+    ``…-card-rating`` (or its stars' ``aria-label="N stars"``), the text in its
+    ``…-card-body`` (up to the "read more" button that follows it - the body
+    can hold quotes and spoilers of its own), the date in the first ``<time>``,
+    the game version it was written for in its ``…-versionPill`` (kept as
+    ``version``). Each review once: the "most helpful" highlights repeat a card,
+    and are links, not cards. Generic ``web`` entries, like
+    _parse_forum_message_reviews. Every page of them: _collect_forum_thread_reviews.
+    """
+    from core.library import quantize_rating
+    if not html:
+        return []
+    out: list[dict] = []
+    seen: set = set()
+    for m in _FORUM_REVIEW_CARD_RE.finditer(html):
+        attrs = m.group(1)
+        end = html.find("</article>", m.end())
+        chunk = html[m.end():end if end > 0 else m.end() + 60000]
+        rid = _tag_attr("<x " + attrs + ">", "data-content")
+        if rid and rid in seen:
+            continue
+        who = _tag_attr("<x " + attrs + ">", "data-author")
+        if not who:
+            um = re.search(
+                r'class=["\'][^"\']*\busername\b[^"\']*["\'][^>]*>\s*'
+                r'(?:<span[^>]*>)?\s*([^<]+)', chunk, re.I)
+            if um:
+                who = _decode_entities(um.group(1)).strip()
+        rate = 0.0
+        rm = (re.search(r'class=["\'][^"\']*-card-rating\b[^"\']*["\'][^>]*>\s*([\d.]+)', chunk, re.I)
+              or re.search(r'role=["\']img["\'][^>]*aria-label=["\']\s*([\d.]+)\s*stars?', chunk, re.I))
+        if rm:
+            try:
+                rate = float(rm.group(1))
+            except ValueError:
+                rate = 0.0
+        body = ""
+        bm = (re.search(r'class=["\'][^"\']*-card-body\b[^"\']*["\'][^>]*>', chunk, re.I)
+              or re.search(r'class=["\'][^"\']*\bbbWrapper\b[^"\']*["\'][^>]*>', chunk, re.I))
+        if bm:
+            rest = chunk[bm.end():]
+            stop = re.search(r'<button\b|class=["\'][^"\']*-card-footer\b', rest, re.I)
+            raw = rest[:stop.start()] if stop else rest
+            raw = re.sub(r'<br\s*/?>', '\n', raw, flags=re.I)
+            raw = re.sub(r'</(?:p|div|li)\s*>', '\n', raw, flags=re.I)
+            raw = re.sub(r'<script[\s\S]*?</script>|<style[\s\S]*?</style>', ' ', raw, flags=re.I)
+            raw = re.sub(r'<[^>]+>', ' ', raw)
+            body = _INVISIBLE_CHARS_RE.sub('', _decode_entities(raw))
+            body = re.sub(r'[^\S\n]+', ' ', body)
+            body = re.sub(r' ?\n ?', '\n', body)
+            body = re.sub(r'\n{3,}', '\n\n', body).strip()
+        when = ""
+        dm = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', chunk, re.I)
+        if dm:
+            when = dm.group(1).strip()
+        label = ""
+        vm = re.search(r'class=["\'][^"\']*-versionPill\b[^"\']*["\'][^>]*>\s*([^<]{1,40}?)\s*<', chunk, re.I)
+        if vm:
+            label = _decode_entities(vm.group(1)).strip()
+        # A review written before the thread had versions carries the engine's
+        # name in that place ("Ren'Py"): not a version, and labelled as one it
+        # would read like it. A version has a number in it.
+        version = label if re.search(r'\d', label) else ""
+        if rate <= 0 and not body:
+            continue
+        if rid:
+            seen.add(rid)
+        review = {
+            "id": rid,
+            "rating": quantize_rating(rate),
+            "reviewer": who or _web_reviewer_label(),
+            "text": body,
+            "notes": "",
+            "source": "web",
+            "at": when,
+        }
+        if version:
+            review["version"] = version
+        if with_list and label:
+            review["_list"] = label        # (which of the page's lists it is in; see _collect_forum_thread_reviews)
+        out.append(review)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# A thread's reviews page shows the current version's reviews and folds the
+# older versions' away (a few "most helpful" at most, the rest behind a link to
+# that version's own list, …/reviews/?version=N). A review counts whatever
+# version it was written for, so the folded lists are read too. What is
+# IMPORTED stops at the same twenty reviews the reviews tab always gave (a
+# thread can have hundreds, and nothing pages through them here); the SCORE is
+# the average of every review's own user score, all versions. Not the average
+# the page states: the site only starts showing one from the fifth review on.
+# Bounded in pages, so one lookup can never become hundreds of requests.
+_FORUM_THREAD_REVIEWS_MAX = _FORUM_REVIEW_LIMIT
+_FORUM_THREAD_REVIEW_PAGES_MAX = 60
+
+
+def _forum_review_version_links(listing: str, base_url: str) -> list:
+    """The per-version lists a thread's reviews page links to (…/reviews/?version=N),
+    once each, in the page's order, as ``(url, name, count)`` - the name and the
+    number of reviews its row in the version menu gives ("v0.7.2", "4.1★ · 5"),
+    "" / -1 when the link says neither. The versions the page itself says have
+    no reviews ("0 reviews") are left out."""
+    found: dict = {}                   # N -> [url, name, count]
+    empty: set = set()
+    for m in re.finditer(
+            r'<a\b[^>]*\bhref=["\']([^"\']*/reviews/?\?(?:[^"\']*?&(?:amp;)?)?version=(\d+)[^"\']*)["\'][^>]*>([\s\S]*?)</a>',
+            listing or "", re.IGNORECASE):
+        n, inner = m.group(2), m.group(3)
+        text = _decode_entities(re.sub(r'<[^>]+>', ' ', inner))
+        if re.search(r'(?<![\d.,])0\s+reviews?\b', text, re.IGNORECASE):
+            empty.add(n)
+            continue
+        name, count = "", -1
+        nm = re.search(r'class=["\'][^"\']*-(?:versionRow|foldRow)-name\b[^"\']*["\'][^>]*>\s*([^<]+)', inner, re.I)
+        sm = re.search(r'class=["\'][^"\']*-(?:versionRow|foldRow)-stat\b[^"\']*["\'][^>]*>([^<]*)<', inner, re.I)
+        if nm:
+            name = _decode_entities(nm.group(1)).strip()
+        if sm:
+            cm = (re.search(r'·\s*(\d+)', _decode_entities(sm.group(1)))
+                  or re.search(r'(?<![\d.,])(\d+)\s+reviews?\b', _decode_entities(sm.group(1)), re.I))
+            count = int(cm.group(1)) if cm else -1
+        if n not in found:
+            href = _decode_entities(m.group(1)).split("#")[0]
+            found[n] = [urllib.parse.urljoin(base_url, href), name, count]
+        elif name and count >= 0 and found[n][2] < 0:
+            found[n][1:] = [name, count]          # (a later link to it - its menu row - says what it holds)
+    return [tuple(v) for n, v in found.items() if n not in empty]
+
+
+def _forum_reviews_next_page(page: str, page_url: str) -> str:
+    """The next page of a reviews list, when it has more than one ("" otherwise)."""
+    m = (re.search(r'<(?:a|link)\b[^>]*\brel=["\']next["\'][^>]*\bhref=["\']([^"\']+)["\']', page or "", re.I)
+         or re.search(r'<(?:a|link)\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*\brel=["\']next["\']', page or "", re.I)
+         or re.search(r'<a\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*\bpageNav-jump--next\b', page or "", re.I)
+         or re.search(r'<a\b[^>]*class=["\'][^"\']*\bpageNav-jump--next\b[^"\']*["\'][^>]*\bhref=["\']([^"\']+)["\']', page or "", re.I))
+    return urllib.parse.urljoin(page_url, _decode_entities(m.group(1))) if m else ""
+
+
+def _collect_forum_thread_reviews(listing: str, base_url: str) -> tuple:
+    """A thread's reviews page, whatever version each review was written for: the
+    ones the page shows, then each folded version's own list (and its next
+    pages), each review once. Two answers: the reviews to import - the first
+    _FORUM_THREAD_REVIEWS_MAX, in the page's order - and the user score of EVERY
+    review read, which is what the game's score is made of (see the note above)."""
+    keep: list[dict] = []
+    scores: list[float] = []
+    seen: set = set()
+    per_list: dict = {}               # a version list's name -> how many of its reviews are read
+
+    def _take(page: str) -> None:
+        for r in _parse_forum_review_cards(page, limit=1_000_000, with_list=True):
+            listed_in = r.pop("_list", "")
+            key = r.get("id") or (r.get("reviewer"), r.get("at"), r.get("text", "")[:60])
+            if key in seen:
+                continue
+            seen.add(key)
+            if listed_in:
+                per_list[listed_in] = per_list.get(listed_in, 0) + 1
+            if float(r.get("rating") or 0) > 0:
+                scores.append(float(r["rating"]))
+            if len(keep) < _FORUM_THREAD_REVIEWS_MAX:
+                keep.append(r)
+
+    _take(listing)
+    queue: list = []                  # (url, version list name, its review count)
+    first_next = _forum_reviews_next_page(listing, base_url)
+    if first_next:
+        queue.append((first_next, "", -1))
+    queue += _forum_review_version_links(listing, base_url)
+    visited: set = set()
+    fetched = 0
+    # (Not stopping at the twentieth review: the scores of the rest still count.)
+    while queue and fetched < _FORUM_THREAD_REVIEW_PAGES_MAX:
+        page_url, list_name, list_count = queue.pop(0)
+        if page_url in visited:
+            continue
+        # A version whose reviews the page already shows, all of them (a thread
+        # with few reviews, or one from before it had versions): nothing to fetch.
+        if list_name and list_count >= 0 and per_list.get(list_name, 0) >= list_count:
+            continue
+        visited.add(page_url)
+        page = _fetch_html(page_url)
+        fetched += 1
+        if not page:
+            continue
+        _take(page)
+        nxt = _forum_reviews_next_page(page, page_url)
+        if nxt and nxt not in visited:
+            queue.insert(0, (nxt, "", -1))
+    if queue:
+        logger.info(f"Forum reviews: stopped after {fetched} page(s) - the cap; "  # i18n-ignore (log text)
+                    f"{len(scores)} score(s) read, {len(keep)} review(s) kept")  # i18n-ignore (log text)
+    return keep, scores
+
+
 def _attach_forum_reviews(info: GameInfo, page_url: str, html: str,
                           reviews_html: Optional[str] = None) -> None:
     """Pull the Reviews-tab listing into *info.reviews* when the thread has one.
@@ -1027,16 +1260,22 @@ def _attach_forum_reviews(info: GameInfo, page_url: str, html: str,
     the page is not a forum thread with that split.
     """
     reviews: list[dict] = []
+    all_scores: list = []            # every review's user score, when the page gives more than the reviews kept
+    listing = ""                     # the page the reviews were read from
     if reviews_html and _looks_like_forum_reviews_html(reviews_html):
-        reviews = _parse_forum_message_reviews(reviews_html)
+        listing = reviews_html
     elif _looks_like_forum_reviews_html(html):
-        reviews = _parse_forum_message_reviews(html)
+        listing = html
     else:
         tab = _find_forum_reviews_tab(html, page_url)
         if tab:
-            tab_html = _fetch_html(tab)
-            if tab_html:
-                reviews = _parse_forum_message_reviews(tab_html)
+            listing = _fetch_html(tab) or ""
+    if listing:
+        if _FORUM_REVIEW_CARD_RE.search(listing):
+            # The thread's own reviews page: every version's reviews, not only the shown ones.
+            reviews, all_scores = _collect_forum_thread_reviews(listing, page_url)
+        else:
+            reviews = _parse_forum_message_reviews(listing)
     if not reviews:
         return
     # Forum reviews are additive to whatever a store link on the same page
@@ -1056,7 +1295,10 @@ def _attach_forum_reviews(info: GameInfo, page_url: str, html: str,
     rated = [float(r.get("rating") or 0) for r in existing
              if float(r.get("rating") or 0) > 0]
     if rated and not info.rating:
-        info.rating = quantize_rating(sum(rated) / len(rated))
+        # A thread's reviews page: the user score of every review read, all
+        # versions - not only the twenty kept.
+        pool = all_scores or rated
+        info.rating = quantize_rating(sum(pool) / len(pool))
     if not info.reviewer:
         info.reviewer = _web_reviewer_label()
 
@@ -1240,6 +1482,33 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
         )
         _op_html = _op.group(1) if _op else ""
         if _op_html:
+            # The cover is the post's FIRST picture, posted one of two ways:
+            #  - a link to the full-size attachment around a smaller copy;
+            #  - a picture shown at full size in a "bbImageWrapper", the
+            #    original in its data-src and no link around it. A forum now
+            #    posts its first picture this way and keeps the links (around
+            #    /thumb/ copies) for the rest - looking for links alone took
+            #    the first screenshot for the cover.
+            # Whichever of the two comes first in the post is the cover.
+            _picks: list = []                  # (position in the post, url)
+            for _wm in _re.finditer(r'<div\b[^>]*\bbbImageWrapper\b[^>]*>',
+                                    _op_html, _re.IGNORECASE):
+                _w_src = _tag_attr(_wm.group(0), "data-src")
+                if not _w_src or _w_src.startswith("data:"):
+                    # (else the picture inside the wrapper, up to where it closes)
+                    _w_end = _op_html.find("</div>", _wm.end())
+                    _w_img = _re.search(r'<img\b[^>]*>',
+                                        _op_html[_wm.end():_w_end if _w_end > 0 else None],
+                                        _re.IGNORECASE)
+                    _w_src = ""
+                    if _w_img:
+                        _w_src = _tag_attr(_w_img.group(0), "data-src") or _tag_attr(_w_img.group(0), "src")
+                        if _w_src.startswith("data:"):
+                            _w_src = ""
+                _w_src = _resolve_src(_w_src) if _w_src else None
+                if _w_src and not _is_favicon_like(_w_src):
+                    _picks.append((_wm.start(), _w_src.replace("/thumb/", "/", 1)))
+                    break
             for _am in _re.finditer(
                 r'<a[^>]+href=(["\'])(https?://[^"\']*attachments\.[^"\']+\.'
                 r'(?:png|jpg|jpeg|webp|gif|avif|bmp)(?:\?[^"\']*)?)\1',
@@ -1249,8 +1518,10 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
                 if "/thumb/" in _href:
                     _href = _href.replace("/thumb/", "/", 1)
                 if not _SKIP_IMG.search(_href):
-                    image_url = _href
+                    _picks.append((_am.start(), _href))
                     break
+            if _picks:
+                image_url = min(_picks)[1]
             if not image_url:
                 for _im in _re.finditer(
                     r'<img[^>]+src=(["\'])(https?://[^"\']+\.'
@@ -1891,7 +2162,8 @@ def _scrape_opengraph(url: str, html: Optional[str] = None) -> Optional[GameInfo
     if _source == "dlsite":
         _attach_dlsite_reviews(info, url, html=html)
     elif (_forum_reviews_html or _forum
-          or _FORUM_REVIEWS_HREF_RE.search(html or "")):
+          or _FORUM_REVIEWS_HREF_RE.search(html or "")
+          or _FORUM_THREAD_REVIEWS_HREF_RE.search(html or "")):
         # XenForo product threads that split Reviews onto a sibling tab:
         # follow that tab (or use the pasted tab body) and import the
         # user reviews as generic "web" entries — never as a named source.

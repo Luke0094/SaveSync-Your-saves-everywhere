@@ -256,6 +256,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         self._cursor_timer = QTimer(self)
         self._cursor_timer.timeout.connect(SystemCursor.reassert)
         self._cursor_timer.setInterval(16)
+        self._notice_pointer_requested = False      # the hotkey brought the pointer to the notices (bring_pointer_to_notice)
 
         # Foreground change hook — reacts instantly when another window
         # covers the overlay (e.g. game entering fullscreen while visible)
@@ -3147,7 +3148,44 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
 
     def _needs_pointer(self) -> bool:
         return (self._overlay_mode in self._POINTER_MODES
-                or time.monotonic() - getattr(self, "_user_summon_at", -10.0) < 1.5)
+                or time.monotonic() - getattr(self, "_user_summon_at", -10.0) < 1.5
+                # (the hotkey brought the pointer to the notices: one arriving meanwhile does not take it away)
+                or (self._overlay_mode == "notif" and getattr(self, "_notice_pointer_requested", False)))
+
+    def bring_pointer_to_notice(self) -> bool:
+        """The hotkey, pressed while an in-game notice is on screen (a backup was made, a sync ran) over a game that has
+        hidden its pointer: the notice takes the pointer and stays until it is closed or answered, instead of being
+        swapped for the dashboard. The notice is what the player wants to reach - to close it, or "don't show
+        again" - and with no pointer the hotkey was the only way to get one, and it took the notice away. A second
+        press, with the pointer already here, does what it always did. True when it did this.
+
+        A game that shows its own cursor is left alone: the notice can be clicked as it is, and the press opens the
+        dashboard as before. Over exclusive fullscreen (the notice drawn as a picture) the game has no pointer to show."""
+        if getattr(self, "_overlay_mode", "") != "notif" or getattr(self, "_interactive_view", True):
+            return False
+        presenting = self._presenting()
+        if not presenting:
+            if not (self.isVisible() and self.windowOpacity() > 0.3):
+                return False
+            try:
+                if not SystemCursor.pointer_hidden_by_game():
+                    return False
+            except Exception:
+                return False
+        self._interactive_view = True
+        self._notice_pointer_requested = True
+        self._auto_hide_timer.stop()
+        self._auto_hide_ms = 0                     # (it stays until it is closed: the player is on the way to it)
+        if presenting:
+            self._xp_cursor_timer.start()
+            self._xp_cursor_tick()
+        else:
+            SystemCursor.hold("overlay")
+            self._cursor_timer.start()
+            self._apply_click_through()
+            SystemCursor.reassert()
+        logger.info("Overlay hotkey: pointer brought to the notice on screen (the game hides its own)")  # i18n-ignore (log text)
+        return True
 
     def _fullscreen_game_in_front(self) -> bool:
         """A game is being played: SaveSync is tracking one, or a fullscreen window is in front (a game that is
@@ -3179,6 +3217,8 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
         """
         pointer = pointer or self._needs_pointer()
         self._user_summon_at = -10.0          # a request applies to the one view it produced
+        if self._overlay_mode != "notif":
+            self._notice_pointer_requested = False     # (that request was for the notices: see bring_pointer_to_notice)
         # ── Exclusive fullscreen guard ──────────────────────────────────────
         self._rw_exclusive = False
         # (*over_exclusive*: the caller has just judged that the game in front is exclusive. Asked again here, with the foreground at
@@ -3214,8 +3254,12 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             self._apply_fullscreen_stacking()
 
         # Views that are clicked in (dashboard, questions, the queue) while a game is being played. Desktop /
-        # passive toasts: no second cursor.
-        if pointer and self._fullscreen_game_in_front():
+        # passive toasts: no second cursor. The "detected" card is about a game that has just started and is not
+        # tracked yet: in a window that does not fill the screen it was neither, and a game hiding its pointer there
+        # left the card with nothing to click it. (Only that card: on the desktop the pointer is hidden by other
+        # things too - a terminal hides it while one types.)
+        if pointer and (self._fullscreen_game_in_front()
+                        or (self._overlay_mode == "unknown" and SystemCursor.pointer_hidden_by_game())):
             SystemCursor.hold("overlay")
             self._cursor_timer.start()
         else:
@@ -3323,6 +3367,7 @@ class OverlayWidget(QWidget, ScreenSignalMixin):
             logger.debug("Overlay: could not set whether the mouse goes through", exc_info=True)
 
     def hide_animated(self):
+        self._notice_pointer_requested = False
         self._hide_presenter()
         self._clear_inline()
         self._auto_hide_timer.stop()
